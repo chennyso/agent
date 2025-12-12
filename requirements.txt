@@ -1,0 +1,10 @@
+# 核心依赖
+torch>=2.4
+transformers>=4.42.0
+
+# 可选：如需运行 LLM Agent 调用
+openai>=1.40.0
+
+# 其他工具
+tqdm>=4.66.0
+numpy>=1.26.0
