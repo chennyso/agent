@@ -1,40 +1,40 @@
-# FSDP2 Agent µ÷ÓÅ¹Ç¼Ü£¨Ä¬ÈÏÊ¾Àı Qwen-7B / 4¡ÁA800£¬¿É»»Ä£ĞÍ£©
+# FSDP2 Agent è°ƒä¼˜éª¨æ¶ï¼ˆé»˜è®¤ç¤ºä¾‹ Qwen-7B / 4Ã—A800ï¼Œå¯æ¢æ¨¡å‹ï¼‰
 
-ÕâÊÇÒ»¸ö**¿ÉÂäµØ**µÄ Agent µ÷ÓÅ¿ò¼Ü£ºLLM ×ö²ßÂÔÉú³É£¬PyTorch FSDP2 ÕæÊµÅÜ¡¢profiling¡¢´ò·Ö£¬È»ºóµü´ú¡£Ä¬ÈÏÊ¾ÀıÓÃ Qwen-7B + 4¡ÁA800£¬µ«Ä£ĞÍÃû³Æ¿ÉÍ¨¹ı²ÎÊı¸Ä³ÉÈÎÒâ Hugging Face Causal LM¡£Ó²¼ş²»¹Ì¶¨£º¿É×Ô¶¯Ì½²â GPU/ÏÔ´æ£¬Ò²¿ÉÍ¨¹ı --hardware-json ´«Èë×Ô¶¨ÒåÍØÆË£¨½ÚµãÊı/Ã¿½Úµã GPU/´ø¿íÀàĞÍ/mesh_shape£©¡£
+è¿™æ˜¯ä¸€ä¸ª**å¯è½åœ°**çš„ Agent è°ƒä¼˜æ¡†æ¶ï¼šLLM åšç­–ç•¥ç”Ÿæˆï¼ŒPyTorch FSDP2 çœŸå®è·‘ã€profilingã€æ‰“åˆ†ï¼Œç„¶åè¿­ä»£ã€‚é»˜è®¤ç¤ºä¾‹ç”¨ Qwen-7B + 4Ã—A800ï¼Œä½†æ¨¡å‹åç§°å¯é€šè¿‡å‚æ•°æ”¹æˆä»»æ„ Hugging Face Causal LMã€‚ç¡¬ä»¶ä¸å›ºå®šï¼šå¯è‡ªåŠ¨æ¢æµ‹ GPU/æ˜¾å­˜ï¼Œä¹Ÿå¯é€šè¿‡ --hardware-json ä¼ å…¥è‡ªå®šä¹‰æ‹“æ‰‘ï¼ˆèŠ‚ç‚¹æ•°/æ¯èŠ‚ç‚¹ GPU/å¸¦å®½ç±»å‹/mesh_shapeï¼‰ã€‚
 
-## Èı²ã¼Ü¹¹£¨ÎÒÃÇµÄÉè¼Æ£¬²»ÊÇ³­ CUDAForge£©
-- Level 3£º**Strategy Controller**£¨ÊµÑé¾­Àí£©
-  ¹ÜÔ¤Ëã/ÍË³öÌõ¼ş/·Ç·¨²ßÂÔ¹ıÂË£¨ÏÔ´æÔ½½ç¡¢mesh ÎŞĞ§µÈ£©£¬²¢Ğ­µ÷ Judge/Coder ÓëÖ´ĞĞ¡£
-- Level 2£º**Dual-Agent Reasoning**
-  - Agent-Judge£º¶Á profiler metrics£¬×öÆ¿¾±¹éÒò£¨compute/comm/memory/overlap£©£¬¸ø³öµ÷ÓÅ·½Ïò¡£
-  - Agent-Coder£º¸ù¾İ Judge + ÀúÊ·Éú³ÉĞÂ²ßÂÔ JSON£¨½á¹¹»¯ DSL£©¡£
-- Level 1£º**Executor**
-  ÕæÊµ torchrun ×Ó½ø³ÌÖ´ĞĞ FSDP2 ÑµÁ· + profiling£¨comm/compute/ÏÔ´æ£©£¬Êä³öÍ³Ò» JSON¡£
+## ä¸‰å±‚æ¶æ„
+- Level 3ï¼š**Strategy Controller**ï¼ˆå®éªŒç»ç†ï¼‰
+  ç®¡é¢„ç®—/é€€å‡ºæ¡ä»¶/éæ³•ç­–ç•¥è¿‡æ»¤ï¼ˆæ˜¾å­˜è¶Šç•Œã€mesh æ— æ•ˆç­‰ï¼‰ï¼Œå¹¶åè°ƒ Judge/Coder ä¸æ‰§è¡Œã€‚
+- Level 2ï¼š**Dual-Agent Reasoning**
+  - Agent-Judgeï¼šè¯» profiler metricsï¼Œåšç“¶é¢ˆå½’å› ï¼ˆcompute/comm/memory/overlapï¼‰ï¼Œç»™å‡ºè°ƒä¼˜æ–¹å‘ã€‚
+  - Agent-Coderï¼šæ ¹æ® Judge + å†å²ç”Ÿæˆæ–°ç­–ç•¥ JSONï¼ˆç»“æ„åŒ– DSLï¼‰ã€‚
+- Level 1ï¼š**Executor**
+  çœŸå® torchrun å­è¿›ç¨‹æ‰§è¡Œ FSDP2 è®­ç»ƒ + profilingï¼ˆcomm/compute/æ˜¾å­˜ï¼‰ï¼Œè¾“å‡ºç»Ÿä¸€ JSONã€‚
 
-Á÷³Ì£ºprofile ¡ú Judge Õï¶Ï ¡ú Coder Éú³É²ßÂÔ ¡ú Controller Ğ£Ñé/Ö¹Ëğ ¡ú torchrun Ö´ĞĞ ¡ú µü´ú¡£
+æµç¨‹ï¼šprofile â†’ Judge è¯Šæ–­ â†’ Coder ç”Ÿæˆç­–ç•¥ â†’ Controller æ ¡éªŒ/æ­¢æŸ â†’ torchrun æ‰§è¡Œ â†’ è¿­ä»£ã€‚
 
-## Ä¿Â¼
-- src/fsdp_agent/config.py£º²ßÂÔ dataclass¡¢Ä¬ÈÏ/Æô·¢Ê½/Ëæ»úÖÖ×Ó¡¢JSON ĞòÁĞ»¯¡£
-- src/fsdp_agent/fsdp_apply.py£º½«²ßÂÔÓ³Éäµ½ FSDP2 °ü×°Âß¼­¡£
-- src/fsdp_agent/dataloaders.py£ººÏ³É Causal LM Êı¾İ¼ÓÔØ¡£
-- src/fsdp_agent/dataset_stats.py£ºÊı¾İ¼¯Í³¼Æ¹¤¾ß¡£
-- src/fsdp_agent/hardware_info.py£ºÓ²¼ş/ÍØÆËÌ½²â»ò×Ô¶¨Òå JSON¡£
-- src/fsdp_agent/train.py£º¼ÓÔØÄ£ĞÍ¡¢ÑµÁ·Óë profiling¡¢´ò·Ö¡£
-- src/fsdp_agent/trial_runner.py£ºµ¥´Î²ßÂÔµÄ torchrun Èë¿Ú£¨rank0 Ğ´ metrics£©¡£
-- src/fsdp_agent/agent_loop.py£ºLLM Çı¶¯µÄËÑË÷Ñ­»·¡£
+## ç›®å½•
+- src/fsdp_agent/config.pyï¼šç­–ç•¥ dataclassã€é»˜è®¤/å¯å‘å¼/éšæœºç§å­ã€JSON åºåˆ—åŒ–ã€‚
+- src/fsdp_agent/fsdp_apply.pyï¼šå°†ç­–ç•¥æ˜ å°„åˆ° FSDP2 åŒ…è£…é€»è¾‘ã€‚
+- src/fsdp_agent/dataloaders.pyï¼šåˆæˆ Causal LM æ•°æ®åŠ è½½ã€‚
+- src/fsdp_agent/dataset_stats.pyï¼šæ•°æ®é›†ç»Ÿè®¡å·¥å…·ã€‚
+- src/fsdp_agent/hardware_info.pyï¼šç¡¬ä»¶/æ‹“æ‰‘æ¢æµ‹æˆ–è‡ªå®šä¹‰ JSONã€‚
+- src/fsdp_agent/train.pyï¼šåŠ è½½æ¨¡å‹ã€è®­ç»ƒä¸ profilingã€æ‰“åˆ†ã€‚
+- src/fsdp_agent/trial_runner.pyï¼šå•æ¬¡ç­–ç•¥çš„ torchrun å…¥å£ï¼ˆrank0 å†™ metricsï¼‰ã€‚
+- src/fsdp_agent/agent_loop.pyï¼šLLM é©±åŠ¨çš„æœç´¢å¾ªç¯ã€‚
 
-## ÒÀÀµÓë»·¾³
-- Ä¬ÈÏµ¥»ú 4¡ÁA800 (80GB) + NVLink£»Ò²¿ÉÍ¨¹ı --hardware-json ¸²¸ÇÓ²¼şÃèÊö£¨½ÚµãÊı¡¢Ã¿½Úµã GPU Êı/ÏÔ´æ¡¢interconnect¡¢mesh_shape£©¡£´úÂëÄÚÖÃ×Ô¶¯Ì½²â GPU/ÏÔ´æ×÷Îª¶µµ×¡£
-- Python 3.10+£¬	orch>=2.4£¨FSDP2 ×éºÏÊ½£©£¬	ransformers£¬openai£¨»òÌæ»»Îª×ÔÓĞ LLM ¿Í»§¶Ë£©¡£
-- NCCL Õı³££¬Ê¹ÓÃ 	orchrun Æô¶¯¡£
-- OPENAI_API_KEY ĞèÉèÖÃ£¨»òĞŞ¸Ä call_llm£©¡£
+## ä¾èµ–ä¸ç¯å¢ƒ
+- é»˜è®¤å•æœº 4Ã—A800 (80GB) + NVLinkï¼›ä¹Ÿå¯é€šè¿‡ --hardware-json è¦†ç›–ç¡¬ä»¶æè¿°ï¼ˆèŠ‚ç‚¹æ•°ã€æ¯èŠ‚ç‚¹ GPU æ•°/æ˜¾å­˜ã€interconnectã€mesh_shapeï¼‰ã€‚ä»£ç å†…ç½®è‡ªåŠ¨æ¢æµ‹ GPU/æ˜¾å­˜ä½œä¸ºå…œåº•ã€‚
+- Python 3.10+ï¼Œ	orch>=2.4ï¼ˆFSDP2 ç»„åˆå¼ï¼‰ï¼Œ	ransformersï¼Œopenaiï¼ˆæˆ–æ›¿æ¢ä¸ºè‡ªæœ‰ LLM å®¢æˆ·ç«¯ï¼‰ã€‚
+- NCCL æ­£å¸¸ï¼Œä½¿ç”¨ 	orchrun å¯åŠ¨ã€‚
+- OPENAI_API_KEY éœ€è®¾ç½®ï¼ˆæˆ–ä¿®æ”¹ call_llmï¼‰ã€‚
 
-°²×°Ê¾Àı£¨°´Ğè¹Ì¶¨°æ±¾£©£º
+å®‰è£…ç¤ºä¾‹ï¼ˆæŒ‰éœ€å›ºå®šç‰ˆæœ¬ï¼‰ï¼š
 `ash
 pip install "torch>=2.4" transformers openai
 `
 
-## ÅÜµ¥¸ö²ßÂÔÊÔÑé
+## è·‘å•ä¸ªç­–ç•¥è¯•éªŒ
 `ash
 torchrun --nproc_per_node=4 -m fsdp_agent.trial_runner \
   --strategy-file path/to/strategy.json \
@@ -44,9 +44,9 @@ torchrun --nproc_per_node=4 -m fsdp_agent.trial_runner \
   --dataset-stats-file dataset_stats.json \
   --hardware-json hardware.json
 `
-metrics_0.json ÖĞ°üº¬ tokens/s¡¢Í¨ĞÅ/¼ÆËãÊ±¼ä¡¢ÏÔ´æ·åÖµºÍµÃ·Ö¡£
+metrics_0.json ä¸­åŒ…å« tokens/sã€é€šä¿¡/è®¡ç®—æ—¶é—´ã€æ˜¾å­˜å³°å€¼å’Œå¾—åˆ†ã€‚
 
-## ÅÜ Agent Ñ­»·£¨LLM Çı¶¯£©
+## è·‘ Agent å¾ªç¯ï¼ˆLLM é©±åŠ¨ï¼‰
 `ash
 python -m fsdp_agent.agent_loop \
   --rounds 5 \
@@ -59,13 +59,15 @@ python -m fsdp_agent.agent_loop \
   --dataset-stats-file dataset_stats.json \
   --hardware-json hardware.json
 `
-Á÷³Ì£º
-1) ÏÈÅÜ default¡¢heuristic¡¢andom Èı¸öÖÖ×Ó²ßÂÔ¡£
-2) Ã¿ÂÖÓÃ×î½üÀúÊ·¹¹Ôì prompt£¬ÈÃ LLM Êä³ö JSON ²ßÂÔ£¬Ğ£Ñéºó torchrun Ö´ĞĞ²¢´ò·Ö¡£
-3) ½á¹ûĞ´Èë ./runs/metrics_*.json¡¢²ßÂÔ´æ strategy_*.json¡¢trace ÔÚ ./runs/traces/£¬×Ü½áÔÚ summary.json¡£
+æµç¨‹ï¼š
+1) å…ˆè·‘ defaultã€heuristicã€
+andom ä¸‰ä¸ªç§å­ç­–ç•¥ã€‚
+2) æ¯è½®ç”¨æœ€è¿‘å†å²æ„é€  promptï¼Œè®© LLM è¾“å‡º JSON ç­–ç•¥ï¼Œæ ¡éªŒå torchrun æ‰§è¡Œå¹¶æ‰“åˆ†ã€‚
+3) ç»“æœå†™å…¥ ./runs/metrics_*.jsonã€ç­–ç•¥å­˜ strategy_*.jsonã€trace åœ¨ ./runs/traces/ï¼Œæ€»ç»“åœ¨ summary.jsonã€‚
 
-## ËµÃ÷Óë×¢Òâ
-- sdp_apply ´¥´ï FSDP2 ÄÚ²¿×Ö¶Î£¨_get_fsdp_state µÈ£©£¬ÕıÊ½ÊµÑéĞè¹Ì¶¨ PyTorch °æ±¾¡£
-- Ä¿Ç° throughput ÓÉ step Ê±¼ä¹ÀËã£¬ÈçĞè¸ü¾«È·¿É½âÎö profiler trace ÖĞµÄ tokens ¼ÆÊı¡£
-- Èç²»ÏëÓÃ OpenAI£¬Ìæ»» gent_loop.py ÀïµÄ call_llm ¼´¿É¡£
-- ½¨ÒéÔÚÕæÊµÊµÑéÖĞÔö¼ÓÑéÖ¤ËğÊ§ºÍ¶à´ÎÖØ¸´ÒÔÆ½»¬ÔëÉù£»Òì¹¹/¶à½Úµã¿ÉÍ¨¹ı hardware.json + mesh_shape ÃèÊö¡£
+## è¯´æ˜ä¸æ³¨æ„
+- sdp_apply è§¦è¾¾ FSDP2 å†…éƒ¨å­—æ®µï¼ˆ_get_fsdp_state ç­‰ï¼‰ï¼Œæ­£å¼å®éªŒéœ€å›ºå®š PyTorch ç‰ˆæœ¬ã€‚
+- ç›®å‰ throughput ç”± step æ—¶é—´ä¼°ç®—ï¼Œå¦‚éœ€æ›´ç²¾ç¡®å¯è§£æ profiler trace ä¸­çš„ tokens è®¡æ•°ã€‚
+- å¦‚ä¸æƒ³ç”¨ OpenAIï¼Œæ›¿æ¢ gent_loop.py é‡Œçš„ call_llm å³å¯ã€‚
+- å»ºè®®åœ¨çœŸå®å®éªŒä¸­å¢åŠ éªŒè¯æŸå¤±å’Œå¤šæ¬¡é‡å¤ä»¥å¹³æ»‘å™ªå£°ï¼›å¼‚æ„/å¤šèŠ‚ç‚¹å¯é€šè¿‡ hardware.json + mesh_shape æè¿°ã€‚
+
