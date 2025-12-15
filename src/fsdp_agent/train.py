@@ -5,15 +5,16 @@ from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
 from .config import Fsdp2Strategy
-from .dataloaders import build_synthetic_loader
-from .dataset_stats import DatasetStats
 from .fsdp_apply import apply_fsdp2_strategy
-from .metrics_utils import score_strategy
+from .utils.dataloaders import build_synthetic_loader
+from .utils.dataset_stats import DatasetStats
+from .utils.metrics_utils import score_strategy
 
 
 def set_seeds(seed: int) -> None:
@@ -133,10 +134,11 @@ def run_trial(
     mem_limit_gb: float = 70.0,
 ) -> Dict:
     """
-    执行单策略多次重复，取中位数吞吐，返回最佳一次的详细 metrics。
+    执行单策略多次重复，取中位数吞吐，返回最佳一次的详细 metrics（含 trace_summary、MFU）。
     """
     set_seeds(0)
     all_runs = []
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     for r in range(repeats):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
@@ -180,6 +182,16 @@ def run_trial(
         prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(
             prof_metrics["step_time_ms"], global_batch_size, seq_len
         )
+
+        # MFU 估计（基于总参数量与 tokens_per_step）
+        total_params = sum(p.numel() for p in model.parameters())
+        step_time_s = max(prof_metrics["step_time_ms"] / 1000.0, 1e-6)
+        tokens_per_step = global_batch_size * seq_len
+        achieved_tflops = (6 * total_params * tokens_per_step / step_time_s) / 1e12
+        peak_tflops = _get_gpu_peak_tflops()
+        prof_metrics["mfu_percent"] = min(achieved_tflops / peak_tflops * 100.0, 999.0)
+        prof_metrics["total_params"] = total_params
+
         prof_metrics["oom"] = False
         prof_metrics["trial_id"] = trial_id
         prof_metrics["run"] = r
@@ -191,6 +203,24 @@ def run_trial(
     best["median_throughput_tokens_per_s"] = median_tp
     best["dataset_stats"] = dataset_stats.__dict__
     best["score"] = score_strategy(best, mem_limit_bytes=int(mem_limit_gb * 1024**3))
+
+    # 结构化 trace summary，供 LLM 直接阅读
+    mem_limit_bytes = int(mem_limit_gb * 1024**3)
+    headroom_mb = (mem_limit_bytes - best.get("max_mem_bytes", 0)) // (1024 * 1024)
+    overlap_ratio = 0.0
+    total = best.get("comm_time_ms", 0.0) + best.get("compute_time_ms", 0.0)
+    if total > 0:
+        overlap_ratio = 1.0 - (best.get("idle_ratio", 0.0))
+    peak_unsharded_groups = best.get("fsdp_events", {}).get("all_gather_calls", 0)
+    best["trace_summary"] = {
+        "all_gather_forward_late": best.get("idle_ratio", 0.0) > 0.2,
+        "overlap_ratio": overlap_ratio,
+        "peak_unsharded_groups": peak_unsharded_groups,
+        "memory_headroom_mb": headroom_mb,
+        "mfu_percent": best.get("mfu_percent", 0.0),
+        "tokens_per_step": global_batch_size * seq_len,
+        "world_size": world_size,
+    }
     return best
 
 
@@ -199,3 +229,17 @@ def _estimate_tokens_per_s(step_time_ms: float, global_batch: int, seq_len: int)
         return 0.0
     tokens = global_batch * seq_len
     return tokens / (step_time_ms / 1000.0)
+
+
+def _get_gpu_peak_tflops(default_bf16: float = 312.0) -> float:
+    """
+    估算 GPU 峰值 BF16 TFLOPS。
+    优先读取环境变量 FSDP_AGENT_GPU_PEAK_TFLOPS；否则默认 A800 312。
+    """
+    env_val = os.environ.get("FSDP_AGENT_GPU_PEAK_TFLOPS")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    return default_bf16
