@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import requests
+
 from .config import (
     Fsdp2Strategy,
     default_strategy,
@@ -16,8 +18,8 @@ from .config import (
     strategy_from_dict,
     validate_strategy,
 )
-from .dataset_stats import DatasetStats, load_stats_from_file
-from .hardware_info import HardwareInfo, detect_hardware, load_hardware_info
+from .utils.dataset_stats import DatasetStats, load_stats_from_file
+from .utils.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
 
 # ---------------------------------------------------------------
 # Level 3: Strategy Controller
@@ -37,13 +39,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-steps", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--workdir", type=str, default="./runs")
-    p.add_argument("--llm-model", type=str, default="gpt-4o-mini")
+    p.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     p.add_argument("--llm-temperature", type=float, default=0.2)
     p.add_argument("--max-history", type=int, default=6, help="提示时保留的最近 trial 数。")
     p.add_argument("--stop-drop", type=float, default=0.03, help="连续性能下降比例阈值。")
     p.add_argument("--dataset-stats-file", type=str, default=None, help="数据集统计 JSON。")
     p.add_argument("--repeats", type=int, default=1, help="每个策略重复运行次数。")
     p.add_argument("--hardware-json", type=str, default=None, help="自定义硬件/拓扑 JSON，覆盖自动探测。")
+    p.add_argument("--llm-endpoint", type=str, default="http://10.100.1.93:12365/v1/chat/completions", help="LLM 服务 HTTP 接口")
     return p.parse_args()
 
 
@@ -55,26 +58,26 @@ def _hardware_summary(hw: HardwareInfo) -> str:
     )
 
 
-def call_llm(prompt: str, system_prompt: str, model: str, temperature: float) -> str:
-    """统一 LLM 调用封装；如需自有模型请自行替换。"""
-    try:
-        from openai import OpenAI
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("需要安装 openai 或替换 call_llm 实现") from exc
-
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    if client is None:
-        raise RuntimeError("OPENAI_API_KEY 未设置")
-
-    resp = client.responses.create(
-        model=model,
-        temperature=temperature,
-        messages=[
+def call_llm(prompt: str, system_prompt: str, model: str, temperature: float, endpoint: str) -> str:
+    """调用内网 LLM HTTP 接口（兼容 openai chat/completions 风格）。"""
+    payload = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-    )
-    return resp.output[0].content[0].text
+        "temperature": temperature,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    resp = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    # 兼容 openai 返回格式
+    if "choices" in data and data["choices"]:
+        msg = data["choices"][0].get("message", {})
+        return msg.get("content", "")
+    raise RuntimeError(f"LLM response format unexpected: {data}")
 
 
 # ---------------------------------------------------------------
@@ -263,6 +266,7 @@ def main() -> None:
             system_prompt=JUDGE_SYSTEM,
             model=args.llm_model,
             temperature=args.llm_temperature,
+            endpoint=args.llm_endpoint,
         )
 
         c_prompt = build_coder_prompt(judge_reply, mem_limit_gb=args.mem_limit_gb)
@@ -271,6 +275,7 @@ def main() -> None:
             system_prompt=CODER_SYSTEM,
             model=args.llm_model,
             temperature=args.llm_temperature,
+            endpoint=args.llm_endpoint,
         )
         try:
             raw_json = json.loads(coder_reply)
