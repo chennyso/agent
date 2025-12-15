@@ -113,8 +113,23 @@ class Fsdp2Strategy:
 
 
 def default_strategy() -> Fsdp2Strategy:
-    """Official-ish FSDP2 default style baseline."""
-    return Fsdp2Strategy()
+    """Safe baseline: block wrap + memory_saving reshard, no prefetch/async, embeddings normal."""
+    return Fsdp2Strategy(
+        grouping=GroupingConfig(
+            module_grouping="block",
+            use_size_based_auto_wrap=False,
+            size_based_min_num_params=int(1e8),
+            treat_embeddings_special=False,
+        ),
+        shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
+        comm_overlap=CommOverlapConfig(
+            backward_prefetch_num=0,
+            forward_prefetch_num=0,
+            unshard_async_op=False,
+            unshard_in_backward_embeddings=False,
+        ),
+        precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
+    )
 
 
 def heuristic_mem_eff_strategy() -> Fsdp2Strategy:

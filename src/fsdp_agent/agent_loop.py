@@ -153,7 +153,7 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
     cmd = [
         sys.executable,
         "-m",
-        "torchrun",
+        "torch.distributed.run",
         "--nproc_per_node",
         str(args.nproc),
         "-m",
@@ -236,11 +236,8 @@ def main() -> None:
     )
     history: List[Dict] = []
 
-    seeds = [
-        ("default", default_strategy()),
-        ("heuristic", heuristic_mem_eff_strategy()),
-        ("random", random_strategy()),
-    ]
+    # 只保留安全种子，避免随机/启发式触发 OOM/断言
+    seeds = [("safe", default_strategy())]
     trial_id = 0
 
     for name, strat in seeds:

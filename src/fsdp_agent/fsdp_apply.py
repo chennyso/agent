@@ -121,7 +121,12 @@ def _apply_prefetch(
             for j in range(1, forward_window + 1):
                 if i + j < len(layers):
                     targets.append(layers[i + j])
-            if targets and hasattr(layer, "set_modules_to_forward_prefetch"):
+            # 只有当 layer 和 targets 都是 FSDP 包装（具备 prefetch 方法）时才调用，避免原生模块触发断言
+            if (
+                targets
+                and hasattr(layer, "set_modules_to_forward_prefetch")
+                and all(hasattr(t, "set_modules_to_forward_prefetch") for t in targets)
+            ):
                 layer.set_modules_to_forward_prefetch(targets)
 
     if backward_window > 0:
@@ -130,7 +135,11 @@ def _apply_prefetch(
             for j in range(1, backward_window + 1):
                 if i - j >= 0:
                     targets.append(layers[i - j])
-            if targets and hasattr(layer, "set_modules_to_backward_prefetch"):
+            if (
+                targets
+                and hasattr(layer, "set_modules_to_backward_prefetch")
+                and all(hasattr(t, "set_modules_to_backward_prefetch") for t in targets)
+            ):
                 layer.set_modules_to_backward_prefetch(targets)
 
 

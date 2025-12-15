@@ -179,7 +179,8 @@ def run_trial(
 
         prof = profile(
             activities=activities,
-            schedule=schedule(wait=1, warmup=3, active=num_steps),
+            # 捕获全部迭代（0 等待，1 步预热，active=num_steps）
+            schedule=schedule(wait=0, warmup=1, active=num_steps),
             on_trace_ready=tensorboard_trace_handler(trace_path),
             record_shapes=False,
             profile_memory=True,
