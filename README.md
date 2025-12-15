@@ -1,73 +1,82 @@
-# FSDP2 Agent è°ƒä¼˜éª¨æ¶ï¼ˆé»˜è®¤ç¤ºä¾‹ Qwen-7B / 4Ã—A800ï¼Œå¯æ¢æ¨¡å‹ï¼‰
+# AutoFSDP-Agent£¨¿ÉÕæÊµÔËĞĞµÄ FSDP2 µ÷ÓÅ¿ò¼Ü£©
 
-è¿™æ˜¯ä¸€ä¸ª**å¯è½åœ°**çš„ Agent è°ƒä¼˜æ¡†æ¶ï¼šLLM åšç­–ç•¥ç”Ÿæˆï¼ŒPyTorch FSDP2 çœŸå®è·‘ã€profilingã€æ‰“åˆ†ï¼Œç„¶åè¿­ä»£ã€‚é»˜è®¤ç¤ºä¾‹ç”¨ Qwen-7B + 4Ã—A800ï¼Œä½†æ¨¡å‹åç§°å¯é€šè¿‡å‚æ•°æ”¹æˆä»»æ„ Hugging Face Causal LMã€‚ç¡¬ä»¶ä¸å›ºå®šï¼šå¯è‡ªåŠ¨æ¢æµ‹ GPU/æ˜¾å­˜ï¼Œä¹Ÿå¯é€šè¿‡ --hardware-json ä¼ å…¥è‡ªå®šä¹‰æ‹“æ‰‘ï¼ˆèŠ‚ç‚¹æ•°/æ¯èŠ‚ç‚¹ GPU/å¸¦å®½ç±»å‹/mesh_shapeï¼‰ã€‚
+AutoFSDP-Agent ÊÇÒ»¸öÒÔ LLM Îª¡°¶Ô±ÈÊ½²ßÂÔ²ÃÅĞ¡±µÄ±Õ»·ÏµÍ³£ºÔÚÕæÊµÓ²¼şÉÏÔËĞĞ FSDP2£¬²É¼¯Í¨ĞÅ/¼ÆËã/ÏÔ´æÖ¤¾İ£¬¹¹ÔìÉÙÁ¿²ßÂÔ±ä¸ü¼ÙÉè£¬ÈÃ LLM Ñ¡Ôñ×îºÏÀíµÄĞĞÎª¸Ä±ä£¬²¢Í¨¹ıÊÜÏŞËã×ÓÂäµØ£¬ÊÔÑé¡¢½ÓÊÜ»ò»Ø¹ö¡£
 
-## ä¸‰å±‚æ¶æ„
-- Level 3ï¼š**Strategy Controller**ï¼ˆå®éªŒç»ç†ï¼‰
-  ç®¡é¢„ç®—/é€€å‡ºæ¡ä»¶/éæ³•ç­–ç•¥è¿‡æ»¤ï¼ˆæ˜¾å­˜è¶Šç•Œã€mesh æ— æ•ˆç­‰ï¼‰ï¼Œå¹¶åè°ƒ Judge/Coder ä¸æ‰§è¡Œã€‚
-- Level 2ï¼š**Dual-Agent Reasoning**
-  - Agent-Judgeï¼šè¯» profiler metricsï¼Œåšç“¶é¢ˆå½’å› ï¼ˆcompute/comm/memory/overlapï¼‰ï¼Œç»™å‡ºè°ƒä¼˜æ–¹å‘ã€‚
-  - Agent-Coderï¼šæ ¹æ® Judge + å†å²ç”Ÿæˆæ–°ç­–ç•¥ JSONï¼ˆç»“æ„åŒ– DSLï¼‰ã€‚
-- Level 1ï¼š**Executor**
-  çœŸå® torchrun å­è¿›ç¨‹æ‰§è¡Œ FSDP2 è®­ç»ƒ + profilingï¼ˆcomm/compute/æ˜¾å­˜ï¼‰ï¼Œè¾“å‡ºç»Ÿä¸€ JSONã€‚
+ºËĞÄ·Ö¹¤£º
+- Executor£¨Level 1£©£ºÕæÊµ torchrun ×Ó½ø³ÌÖ´ĞĞ FSDP2£¬²É¼¯ profiler Ö¤¾İ¡£
+- Judge/Coder£¨Level 2£©£ºLLM Ö»×ö¶Ô±ÈÅĞ¶Ï¡°ÄÄÖÖ²ßÂÔ¸Ä±ä¸üºÏÀí¡±£¬²»Ö±½ÓÉú³É´úÂë¡£
+- Controller£¨Level 3£©£º¸ºÔğÔ¤Ëã/¹ıÂË/Ö¹Ëğ¡¢µ÷ÓÃ LLM¡¢µ÷ÓÃËã×Ó¿âÓë validator£¬×éÖ¯ trial¡£
+- Profiler£ºÌá¹©¡°·¢ÉúÁËÊ²Ã´¡±µÄ½á¹¹»¯Ö¤¾İ£¨Í¨ĞÅÕ¼±È¡¢overlap¡¢ÏÔ´æ¡¢collective ´ÎÊıµÈ£©¡£
+- Diagnoser£¨Çá£©£º½«Ô­Ê¼Ö¸±ê×ª³É¿É¶ÁÊÂÊµÃèÊö£¬¹© LLM ÅĞ¶Ï¡£
+- Action Library£º½« LLM Ñ¡ÖĞµÄ¡°ĞĞÎª¼ÙÉè¡±·­Òë³É°²È«¡¢¿É»Ø¹öµÄ FSDP2 ÅäÖÃĞŞ¸Ä¡£
+- Validator£ºÀ¹½Ø·Ç·¨/Î£ÏÕ×éºÏ£¬±£ÊØ¹ÀËãÏÔ´æ¡£
 
-æµç¨‹ï¼šprofile â†’ Judge è¯Šæ–­ â†’ Coder ç”Ÿæˆç­–ç•¥ â†’ Controller æ ¡éªŒ/æ­¢æŸ â†’ torchrun æ‰§è¡Œ â†’ è¿­ä»£ã€‚
+Á÷³Ì£¨Ã¿ÂÖ£©£ºprofile ¡ú Ö¤¾İÃèÊö ¡ú ºòÑ¡ĞĞÎª¼ÙÉè ¡ú LLM Ñ¡Ôñ ¡ú ¶¯×÷Ó¦ÓÃ ¡ú ÊÔÑé ¡ú ½ÓÊÜ/»Ø¹ö¡£
 
-## ç›®å½•
-- src/fsdp_agent/config.pyï¼šç­–ç•¥ dataclassã€é»˜è®¤/å¯å‘å¼/éšæœºç§å­ã€JSON åºåˆ—åŒ–ã€‚
-- src/fsdp_agent/fsdp_apply.pyï¼šå°†ç­–ç•¥æ˜ å°„åˆ° FSDP2 åŒ…è£…é€»è¾‘ã€‚
-- src/fsdp_agent/dataloaders.pyï¼šåˆæˆ Causal LM æ•°æ®åŠ è½½ã€‚
-- src/fsdp_agent/dataset_stats.pyï¼šæ•°æ®é›†ç»Ÿè®¡å·¥å…·ã€‚
-- src/fsdp_agent/hardware_info.pyï¼šç¡¬ä»¶/æ‹“æ‰‘æ¢æµ‹æˆ–è‡ªå®šä¹‰ JSONã€‚
-- src/fsdp_agent/train.pyï¼šåŠ è½½æ¨¡å‹ã€è®­ç»ƒä¸ profilingã€æ‰“åˆ†ã€‚
-- src/fsdp_agent/trial_runner.pyï¼šå•æ¬¡ç­–ç•¥çš„ torchrun å…¥å£ï¼ˆrank0 å†™ metricsï¼‰ã€‚
-- src/fsdp_agent/agent_loop.pyï¼šLLM é©±åŠ¨çš„æœç´¢å¾ªç¯ã€‚
+## Ä£Ê½ËµÃ÷
+- Config-level Ä£Ê½£¨Ä¬ÈÏ£©£ºLLM ÔÚÈô¸ÉÍêÕû Fsdp2Strategy ·½°¸ÖĞÑ¡Ôñ¡£
+- Action-level Ä£Ê½£¨ÍÆ¼ö£¬¡Ü10 ´ÎÊÔÑé£©£ºLLM ÔÚÉÙÁ¿¡°ĞĞÎª¼ÙÉè/¶¯×÷¡±ÖĞ×ö¶Ô±ÈÑ¡Ôñ£¨ÈçÌáÇ° all-gather¡¢ºÏ²¢ group£©£¬ÓÉ¶¯×÷¿âÂäµØ×îĞ¡ÅäÖÃĞŞ¸Ä¡£±¾ÎÄ·½·¨ÂÛÄ¬ÈÏÒÔ action-level ÊÓ½ÇÃèÊö¡£
 
-## ä¾èµ–ä¸ç¯å¢ƒ
-- é»˜è®¤å•æœº 4Ã—A800 (80GB) + NVLinkï¼›ä¹Ÿå¯é€šè¿‡ --hardware-json è¦†ç›–ç¡¬ä»¶æè¿°ï¼ˆèŠ‚ç‚¹æ•°ã€æ¯èŠ‚ç‚¹ GPU æ•°/æ˜¾å­˜ã€interconnectã€mesh_shapeï¼‰ã€‚ä»£ç å†…ç½®è‡ªåŠ¨æ¢æµ‹ GPU/æ˜¾å­˜ä½œä¸ºå…œåº•ã€‚
-- Python 3.10+ï¼Œ	orch>=2.4ï¼ˆFSDP2 ç»„åˆå¼ï¼‰ï¼Œ	ransformersï¼Œopenaiï¼ˆæˆ–æ›¿æ¢ä¸ºè‡ªæœ‰ LLM å®¢æˆ·ç«¯ï¼‰ã€‚
-- NCCL æ­£å¸¸ï¼Œä½¿ç”¨ 	orchrun å¯åŠ¨ã€‚
-- OPENAI_API_KEY éœ€è®¾ç½®ï¼ˆæˆ–ä¿®æ”¹ call_llmï¼‰ã€‚
+## ²Ö¿â½á¹¹£¨¿ÉÔËĞĞÖ÷Ïß£©
+- src/fsdp_agent/config.py£ºFSDP2 ²ßÂÔ¶¨Òå¡¢Ä¬ÈÏ/Æô·¢Ê½/Ëæ»úÖÖ×Ó¡£
+- src/fsdp_agent/fsdp_apply.py£º²ßÂÔµ½ FSDP2 °ü×°Ó³Éä¡£
+- src/fsdp_agent/utils/£ºÊı¾İ¡¢Í³¼Æ¡¢Ó²¼ş¡¢Ö¸±ê¹¤¾ß¡£
+- src/fsdp_agent/train.py£º¼ÓÔØÄ£ĞÍ¡¢ÑµÁ·Óë profiling¡¢´ò·Ö£¨º¬ trace_summary ºÍ MFU£©¡£
+- src/fsdp_agent/trial_runner.py£ºtorchrun Èë¿Ú£¨µ¥²ßÂÔÊÔÑé¡¢Ğ´ metrics£¬º¬ strategy_hash£©¡£
+- src/fsdp_agent/agent_loop.py£ºController + LLM ±È½Ï²ÃÅĞ + ×Ó½ø³ÌÖ´ĞĞ£¨Ä¬ÈÏÄÚÍø LLM£©¡£
+- docs/AutoFSDP-Agent.md£º·½·¨Ï¸½Ú¡¢LLM prompt¡¢¶¯×÷Ó³Éä±í¡¢Ä£Ê½ËµÃ÷¡£
 
-å®‰è£…ç¤ºä¾‹ï¼ˆæŒ‰éœ€å›ºå®šç‰ˆæœ¬ï¼‰ï¼š
+## ÒÀÀµ
+- Python 3.10+
+- PyTorch >= 2.4£¨FSDP2 ×éºÏÊ½£©
+- transformers£¨¼ÓÔØ Qwen µÈ HF Ä£ĞÍ£©
+- requests£¨ÄÚÍø LLM HTTP µ÷ÓÃ£»ÈçĞè openai ·ç¸ñ¿É×ÔĞĞ¸Ä£©
+- NCCL ¿ÉÓÃ£¨Linux + GPU »·¾³£©
+
+°²×°Ê¾Àı£º
 `ash
-pip install "torch>=2.4" transformers openai
+pip install "torch>=2.4" transformers requests
 `
 
-## è·‘å•ä¸ªç­–ç•¥è¯•éªŒ
+## ÔËĞĞÊ¾Àı£¨A800 4 ¿¨£¬Ä£ĞÍÂ·¾¶ /public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B£©
+### µ¥²ßÂÔÊÔÑé
 `ash
 torchrun --nproc_per_node=4 -m fsdp_agent.trial_runner \
   --strategy-file path/to/strategy.json \
   --output ./runs/metrics_0.json \
-  --model-name Qwen/Qwen-7B \
+  --model-name /public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B \
   --global-batch-size 8 --seq-len 2048 --num-steps 30 \
   --dataset-stats-file dataset_stats.json \
   --hardware-json hardware.json
 `
-metrics_0.json ä¸­åŒ…å« tokens/sã€é€šä¿¡/è®¡ç®—æ—¶é—´ã€æ˜¾å­˜å³°å€¼å’Œå¾—åˆ†ã€‚
+metrics_0.json ½«°üº¬ tokens/s¡¢Í¨ĞÅ/¼ÆËãÊ±¼ä¡¢ÏÔ´æ·åÖµ¡¢MFU¡¢trace_summary¡¢µÃ·Ö¡£
 
-## è·‘ Agent å¾ªç¯ï¼ˆLLM é©±åŠ¨ï¼‰
+### Agent Ñ­»·£¨LLM Ê¹ÓÃÄÚÍø½Ó¿Ú£©
 `ash
 python -m fsdp_agent.agent_loop \
   --rounds 5 \
-  --model-name Qwen/Qwen-7B \
+  --model-name /public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B \
   --global-batch-size 8 --seq-len 2048 \
   --num-steps 30 --num-warmup 5 \
   --mem-limit-gb 70 \
   --workdir ./runs \
-  --llm-model gpt-4o-mini \
+  --llm-model /models/Qwen2.5-72B-Instruct \
+  --llm-endpoint http://10.100.1.93:12365/v1/chat/completions \
   --dataset-stats-file dataset_stats.json \
   --hardware-json hardware.json
 `
-æµç¨‹ï¼š
-1) å…ˆè·‘ defaultã€heuristicã€
-andom ä¸‰ä¸ªç§å­ç­–ç•¥ã€‚
-2) æ¯è½®ç”¨æœ€è¿‘å†å²æ„é€  promptï¼Œè®© LLM è¾“å‡º JSON ç­–ç•¥ï¼Œæ ¡éªŒå torchrun æ‰§è¡Œå¹¶æ‰“åˆ†ã€‚
-3) ç»“æœå†™å…¥ ./runs/metrics_*.jsonã€ç­–ç•¥å­˜ strategy_*.jsonã€trace åœ¨ ./runs/traces/ï¼Œæ€»ç»“åœ¨ summary.jsonã€‚
+Á÷³Ì£ºÅÜ default/heuristic/random ÖÖ×Ó ¡ú Ã¿ÂÖÉú³É¡°Ö´ĞĞÖ¤¾İ + ºòÑ¡ĞĞÎª¼ÙÉè¡± ¡ú LLM Ñ¡Ôñ ¡ú Ğ£Ñé ¡ú torchrun ÊÔÑé ¡ú ½ÓÊÜ/»Ø¹ö¡£
 
-## è¯´æ˜ä¸æ³¨æ„
-- sdp_apply è§¦è¾¾ FSDP2 å†…éƒ¨å­—æ®µï¼ˆ_get_fsdp_state ç­‰ï¼‰ï¼Œæ­£å¼å®éªŒéœ€å›ºå®š PyTorch ç‰ˆæœ¬ã€‚
-- ç›®å‰ throughput ç”± step æ—¶é—´ä¼°ç®—ï¼Œå¦‚éœ€æ›´ç²¾ç¡®å¯è§£æ profiler trace ä¸­çš„ tokens è®¡æ•°ã€‚
-- å¦‚ä¸æƒ³ç”¨ OpenAIï¼Œæ›¿æ¢ gent_loop.py é‡Œçš„ call_llm å³å¯ã€‚
-- å»ºè®®åœ¨çœŸå®å®éªŒä¸­å¢åŠ éªŒè¯æŸå¤±å’Œå¤šæ¬¡é‡å¤ä»¥å¹³æ»‘å™ªå£°ï¼›å¼‚æ„/å¤šèŠ‚ç‚¹å¯é€šè¿‡ hardware.json + mesh_shape æè¿°ã€‚
+## LLM µ÷ÓÃËµÃ÷
+- gent_loop.py Ä¬ÈÏÊ¹ÓÃÄÚÍø HTTP ½Ó¿Ú http://10.100.1.93:12365/v1/chat/completions£¬Ä£ĞÍ /models/Qwen2.5-72B-Instruct¡£ÈçĞè¸ü»»£¬ĞŞ¸Ä --llm-endpoint/--llm-model »ò call_llm¡£
+- LLM ²»Ö±½ÓÉú³ÉÅäÖÃ£¬Ö»ÔÚºòÑ¡¼ÙÉè/²ßÂÔÖĞ×ö¶Ô±ÈÑ¡Ôñ²¢¸ø³öÀíÓÉ¡£
 
+## ÕæÊµÖ´ĞĞÓë°²È«
+- ÑµÁ·/ÊÔÑéÊ¹ÓÃÕæÊµ FSDP2 °ü×°£¨sdp_apply.py£©£¬torchrun ¶à½ø³Ì£¬profiler ²É¼¯ÕæÊµÍ¨ĞÅÓëÏÔ´æ£»trace Ğ´Èë --trace-dir£¨Ä¬ÈÏ ./runs/traces£¬¿ÉÓÃ TensorBoard ²é¿´£©¡£
+- ¿ÉÓÃ utils.hardware_info ×Ô¶¯Ì½²â GPU/ÏÔ´æ£¬»òÓÃ --hardware-json ¸²¸Ç¡£
+- Validator/¶¯×÷¿âÂß¼­²Î¿¼ docs/AutoFSDP-Agent.md£¬°´Ğè½ÓÈë¡£
+
+## ¿ÉÑ¡ÔöÇ¿
+- ½«¶¯×÷¿âÕæÕı½ÓÈë agent_loop£¬Ä¬ÈÏÊ¹ÓÃ action-level ËÑË÷¡£
+- ¼ÓÇ¿ validator£¨OOM/timeout ·çÏÕ£©¡¢ÀúÊ·¼ÇÒä£¨±ÜÃâÖØ¸´ÎŞĞ§¶¯×÷£©¡£
+- À©Õ¹ profiler ÌáÈ¡¸ü·á¸»µÄ overlap/collective ÌØÕ÷£¬·á¸» trace_summary¡£

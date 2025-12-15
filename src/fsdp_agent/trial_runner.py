@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--strategy-json", type=str, help="Inline JSON strategy string.")
     p.add_argument("--output", type=str, required=True, help="Where to write metrics JSON (rank0).")
     p.add_argument("--trace-dir", type=str, default="./traces", help="Trace output directory.")
-    p.add_argument("--model-name", type=str, default="Qwen/Qwen-7B", help="HF Causal LM name or local path.")
+    p.add_argument("--model-name", type=str, default="/public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B", help="HF Causal LM name or local path.")
     p.add_argument("--global-batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--vocab-size", type=int, default=151936)  # Qwen vocab size

@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rounds", type=int, default=5, help="LLM 迭代轮数（不含种子）。")
     p.add_argument("--nproc", type=int, default=4, help="每节点 GPU 数。")
     p.add_argument("--mem-limit-gb", type=float, default=70.0, help="显存上限，提前过滤策略。")
-    p.add_argument("--model-name", type=str, default="Qwen/Qwen-7B", help="HF Causal LM 名称或本地路径。")
+    p.add_argument("--model-name", type=str, default="/public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B", help="HF Causal LM 名称或本地路径。")
     p.add_argument("--global-batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--vocab-size", type=int, default=151936)
