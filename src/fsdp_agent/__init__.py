@@ -16,5 +16,8 @@ __all__ = [
     "data",
     "train",
     "agent_loop",
-    "utils",
+    "dataloaders",
+    "dataset_stats",
+    "hardware_info",
+    "metrics_utils",
 ]

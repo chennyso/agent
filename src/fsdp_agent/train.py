@@ -11,9 +11,9 @@ from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trac
 
 from fsdp_agent.config import Fsdp2Strategy
 from fsdp_agent.fsdp_apply import apply_fsdp2_strategy
-from fsdp_agent.utils.dataloaders import build_synthetic_loader
-from fsdp_agent.utils.dataset_stats import DatasetStats
-from fsdp_agent.utils.metrics_utils import score_strategy
+from fsdp_agent.dataloaders import build_synthetic_loader
+from fsdp_agent.dataset_stats import DatasetStats
+from fsdp_agent.metrics_utils import score_strategy
 
 
 def set_seeds(seed: int) -> None:

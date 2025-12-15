@@ -18,8 +18,8 @@ from fsdp_agent.config import (
     strategy_from_dict,
     validate_strategy,
 )
-from fsdp_agent.utils.dataset_stats import DatasetStats, load_stats_from_file
-from fsdp_agent.utils.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
+from fsdp_agent.dataset_stats import DatasetStats, load_stats_from_file
+from fsdp_agent.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
 
 # ---------------------------------------------------------------
 # Level 3: Strategy Controller
