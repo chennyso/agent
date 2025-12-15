@@ -72,9 +72,10 @@ def run_steps(
     losses: List[float] = []
     for step in range(num_warmup + num_steps):
         batch = next(it)
-        ctx = profiler_ctx.step() if profiler_ctx else nullcontext()
-        with ctx:
-            loss = train_step(model, optimizer, batch, scaler=None)
+        # torch.profiler.profile 在 with 块外调用 step() 即可，无需 __enter__
+        if profiler_ctx:
+            profiler_ctx.step()
+        loss = train_step(model, optimizer, batch, scaler=None)
         if step >= num_warmup:
             losses.append(loss)
     return losses
