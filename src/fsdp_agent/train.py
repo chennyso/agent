@@ -83,8 +83,21 @@ def run_steps(
 
 def _extract_profiler_metrics(prof) -> Dict[str, float]:
     events = prof.key_averages()
-    total_cuda_time = sum(e.cuda_time_total for e in events) / 1e6  # ms
-    total_cpu_time = sum(e.cpu_time_total for e in events) / 1e6
+    # 兼容不同版本的 profiler 字段命名：优先 device_time_total/self_device_time_total（2.0+）
+    def _get_cuda_time(evt):
+        return (
+            getattr(evt, "device_time_total", None)
+            or getattr(evt, "self_device_time_total", None)
+            or getattr(evt, "cuda_time_total", None)  # 旧字段
+            or getattr(evt, "self_cuda_time_total", 0.0)  # 旧字段
+            or 0.0
+        )
+
+    def _get_cpu_time(evt):
+        return getattr(evt, "cpu_time_total", None) or getattr(evt, "self_cpu_time_total", 0.0) or 0.0
+
+    total_cuda_time = sum(_get_cuda_time(e) for e in events) / 1e6  # ms
+    total_cpu_time = sum(_get_cpu_time(e) for e in events) / 1e6
     step_time_ms = total_cuda_time / max(prof.step_num, 1)
 
     comm_time_ms = 0.0
@@ -94,13 +107,13 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
     for e in events:
         name = e.key
         if "all_gather" in name:
-            comm_time_ms += e.cuda_time_total / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e6
             all_gather_calls += 1
         elif "reduce_scatter" in name:
-            comm_time_ms += e.cuda_time_total / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e6
             reduce_scatter_calls += 1
         elif "all_reduce" in name:
-            comm_time_ms += e.cuda_time_total / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e6
             all_reduce_calls += 1
     compute_time_ms = max(total_cuda_time - comm_time_ms, 0.0)
     idle_ratio = max(1.0 - (comm_time_ms + compute_time_ms) / max(total_cuda_time, 1e-6), 0.0)
