@@ -53,7 +53,11 @@ def build_mp_policy(cfg: PrecisionOffloadConfig) -> Optional[MixedPrecisionPolic
     if cfg.mp_policy == "none":
         return None
     dtype = torch.bfloat16 if cfg.mp_policy == "bf16" else torch.float16
-    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+    # 兼容不同 torch 版本：部分版本不支持 buffer_dtype 参数
+    try:
+        return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+    except TypeError:
+        return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
 
 def build_offload_policy(cfg: PrecisionOffloadConfig) -> Optional[OffloadPolicy]:
