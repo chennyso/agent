@@ -5,10 +5,9 @@ Modules:
 - config: strategy dataclasses / JSON schema helpers.
 - fsdp_apply: utilities to materialize FSDP2 strategies on a model.
 - data: synthetic dataset builders.
-- dataloaders: synthetic loader with seq_len control.
-- dataset_stats: dataset statistics utilities.
 - train: training loop and profiling harness.
 - agent_loop: LLM-driven search scaffold.
+- utils: dataloaders/dataset_stats/hardware_info/metrics_utils.
 """
 
 __all__ = [
@@ -17,4 +16,5 @@ __all__ = [
     "data",
     "train",
     "agent_loop",
+    "utils",
 ]

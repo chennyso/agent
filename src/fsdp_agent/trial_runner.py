@@ -9,9 +9,9 @@ from typing import Dict
 import torch
 import torch.distributed as dist
 
-from .config import Fsdp2Strategy, strategy_from_dict
-from .train import run_trial
-from .utils.dataset_stats import load_stats_from_file, DatasetStats
+from fsdp_agent.config import Fsdp2Strategy, strategy_from_dict
+from fsdp_agent.train import run_trial
+from fsdp_agent.utils.dataset_stats import load_stats_from_file, DatasetStats
 
 
 def init_distributed() -> None:

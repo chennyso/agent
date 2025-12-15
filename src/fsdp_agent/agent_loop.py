@@ -10,7 +10,7 @@ from typing import Dict, List
 
 import requests
 
-from .config import (
+from fsdp_agent.config import (
     Fsdp2Strategy,
     default_strategy,
     heuristic_mem_eff_strategy,
@@ -18,8 +18,8 @@ from .config import (
     strategy_from_dict,
     validate_strategy,
 )
-from .utils.dataset_stats import DatasetStats, load_stats_from_file
-from .utils.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
+from fsdp_agent.utils.dataset_stats import DatasetStats, load_stats_from_file
+from fsdp_agent.utils.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
 
 # ---------------------------------------------------------------
 # Level 3: Strategy Controller
