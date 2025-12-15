@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import Optimizer
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
