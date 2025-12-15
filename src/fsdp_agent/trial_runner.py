@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from typing import Dict
 
 import torch
@@ -83,7 +84,11 @@ def main() -> None:
     except torch.cuda.OutOfMemoryError:
         metrics = {"oom": True, "score": float("-inf")}
     except Exception as exc:
-        metrics = {"error": str(exc), "score": float("-inf")}
+        metrics = {
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "score": float("-inf"),
+        }
 
     if dist.get_rank() == 0:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
