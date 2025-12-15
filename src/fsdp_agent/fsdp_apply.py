@@ -160,8 +160,6 @@ def apply_fsdp2_strategy(model: nn.Module, strategy: Fsdp2Strategy) -> nn.Module
         "reshard_after_forward": reshard_after_forward,
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
-        # 使用原始参数存储，避免零大小存储导致的 backward 访问异常
-        "use_orig_params": True,
     }
 
     layers = _get_transformer_layers(model)
