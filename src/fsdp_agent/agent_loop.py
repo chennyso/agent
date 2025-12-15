@@ -17,9 +17,14 @@ from fsdp_agent.config import (
     random_strategy,
     strategy_from_dict,
     validate_strategy,
+    perf_tier_candidates,
 )
 from fsdp_agent.dataset_stats import DatasetStats, load_stats_from_file
 from fsdp_agent.hardware_info import HardwareInfo, detect_hardware, load_hardware_info
+
+# 去重用：对策略 dict 做稳定哈希
+def _strategy_hash(strategy: Fsdp2Strategy) -> str:
+    return json.dumps(strategy.to_dict(), sort_keys=True, ensure_ascii=False)
 
 # ---------------------------------------------------------------
 # Level 3: Strategy Controller
@@ -106,11 +111,17 @@ def build_judge_prompt(
     seq_len: int,
     dataset_stats: DatasetStats,
 ) -> str:
+    # 提取最近一次的 key signals
+    last = history[-1] if history else {}
+    comm_ratio = last.get("comm_ratio", 0.0)
+    headroom_gb = max(0, (70.0 - last.get("max_mem_bytes", 0) / 1024**3))
+
     text = [
         f"硬件：{_hardware_summary(hw)}",
         f"模型：{model_name}",
         f"训练：global_batch_size={gbs}, seq_len={seq_len}",
         f"数据集统计：p50={dataset_stats.seq_len_p50}, p90={dataset_stats.seq_len_p90}, p99={dataset_stats.seq_len_p99}, max={dataset_stats.seq_len_max}, pad_ratio={dataset_stats.pad_ratio:.2f}, entropy_mean={dataset_stats.entropy_mean:.2f}",
+        f"最近一次指标：comm_ratio={comm_ratio:.2f}, mem_headroom(GB)≈{headroom_gb:.1f}",
         "最近 trial：",
     ]
     for t in history[-6:]:
@@ -125,10 +136,20 @@ def build_judge_prompt(
 
 
 def build_coder_prompt(judge_analysis: str, mem_limit_gb: float) -> str:
+    # 提供性能优先的动作方向，避免无谓探索
+    perf_hints = [
+        "优先考虑：no_reshard（或 root no_reshard）",
+        "开启 overlap：forward_prefetch/backward_prefetch ∈ {1,2}",
+        "减少 group 数：module_grouping=mem_eff 或合并多层",
+        "embedding 特化：unshard_in_backward_embeddings=false",
+        "如有显存余量，适当增大 micro_batch 或减少 grad_accum",
+    ]
     return "\n".join(
         [
             "Judge 分析：",
             judge_analysis,
+            "性能优先动作提示（按优先级尝试）：",
+            "\n".join(f"- {h}" for h in perf_hints),
             f"显存限制：{mem_limit_gb} GB。请只输出一个 FSDP2 策略 JSON（无解释）。",
         ]
     )
@@ -235,15 +256,19 @@ def main() -> None:
         load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
     )
     history: List[Dict] = []
+    seen_hashes = set()
 
     # 只保留安全种子，避免随机/启发式触发 OOM/断言
     seeds = [("safe", default_strategy())]
     trial_id = 0
 
     for name, strat in seeds:
+        strat_hash = _strategy_hash(strat)
         metrics = _run_trial_subprocess(args, strat, trial_id=trial_id)
         metrics["config_name"] = name
+        metrics["strategy_hash"] = strat_hash
         history.append(metrics)
+        seen_hashes.add(strat_hash)
         trial_id += 1
 
     best_score = max(m.get("score", float("-inf")) for m in history)
@@ -281,9 +306,25 @@ def main() -> None:
             raw_json = json.loads(brace)
 
         candidate = sanitize_strategy(raw_json, fallback=seeds[0][1], mem_limit_gb=args.mem_limit_gb)
-        metrics = _run_trial_subprocess(args, candidate, trial_id=trial_id)
-        metrics["config_name"] = f"agent_round_{round_idx}"
-        metrics["judge_note"] = judge_reply
+        cand_hash = _strategy_hash(candidate)
+
+        # 去重：如果与历史完全一致，直接记为无效，避免浪费试验
+        if cand_hash in seen_hashes:
+            metrics = {
+                "trial_id": trial_id,
+                "config_name": f"agent_round_{round_idx}",
+                "judge_note": judge_reply,
+                "strategy_hash": cand_hash,
+                "error": "duplicate_strategy",
+                "score": float("-inf"),
+            }
+        else:
+            metrics = _run_trial_subprocess(args, candidate, trial_id=trial_id)
+            metrics["config_name"] = f"agent_round_{round_idx}"
+            metrics["judge_note"] = judge_reply
+            metrics["strategy_hash"] = cand_hash
+            seen_hashes.add(cand_hash)
+
         history.append(metrics)
         trial_id += 1
 

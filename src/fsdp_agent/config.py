@@ -214,3 +214,75 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float) -> Fsdp2Stra
     if mem_limit_gb < 70 and strategy.shard_reshard.reshard_behavior == "no_reshard":
         strategy.shard_reshard.reshard_behavior = "memory_saving"
     return strategy
+
+
+# 性能优先候选（给 LLM 参考的“动作方向”）
+def perf_tier_candidates() -> List[Fsdp2Strategy]:
+    """一组性能导向的候选，用于提示 LLM 应该尝试的方向。"""
+    candidates: List[Fsdp2Strategy] = []
+
+    # Tier-1: overlap + mem_eff + root no_reshard
+    candidates.append(
+        Fsdp2Strategy(
+            grouping=GroupingConfig(module_grouping="mem_eff", treat_embeddings_special=False),
+            shard_reshard=ShardReshardConfig(reshard_behavior="no_reshard"),
+            comm_overlap=CommOverlapConfig(
+                forward_prefetch_num=1,
+                backward_prefetch_num=1,
+                unshard_async_op=False,
+                unshard_in_backward_embeddings=False,
+            ),
+            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
+            train_hyper={"micro_batch": 2},
+        )
+    )
+
+    # Tier-2: overlap+async，per-layer reshard（默认）
+    candidates.append(
+        Fsdp2Strategy(
+            grouping=GroupingConfig(module_grouping="block", treat_embeddings_special=False),
+            shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
+            comm_overlap=CommOverlapConfig(
+                forward_prefetch_num=2,
+                backward_prefetch_num=1,
+                unshard_async_op=True,
+                unshard_in_backward_embeddings=False,
+            ),
+            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
+            train_hyper={"micro_batch": 1, "grad_accum": 1},
+        )
+    )
+
+    # Tier-2: 合并 group，少通信
+    candidates.append(
+        Fsdp2Strategy(
+            grouping=GroupingConfig(module_grouping="mem_eff", treat_embeddings_special=False),
+            shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
+            comm_overlap=CommOverlapConfig(
+                forward_prefetch_num=1,
+                backward_prefetch_num=1,
+                unshard_async_op=False,
+                unshard_in_backward_embeddings=False,
+            ),
+            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
+            train_hyper={"micro_batch": 1},
+        )
+    )
+
+    # Tier-3: root no_reshard + embedding 特化
+    candidates.append(
+        Fsdp2Strategy(
+            grouping=GroupingConfig(module_grouping="block", treat_embeddings_special=True),
+            shard_reshard=ShardReshardConfig(reshard_behavior="no_reshard"),
+            comm_overlap=CommOverlapConfig(
+                forward_prefetch_num=1,
+                backward_prefetch_num=1,
+                unshard_async_op=False,
+                unshard_in_backward_embeddings=False,
+            ),
+            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
+            train_hyper={"micro_batch": 2},
+        )
+    )
+
+    return candidates
