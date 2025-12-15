@@ -11,7 +11,7 @@ import torch.distributed as dist
 
 from .config import Fsdp2Strategy, strategy_from_dict
 from .train import run_trial
-from .dataset_stats import load_stats_from_file, DatasetStats
+from .utils.dataset_stats import load_stats_from_file, DatasetStats
 
 
 def init_distributed() -> None:

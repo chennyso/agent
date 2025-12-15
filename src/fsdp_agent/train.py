@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
