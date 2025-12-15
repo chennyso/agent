@@ -67,18 +67,26 @@ def run_steps(
     num_warmup: int,
     num_steps: int,
     profiler_ctx=None,
-) -> List[float]:
+) -> (List[float], List[float]):
     it = iter(dataloader)
     losses: List[float] = []
+    step_times_ms: List[float] = []
     for step in range(num_warmup + num_steps):
-        batch = next(it)
-        # torch.profiler.profile 在 with 块外调用 step() 即可，无需 __enter__
         if profiler_ctx:
             profiler_ctx.step()
+        batch = next(it)
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
         loss = train_step(model, optimizer, batch, scaler=None)
+        t1.record()
+        torch.cuda.synchronize()
+        iter_ms = t0.elapsed_time(t1)  # ms
         if step >= num_warmup:
             losses.append(loss)
-    return losses
+            step_times_ms.append(iter_ms)
+    return losses, step_times_ms
 
 
 def _extract_profiler_metrics(prof) -> Dict[str, float]:
@@ -178,7 +186,7 @@ def run_trial(
         )
 
         with prof:
-            losses = run_steps(
+            losses, step_times_ms = run_steps(
                 model,
                 optimizer,
                 dataloader,
@@ -193,8 +201,12 @@ def run_trial(
         prof_metrics["max_mem_bytes"] = mem_bytes
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
+        # 若 profiler 报 0，则回退到实测 step_times_ms
+        mean_step_ms = prof_metrics["step_time_ms"]
+        if mean_step_ms <= 0 and step_times_ms:
+            mean_step_ms = sum(step_times_ms) / len(step_times_ms)
         prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(
-            prof_metrics["step_time_ms"], global_batch_size, seq_len
+            mean_step_ms, global_batch_size, seq_len
         )
 
         # MFU 估计（基于总参数量与 tokens_per_step）
