@@ -16,6 +16,8 @@ from fsdp_agent.dataloaders import build_synthetic_loader
 from fsdp_agent.dataset_stats import DatasetStats
 from fsdp_agent.metrics_utils import score_strategy
 
+_MIN_STEP_TIME_MS = 1e-3
+
 
 def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
@@ -71,18 +73,26 @@ def run_steps(
     it = iter(dataloader)
     losses: List[float] = []
     step_times_ms: List[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     for step in range(num_warmup + num_steps):
         if profiler_ctx:
             profiler_ctx.step()
-        batch = next(it)
-        torch.cuda.synchronize()
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record()
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(dataloader)
+            try:
+                batch = next(it)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "dataloader produced 0 batches; check SyntheticDataset length/global_batch_size configuration"
+                ) from exc
+        start_event.record()
         loss = train_step(model, optimizer, batch, scaler=None)
-        t1.record()
-        torch.cuda.synchronize()
-        iter_ms = t0.elapsed_time(t1)  # ms
+        end_event.record()
+        end_event.synchronize()
+        iter_ms = start_event.elapsed_time(end_event)
         if step >= num_warmup:
             losses.append(loss)
             step_times_ms.append(iter_ms)
@@ -244,7 +254,7 @@ def run_trial(
 
 
 def _estimate_tokens_per_s(step_time_ms: float, global_batch: int, seq_len: int) -> float:
-    if step_time_ms <= 0:
+    if step_time_ms < _MIN_STEP_TIME_MS:
         return 0.0
     tokens = global_batch * seq_len
     return tokens / (step_time_ms / 1000.0)

@@ -82,12 +82,13 @@ def main() -> None:
             mem_limit_gb=args.mem_limit_gb,
         )
     except torch.cuda.OutOfMemoryError:
-        metrics = {"oom": True, "score": float("-inf")}
+        metrics = {"oom": True, "score": float("-inf"), "error_msg": "CUDA out of memory (trial_runner)"}
     except Exception as exc:
         metrics = {
             "error": str(exc),
             "traceback": traceback.format_exc(),
             "score": float("-inf"),
+            "error_msg": str(exc),
         }
 
     if dist.get_rank() == 0:

@@ -31,4 +31,5 @@ def build_synthetic_loader(train_hyper: Dict, vocab_size: int, seq_len: int, len
     world = dist.get_world_size() if dist.is_initialized() else 1
     per_rank_batch = math.ceil(batch / world)
     dataset = SyntheticDataset(vocab_size=vocab_size, seq_len=seq_len, length=length)
-    return DataLoader(dataset, batch_size=per_rank_batch, shuffle=True, drop_last=True, pin_memory=True)
+    # drop_last=False to avoid silently yielding 0 batches when dataset length < batch_size
+    return DataLoader(dataset, batch_size=per_rank_batch, shuffle=True, drop_last=False, pin_memory=True)

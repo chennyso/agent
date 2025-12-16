@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 
@@ -122,12 +122,12 @@ CODER_SYSTEM = (
     "请输出 Fsdp2Strategy JSON，schema_version=2：\n"
     "{\n"
     '  "global_layout": {...},\n'
-    '  "layer_overrides": [{"start_layer":0,"end_layer":4,"layout":{...}}, ...],\n'
+    '  "layer_overrides": [{"start_layer":0,"end_layer":4,"layers":[0,1,2],"layout":{...}}, ...],\n'
     '  "named_overrides": {"embed_tokens": {...}, "lm_head": {...}}\n'
     "}\n"
     "字段：mesh_topology(\"1D\"/\"2D\"), sharding_strategy(\"FULL\"/\"HYBRID\"/\"NO\"), "
     "reshard_after_forward(bool/int), shard_plan(\"DIM0\"/\"DIM1\"/\"LARGEST\"), "
-    "offload_params(bool), mp_policy(\"bf16\"/\"fp32\").\n"
+    "offload_params(bool), mp_policy(\"bf16\"/\"fp32\"). layer_overrides 支持 start/end 区间或 layers 数组指定离散层。\n"
     "约束：world_size=4；避免非法字段；优先使用 layer_overrides/named_overrides 做局部优化。"
 )
 
@@ -184,7 +184,7 @@ def build_judge_prompt(
     return "\n".join(lines)
 
 
-def build_coder_prompt(judge_analysis: str, mem_limit_gb: float) -> str:
+def build_coder_prompt(judge_analysis: str, mem_limit_gb: float, failure_feedback: Optional[str] = None) -> str:
     hints = [
         "优先考虑：局部 no_reshard（或 root no_reshard），显存足够时少一次 all-gather。",
         "开启 overlap：forward/backward prefetch 可设为 1 或 2。",
@@ -192,15 +192,30 @@ def build_coder_prompt(judge_analysis: str, mem_limit_gb: float) -> str:
         "embedding/lm_head 特化：named_overrides 里可设置 sharding_strategy='NO' 或 HYBRID。",
         "必须与上一轮策略至少有一个字段不同，否则视为无效。",
     ]
-    return "\n".join(
-        [
-            "Judge 分析：",
-            judge_analysis,
-            "性能提示（按优先级）：",
-            "\n".join(f"- {h}" for h in hints),
-            f"显存限制：{mem_limit_gb} GB。只输出合法 JSON，不要解释。",
-        ]
-    )
+    sections = [
+        "Judge 分析：",
+        judge_analysis,
+        "性能提示（按优先级）：",
+        "\n".join(f"- {h}" for h in hints),
+    ]
+    if failure_feedback:
+        sections.append(f"最近运行错误：{failure_feedback}")
+    sections.append(f"显存限制：{mem_limit_gb} GB。只输出合法 JSON，不要解释。")
+    return "\n".join(sections)
+
+
+def _derive_failure_feedback(metrics: Dict) -> Optional[str]:
+    if not metrics:
+        return None
+    if metrics.get("error_msg"):
+        return str(metrics["error_msg"])
+    if metrics.get("error") == "duplicate_strategy":
+        return f"策略与历史重复 (hash={metrics.get('strategy_hash')}); 请修改 layer_overrides 或 reshard 方案。"
+    if metrics.get("error"):
+        return str(metrics["error"])
+    if metrics.get("oom"):
+        return "CUDA OOM：请降低并行粒度或增大 reshard_after_forward 的延迟。"
+    return None
 
 
 def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, trial_id: int) -> Dict:
@@ -283,6 +298,8 @@ def main() -> None:
     dataset_stats = load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
     history: List[Dict] = []
     seen_hashes = set()
+    hash_to_strategy = {}
+    pending_failure_feedback: Optional[str] = None
 
     seeds = [("safe", default_strategy()), ("sandwich", sandwich_sample_strategy())]
     trial_id = 0
@@ -293,6 +310,8 @@ def main() -> None:
         metrics["strategy_hash"] = strat_hash
         history.append(metrics)
         seen_hashes.add(strat_hash)
+        hash_to_strategy[strat_hash] = strat.to_dict()
+        pending_failure_feedback = _derive_failure_feedback(metrics)
         trial_id += 1
 
     best_score = max(m.get("score", float("-inf")) for m in history)
@@ -310,7 +329,8 @@ def main() -> None:
         )
         judge_reply = call_llm(j_prompt, JUDGE_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
 
-        c_prompt = build_coder_prompt(judge_reply, mem_limit_gb=args.mem_limit_gb)
+        c_prompt = build_coder_prompt(judge_reply, mem_limit_gb=args.mem_limit_gb, failure_feedback=pending_failure_feedback)
+        pending_failure_feedback = None
         coder_reply = call_llm(c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
 
         max_retry = 2
@@ -334,7 +354,12 @@ def main() -> None:
                 break
 
             print(f"[controller] 策略重复 (attempt {attempt})，要求 LLM 生成新策略")
-            current_c_prompt = current_c_prompt + "\n\n【错误】你生成的策略与历史重复，请修改 layer_overrides 或 reshard 相关字段。"
+            prev = hash_to_strategy.get(cand_hash)
+            dedup_hint = "【错误】你生成的策略与历史重复，请修改 layer_overrides、mesh_topology 或 reshard 等核心字段。"
+            if prev:
+                prev_json = json.dumps(prev, ensure_ascii=False)
+                dedup_hint += f"\n重复策略摘要（hash={cand_hash}）：{prev_json}"
+            current_c_prompt = current_c_prompt + "\n\n" + dedup_hint
             coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
             attempt += 1
 
@@ -353,9 +378,13 @@ def main() -> None:
             metrics["judge_note"] = judge_reply
             metrics["strategy_hash"] = cand_hash
             seen_hashes.add(cand_hash)
+            hash_to_strategy[cand_hash] = candidate.to_dict()
 
         history.append(metrics)
         trial_id += 1
+        feedback = _derive_failure_feedback(metrics)
+        if feedback:
+            pending_failure_feedback = feedback
 
         cur_score = metrics.get("score", float("-inf"))
         if cur_score > best_score:

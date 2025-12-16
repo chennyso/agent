@@ -38,9 +38,10 @@ class Fsdp2Layout:
 
 @dataclass
 class LayerOverride:
-    start_layer: int
-    end_layer: int
+    start_layer: Optional[int]
+    end_layer: Optional[int]
     layout: Fsdp2Layout
+    layers: Optional[List[int]] = None
 
 
 @dataclass
@@ -60,6 +61,7 @@ class Fsdp2Strategy:
                 {
                     "start_layer": o.start_layer,
                     "end_layer": o.end_layer,
+                    "layers": o.layers,
                     "layout": asdict(o.layout),
                 }
                 for o in self.layer_overrides
@@ -76,9 +78,10 @@ class Fsdp2Strategy:
         for o in payload.get("layer_overrides", []):
             ovrs.append(
                 LayerOverride(
-                    start_layer=int(o["start_layer"]),
-                    end_layer=int(o["end_layer"]),
+                    start_layer=int(o["start_layer"]) if o.get("start_layer") is not None else None,
+                    end_layer=int(o["end_layer"]) if o.get("end_layer") is not None else None,
                     layout=Fsdp2Layout(**o["layout"]),
+                    layers=[int(x) for x in o.get("layers", [])] if o.get("layers") else None,
                 )
             )
         named = {k: Fsdp2Layout(**v) for k, v in payload.get("named_overrides", {}).items()}
@@ -92,25 +95,41 @@ class Fsdp2Strategy:
         norm = copy.deepcopy(self)
 
         # 1) drop overrides equal to global layout
-        filtered: List[LayerOverride] = []
+        gl_layout_dict = asdict(norm.global_layout)
+        range_overrides: List[LayerOverride] = []
+        list_overrides: List[LayerOverride] = []
         for o in norm.layer_overrides:
-            if o.start_layer >= o.end_layer:
+            if asdict(o.layout) == gl_layout_dict:
                 continue
-            if asdict(o.layout) == asdict(norm.global_layout):
+            has_layers = False
+            if o.layers:
+                uniq_layers = sorted({int(x) for x in o.layers if int(x) >= 0})
+                if uniq_layers:
+                    clone = copy.deepcopy(o)
+                    clone.layers = uniq_layers
+                    list_overrides.append(clone)
+                    has_layers = True
+            has_range = o.start_layer is not None and o.end_layer is not None
+            if has_range:
+                if o.start_layer >= o.end_layer:
+                    continue
+                range_overrides.append(copy.deepcopy(o))
+            elif not has_layers:
                 continue
-            filtered.append(o)
 
         # 2) sort by range
-        filtered.sort(key=lambda x: (x.start_layer, x.end_layer))
+        range_overrides.sort(key=lambda x: (x.start_layer, x.end_layer))
 
         # 3) merge adjacent ranges with identical layout
         merged: List[LayerOverride] = []
-        for o in filtered:
+        for o in range_overrides:
             if merged and asdict(merged[-1].layout) == asdict(o.layout) and merged[-1].end_layer == o.start_layer:
                 merged[-1].end_layer = o.end_layer
             else:
-                merged.append(copy.deepcopy(o))
-        norm.layer_overrides = merged
+                merged.append(o)
+
+        list_overrides.sort(key=lambda x: x.layers[0] if x.layers else -1)
+        norm.layer_overrides = merged + list_overrides
 
         # 4) sort named overrides
         norm.named_overrides = dict(sorted(norm.named_overrides.items(), key=lambda kv: kv[0]))
@@ -118,7 +137,10 @@ class Fsdp2Strategy:
 
     def semantic_hash(self) -> str:
         norm = self.normalized()
-        blob = json.dumps(norm.to_dict(), sort_keys=True)
+        payload = norm.to_dict()
+        # dataset_stats 不影响策略语义，避免噪声字段导致“伪去重失败”
+        payload["dataset_stats"] = None
+        blob = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
@@ -131,35 +153,59 @@ _ALLOWED_PLAN = {"DIM0", "DIM1", "LARGEST"}
 _ALLOWED_MP = {"bf16", "fp32"}
 
 
-def _validate_layout(layout: Fsdp2Layout) -> Fsdp2Layout:
+def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layout:
     l = copy.deepcopy(layout)
     if l.mesh_topology not in _ALLOWED_MESH:
-        l.mesh_topology = "1D"
+        raise ValueError(f"{context}.mesh_topology must be in {_ALLOWED_MESH}; got {l.mesh_topology}")
     if l.sharding_strategy not in _ALLOWED_SHARD:
-        l.sharding_strategy = "FULL"
-    if isinstance(l.reshard_after_forward, int) and l.reshard_after_forward < 1:
-        l.reshard_after_forward = 1
-    if not isinstance(l.reshard_after_forward, (bool, int)):
-        l.reshard_after_forward = True
+        raise ValueError(f"{context}.sharding_strategy must be in {_ALLOWED_SHARD}; got {l.sharding_strategy}")
+    if isinstance(l.reshard_after_forward, int):
+        if l.reshard_after_forward < 1:
+            raise ValueError(f"{context}.reshard_after_forward int value must be >=1; got {l.reshard_after_forward}")
+    elif not isinstance(l.reshard_after_forward, bool):
+        raise ValueError(f"{context}.reshard_after_forward must be bool or int; got {type(l.reshard_after_forward).__name__}")
     if l.shard_plan not in _ALLOWED_PLAN:
-        l.shard_plan = "DIM0"
+        raise ValueError(f"{context}.shard_plan must be in {_ALLOWED_PLAN}; got {l.shard_plan}")
     if l.mp_policy not in _ALLOWED_MP:
-        l.mp_policy = "bf16"
+        raise ValueError(f"{context}.mp_policy must be in {_ALLOWED_MP}; got {l.mp_policy}")
     l.offload_params = bool(l.offload_params)
     return l
 
 
+def _coerce_layers(layers: Optional[List[int]], context: str) -> Optional[List[int]]:
+    if layers is None:
+        return None
+    try:
+        normalized = sorted({int(x) for x in layers if int(x) >= 0})
+    except Exception as exc:
+        raise ValueError(f"{context}.layers must be a list of non-negative integers") from exc
+    if not normalized:
+        raise ValueError(f"{context}.layers must contain at least one non-negative integer")
+    return normalized
+
+
 def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> Fsdp2Strategy:
     """Lightweight sanity filter; does not estimate exact memory."""
-    gl = _validate_layout(strategy.global_layout)
+    gl = _validate_layout(strategy.global_layout, "global_layout")
 
     ovrs: List[LayerOverride] = []
-    for o in strategy.layer_overrides:
-        if o.start_layer >= o.end_layer:
-            continue
-        ovrs.append(LayerOverride(start_layer=int(o.start_layer), end_layer=int(o.end_layer), layout=_validate_layout(o.layout)))
+    for idx, o in enumerate(strategy.layer_overrides):
+        ctx = f"layer_overrides[{idx}]"
+        layout = _validate_layout(o.layout, f"{ctx}.layout")
+        layers_list = _coerce_layers(o.layers, ctx)
+        start = end = None
+        if o.start_layer is not None or o.end_layer is not None:
+            if o.start_layer is None or o.end_layer is None:
+                raise ValueError(f"{ctx}: start_layer and end_layer must both be provided")
+            start = int(o.start_layer)
+            end = int(o.end_layer)
+            if start >= end:
+                raise ValueError(f"{ctx}: start_layer must be < end_layer")
+        if start is None and layers_list is None:
+            raise ValueError(f"{ctx}: specify either (start_layer,end_layer) or a non-empty layers list")
+        ovrs.append(LayerOverride(start_layer=start, end_layer=end, layout=layout, layers=layers_list))
 
-    named = {k: _validate_layout(v) for k, v in strategy.named_overrides.items()}
+    named = {k: _validate_layout(v, f"named_overrides['{k}']") for k, v in strategy.named_overrides.items()}
     ds = strategy.dataset_stats
 
     validated = Fsdp2Strategy(global_layout=gl, layer_overrides=ovrs, named_overrides=named, schema_version=strategy.schema_version, dataset_stats=ds)
