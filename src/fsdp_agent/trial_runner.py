@@ -10,7 +10,7 @@ from typing import Dict
 import torch
 import torch.distributed as dist
 
-from fsdp_agent.config import Fsdp2Strategy, strategy_from_dict
+from fsdp_agent.config import Fsdp2Strategy, validate_strategy
 from fsdp_agent.train import run_trial
 from fsdp_agent.dataset_stats import load_stats_from_file, DatasetStats
 
