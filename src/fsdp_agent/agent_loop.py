@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,8 @@ from fsdp_agent.hardware_info import detect_hardware, load_hardware_info
 
 
 def _strategy_hash(strategy: Fsdp2Strategy) -> str:
-    return json.dumps(strategy.to_dict(), sort_keys=True, ensure_ascii=False)
+    """使用语义归一化后的哈希，避免等价区间扰动导致重复试验。"""
+    return strategy.semantic_hash()
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-stats-file", type=str, default=None, help="数据集统计 JSON")
     p.add_argument("--repeats", type=int, default=1, help="每个策略重复运行次数")
     p.add_argument("--hardware-json", type=str, default=None, help="手动硬件拓扑 JSON，覆盖自动探测")
-    p.add_argument("--llm-endpoint", type=str, default="http://10.100.1.93:12365/v1/chat/completions", help="LLM 服务 HTTP 接口")
+    p.add_argument(
+        "--llm-endpoint",
+        type=str,
+        default="http://10.100.1.93:12365/v1/chat/completions",
+        help="LLM 服务 HTTP 接口",
+    )
     return p.parse_args()
 
 
@@ -72,9 +79,41 @@ def call_llm(prompt: str, system_prompt: str, model: str, temperature: float, en
     raise RuntimeError(f"LLM response format unexpected: {data}")
 
 
+def robust_parse_json(text: str) -> Dict:
+    """尽量容错地从 LLM 回复中提取 JSON。"""
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        import ast
+
+        return ast.literal_eval(text)
+    except Exception as e:
+        raise ValueError(f"无法解析 JSON: {e}, 原始内容片段: {text[:200]}")
+
+
+def _parse_error(stderr: str) -> str:
+    """粗粒度解析错误，给 LLM 更多上下文。"""
+    if "CUDA out of memory" in stderr:
+        match = re.search(r"Tried to allocate ([0-9\.]+) (MiB|GiB)", stderr)
+        return f"CUDA OOM: {match.group(0) if match else 'unknown alloc size'}"
+    if "NCCL" in stderr and ("Watchdog" in stderr or "timed out" in stderr):
+        return "NCCL Timeout (可能 OOM 或死锁)"
+    if "illegal memory access" in stderr:
+        return "CUDA Illegal Access (检查 sharding 策略)"
+    tail = stderr[-200:] if stderr else ""
+    return f"Runtime Error: {tail}"
+
+
 JUDGE_SYSTEM = (
     "你是训练系统性能诊断专家（Agent-Judge）。\n"
     "输入：硬件、训练超参、数据集统计（seq_len 分布、pad_ratio、entropy）、近期 trial metrics。\n"
+    "注意：OOM 是硬失败；轻微超显存(<5%) 可通过局部 reshard/offload 修复。\n"
     "输出：瓶颈归因（compute/comm/memory/overlap/idle）和 2-3 条可操作建议（分组/reshard/overlap/批尺寸/精度/显存风险）。"
 )
 
@@ -93,24 +132,54 @@ CODER_SYSTEM = (
 )
 
 
-def build_judge_prompt(history: List[Dict], hw, model_name: str, gbs: int, seq_len: int, dataset_stats: DatasetStats) -> str:
+def build_judge_prompt(
+    history: List[Dict],
+    hw,
+    model_name: str,
+    gbs: int,
+    seq_len: int,
+    dataset_stats: DatasetStats,
+    mem_limit_gb: float,
+) -> str:
     last = history[-1] if history else {}
     comm_ratio = last.get("comm_ratio", 0.0)
-    mem_headroom = 70.0 - last.get("max_mem_bytes", 0) / 1024**3 if last else 70.0
-    lines = [
+    mem_headroom = mem_limit_gb - last.get("max_mem_bytes", 0) / 1024**3 if last else mem_limit_gb
+    err_msg = last.get("error_msg", "")
+
+    lines: List[str] = [
         f"硬件：{_hardware_summary(hw)}",
         f"模型：{model_name}",
         f"训练：global_batch_size={gbs}, seq_len={seq_len}",
-        f"数据集：p50={dataset_stats.seq_len_p50}, p90={dataset_stats.seq_len_p90}, p99={dataset_stats.seq_len_p99}, max={dataset_stats.seq_len_max}, pad_ratio={dataset_stats.pad_ratio:.2f}",
+        (
+            f"数据集：p50={dataset_stats.seq_len_p50}, p90={dataset_stats.seq_len_p90}, "
+            f"p99={dataset_stats.seq_len_p99}, max={dataset_stats.seq_len_max}, pad_ratio={dataset_stats.pad_ratio:.2f}"
+        ),
         f"最近一次：comm_ratio={comm_ratio:.2f}, mem_headroom≈{mem_headroom:.1f}GB",
-        "近期 trial：",
     ]
-    for t in history[-6:]:
+
+    baseline = next((t for t in history if t.get("config_name") == "safe"), None)
+    if baseline:
         lines.append(
-            f"- trial={t.get('trial_id','?')} score={t.get('score',0):.1f} "
-            f"tps={t.get('throughput_tokens_per_s',0):.1f} comm_ratio={t.get('comm_ratio',0):.2f} "
-            f"memGB={t.get('max_mem_bytes',0)/(1024**3):.1f}"
+            "【Baseline】 "
+            f"Speed={baseline.get('throughput_tokens_per_s',0):.0f} tok/s, "
+            f"Mem={baseline.get('max_mem_bytes',0)/1024**3:.1f} GB, "
+            f"CommRatio={baseline.get('comm_ratio',0):.2f}, "
+            f"Status={'OOM' if baseline.get('oom') else 'Pass'}"
         )
+
+    lines.append("【Recent Trials】")
+    recent = history[-5:] if len(history) > 5 else history
+    for t in recent:
+        lines.append(
+            f"- trial={t.get('trial_id','?')} "
+            f"Speed={t.get('throughput_tokens_per_s',0):.0f} tok/s, "
+            f"Mem={t.get('max_mem_bytes',0)/1024**3:.1f} GB, "
+            f"CommRatio={t.get('comm_ratio',0):.2f}, "
+            f"Status={'OOM' if t.get('oom') else 'Pass'}"
+        )
+
+    if err_msg:
+        lines.append(f"最近错误：{err_msg}")
     lines.append("请给出瓶颈归因和 2-3 条调优方向（通信/显存/overlap/分组/reshard/批尺寸/精度），附显存风险提示。")
     return "\n".join(lines)
 
@@ -121,6 +190,7 @@ def build_coder_prompt(judge_analysis: str, mem_limit_gb: float) -> str:
         "开启 overlap：forward/backward prefetch 可设为 1 或 2。",
         "减少 group 数：用 layer_overrides 合并多层，避免逐层 all-gather。",
         "embedding/lm_head 特化：named_overrides 里可设置 sharding_strategy='NO' 或 HYBRID。",
+        "必须与上一轮策略至少有一个字段不同，否则视为无效。",
     ]
     return "\n".join(
         [
@@ -183,10 +253,16 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
     if proc.returncode != 0:
         print(proc.stdout)
         print(proc.stderr, file=sys.stderr)
-        return {"oom": True, "score": float("-inf"), "trial_id": trial_id}
+        return {
+            "oom": True,
+            "score": float("-inf"),
+            "trial_id": trial_id,
+            "error_msg": _parse_error(proc.stderr),
+        }
 
     metrics = json.loads(out_path.read_text(encoding="utf-8"))
     metrics["trial_id"] = trial_id
+    metrics["mem_limit_gb"] = args.mem_limit_gb
     if "comm_ratio" not in metrics:
         comm = metrics.get("comm_time_ms", 0.0)
         compute = metrics.get("compute_time_ms", 0.0)
@@ -196,11 +272,8 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
     return metrics
 
 
-def sanitize_strategy(raw: Dict, fallback: Fsdp2Strategy, mem_limit_gb: float) -> Fsdp2Strategy:
-    try:
-        strat = Fsdp2Strategy.from_dict(raw)
-    except Exception:
-        return fallback
+def sanitize_strategy(raw: Dict, mem_limit_gb: float) -> Fsdp2Strategy:
+    strat = Fsdp2Strategy.from_dict(raw)
     return validate_strategy(strat, mem_limit_gb=mem_limit_gb)
 
 
@@ -211,7 +284,6 @@ def main() -> None:
     history: List[Dict] = []
     seen_hashes = set()
 
-    # 种子：安全基线 + 轻度异构示例
     seeds = [("safe", default_strategy()), ("sandwich", sandwich_sample_strategy())]
     trial_id = 0
     for name, strat in seeds:
@@ -227,19 +299,44 @@ def main() -> None:
     drop_streak = 0
 
     for round_idx in range(args.rounds):
-        j_prompt = build_judge_prompt(history, hardware, args.model_name, args.global_batch_size, args.seq_len, dataset_stats)
+        j_prompt = build_judge_prompt(
+            history=history,
+            hw=hardware,
+            model_name=args.model_name,
+            gbs=args.global_batch_size,
+            seq_len=args.seq_len,
+            dataset_stats=dataset_stats,
+            mem_limit_gb=args.mem_limit_gb,
+        )
         judge_reply = call_llm(j_prompt, JUDGE_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
 
         c_prompt = build_coder_prompt(judge_reply, mem_limit_gb=args.mem_limit_gb)
         coder_reply = call_llm(c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
-        try:
-            raw_json = json.loads(coder_reply)
-        except json.JSONDecodeError:
-            brace = coder_reply[coder_reply.find("{") : coder_reply.rfind("}") + 1]
-            raw_json = json.loads(brace)
 
-        candidate = sanitize_strategy(raw_json, fallback=seeds[0][1], mem_limit_gb=args.mem_limit_gb)
-        cand_hash = _strategy_hash(candidate)
+        max_retry = 2
+        attempt = 0
+        candidate = None
+        cand_hash = None
+        current_c_prompt = c_prompt
+        while attempt <= max_retry:
+            try:
+                raw_json = robust_parse_json(coder_reply)
+                candidate = sanitize_strategy(raw_json, mem_limit_gb=args.mem_limit_gb)
+            except Exception as e:
+                print(f"[controller] 策略解析/校验错误: {e}")
+                current_c_prompt = current_c_prompt + f"\n\n【格式错误】{e}"
+                coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+                attempt += 1
+                continue
+
+            cand_hash = _strategy_hash(candidate)
+            if cand_hash not in seen_hashes:
+                break
+
+            print(f"[controller] 策略重复 (attempt {attempt})，要求 LLM 生成新策略")
+            current_c_prompt = current_c_prompt + "\n\n【错误】你生成的策略与历史重复，请修改 layer_overrides 或 reshard 相关字段。"
+            coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+            attempt += 1
 
         if cand_hash in seen_hashes:
             metrics = {
