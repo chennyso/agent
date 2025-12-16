@@ -11,7 +11,7 @@ from torch.optim import Optimizer
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
 from fsdp_agent.config import Fsdp2Strategy
-from fsdp_agent.fsdp_apply import apply_fsdp2_strategy
+from fsdp_agent.fsdp_apply import apply_strategy
 from fsdp_agent.dataloaders import build_synthetic_loader
 from fsdp_agent.dataset_stats import DatasetStats
 from fsdp_agent.metrics_utils import score_strategy
@@ -165,7 +165,7 @@ def run_trial(
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         model = load_model(model_name=model_name)
-        model = apply_fsdp2_strategy(model, strategy)
+        model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
         optimizer = build_optimizer(model, lr=lr)
         dataloader = build_synthetic_loader(
             train_hyper={"global_batch_size": global_batch_size},
@@ -202,22 +202,14 @@ def run_trial(
         prof_metrics["max_mem_bytes"] = mem_bytes
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
-        # 若 profiler 报 0，则回退到实测 step_times_ms
-        mean_step_ms = prof_metrics["step_time_ms"]
-        if mean_step_ms <= 0 and step_times_ms:
-            mean_step_ms = sum(step_times_ms) / len(step_times_ms)
-        prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(
-            mean_step_ms, global_batch_size, seq_len
-        )
+        # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差
+        mean_step_ms = sum(step_times_ms) / max(len(step_times_ms), 1)
+        prof_metrics["step_time_ms"] = mean_step_ms
+        prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(mean_step_ms, global_batch_size, seq_len)
 
-        # MFU 估计（基于总参数量与 tokens_per_step）
-        total_params = sum(p.numel() for p in model.parameters())
-        step_time_s = max(prof_metrics["step_time_ms"] / 1000.0, 1e-6)
-        tokens_per_step = global_batch_size * seq_len
-        achieved_tflops = (6 * total_params * tokens_per_step / step_time_s) / 1e12
-        peak_tflops = _get_gpu_peak_tflops()
-        prof_metrics["mfu_percent"] = min(achieved_tflops / peak_tflops * 100.0, 999.0)
-        prof_metrics["total_params"] = total_params
+        # MFU 暂不可信，置空，避免误导
+        prof_metrics["mfu_percent"] = None
+        prof_metrics["total_params"] = sum(p.numel() for p in model.parameters())
 
         prof_metrics["oom"] = False
         prof_metrics["trial_id"] = trial_id

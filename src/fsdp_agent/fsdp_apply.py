@@ -1,259 +1,88 @@
 from __future__ import annotations
 
-import logging
-from typing import Iterable, List, Optional, Sequence
-
 import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import (
     MixedPrecisionPolicy,
-    OffloadPolicy,
+    CPUOffloadPolicy,
     fully_shard,
 )
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import Shard
 
-from .config import (
-    CommOverlapConfig,
-    Fsdp2Strategy,
-    GroupingConfig,
-    MeshConfig,
-    PrecisionOffloadConfig,
-    ShardReshardConfig,
-)
-
-log = logging.getLogger(__name__)
+from fsdp_agent.config import Fsdp2Layout, Fsdp2Strategy, LayerOverride
 
 
-# -----------------------------------------------------------------------------
-# Helpers for policies
-# -----------------------------------------------------------------------------
+def get_mesh(topology: str, world_size: int):
+    """构建 1D 或简化 2D mesh（单机 4 卡假设 2x2）。"""
+    if topology == "1D":
+        return init_device_mesh("cuda", (world_size,))
+    if topology == "2D":
+        # 简化：单机 4 卡 → 2x2；多机需按实际拓扑改造
+        return init_device_mesh("cuda", (2, 2), mesh_dim_names=("replicate", "shard"))
+    raise ValueError(f"Unknown mesh_topology: {topology}")
 
 
-def build_mesh(mesh_cfg: MeshConfig) -> DeviceMesh:
-    """构造 DeviceMesh，支持自定义 shape/ranks，多节点 reshape。"""
-    world_size = torch.distributed.get_world_size()
-    if mesh_cfg.mesh_ranks is not None:
-        ranks = torch.tensor(list(mesh_cfg.mesh_ranks), device=torch.device("cpu"))
-    else:
-        ranks = torch.arange(world_size, device=torch.device("cpu"))
-    if mesh_cfg.mesh_shape is not None:
-        shape = tuple(mesh_cfg.mesh_shape)
-        if int(torch.prod(torch.tensor(shape))) != ranks.numel():
-            raise ValueError("mesh_shape 与 ranks 数量不一致")
-        return DeviceMesh("cuda", ranks.reshape(*shape))
-    if mesh_cfg.layout == "dp_1d":
-        return DeviceMesh("cuda", ranks)
-    if mesh_cfg.layout == "hsdp_2d":
-        dim = int(torch.sqrt(torch.tensor(world_size)).item())
-        return DeviceMesh("cuda", ranks.reshape(dim, -1))
-    raise ValueError(f"Unsupported layout: {mesh_cfg.layout}")
+def resolve_shard_fn(plan: str):
+    if plan == "DIM0":
+        return lambda p: Shard(0)
+    if plan == "DIM1":
+        return lambda p: Shard(1)
+    if plan == "LARGEST":
+        return lambda p: Shard(p.shape.index(max(p.shape)))
+    return None
 
 
-def build_mp_policy(cfg: PrecisionOffloadConfig) -> Optional[MixedPrecisionPolicy]:
-    if cfg.mp_policy == "none":
-        return None
-    dtype = torch.bfloat16 if cfg.mp_policy == "bf16" else torch.float16
-    # 兼容不同 torch 版本：部分版本不支持 buffer_dtype 参数
-    try:
-        return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
-    except TypeError:
-        return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
-
-
-def build_offload_policy(cfg: PrecisionOffloadConfig) -> Optional[OffloadPolicy]:
-    if not (cfg.offload_grad or cfg.offload_param or cfg.offload_optim):
-        return None
-    return OffloadPolicy(
-        offload_params=cfg.offload_param,
-        offload_gradients=cfg.offload_grad,
-        offload_optimizer_states=cfg.offload_optim,
+def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh) -> None:
+    """把单个 layout 编译成 fully_shard 调用。"""
+    reshard = layout.reshard_after_forward
+    mp = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    offload = CPUOffloadPolicy(pin_memory=True) if layout.offload_params else None
+    fully_shard(
+        mod,
+        mesh=mesh,
+        reshard_after_forward=reshard,
+        shard_placement_fn=resolve_shard_fn(layout.shard_plan),
+        mp_policy=mp,
+        offload_policy=offload,
     )
 
 
-def convert_reshard_behavior(cfg: ShardReshardConfig):
-    if cfg.reshard_behavior == "memory_saving":
-        return True
-    if cfg.reshard_behavior == "no_reshard":
-        return False
-    if cfg.reshard_behavior == "intra_node":
-        # assume single node with 4 GPUs -> reshard to 2-way as an example
-        return 2
-    return None  # auto
+def _pick_layout_for_layer(idx: int, strategy: Fsdp2Strategy) -> Fsdp2Layout:
+    for ovr in strategy.layer_overrides:
+        if ovr.start_layer <= idx < ovr.end_layer:
+            return ovr.layout
+    return strategy.global_layout
 
 
-# -----------------------------------------------------------------------------
-# Grouping helpers
-# -----------------------------------------------------------------------------
-
-
-def _get_transformer_layers(model: nn.Module) -> List[nn.Module]:
-    """Best-effort fetch of transformer blocks for Qwen-7B."""
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return list(model.transformer.h)
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return list(model.model.layers)
-    raise AttributeError("Cannot locate transformer layers on model")
-
-
-def _get_embedding_modules(model: nn.Module) -> List[nn.Module]:
-    modules: List[nn.Module] = []
-    for name in ["wte", "embed_tokens", "tok_embeddings", "word_embeddings"]:
-        mod = getattr(getattr(model, "transformer", model), name, None)
-        if mod is not None:
-            modules.append(mod)
-    pos_embed = getattr(getattr(model, "transformer", model), "wpe", None)
-    if pos_embed is not None:
-        modules.append(pos_embed)
-    head = getattr(model, "lm_head", None)
-    if head is not None:
-        modules.append(head)
-    return modules
-
-
-def _apply_prefetch(
-    layers: Sequence[nn.Module],
-    forward_window: int,
-    backward_window: int,
-) -> None:
-    if forward_window > 0:
-        for i, layer in enumerate(layers):
-            targets: List[nn.Module] = []
-            for j in range(1, forward_window + 1):
-                if i + j < len(layers):
-                    targets.append(layers[i + j])
-            # 只有当 layer 和 targets 都是 FSDP 包装（具备 prefetch 方法）时才调用，避免原生模块触发断言
-            if (
-                targets
-                and hasattr(layer, "set_modules_to_forward_prefetch")
-                and all(hasattr(t, "set_modules_to_forward_prefetch") for t in targets)
-            ):
-                layer.set_modules_to_forward_prefetch(targets)
-
-    if backward_window > 0:
-        for i, layer in enumerate(layers):
-            targets: List[nn.Module] = []
-            for j in range(1, backward_window + 1):
-                if i - j >= 0:
-                    targets.append(layers[i - j])
-            if (
-                targets
-                and hasattr(layer, "set_modules_to_backward_prefetch")
-                and all(hasattr(t, "set_modules_to_backward_prefetch") for t in targets)
-            ):
-                layer.set_modules_to_backward_prefetch(targets)
-
-
-# -----------------------------------------------------------------------------
-# Main application
-# -----------------------------------------------------------------------------
-
-
-def apply_fsdp2_strategy(model: nn.Module, strategy: Fsdp2Strategy) -> nn.Module:
+def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -> nn.Module:
     """
-    Apply the given Fsdp2Strategy onto a Qwen-7B model.
-
-    Notes:
-    - Assumes torch.distributed is already initialized.
-    - Uses internal FSDP2 APIs; lock to a known PyTorch version in practice.
+    遍历模型，分层应用策略：
+    1) Transformer layers 按 layer_overrides 覆盖
+    2) named_overrides 匹配 embed/head 等特殊模块
+    3) root fully_shard 兜底
     """
-    if not torch.distributed.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before applying FSDP2")
+    # 假设 HuggingFace 样式：model.model.layers 是 ModuleList
+    layers = getattr(getattr(model, "model", model), "layers", None)
+    if layers is None:
+        raise ValueError("Model does not expose `model.layers`; please adapt apply_strategy.")
 
-    mesh = build_mesh(strategy.mesh)
-    mp_policy = build_mp_policy(strategy.precision_offload)
-    offload_policy = build_offload_policy(strategy.precision_offload)
-    reshard_after_forward = convert_reshard_behavior(strategy.shard_reshard)
+    for i, layer in enumerate(layers):
+        layout = _pick_layout_for_layer(i, strategy)
+        mesh = get_mesh(layout.mesh_topology, world_size)
+        apply_layout_to_module(layer, layout, mesh)
 
-    fsdp_kwargs = {
-        "mesh": mesh,
-        "reshard_after_forward": reshard_after_forward,
-        "mp_policy": mp_policy,
-        "offload_policy": offload_policy,
-    }
+    # 特殊模块覆盖（embed_tokens, lm_head 等）
+    for name, mod in model.named_modules():
+        for key, layout in strategy.named_overrides.items():
+            if key in name:
+                mesh = get_mesh(layout.mesh_topology, world_size)
+                apply_layout_to_module(mod, layout, mesh)
 
-    layers = _get_transformer_layers(model)
-
-    if strategy.grouping.module_grouping == "manual" and strategy.grouping.manual_groups:
-        name_to_layer = {f"layer_{i}": layer for i, layer in enumerate(layers)}
-        for grp in strategy.grouping.manual_groups:
-            modules = []
-            for name in grp:
-                if name in name_to_layer:
-                    modules.append(name_to_layer[name])
-            if modules:
-                fully_shard(modules, **fsdp_kwargs)
-    elif strategy.grouping.module_grouping == "block":
-        for layer in layers:
-            fully_shard(layer, **fsdp_kwargs)
-    elif strategy.grouping.module_grouping == "mem_eff":
-        if len(layers) > 2:
-            fully_shard(layers[0], **fsdp_kwargs)
-            fully_shard(layers[-2], **fsdp_kwargs)
-            fully_shard(layers[-1], **fsdp_kwargs)
-        else:
-            for layer in layers:
-                fully_shard(layer, **fsdp_kwargs)
-    elif strategy.grouping.module_grouping == "all":
-        pass
-
-    if strategy.grouping.treat_embeddings_special:
-        for mod in _get_embedding_modules(model):
-            fully_shard(mod, **fsdp_kwargs)
-            if not strategy.comm_overlap.unshard_in_backward_embeddings:
-                if hasattr(mod, "set_unshard_in_backward"):
-                    mod.set_unshard_in_backward(False)
-
-    _apply_prefetch(
-        layers,
-        forward_window=strategy.comm_overlap.forward_prefetch_num,
-        backward_window=strategy.comm_overlap.backward_prefetch_num,
-    )
-
-    fully_shard(model, **fsdp_kwargs)
-
-    # Configure overlap flags on param groups
-    state = model._get_fsdp_state()  # type: ignore[attr-defined]
-    param_groups = getattr(state, "_param_groups", [])
-    for group in param_groups:
-        group.unshard_async_op = strategy.comm_overlap.unshard_async_op
-        group.force_sum_reduction_for_comms = (
-            strategy.comm_overlap.force_sum_reduction_for_comms
-        )
-        if strategy.comm_overlap.disable_hsdp_all_reduce:
-            group.all_reduce_grads = False
-    # per-group reshard 覆盖
-    if strategy.shard_reshard.per_group_reshard:
-        for group in param_groups:
-            name = getattr(group, "name", None)
-            if name and name in strategy.shard_reshard.per_group_reshard:
-                beh = strategy.shard_reshard.per_group_reshard[name]
-                group.reshard_after_forward = convert_reshard_behavior(
-                    ShardReshardConfig(reshard_behavior=beh)
-                )
-
-    if strategy.shard_reshard.use_custom_shard_placement:
-        _apply_custom_shard_rules(state, strategy.shard_reshard.custom_shard_rules)
-
+    # Root 包装，使用全局布局
+    mesh_root = get_mesh(strategy.global_layout.mesh_topology, world_size)
+    apply_layout_to_module(model, strategy.global_layout, mesh_root)
     return model
-
-
-def _apply_custom_shard_rules(state, rules: dict) -> None:
-    """
-    Optionally change shard dims for parameters that match a substring rule.
-
-    This is a limited hook: FSDP2 exposes `_shard_param` on param groups.
-    """
-    if not rules:
-        return
-    param_groups = getattr(state, "_param_groups", [])
-    for group in param_groups:
-        for param, spec in zip(group.params, group._fsdp_param_specs):
-            name = getattr(param, "name", "")
-            if not name:
-                continue
-            for pattern, dim in rules.items():
-                if pattern in name and hasattr(spec, "shard_spec"):
-                    try:
-                        spec.shard_spec.dim = dim
-                    except Exception as exc:  # pragma: no cover - best-effort
-                        log.warning("Failed to apply shard rule %s to %s: %s", pattern, name, exc)

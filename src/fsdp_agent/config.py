@@ -1,288 +1,181 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Literal, Optional, Sequence
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Literal, Optional, Union
 
-# Mesh / topology ----------------------------------------------------------------
-
-
-@dataclass
-class MeshConfig:
-    """Device mesh topology. Only supports 1D DP or 2D HSDP for 4 GPUs."""
-
-    layout: Literal["dp_1d", "hsdp_2d"] = "dp_1d"
-    dp_world: int = 4
-    hs_replicate_dim: Optional[int] = None  # optional replication dim for HSDP
-    mesh_shape: Optional[Sequence[int]] = None  # 支持多节点自定义 shape
-    mesh_ranks: Optional[Sequence[int]] = None  # 扁平 rank 列表
-
-
-# Grouping / wrapping -------------------------------------------------------------
+# ---------------------------------------------------------------
+# FSDP2 策略协议：分层覆盖 + 特殊模块覆盖
+# ---------------------------------------------------------------
 
 
 @dataclass
-class GroupingConfig:
-    """Module grouping and wrap policy for FSDP2."""
+class Fsdp2Layout:
+    """单个模块/层的布局与精度配置。"""
 
-    module_grouping: Literal["block", "mem_eff", "all", "manual"] = "block"
-    use_size_based_auto_wrap: bool = False
-    size_based_min_num_params: int = int(1e8)
-    treat_embeddings_special: bool = True
-    manual_groups: List[List[str]] = field(default_factory=list)  # 层名/正则列表
-
-
-# Shard and reshard ---------------------------------------------------------------
-
-
-@dataclass
-class ShardReshardConfig:
-    """Parameter sharding dims and reshard policy."""
-
-    use_custom_shard_placement: bool = False
-    custom_shard_rules: Dict[str, int] = field(default_factory=dict)
-    # memory_saving=True, no_reshard=False, intra_node=int, auto=None
-    reshard_behavior: Literal["memory_saving", "no_reshard", "intra_node", "auto"] = (
-        "auto"
-    )
-    per_group_reshard: Dict[str, Literal["memory_saving", "no_reshard", "intra_node", "auto"]] = field(
-        default_factory=dict
-    )
-
-
-# Communication / overlap / prefetch ---------------------------------------------
+    mesh_topology: Literal["1D", "2D"] = "1D"  # 1D DP 或 2D HSDP
+    sharding_strategy: Literal["FULL", "HYBRID", "NO"] = "FULL"
+    # True/False 或 int（用于 intra-node reshard）
+    reshard_after_forward: Union[bool, int] = True
+    shard_plan: Literal["DIM0", "DIM1", "LARGEST"] = "DIM0"
+    offload_params: bool = False
+    mp_policy: Literal["bf16", "fp32"] = "bf16"
 
 
 @dataclass
-class CommOverlapConfig:
-    """Communication overlap and prefetch knobs."""
+class LayerOverride:
+    """按层范围覆盖策略。"""
 
-    unshard_async_op: bool = False
-    unshard_in_backward_embeddings: bool = False
-    backward_prefetch_num: int = 0
-    forward_prefetch_num: int = 0
-    force_sum_reduction_for_comms: bool = False
-    disable_hsdp_all_reduce: bool = False
-
-
-# Precision / offload -------------------------------------------------------------
-
-
-@dataclass
-class PrecisionOffloadConfig:
-    mp_policy: Literal["bf16", "fp16", "none"] = "bf16"
-    offload_param: bool = False
-    offload_grad: bool = False
-    offload_optim: bool = False
-
-
-@dataclass
-class DatasetStats:
-    """数据集/队列的形状统计，供 Agent/Judge 推理和控制显存风险。"""
-
-    seq_len_p50: int = 2048
-    seq_len_p90: int = 2048
-    seq_len_p99: int = 2048
-    seq_len_max: int = 2048
-    pad_ratio: float = 0.0
-    entropy_mean: float = 0.0
-    entropy_var: float = 0.0
-    squeue: str = "default"  # 任务/队列标签
-
-
-# Full strategy -------------------------------------------------------------------
+    start_layer: int  # 包含
+    end_layer: int  # 不包含
+    layout: Fsdp2Layout
 
 
 @dataclass
 class Fsdp2Strategy:
-    mesh: MeshConfig = field(default_factory=MeshConfig)
-    grouping: GroupingConfig = field(default_factory=GroupingConfig)
-    shard_reshard: ShardReshardConfig = field(default_factory=ShardReshardConfig)
-    comm_overlap: CommOverlapConfig = field(default_factory=CommOverlapConfig)
-    precision_offload: PrecisionOffloadConfig = field(
-        default_factory=PrecisionOffloadConfig
-    )
-    train_hyper: Dict = field(default_factory=dict)  # micro_batch, grad_accum, seq_len override
-    dataset_stats: DatasetStats = field(default_factory=DatasetStats)
-    schema_version: int = 1
+    """Agent 输出的完整策略对象。"""
+
+    global_layout: Fsdp2Layout
+    layer_overrides: List[LayerOverride] = field(default_factory=list)
+    named_overrides: Dict[str, Fsdp2Layout] = field(default_factory=dict)
+    dataset_stats: Dict[str, Union[int, float, str]] = field(default_factory=dict)
+    schema_version: int = 2
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        return {
+            "global_layout": asdict(self.global_layout),
+            "layer_overrides": [
+                {
+                    "start_layer": o.start_layer,
+                    "end_layer": o.end_layer,
+                    "layout": asdict(o.layout),
+                }
+                for o in self.layer_overrides
+            ],
+            "named_overrides": {k: asdict(v) for k, v in self.named_overrides.items()},
+            "dataset_stats": self.dataset_stats,
+            "schema_version": self.schema_version,
+        }
+
+    @staticmethod
+    def from_dict(data: Dict) -> "Fsdp2Strategy":
+        gl = Fsdp2Layout(**data.get("global_layout", {}))
+        layer_overrides = [
+            LayerOverride(
+                start_layer=o["start_layer"],
+                end_layer=o["end_layer"],
+                layout=Fsdp2Layout(**o["layout"]),
+            )
+            for o in data.get("layer_overrides", [])
+        ]
+        named_overrides = {
+            k: Fsdp2Layout(**v) for k, v in data.get("named_overrides", {}).items()
+        }
+        return Fsdp2Strategy(
+            global_layout=gl,
+            layer_overrides=layer_overrides,
+            named_overrides=named_overrides,
+            dataset_stats=data.get("dataset_stats", {}),
+            schema_version=data.get("schema_version", 2),
+        )
 
 
-# Strategy seeds for reproducible baselines --------------------------------------
+# ---------------------------------------------------------------
+# 默认策略与示例种子
+# ---------------------------------------------------------------
 
 
 def default_strategy() -> Fsdp2Strategy:
-    """Safe baseline: block wrap + memory_saving reshard, no prefetch/async, embeddings normal."""
-    return Fsdp2Strategy(
-        grouping=GroupingConfig(
-            module_grouping="block",
-            use_size_based_auto_wrap=False,
-            size_based_min_num_params=int(1e8),
-            treat_embeddings_special=False,
-        ),
-        shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
-        comm_overlap=CommOverlapConfig(
-            backward_prefetch_num=0,
-            forward_prefetch_num=0,
-            unshard_async_op=False,
-            unshard_in_backward_embeddings=False,
-        ),
-        precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
-    )
+    """安全基线：全局 FULL + reshard=True（memory saving）。"""
+    return Fsdp2Strategy(global_layout=Fsdp2Layout())
 
 
-def heuristic_mem_eff_strategy() -> Fsdp2Strategy:
-    """Human heuristic focusing on memory efficiency + some prefetch."""
-    return Fsdp2Strategy(
-        grouping=GroupingConfig(module_grouping="mem_eff", treat_embeddings_special=True),
-        shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
-        comm_overlap=CommOverlapConfig(
-            backward_prefetch_num=2, forward_prefetch_num=1, unshard_async_op=True
-        ),
-    )
-
-
-def random_strategy(space_overrides: Optional[Dict[str, List]] = None) -> Fsdp2Strategy:
+def sandwich_sample_strategy() -> Fsdp2Strategy:
     """
-    Simple random sampler for ablations.
-
-    space_overrides lets callers constrain options. This keeps the space discrete and
-    small so the LLM loop can be compared against a cheap baseline.
+    示例：前 4 层 HYBRID+不 reshard（减少通信），中间默认，Embedding 不切（NO）。
     """
-    import random
-
-    space_overrides = space_overrides or {}
-
-    layout = random.choice(space_overrides.get("layout", ["dp_1d", "hsdp_2d"]))
-    grouping = random.choice(
-        space_overrides.get("module_grouping", ["block", "mem_eff", "all"])
+    return Fsdp2Strategy(
+        global_layout=Fsdp2Layout(),
+        layer_overrides=[
+            LayerOverride(
+                start_layer=0,
+                end_layer=4,
+                layout=Fsdp2Layout(
+                    mesh_topology="2D",
+                    sharding_strategy="HYBRID",
+                    reshard_after_forward=False,
+                ),
+            )
+        ],
+        named_overrides={
+            "embed_tokens": Fsdp2Layout(
+                sharding_strategy="NO", reshard_after_forward=False
+            )
+        },
     )
-    reshard = random.choice(
-        space_overrides.get(
-            "reshard_behavior", ["memory_saving", "no_reshard", "intra_node", "auto"]
+
+
+def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 70.0) -> Fsdp2Strategy:
+    """基础合法性检查，防止 LLM 输出非法字段。"""
+
+    def _clip_layout(layout: Fsdp2Layout) -> Fsdp2Layout:
+        if layout.mesh_topology not in ("1D", "2D"):
+            layout.mesh_topology = "1D"
+        if layout.sharding_strategy not in ("FULL", "HYBRID", "NO"):
+            layout.sharding_strategy = "FULL"
+        if isinstance(layout.reshard_after_forward, bool):
+            pass
+        elif isinstance(layout.reshard_after_forward, int):
+            layout.reshard_after_forward = max(1, layout.reshard_after_forward)
+        else:
+            layout.reshard_after_forward = True
+        if layout.shard_plan not in ("DIM0", "DIM1", "LARGEST"):
+            layout.shard_plan = "DIM0"
+        if layout.mp_policy not in ("bf16", "fp32"):
+            layout.mp_policy = "bf16"
+        layout.offload_params = bool(layout.offload_params)
+        return layout
+
+    strategy.global_layout = _clip_layout(strategy.global_layout)
+    strategy.layer_overrides = [
+        LayerOverride(
+            start_layer=o.start_layer,
+            end_layer=o.end_layer,
+            layout=_clip_layout(o.layout),
         )
-    )
-    backward_prefetch_num = random.choice(
-        space_overrides.get("backward_prefetch_num", [0, 1, 2])
-    )
-    forward_prefetch_num = random.choice(
-        space_overrides.get("forward_prefetch_num", [0, 1])
-    )
-    mp_policy = random.choice(space_overrides.get("mp_policy", ["bf16", "fp16"]))
-
-    return Fsdp2Strategy(
-        mesh=MeshConfig(layout=layout),
-        grouping=GroupingConfig(module_grouping=grouping),
-        shard_reshard=ShardReshardConfig(reshard_behavior=reshard),
-        comm_overlap=CommOverlapConfig(
-            backward_prefetch_num=backward_prefetch_num,
-            forward_prefetch_num=forward_prefetch_num,
-            unshard_async_op=random.choice([False, True]),
-        ),
-        precision_offload=PrecisionOffloadConfig(mp_policy=mp_policy),
-    )
-
-
-def strategy_from_dict(payload: Dict) -> Fsdp2Strategy:
-    """Hydrate Fsdp2Strategy from a plain dict (e.g., parsed LLM JSON)."""
-    return Fsdp2Strategy(
-        mesh=MeshConfig(**payload.get("mesh", {})),
-        grouping=GroupingConfig(**payload.get("grouping", {})),
-        shard_reshard=ShardReshardConfig(**payload.get("shard_reshard", {})),
-        comm_overlap=CommOverlapConfig(**payload.get("comm_overlap", {})),
-        precision_offload=PrecisionOffloadConfig(
-            **payload.get("precision_offload", {})
-        ),
-        train_hyper=payload.get("train_hyper", {}),
-        dataset_stats=DatasetStats(**payload.get("dataset_stats", {})),
-        schema_version=payload.get("schema_version", 1),
-    )
-
-
-def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float) -> Fsdp2Strategy:
-    """简单合法性和保守兜底。"""
-    if strategy.mesh.layout not in ("dp_1d", "hsdp_2d"):
-        strategy.mesh.layout = "dp_1d"
-    if strategy.shard_reshard.reshard_behavior not in (
-        "memory_saving",
-        "no_reshard",
-        "intra_node",
-        "auto",
-    ):
-        strategy.shard_reshard.reshard_behavior = "auto"
-    if mem_limit_gb < 70 and strategy.shard_reshard.reshard_behavior == "no_reshard":
-        strategy.shard_reshard.reshard_behavior = "memory_saving"
+        for o in strategy.layer_overrides
+        if o.end_layer > o.start_layer
+    ]
+    strategy.named_overrides = {
+        k: _clip_layout(v) for k, v in strategy.named_overrides.items()
+    }
     return strategy
 
 
-# 性能优先候选（给 LLM 参考的“动作方向”）
-def perf_tier_candidates() -> List[Fsdp2Strategy]:
-    """一组性能导向的候选，用于提示 LLM 应该尝试的方向。"""
-    candidates: List[Fsdp2Strategy] = []
+# ---------------------------------------------------------------
+# 性能导向提示（供 Prompt 使用，不直接作为种子）
+# ---------------------------------------------------------------
 
-    # Tier-1: overlap + mem_eff + root no_reshard
-    candidates.append(
-        Fsdp2Strategy(
-            grouping=GroupingConfig(module_grouping="mem_eff", treat_embeddings_special=False),
-            shard_reshard=ShardReshardConfig(reshard_behavior="no_reshard"),
-            comm_overlap=CommOverlapConfig(
-                forward_prefetch_num=1,
-                backward_prefetch_num=1,
-                unshard_async_op=False,
-                unshard_in_backward_embeddings=False,
-            ),
-            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
-            train_hyper={"micro_batch": 2},
-        )
-    )
 
-    # Tier-2: overlap+async，per-layer reshard（默认）
-    candidates.append(
-        Fsdp2Strategy(
-            grouping=GroupingConfig(module_grouping="block", treat_embeddings_special=False),
-            shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
-            comm_overlap=CommOverlapConfig(
-                forward_prefetch_num=2,
-                backward_prefetch_num=1,
-                unshard_async_op=True,
-                unshard_in_backward_embeddings=False,
-            ),
-            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
-            train_hyper={"micro_batch": 1, "grad_accum": 1},
-        )
-    )
+def perf_tier_candidates() -> Dict[str, Dict]:
+    """预置的性能导向提示，帮助提示词强调方向。"""
+    return {
+        "overlap_first": {
+            "global_layout": {"mesh_topology": "1D", "reshard_after_forward": True},
+            "hints": "先开启 overlap，再观察显存，再逐步放宽分片策略。",
+        },
+        "no_reshard": {
+            "global_layout": {"reshard_after_forward": False},
+            "hints": "显存充足时减少一次 all-gather 通信。",
+        },
+        "mem_eff": {
+            "layer_overrides": [
+                {"start_layer": 0, "end_layer": 4, "layout": {"reshard_after_forward": False}}
+            ],
+            "hints": "前几层不 reshard，减少通信次数。",
+        },
+    }
 
-    # Tier-2: 合并 group，少通信
-    candidates.append(
-        Fsdp2Strategy(
-            grouping=GroupingConfig(module_grouping="mem_eff", treat_embeddings_special=False),
-            shard_reshard=ShardReshardConfig(reshard_behavior="memory_saving"),
-            comm_overlap=CommOverlapConfig(
-                forward_prefetch_num=1,
-                backward_prefetch_num=1,
-                unshard_async_op=False,
-                unshard_in_backward_embeddings=False,
-            ),
-            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
-            train_hyper={"micro_batch": 1},
-        )
-    )
 
-    # Tier-3: root no_reshard + embedding 特化
-    candidates.append(
-        Fsdp2Strategy(
-            grouping=GroupingConfig(module_grouping="block", treat_embeddings_special=True),
-            shard_reshard=ShardReshardConfig(reshard_behavior="no_reshard"),
-            comm_overlap=CommOverlapConfig(
-                forward_prefetch_num=1,
-                backward_prefetch_num=1,
-                unshard_async_op=False,
-                unshard_in_backward_embeddings=False,
-            ),
-            precision_offload=PrecisionOffloadConfig(mp_policy="bf16"),
-            train_hyper={"micro_batch": 2},
-        )
-    )
-
-    return candidates
+# 兼容调用入口
+def strategy_from_dict(payload: Dict) -> Fsdp2Strategy:
+    return Fsdp2Strategy.from_dict(payload)
