@@ -126,7 +126,7 @@ CODER_SYSTEM = (
     '  "named_overrides": {"embed_tokens": {...}, "lm_head": {...}}\n'
     "}\n"
     "字段：mesh_topology(\"1D\"/\"2D\"), sharding_strategy(\"FULL\"/\"HYBRID\"/\"NO\"), "
-    "reshard_after_forward(bool/int), shard_plan(\"DIM0\"/\"DIM1\"/\"LARGEST\"), "
+    "reshard_after_forward(bool/int, 若为 int 必须 >=1，0 不合法请用 false), shard_plan(\"DIM0\"/\"DIM1\"/\"LARGEST\"), "
     "offload_params(bool), mp_policy(\"bf16\"/\"fp32\"). layer_overrides 支持 start/end 区间或 layers 数组指定离散层。\n"
     "约束：world_size=4；避免非法字段；优先使用 layer_overrides/named_overrides 做局部优化。"
 )

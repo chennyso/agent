@@ -160,13 +160,30 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
     if l.sharding_strategy not in _ALLOWED_SHARD:
         raise ValueError(f"{context}.sharding_strategy must be in {_ALLOWED_SHARD}; got {l.sharding_strategy}")
     # Note: bool is a subclass of int in Python, so check bool before int.
+    raf = l.reshard_after_forward
+    if isinstance(raf, str):
+        low = raf.strip().lower()
+        if low in {"true", "false"}:
+            raf = (low == "true")
+        else:
+            try:
+                raf = int(low)
+            except Exception as exc:
+                raise ValueError(f"{context}.reshard_after_forward must be bool or int; got {raf!r}") from exc
+        l.reshard_after_forward = raf
+
     if isinstance(l.reshard_after_forward, bool):
         pass
     elif isinstance(l.reshard_after_forward, int):
-        if l.reshard_after_forward < 1:
+        # Allow 0 as a permissive encoding of False (common from LLMs / config UIs).
+        if l.reshard_after_forward == 0:
+            l.reshard_after_forward = False
+        elif l.reshard_after_forward < 1:
             raise ValueError(f"{context}.reshard_after_forward int value must be >=1; got {l.reshard_after_forward}")
     else:
-        raise ValueError(f"{context}.reshard_after_forward must be bool or int; got {type(l.reshard_after_forward).__name__}")
+        raise ValueError(
+            f"{context}.reshard_after_forward must be bool or int; got {type(l.reshard_after_forward).__name__}"
+        )
     if l.shard_plan not in _ALLOWED_PLAN:
         raise ValueError(f"{context}.shard_plan must be in {_ALLOWED_PLAN}; got {l.shard_plan}")
     if l.mp_policy not in _ALLOWED_MP:
