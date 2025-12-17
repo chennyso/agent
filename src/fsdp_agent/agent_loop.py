@@ -144,7 +144,7 @@ def build_judge_prompt(
     last = history[-1] if history else {}
     comm_ratio = last.get("comm_ratio", 0.0)
     mem_headroom = mem_limit_gb - last.get("max_mem_bytes", 0) / 1024**3 if last else mem_limit_gb
-    err_msg = last.get("error_msg", "")
+    err_msg = last.get("error_msg") or last.get("error") or ""
 
     lines: List[str] = [
         f"硬件：{_hardware_summary(hw)}",
@@ -157,6 +157,13 @@ def build_judge_prompt(
         f"最近一次：comm_ratio={comm_ratio:.2f}, mem_headroom≈{mem_headroom:.1f}GB",
     ]
 
+    def _status(t: Dict) -> str:
+        if t.get("oom"):
+            return "OOM"
+        if t.get("error") or t.get("error_msg"):
+            return "Error"
+        return "Pass"
+
     baseline = next((t for t in history if t.get("config_name") == "safe"), None)
     if baseline:
         lines.append(
@@ -164,7 +171,7 @@ def build_judge_prompt(
             f"Speed={baseline.get('throughput_tokens_per_s',0):.0f} tok/s, "
             f"Mem={baseline.get('max_mem_bytes',0)/1024**3:.1f} GB, "
             f"CommRatio={baseline.get('comm_ratio',0):.2f}, "
-            f"Status={'OOM' if baseline.get('oom') else 'Pass'}"
+            f"Status={_status(baseline)}"
         )
 
     lines.append("【Recent Trials】")
@@ -175,7 +182,7 @@ def build_judge_prompt(
             f"Speed={t.get('throughput_tokens_per_s',0):.0f} tok/s, "
             f"Mem={t.get('max_mem_bytes',0)/1024**3:.1f} GB, "
             f"CommRatio={t.get('comm_ratio',0):.2f}, "
-            f"Status={'OOM' if t.get('oom') else 'Pass'}"
+            f"Status={_status(t)}"
         )
 
     if err_msg:
@@ -268,16 +275,27 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
     if proc.returncode != 0:
         print(proc.stdout)
         print(proc.stderr, file=sys.stderr)
-        return {
-            "oom": True,
-            "score": float("-inf"),
+        parsed = _parse_error(proc.stderr)
+        oom = "CUDA OOM" in parsed or "out of memory" in (proc.stderr or "")
+        metrics: Dict = {
             "trial_id": trial_id,
-            "error_msg": _parse_error(proc.stderr),
+            "score": float("-inf"),
+            "oom": oom,
+            "error_msg": parsed,
+            "returncode": proc.returncode,
         }
+        if out_path.exists():
+            try:
+                metrics.update(json.loads(out_path.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        return metrics
 
-    metrics = json.loads(out_path.read_text(encoding="utf-8"))
+    metrics = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
     metrics["trial_id"] = trial_id
     metrics["mem_limit_gb"] = args.mem_limit_gb
+    if metrics.get("error") and not metrics.get("error_msg"):
+        metrics["error_msg"] = str(metrics["error"])
     if "comm_ratio" not in metrics:
         comm = metrics.get("comm_time_ms", 0.0)
         compute = metrics.get("compute_time_ms", 0.0)
@@ -337,12 +355,14 @@ def main() -> None:
         attempt = 0
         candidate = None
         cand_hash = None
+        last_parse_error: Optional[Exception] = None
         current_c_prompt = c_prompt
         while attempt <= max_retry:
             try:
                 raw_json = robust_parse_json(coder_reply)
                 candidate = sanitize_strategy(raw_json, mem_limit_gb=args.mem_limit_gb)
             except Exception as e:
+                last_parse_error = e
                 print(f"[controller] 策略解析/校验错误: {e}")
                 current_c_prompt = current_c_prompt + f"\n\n【格式错误】{e}"
                 coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
@@ -363,7 +383,16 @@ def main() -> None:
             coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
             attempt += 1
 
-        if cand_hash in seen_hashes:
+        if candidate is None:
+            metrics = {
+                "trial_id": trial_id,
+                "config_name": f"agent_round_{round_idx}",
+                "judge_note": judge_reply,
+                "error": "strategy_parse_failed",
+                "error_msg": str(last_parse_error) if last_parse_error else "unknown parse failure",
+                "score": float("-inf"),
+            }
+        elif cand_hash and cand_hash in seen_hashes:
             metrics = {
                 "trial_id": trial_id,
                 "config_name": f"agent_round_{round_idx}",
@@ -377,8 +406,9 @@ def main() -> None:
             metrics["config_name"] = f"agent_round_{round_idx}"
             metrics["judge_note"] = judge_reply
             metrics["strategy_hash"] = cand_hash
-            seen_hashes.add(cand_hash)
-            hash_to_strategy[cand_hash] = candidate.to_dict()
+            if cand_hash:
+                seen_hashes.add(cand_hash)
+                hash_to_strategy[cand_hash] = candidate.to_dict()
 
         history.append(metrics)
         trial_id += 1

@@ -55,7 +55,9 @@ def _load_strategy(args: argparse.Namespace) -> Fsdp2Strategy:
             payload = json.load(f)
     else:
         payload = json.loads(args.strategy_json)
-    return strategy_from_dict(payload)
+    # Single entry-point for schema upgrades + validation
+    strat = Fsdp2Strategy.from_dict(payload)
+    return validate_strategy(strat, mem_limit_gb=args.mem_limit_gb)
 
 
 def main() -> None:

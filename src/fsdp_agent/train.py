@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from contextlib import nullcontext
 from typing import Dict, List, Optional
 
@@ -177,10 +178,16 @@ def run_trial(
         model = load_model(model_name=model_name)
         model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
         optimizer = build_optimizer(model, lr=lr)
+        # Ensure synthetic loader won't be empty with drop_last=True and won't exhaust during warmup+steps.
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        per_rank_batch = int(math.ceil(global_batch_size / max(world, 1)))
+        required_batches = num_warmup + num_steps + 1
+        required_len = per_rank_batch * required_batches
         dataloader = build_synthetic_loader(
             train_hyper={"global_batch_size": global_batch_size},
             vocab_size=vocab_size,
             seq_len=seq_len,
+            length=max(10_000, required_len),
         )
 
         activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -212,8 +219,13 @@ def run_trial(
         prof_metrics["max_mem_bytes"] = mem_bytes
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
-        # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差
-        mean_step_ms = sum(step_times_ms) / max(len(step_times_ms), 1)
+        # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差（用 median 抵抗偶发抖动/0ms）
+        sane = [t for t in step_times_ms if t >= _MIN_STEP_TIME_MS]
+        if not sane:
+            mean_step_ms = 0.0
+        else:
+            sane.sort()
+            mean_step_ms = float(sane[len(sane) // 2])
         prof_metrics["step_time_ms"] = mean_step_ms
         prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(mean_step_ms, global_batch_size, seq_len)
 
