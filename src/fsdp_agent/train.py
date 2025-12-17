@@ -115,8 +115,9 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
     def _get_cpu_time(evt):
         return getattr(evt, "cpu_time_total", None) or getattr(evt, "self_cpu_time_total", 0.0) or 0.0
 
-    total_cuda_time = sum(_get_cuda_time(e) for e in events) / 1e6  # ms
-    total_cpu_time = sum(_get_cpu_time(e) for e in events) / 1e6
+    # torch.profiler returns times in microseconds; convert to milliseconds.
+    total_cuda_time = sum(_get_cuda_time(e) for e in events) / 1e3  # ms
+    total_cpu_time = sum(_get_cpu_time(e) for e in events) / 1e3
     step_time_ms = total_cuda_time / max(prof.step_num, 1)
 
     comm_time_ms = 0.0
@@ -126,13 +127,13 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
     for e in events:
         name = e.key
         if "all_gather" in name:
-            comm_time_ms += _get_cuda_time(e) / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e3
             all_gather_calls += 1
         elif "reduce_scatter" in name:
-            comm_time_ms += _get_cuda_time(e) / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e3
             reduce_scatter_calls += 1
         elif "all_reduce" in name:
-            comm_time_ms += _get_cuda_time(e) / 1e6
+            comm_time_ms += _get_cuda_time(e) / 1e3
             all_reduce_calls += 1
     compute_time_ms = max(total_cuda_time - comm_time_ms, 0.0)
     idle_ratio = max(1.0 - (comm_time_ms + compute_time_ms) / max(total_cuda_time, 1e-6), 0.0)

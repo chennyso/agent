@@ -159,10 +159,13 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
         raise ValueError(f"{context}.mesh_topology must be in {_ALLOWED_MESH}; got {l.mesh_topology}")
     if l.sharding_strategy not in _ALLOWED_SHARD:
         raise ValueError(f"{context}.sharding_strategy must be in {_ALLOWED_SHARD}; got {l.sharding_strategy}")
-    if isinstance(l.reshard_after_forward, int):
+    # Note: bool is a subclass of int in Python, so check bool before int.
+    if isinstance(l.reshard_after_forward, bool):
+        pass
+    elif isinstance(l.reshard_after_forward, int):
         if l.reshard_after_forward < 1:
             raise ValueError(f"{context}.reshard_after_forward int value must be >=1; got {l.reshard_after_forward}")
-    elif not isinstance(l.reshard_after_forward, bool):
+    else:
         raise ValueError(f"{context}.reshard_after_forward must be bool or int; got {type(l.reshard_after_forward).__name__}")
     if l.shard_plan not in _ALLOWED_PLAN:
         raise ValueError(f"{context}.shard_plan must be in {_ALLOWED_PLAN}; got {l.shard_plan}")
