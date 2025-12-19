@@ -9,6 +9,7 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     """把 raw metrics 压缩成 LLM 可用的语义状态（可信输入）。"""
     mem_bytes = float(metrics.get("max_mem_bytes") or 0.0)
     headroom_gb = mem_limit_gb - mem_bytes / 1024**3
+    headroom_ratio = (headroom_gb / mem_limit_gb) if mem_limit_gb > 0 else 0.0
     profiling = str(metrics.get("profiling") or "light")
 
     comm_time = metrics.get("comm_time_ms", None)
@@ -23,6 +24,9 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     elif headroom_gb < 2.0:
         bottleneck = "MEMORY"
         confidence = 0.7
+    elif metrics.get("gpu_busy_ratio_est") is not None and float(metrics.get("gpu_busy_ratio_est") or 0.0) < 0.75:
+        bottleneck = "CPU_OR_WAIT"
+        confidence = 0.75 if profiling == "heavy" else 0.6
     elif comm_ratio is not None and comm_ratio >= 0.35:
         bottleneck = "COMMUNICATION"
         confidence = 0.7
@@ -31,6 +35,11 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         confidence = 0.55 if profiling != "heavy" else 0.7
 
     action_cost = _action_cost_map(phase)
+    # 动态 cost：显存余量大时，允许更“激进”的 unsharded span（但仍由 LLM 自行做风险评估）。
+    if headroom_ratio >= 0.25:
+        action_cost["expand_unsharded_span"] = "low"
+    else:
+        action_cost["expand_unsharded_span"] = "high"
     layer_stats = metrics.get("layer_stats") or {}
     top_targets = _top_layer_targets(layer_stats)
     if layer_stats:
@@ -42,9 +51,14 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "bottleneck": bottleneck,
         "confidence": confidence,
         "headroom_gb": headroom_gb,
+        "headroom_ratio": headroom_ratio,
         "comm_ratio": comm_ratio,
         "tokens_per_s": float(metrics.get("throughput_tokens_per_s") or 0.0),
+        "throughput_effective_tokens_per_s": float(metrics.get("throughput_effective_tokens_per_s") or 0.0),
+        "effective_tokens_per_step": int(metrics.get("effective_tokens_per_step") or 0),
         "step_time_ms": float(metrics.get("step_time_ms") or 0.0),
+        "gpu_busy_ratio_est": metrics.get("gpu_busy_ratio_est", None),
+        "host_overhead_ratio_est": metrics.get("host_overhead_ratio_est", None),
         "top_targets": top_targets,
         "action_cost": action_cost,
     }

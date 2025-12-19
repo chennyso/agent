@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -41,6 +42,32 @@ def _supports_merged_grouping() -> bool:
     return ("List[nn.Module]" in src) or ("Union[nn.Module, List" in src) or ("isinstance(module, list" in src)
 
 
+def _infer_num_hidden_layers(model_name: str) -> Optional[int]:
+    """只读模型 config，不加载权重，用于生成更合理的 seed。"""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name)
+    except Exception:
+        return None
+    for key in ("num_hidden_layers", "n_layer", "num_layers"):
+        v = getattr(cfg, key, None)
+        if isinstance(v, int) and v > 0:
+            return int(v)
+    return None
+
+
+def _pick_nontrivial_divisor(n: int) -> Optional[int]:
+    """给 reshard_after_forward(int) 选一个合法值：必须是 n 的非平凡因子（排除 1 和 n）。"""
+    n = int(n)
+    if n < 4:
+        return None
+    for d in range(n // 2, 1, -1):
+        if n % d == 0:
+            return d
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="FSDP2 Agent（Controller + Judge/Coder + Executor）")
     p.add_argument("--rounds", type=int, default=5, help="LLM 迭代轮数（不含种子）")
@@ -56,11 +83,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workdir", type=str, default="./runs")
     p.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     p.add_argument("--llm-temperature", type=float, default=0.2)
+    p.add_argument("--objective", type=str, default="throughput", choices=["throughput", "latency"])
     p.add_argument("--max-history", type=int, default=6, help="提示中保留的最近 trial 数")
     p.add_argument("--stop-drop", type=float, default=0.03, help="连续下降阈值，触发提前停止")
     p.add_argument("--dataset-stats-file", type=str, default=None, help="数据集统计 JSON")
     p.add_argument("--repeats", type=int, default=1, help="每个策略重复运行次数")
     p.add_argument("--hardware-json", type=str, default=None, help="手动硬件拓扑 JSON，覆盖自动探测")
+    p.add_argument("--allow-mesh", action="store_true", help="允许探索 2D/HSDP 等 mesh 变化")
+    p.add_argument("--allow-offload", action="store_true", help="允许探索 CPU 参数 offload")
+    p.add_argument("--include-offload-seed", action="store_true", help="加入 CPU offload 种子（需要 --allow-offload）")
+    p.add_argument("--enable-batch-probe", action="store_true", help="满足 gate 条件后进入 Batch Probing Phase")
+    p.add_argument(
+        "--batch-probe-sizes",
+        type=str,
+        default="",
+        help="Batch Probing 的 global_batch_size 列表（逗号分隔，空则自动生成）",
+    )
+    p.add_argument("--batch-probe-plateau-window", type=int, default=3, help="吞吐平台期判定窗口")
+    p.add_argument("--batch-probe-plateau-tol", type=float, default=0.02, help="平台期判定相对阈值（默认 2%）")
+    p.add_argument("--batch-probe-min-headroom-ratio", type=float, default=0.3, help="进入 batch probing 的最小显存余量比例")
     p.add_argument(
         "--llm-endpoint",
         type=str,
@@ -145,11 +186,12 @@ CODER_SYSTEM = (
     "- Respect forbidden_in_phase.\n"
     "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
     "Schema fields:\n"
-    "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2), shard_plan, offload_params, mp_policy\n"
+    "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy\n"
     "- layer_overrides: start_layer/end_layer or layers[] + layout\n"
     "- named_overrides: substring -> layout\n"
     "- grouping: {mode: block|merged, merge_factor>=1}\n"
     "If supports_merged_grouping=false, do not use grouping.mode='merged'.\n"
+    "Prefer targeted layer_overrides over setting global reshard_after_forward=False for all layers.\n"
     "Put the JSON inside a single ```json code fence.\n"
 )
 
@@ -199,13 +241,21 @@ def _derive_failure_feedback(metrics: Dict) -> Optional[str]:
     return None
 
 
-def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, trial_id: int, *, profile: str = "light") -> Dict:
+def _run_trial_subprocess(
+    args: argparse.Namespace,
+    strategy: Fsdp2Strategy,
+    trial_id: int,
+    *,
+    profile: str = "light",
+    override_global_batch_size: Optional[int] = None,
+) -> Dict:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     strat_path = workdir / f"strategy_{trial_id}.json"
     out_path = workdir / f"metrics_{trial_id}.json"
     strat_path.write_text(json.dumps(strategy.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
 
+    gbs = int(override_global_batch_size) if override_global_batch_size is not None else int(args.global_batch_size)
     cmd = [
         sys.executable,
         "-m",
@@ -221,7 +271,7 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
         "--model-name",
         str(args.model_name),
         "--global-batch-size",
-        str(args.global_batch_size),
+        str(gbs),
         "--seq-len",
         str(args.seq_len),
         "--vocab-size",
@@ -270,6 +320,9 @@ def _run_trial_subprocess(args: argparse.Namespace, strategy: Fsdp2Strategy, tri
     metrics = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
     metrics["trial_id"] = trial_id
     metrics["mem_limit_gb"] = args.mem_limit_gb
+    metrics.setdefault("trial_context", {})
+    # controller 侧也写一份，方便在 subprocess 异常时仍能对齐
+    metrics["trial_context"].setdefault("requested_global_batch_size", gbs)
     if metrics.get("error") and not metrics.get("error_msg"):
         metrics["error_msg"] = str(metrics["error"])
     if "comm_ratio" not in metrics:
@@ -298,11 +351,22 @@ def _strategy_uses_offload(strategy: Fsdp2Strategy) -> bool:
     return False
 
 
-def _enforce_phase_constraints(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy, phase: Phase) -> None:
+def _enforce_phase_constraints(
+    candidate: Fsdp2Strategy,
+    baseline: Fsdp2Strategy,
+    phase: Phase,
+    *,
+    allow_mesh: bool,
+    allow_offload: bool,
+) -> None:
     # 硬门禁：按 phase 限制动作，避免空间爆炸
+    if not allow_mesh and candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
+        raise ValueError("mesh is frozen (allow_mesh=false)")
     if phase == Phase.BASELINE:
         if candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
             raise ValueError("change_mesh is forbidden_in_phase")
+    if not allow_offload and (not _strategy_uses_offload(baseline)) and _strategy_uses_offload(candidate):
+        raise ValueError("offload is frozen (allow_offload=false)")
     # 早期阶段禁止“引入”offload，但不阻止在已启用 offload 的 anchor 上做局部微调
     if phase != Phase.OFFLOAD and (not _strategy_uses_offload(baseline)) and _strategy_uses_offload(candidate):
         raise ValueError("enable_cpu_offload is forbidden_in_phase")
@@ -322,6 +386,7 @@ def main() -> None:
     args = parse_args()
     hardware = load_hardware_info(args.hardware_json) if args.hardware_json else detect_hardware()
     dataset_stats = load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
+    num_layers_hint = _infer_num_hidden_layers(args.model_name)
     history: List[Dict] = []
     seen_hashes = set()
     hash_to_strategy = {}
@@ -339,27 +404,31 @@ def main() -> None:
         grouping=GroupingConfig(mode="block", merge_factor=1),
     )
 
-    seeds: List[tuple[str, Fsdp2Strategy]] = [("safe", baseline), ("sandwich", sandwich_sample_strategy())]
+    seeds: List[tuple[str, Fsdp2Strategy]] = [
+        ("safe", baseline),
+        ("sandwich", sandwich_sample_strategy(num_layers=num_layers_hint, span=4)),
+    ]
 
-    # HSDP-ish: 2D mesh + layer-level reshard True, root False (reduce backward all-gather on root).
-    # Use a large end_layer sentinel to mean "all layers".
-    hsdp_global = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=False)
-    hsdp_layer = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=True)
-    seeds.append(
-        (
-            "hsdp_layered",
-            Fsdp2Strategy(
-                global_layout=hsdp_global,
-                layer_overrides=[LayerOverride(start_layer=0, end_layer=10**9, layout=hsdp_layer)],
-                grouping=GroupingConfig(mode="block", merge_factor=1),
-            ),
+    # HSDP-ish (multi-node only): 2D mesh + layer-level reshard True, root False.
+    if args.allow_mesh and getattr(hardware, "num_nodes", 1) and int(getattr(hardware, "num_nodes", 1)) > 1:
+        hsdp_global = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=False)
+        hsdp_layer = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=True)
+        seeds.append(
+            (
+                "hsdp_layered",
+                Fsdp2Strategy(
+                    global_layout=hsdp_global,
+                    layer_overrides=[LayerOverride(start_layer=0, end_layer=10**9, layout=hsdp_layer)],
+                    grouping=GroupingConfig(mode="block", merge_factor=1),
+                ),
+            )
         )
-    )
 
-    # Conservative memory: 1D mesh + CPU param offload; int reshard commonly uses intra-node size.
-    raf = int(args.nproc) if int(args.nproc) >= 2 else False
-    offload_global = Fsdp2Layout(mesh_topology="1D", offload_params=True, reshard_after_forward=raf)
-    seeds.append(("cpu_offload", Fsdp2Strategy(global_layout=offload_global)))
+    # Conservative memory anchor: 1D + CPU param offload（默认不启用，避免污染“无 offload”阶段）
+    if args.allow_offload and args.include_offload_seed:
+        raf = _pick_nontrivial_divisor(int(args.nproc)) or True
+        offload_global = Fsdp2Layout(mesh_topology="1D", offload_params=True, reshard_after_forward=raf)
+        seeds.append(("cpu_offload", Fsdp2Strategy(global_layout=offload_global)))
     trial_id = 0
     for name, strat in seeds:
         strat_hash = _strategy_hash(strat)
@@ -379,7 +448,7 @@ def main() -> None:
     best_metrics_for_score = best_entry
     best_metrics_for_state = best_entry
     drop_streak = 0
-    phase = _initial_phase_for_strategy(best_strategy, baseline)
+    phase = Phase.MESH if args.allow_mesh else Phase.GROUPING
 
     for round_idx in range(args.rounds):
         semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
@@ -393,6 +462,11 @@ def main() -> None:
         }
         semantic_state["dataset_stats"] = getattr(dataset_stats, "__dict__", {})
         semantic_state["capabilities"] = {"supports_merged_grouping": _supports_merged_grouping()}
+        semantic_state["hard_constraints"] = {
+            "allow_mesh": bool(args.allow_mesh),
+            "allow_offload": bool(args.allow_offload),
+            "batch_size_search": False,
+        }
         semantic_state["recent_trials"] = [
             {
                 "trial_id": t.get("trial_id"),
@@ -405,7 +479,7 @@ def main() -> None:
                 "error_msg": t.get("error_msg"),
                 "strategy_hash": t.get("strategy_hash"),
             }
-            for t in history[-6:]
+            for t in history[-args.max_history :]
         ]
 
         # 不确定性高时，对当前 best 做一次 heavy 诊断（不改变 best 选择，仅补充可信观测）
@@ -431,6 +505,11 @@ def main() -> None:
             }
             semantic_state["dataset_stats"] = getattr(dataset_stats, "__dict__", {})
             semantic_state["capabilities"] = {"supports_merged_grouping": _supports_merged_grouping()}
+            semantic_state["hard_constraints"] = {
+                "allow_mesh": bool(args.allow_mesh),
+                "allow_offload": bool(args.allow_offload),
+                "batch_size_search": False,
+            }
             semantic_state["recent_trials"] = [
                 {
                     "trial_id": t.get("trial_id"),
@@ -443,7 +522,7 @@ def main() -> None:
                     "error_msg": t.get("error_msg"),
                     "strategy_hash": t.get("strategy_hash"),
                 }
-                for t in history[-6:]
+                for t in history[-args.max_history :]
             ]
 
         j_prompt = build_judge_prompt(semantic_state, current_strategy=best_strategy)
@@ -468,7 +547,13 @@ def main() -> None:
             try:
                 raw_json = robust_parse_json(coder_reply)
                 candidate = sanitize_strategy(raw_json, mem_limit_gb=args.mem_limit_gb)
-                _enforce_phase_constraints(candidate, best_strategy, phase)
+                _enforce_phase_constraints(
+                    candidate,
+                    best_strategy,
+                    phase,
+                    allow_mesh=bool(args.allow_mesh),
+                    allow_offload=bool(args.allow_offload),
+                )
             except Exception as e:
                 last_parse_error = e
                 print(f"[controller] 策略解析/校验错误: {e}")
@@ -541,10 +626,143 @@ def main() -> None:
                 break
         phase = next_phase(phase, improved=improved)
 
+    def _parse_batch_probe_sizes(spec: str) -> List[int]:
+        if not spec:
+            return []
+        out: List[int] = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            out.append(int(part))
+        return sorted({x for x in out if x > 0})
+
+    def _strategy_trials_for_plateau(xs: List[Dict]) -> List[Dict]:
+        out = []
+        for m in xs:
+            if m.get("diagnostic_only") or m.get("batch_probe"):
+                continue
+            if m.get("oom") or m.get("error"):
+                continue
+            if not m.get("strategy_hash"):
+                continue
+            out.append(m)
+        return out
+
+    def _is_throughput_plateau(xs: List[Dict], window: int, tol: float) -> bool:
+        window = max(int(window), 2)
+        tol = float(tol)
+        trials = _strategy_trials_for_plateau(xs)
+        if len(trials) < 2:
+            return False
+        # 取最近 window 个“不同 hash”的策略
+        uniq: List[Dict] = []
+        seen: set[str] = set()
+        for m in reversed(trials):
+            h = str(m.get("strategy_hash") or "")
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            uniq.append(m)
+            if len(uniq) >= window:
+                break
+        if len(uniq) < 2:
+            return False
+        vals: List[float] = []
+        for m in uniq:
+            v = m.get("throughput_effective_tokens_per_s")
+            if v is None:
+                v = m.get("throughput_tokens_per_s")
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+        if len(vals) < 2:
+            return False
+        mx = max(vals)
+        mn = min(vals)
+        if mx <= 0:
+            return False
+        return (mx - mn) / mx <= tol
+
+    def _headroom_ratio(m: Dict) -> float:
+        try:
+            return float(m.get("oom_margin_gb") or 0.0) / float(args.mem_limit_gb)
+        except Exception:
+            return 0.0
+
+    batch_probe_summary: Optional[Dict] = None
+    if args.enable_batch_probe and args.objective == "throughput":
+        plateau = _is_throughput_plateau(
+            history,
+            window=args.batch_probe_plateau_window,
+            tol=args.batch_probe_plateau_tol,
+        )
+        hr = _headroom_ratio(best_metrics_for_score)
+        hr_ok = hr >= float(args.batch_probe_min_headroom_ratio)
+        if plateau and hr_ok:
+            # Batch Probing Phase：固定 best_strategy，只探 batch，不改变 FSDP 参数
+            diag = _run_trial_subprocess(args, best_strategy, trial_id=trial_id, profile="heavy")
+            diag["config_name"] = "batch_probe_heavy_confirm"
+            diag["strategy_hash"] = best_hash
+            diag["diagnostic_only"] = True
+            diag["batch_probe"] = True
+            diag["score"] = float("-inf")
+            history.append(diag)
+            trial_id += 1
+
+            sizes = _parse_batch_probe_sizes(args.batch_probe_sizes)
+            if not sizes:
+                ws = max(int(args.nproc), 1)
+                base = int(args.global_batch_size)
+                cand1 = int(math.ceil((base + ws) / ws) * ws)
+                cand2 = int(math.ceil((base + 2 * ws) / ws) * ws)
+                sizes = [cand for cand in [cand1, cand2] if cand > base]
+
+            results: List[Dict] = []
+            for gbs in sizes:
+                m = _run_trial_subprocess(
+                    args,
+                    best_strategy,
+                    trial_id=trial_id,
+                    profile="light",
+                    override_global_batch_size=gbs,
+                )
+                m["config_name"] = f"batch_probe_gbs_{gbs}"
+                m["strategy_hash"] = best_hash
+                m["batch_probe"] = True
+                m["batch_probe_gbs"] = int(gbs)
+                m["score"] = float("-inf")
+                history.append(m)
+                results.append(m)
+                trial_id += 1
+
+            batch_probe_summary = {
+                "gate": {
+                    "objective": args.objective,
+                    "plateau": plateau,
+                    "headroom_ratio": hr,
+                    "headroom_ratio_ok": hr_ok,
+                },
+                "confirm_heavy_trial_id": diag.get("trial_id"),
+                "results": [
+                    {
+                        "trial_id": r.get("trial_id"),
+                        "requested_global_batch_size": r.get("trial_context", {}).get("requested_global_batch_size"),
+                        "effective_global_batch_size": r.get("trial_context", {}).get("effective_global_batch_size"),
+                        "throughput_effective_tokens_per_s": r.get("throughput_effective_tokens_per_s"),
+                        "oom": r.get("oom"),
+                        "oom_margin_gb": r.get("oom_margin_gb"),
+                        "error_msg": r.get("error_msg"),
+                    }
+                    for r in results
+                ],
+            }
+
     def _pareto_front(points: List[Dict], x_key: str, y_key: str) -> List[Dict]:
         pts = []
         for p in points:
-            if p.get("oom") or p.get("error") or p.get("diagnostic_only"):
+            if p.get("oom") or p.get("error") or p.get("diagnostic_only") or p.get("batch_probe"):
                 continue
             x = p.get(x_key)
             y = p.get(y_key)
@@ -568,6 +786,8 @@ def main() -> None:
     for m in history:
         h = m.get("strategy_hash")
         if not h:
+            continue
+        if m.get("batch_probe"):
             continue
         if m.get("error") or m.get("oom"):
             continue
@@ -593,6 +813,7 @@ def main() -> None:
         "second_best": second_best,
         "best_strategy": hash_to_strategy.get(best_h, best_strategy.to_dict()) if best_h else best_strategy.to_dict(),
         "second_best_strategy": hash_to_strategy.get(second_h) if second_h else None,
+        "batch_probe": batch_probe_summary,
         "pareto": {
             "throughput_vs_headroom": [
                 {

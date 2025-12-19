@@ -40,11 +40,14 @@ def get_mesh(topology: str, world_size: int):
                 gpus_per_node = 0
             if gpus_per_node >= 2 and world_size % gpus_per_node == 0:
                 num_nodes = world_size // gpus_per_node
-                return init_device_mesh(
-                    "cuda",
-                    (num_nodes, gpus_per_node),
-                    mesh_dim_names=("replicate", "shard"),
-                )
+                # 单节点时 (1, world_size) 的 HSDP replicate 维度为 1，收益小且更容易踩 torch/NCCL 边界；
+                # 多节点时才启用真正的 (num_nodes, gpus_per_node)。
+                if num_nodes > 1:
+                    return init_device_mesh(
+                        "cuda",
+                        (num_nodes, gpus_per_node),
+                        mesh_dim_names=("replicate", "shard"),
+                    )
 
         # 单机 fallback：优先使用方阵；否则退化为 (2, world_size//2)
         side = int(math.isqrt(world_size))
@@ -68,11 +71,34 @@ def _shard_mesh_size(mesh_topology: str, world_size: int) -> int:
             except ValueError:
                 gpus_per_node = 0
             if gpus_per_node >= 2 and world_size % gpus_per_node == 0:
-                return gpus_per_node
+                num_nodes = world_size // gpus_per_node
+                if num_nodes > 1:
+                    return gpus_per_node
 
         side = int(math.isqrt(world_size))
         return side if side * side == world_size else (world_size // 2)
     return world_size
+
+
+def _validate_reshard_after_forward(reshard, shard_mesh_size: int) -> object:
+    """校验 reshard_after_forward 的 int 语义，避免进入 NCCL 不一致/死锁。"""
+    if isinstance(reshard, bool) or reshard is None:
+        return reshard
+    if isinstance(reshard, int):
+        if reshard == 0:
+            return False
+        if shard_mesh_size <= 1:
+            raise ValueError(f"reshard_after_forward={reshard} requires shard_mesh_size>1")
+        if reshard <= 1 or reshard >= shard_mesh_size:
+            raise ValueError(
+                f"reshard_after_forward int must be a non-trivial divisor of shard_mesh_size; got {reshard} (shard_mesh_size={shard_mesh_size})"
+            )
+        if shard_mesh_size % reshard != 0:
+            raise ValueError(
+                f"reshard_after_forward int must divide shard_mesh_size; got {reshard} (shard_mesh_size={shard_mesh_size})"
+            )
+        return reshard
+    raise ValueError(f"reshard_after_forward must be bool|int; got {type(reshard).__name__}")
 
 
 def resolve_shard_fn(plan: str, shard_mesh_size: int):
@@ -116,7 +142,8 @@ def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size
     if getattr(layout, "sharding_strategy", "FULL") == "NO":
         return
 
-    reshard = layout.reshard_after_forward
+    shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
+    reshard = _validate_reshard_after_forward(layout.reshard_after_forward, shard_size)
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
         reduce_dtype=torch.float32,
@@ -130,7 +157,6 @@ def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size
         offload_policy=offload,
     )
     if "shard_placement_fn" in inspect.signature(fully_shard).parameters:
-        shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
         kwargs["shard_placement_fn"] = resolve_shard_fn(layout.shard_plan, shard_size)
     fully_shard(mod, **kwargs)
 
@@ -156,7 +182,8 @@ def apply_layout_to_modules(mods: List[nn.Module], layout: Fsdp2Layout, mesh, wo
     if getattr(layout, "sharding_strategy", "FULL") == "NO":
         return
 
-    reshard = layout.reshard_after_forward
+    shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
+    reshard = _validate_reshard_after_forward(layout.reshard_after_forward, shard_size)
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
         reduce_dtype=torch.float32,
@@ -165,7 +192,6 @@ def apply_layout_to_modules(mods: List[nn.Module], layout: Fsdp2Layout, mesh, wo
 
     kwargs = dict(mesh=mesh, reshard_after_forward=reshard, mp_policy=mp, offload_policy=offload)
     if "shard_placement_fn" in inspect.signature(fully_shard).parameters:
-        shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
         kwargs["shard_placement_fn"] = resolve_shard_fn(layout.shard_plan, shard_size)
     fully_shard(mods, **kwargs)  # type: ignore[arg-type]
 
@@ -194,6 +220,11 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
     merge_factor = int(getattr(grouping, "merge_factor", 1) or 1)
     if merge_factor < 1:
         merge_factor = 1
+    mesh_cache: dict[str, object] = {}
+    def _mesh_for(topology: str):
+        if topology not in mesh_cache:
+            mesh_cache[topology] = get_mesh(topology, world_size)
+        return mesh_cache[topology]
 
     layers = extract_transformer_layers(model)
     if layers is None:
@@ -216,7 +247,7 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
                 group.append(layers[j])
                 j += 1
 
-            mesh = get_mesh(layout.mesh_topology, world_size)
+            mesh = _mesh_for(layout.mesh_topology)
             param_numel = sum(p.numel() for m in group for p in m.parameters(recurse=True))
             bytes_per = 2 if layout.mp_policy == "bf16" else 4
             wrap_plan.append(
@@ -240,7 +271,7 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
             continue
         for key, layout in strategy.named_overrides.items():
             if key in name:
-                mesh = get_mesh(layout.mesh_topology, world_size)
+                mesh = _mesh_for(layout.mesh_topology)
                 param_numel = sum(p.numel() for p in mod.parameters(recurse=True))
                 bytes_per = 2 if layout.mp_policy == "bf16" else 4
                 wrap_plan.append(
@@ -258,7 +289,7 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
                 break
 
     # Root 包装，使用全局布局
-    mesh_root = get_mesh(strategy.global_layout.mesh_topology, world_size)
+    mesh_root = _mesh_for(strategy.global_layout.mesh_topology)
     wrap_plan.append({"kind": "root", "layout": asdict(strategy.global_layout)})
     apply_layout_to_module(model, strategy.global_layout, mesh_root, world_size)
     model._fsdp_agent_wrap_plan = wrap_plan  # type: ignore[attr-defined]

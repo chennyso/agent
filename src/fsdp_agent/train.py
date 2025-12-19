@@ -129,6 +129,8 @@ class _LayerProbe:
         self._fwd_ms = {}
         self._bwd_ms = {}
         self._mem_delta_mb = {}
+        self._fwd_mem_delta_mb = {}
+        self._bwd_mem_delta_mb = {}
 
         for idx, layer in enumerate(layers):
             name = f"layers.{idx}"
@@ -174,10 +176,14 @@ class _LayerProbe:
         if record:
             for layer_name, s, e, mem0, mem1 in self._fwd_pairs:
                 self._fwd_ms.setdefault(layer_name, []).append(float(s.elapsed_time(e)))
-                self._mem_delta_mb.setdefault(layer_name, []).append(float(mem1 - mem0) / (1024 * 1024))
+                delta = float(mem1 - mem0) / (1024 * 1024)
+                self._mem_delta_mb.setdefault(layer_name, []).append(delta)
+                self._fwd_mem_delta_mb.setdefault(layer_name, []).append(delta)
             for layer_name, s, e, mem0, mem1 in self._bwd_pairs:
                 self._bwd_ms.setdefault(layer_name, []).append(float(s.elapsed_time(e)))
-                self._mem_delta_mb.setdefault(layer_name, []).append(float(mem1 - mem0) / (1024 * 1024))
+                delta = float(mem1 - mem0) / (1024 * 1024)
+                self._mem_delta_mb.setdefault(layer_name, []).append(delta)
+                self._bwd_mem_delta_mb.setdefault(layer_name, []).append(delta)
         self._fwd_pairs.clear()
         self._bwd_pairs.clear()
 
@@ -203,6 +209,8 @@ class _LayerProbe:
                 "fwd_ms_p50": _p50(self._fwd_ms.get(k, [])),
                 "bwd_ms_p50": _p50(self._bwd_ms.get(k, [])),
                 "mem_delta_mb_p50": _p50(self._mem_delta_mb.get(k, [])),
+                "fwd_mem_delta_mb_p50": _p50(self._fwd_mem_delta_mb.get(k, [])),
+                "bwd_mem_delta_mb_p50": _p50(self._bwd_mem_delta_mb.get(k, [])),
             }
         return out
 
@@ -332,6 +340,7 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
     idle_ratio = max(1.0 - (comm_time_ms + compute_time_ms) / max(total_cuda_time, 1e-6), 0.0)
     return {
         "step_time_ms": step_time_ms,
+        "profiler_steps": int(getattr(prof, "step_num", 0) or 0),
         "total_cuda_time_ms": total_cuda_time,
         "total_cpu_time_ms": total_cpu_time,
         "comm_time_ms": comm_time_ms,
@@ -453,6 +462,31 @@ def run_trial(
         )
         prof_metrics["throughput_tokens_per_s"] = _estimate_tokens_per_s(mean_step_ms, global_batch_size, seq_len)
 
+        # 让 LLM 看到更稳健的“是否 CPU/等待占比高”的证据：用 profiler kernel 总时长 vs CUDA event wall time。
+        gpu_busy_ratio_est = None
+        host_overhead_ratio_est = None
+        if profiling == "heavy":
+            total_cuda = float(prof_metrics.get("total_cuda_time_ms", 0.0) or 0.0)
+            steps = int(prof_metrics.get("profiler_steps", 0) or 0)
+            wall = float(mean_step_ms or 0.0)
+            if steps > 0 and wall >= _MIN_STEP_TIME_MS and total_cuda > 0:
+                cuda_kernel_ms_per_step = total_cuda / steps
+                busy = cuda_kernel_ms_per_step / wall
+                # kernel sum 可能因为多 stream 重叠而 > wall；这里只关心“是否明显低于 wall”。
+                gpu_busy_ratio_est = float(min(max(busy, 0.0), 1.0))
+                host_overhead_ratio_est = float(max(1.0 - gpu_busy_ratio_est, 0.0))
+                prof_metrics["cuda_kernel_ms_per_step_est"] = float(cuda_kernel_ms_per_step)
+        prof_metrics["gpu_busy_ratio_est"] = gpu_busy_ratio_est
+        prof_metrics["host_overhead_ratio_est"] = host_overhead_ratio_est
+
+        # comm_ratio：仅 heavy 下可靠
+        if profiling == "heavy":
+            total = float(prof_metrics.get("total_cuda_time_ms", 0.0) or 0.0)
+            comm = float(prof_metrics.get("comm_time_ms", 0.0) or 0.0)
+            prof_metrics["comm_ratio"] = (comm / total) if total > 0 else None
+        else:
+            prof_metrics.setdefault("comm_ratio", None)
+
         # MFU 暂不可信，置空，避免误导
         prof_metrics["mfu_percent"] = None
         prof_metrics["total_params"] = sum(p.numel() for p in model.parameters())
@@ -508,19 +542,19 @@ def run_trial(
     mem_limit_bytes = int(mem_limit_gb * 1024**3)
     headroom_mb = (mem_limit_bytes - best.get("max_mem_bytes", 0)) // (1024 * 1024)
     best["oom_margin_gb"] = float(headroom_mb) / 1024.0
-    overlap_ratio = 0.0
-    total = best.get("comm_time_ms", 0.0) + best.get("compute_time_ms", 0.0)
-    if total > 0:
-        overlap_ratio = 1.0 - (best.get("idle_ratio", 0.0))
+    overlap_ratio = best.get("gpu_busy_ratio_est", None)
     peak_unsharded_groups = best.get("fsdp_events", {}).get("all_gather_calls", 0)
     best["trace_summary"] = {
-        "all_gather_forward_late": best.get("idle_ratio", 0.0) > 0.2,
+        "all_gather_forward_late": (best.get("host_overhead_ratio_est") or 0.0) > 0.2,
         "overlap_ratio": overlap_ratio,
         "peak_unsharded_groups": peak_unsharded_groups,
         "memory_headroom_mb": headroom_mb,
         "mfu_percent": best.get("mfu_percent", 0.0),
         "tokens_per_step": global_batch_size * seq_len,
         "world_size": world_size,
+        "gpu_busy_ratio_est": best.get("gpu_busy_ratio_est", None),
+        "host_overhead_ratio_est": best.get("host_overhead_ratio_est", None),
+        "comm_ratio": best.get("comm_ratio", None),
     }
     return best
 

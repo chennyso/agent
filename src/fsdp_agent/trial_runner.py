@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -18,7 +19,14 @@ from fsdp_agent.dataset_stats import load_stats_from_file, DatasetStats
 def init_distributed() -> None:
     if dist.is_initialized():
         return
-    dist.init_process_group(backend="nccl")
+    # Avoid multi-minute deadlocks on mis-scheduled collectives by using a smaller timeout.
+    timeout_s = int(os.environ.get("FSDP_AGENT_PG_TIMEOUT_S", "180"))
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    # NCCL watchdog 默认可能是 10min；这里尽量统一到更小的超时，快速失败便于 agent 回滚。
+    os.environ.setdefault("NCCL_TIMEOUT", str(timeout_s))
+    os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", str(timeout_s))
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=timeout_s))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 

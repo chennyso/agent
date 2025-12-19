@@ -29,8 +29,8 @@ class DatasetStats:
 class Fsdp2Layout:
     mesh_topology: Literal["1D", "2D"] = "1D"
     sharding_strategy: Literal["FULL", "HYBRID", "NO"] = "FULL"
-    # bool / int: int 可表示“在更小 mesh 上 reshard”
-    reshard_after_forward: Union[bool, int] = True
+    # bool / int / None: None 表示 FSDP2 auto（root=False, others=True）
+    reshard_after_forward: Optional[Union[bool, int]] = True
     shard_plan: Literal["DIM0", "DIM1", "LARGEST"] = "DIM0"
     offload_params: bool = False
     mp_policy: Literal["bf16", "fp32"] = "bf16"
@@ -182,9 +182,13 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
         l.sharding_strategy = "HYBRID" if l.mesh_topology == "2D" else "FULL"
     # Note: bool is a subclass of int in Python, so check bool before int.
     raf = l.reshard_after_forward
-    if isinstance(raf, str):
+    if raf is None:
+        l.reshard_after_forward = None
+    elif isinstance(raf, str):
         low = raf.strip().lower()
-        if low in {"true", "false"}:
+        if low in {"none", "null"}:
+            raf = None
+        elif low in {"true", "false"}:
             raf = (low == "true")
         else:
             try:
@@ -193,7 +197,9 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
                 raise ValueError(f"{context}.reshard_after_forward must be bool or int; got {raf!r}") from exc
         l.reshard_after_forward = raf
 
-    if isinstance(l.reshard_after_forward, bool):
+    if l.reshard_after_forward is None:
+        pass
+    elif isinstance(l.reshard_after_forward, bool):
         pass
     elif isinstance(l.reshard_after_forward, int):
         # Allow 0 as a permissive encoding of False (common from LLMs / config UIs).
@@ -278,14 +284,31 @@ def default_strategy() -> Fsdp2Strategy:
     return Fsdp2Strategy(global_layout=gl)
 
 
-def sandwich_sample_strategy() -> Fsdp2Strategy:
-    """A simple heterogeneous seed: keep ends fast, middle memory-saving."""
+def sandwich_sample_strategy(num_layers: Optional[int] = None, span: int = 4) -> Fsdp2Strategy:
+    """异构 seed：两头更偏性能（unsharded），中间更偏省显存（reshard）。
+
+    - num_layers=None 时使用保守默认（24），避免 controller 侧需要加载模型。
+    - span 表示两头保留的层数（默认 4）。
+    """
+    span = int(span)
+    if span < 1:
+        span = 1
+
+    n = int(num_layers) if num_layers is not None else 24
+    if n < 1:
+        n = 24
+
     gl = Fsdp2Layout(reshard_after_forward=True)
     fast = Fsdp2Layout(reshard_after_forward=False)
-    ovrs = [
-        LayerOverride(start_layer=0, end_layer=4, layout=fast),
-        LayerOverride(start_layer=20, end_layer=24, layout=fast),
-    ]
+
+    head_end = min(span, n)
+    tail_start = max(n - span, 0)
+    ovrs = []
+    if head_end > 0:
+        ovrs.append(LayerOverride(start_layer=0, end_layer=head_end, layout=fast))
+    # n 较小时避免重复覆盖
+    if tail_start < n and tail_start >= head_end:
+        ovrs.append(LayerOverride(start_layer=tail_start, end_layer=n, layout=fast))
     return Fsdp2Strategy(global_layout=gl, layer_overrides=ovrs)
 
 
