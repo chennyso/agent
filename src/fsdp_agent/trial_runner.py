@@ -46,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trial-id", type=int, default=0)
     p.add_argument("--dataset-stats-file", type=str, default=None, help="Path to dataset stats JSON.")
     p.add_argument("--repeats", type=int, default=1, help="Repeat runs and take median throughput.")
+    p.add_argument(
+        "--profile",
+        type=str,
+        default="light",
+        choices=["light", "heavy"],
+        help="Profiling mode: light uses CUDA events; heavy enables torch.profiler traces.",
+    )
     return p.parse_args()
 
 
@@ -82,6 +89,7 @@ def main() -> None:
             dataset_stats=ds_stats,
             repeats=args.repeats,
             mem_limit_gb=args.mem_limit_gb,
+            profiling=args.profile,
         )
     except torch.cuda.OutOfMemoryError:
         metrics = {"oom": True, "score": float("-inf"), "error_msg": "CUDA out of memory (trial_runner)"}

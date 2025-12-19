@@ -18,12 +18,14 @@ def estimate_activation_mem_bytes(train_hyper: Dict, dataset_stats: Dict, model_
 
 
 def score_strategy(metrics: Dict, mem_limit_bytes: int, weights: Dict = None) -> float:
-    """多目标打分：吞吐奖励，通信占比/显存超限惩罚。"""
-    weights = weights or {"comm": 0.5}
+    """多目标打分（去数据分布影响）：有效 tokens 吞吐 + OOM margin + 通信占比惩罚。"""
+    weights = weights or {"comm": 0.5, "headroom": 0.02}
     if metrics.get("oom", False):
         return float("-inf")
     mem = metrics.get("max_mem_bytes", 0)
-    throughput = metrics.get("throughput_tokens_per_s", 0.0)
+    throughput = metrics.get("throughput_effective_tokens_per_s", None)
+    if throughput is None:
+        throughput = metrics.get("throughput_tokens_per_s", 0.0)
     comm = metrics.get("comm_time_ms", 0.0)
     compute = metrics.get("compute_time_ms", 0.0)
     total = max(comm + compute, 1e-6)
@@ -31,4 +33,6 @@ def score_strategy(metrics: Dict, mem_limit_bytes: int, weights: Dict = None) ->
     if mem > mem_limit_bytes:
         over = mem / mem_limit_bytes
         return throughput / (1.0 + 5.0 * (over - 1.0))
-    return throughput * (1.0 - weights["comm"] * comm_ratio)
+    headroom_gb = float(metrics.get("oom_margin_gb", 0.0) or 0.0)
+    headroom_bonus = 1.0 + weights["headroom"] * max(min(headroom_gb, 20.0), 0.0)
+    return throughput * (1.0 - weights["comm"] * comm_ratio) * headroom_bonus

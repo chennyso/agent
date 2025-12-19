@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import os
 from typing import List, Optional
 
 import torch
@@ -18,7 +19,10 @@ except Exception:  # pragma: no cover
     from torch.distributed.tensor import Replicate, Shard  # type: ignore[attr-defined]
 from torch.distributed.device_mesh import init_device_mesh
 
+from dataclasses import asdict
+
 from fsdp_agent.config import Fsdp2Layout, Fsdp2Strategy, LayerOverride
+from fsdp_agent.model_introspection import extract_transformer_layers
 
 
 def get_mesh(topology: str, world_size: int):
@@ -26,7 +30,23 @@ def get_mesh(topology: str, world_size: int):
     if topology == "1D":
         return init_device_mesh("cuda", (world_size,))
     if topology == "2D":
-        # 优先使用方阵；否则退化为 (2, world_size//2)
+        # 优先从 torchrun 环境变量推导 (num_nodes, gpus_per_node)
+        # 这与官方文档示例一致：init_device_mesh("cuda", (num_nodes, gpus_per_node), mesh_dim_names=("replicate","shard"))
+        local_ws = os.environ.get("LOCAL_WORLD_SIZE") or os.environ.get("LOCAL_SIZE")
+        if local_ws:
+            try:
+                gpus_per_node = int(local_ws)
+            except ValueError:
+                gpus_per_node = 0
+            if gpus_per_node >= 2 and world_size % gpus_per_node == 0:
+                num_nodes = world_size // gpus_per_node
+                return init_device_mesh(
+                    "cuda",
+                    (num_nodes, gpus_per_node),
+                    mesh_dim_names=("replicate", "shard"),
+                )
+
+        # 单机 fallback：优先使用方阵；否则退化为 (2, world_size//2)
         side = int(math.isqrt(world_size))
         if side * side == world_size:
             shape = (side, side)
@@ -41,6 +61,15 @@ def get_mesh(topology: str, world_size: int):
 def _shard_mesh_size(mesh_topology: str, world_size: int) -> int:
     # 2D mesh 的 shard 维度大小是第 2 维（get_mesh() 里命名为 "shard"）
     if mesh_topology == "2D":
+        local_ws = os.environ.get("LOCAL_WORLD_SIZE") or os.environ.get("LOCAL_SIZE")
+        if local_ws:
+            try:
+                gpus_per_node = int(local_ws)
+            except ValueError:
+                gpus_per_node = 0
+            if gpus_per_node >= 2 and world_size % gpus_per_node == 0:
+                return gpus_per_node
+
         side = int(math.isqrt(world_size))
         return side if side * side == world_size else (world_size // 2)
     return world_size
@@ -106,6 +135,41 @@ def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size
     fully_shard(mod, **kwargs)
 
 
+def _fully_shard_supports_module_list() -> bool:
+    """兼容不同 PyTorch 版本：部分版本允许 fully_shard(List[nn.Module]) 做 grouping。"""
+    try:
+        src = inspect.getsource(fully_shard)
+    except Exception:  # pragma: no cover
+        return False
+    return ("List[nn.Module]" in src) or ("Union[nn.Module, List" in src) or ("isinstance(module, list" in src)
+
+
+def apply_layout_to_modules(mods: List[nn.Module], layout: Fsdp2Layout, mesh, world_size: int) -> None:
+    """对一组模块应用相同 layout（若 torch 版本支持，则合并为单个 communication group）。"""
+    if not mods:
+        return
+    if len(mods) == 1 or not _fully_shard_supports_module_list():
+        for m in mods:
+            apply_layout_to_module(m, layout, mesh, world_size)
+        return
+
+    if getattr(layout, "sharding_strategy", "FULL") == "NO":
+        return
+
+    reshard = layout.reshard_after_forward
+    mp = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if layout.offload_params else OffloadPolicy()
+
+    kwargs = dict(mesh=mesh, reshard_after_forward=reshard, mp_policy=mp, offload_policy=offload)
+    if "shard_placement_fn" in inspect.signature(fully_shard).parameters:
+        shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
+        kwargs["shard_placement_fn"] = resolve_shard_fn(layout.shard_plan, shard_size)
+    fully_shard(mods, **kwargs)  # type: ignore[arg-type]
+
+
 def _pick_layout_for_layer(idx: int, strategy: Fsdp2Strategy) -> Fsdp2Layout:
     for ovr in strategy.layer_overrides:
         if getattr(ovr, "layers", None) and idx in ovr.layers:
@@ -113,32 +177,6 @@ def _pick_layout_for_layer(idx: int, strategy: Fsdp2Strategy) -> Fsdp2Layout:
         if ovr.start_layer is not None and ovr.end_layer is not None and ovr.start_layer <= idx < ovr.end_layer:
             return ovr.layout
     return strategy.global_layout
-
-
-def _extract_transformer_layers(model: nn.Module) -> nn.ModuleList | None:
-    """
-    尝试在常见的 HuggingFace/Llama 结构里找到真正的 Transformer 层列表。
-    如果没找到则返回 None，由调用方根据是否需要 override 决定是否报错。
-    """
-    candidate_paths = [
-        ("model", "layers"),  # Llama/Mistral/Qwen2/... (CausalLM.model.layers)
-        ("model", "model", "layers"),  # 一些 wrapper
-        ("model", "decoder", "layers"),  # OPT 等 decoder-only
-        ("model", "model", "decoder", "layers"),
-        ("transformer", "h"),  # GPT-2 family
-        ("transformer", "blocks"),  # MPT
-        ("gpt_neox", "layers"),  # GPT-NeoX
-        ("layers",),  # 已经是 backbone
-    ]
-    for path in candidate_paths:
-        cursor: nn.Module | None = model
-        for attr in path:
-            cursor = getattr(cursor, attr, None)
-            if cursor is None:
-                break
-        if isinstance(cursor, nn.ModuleList) and len(cursor) > 0:
-            return cursor
-    return None
 
 
 def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -> nn.Module:
@@ -149,19 +187,52 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
     3) root fully_shard 兜底
     """
     applied: set[int] = set()
+    wrap_plan: List[dict] = []
 
-    layers = _extract_transformer_layers(model)
-    if layers is None and strategy.layer_overrides:
-        raise ValueError(
-            "layer_overrides 已设置，但没有找到 Transformer 层列表。"
-            "请根据你的模型结构修改 fsdp_apply._extract_transformer_layers()."
-        )
-    if layers is not None:
-        for i, layer in enumerate(layers):
+    grouping = getattr(strategy, "grouping", None)
+    grouping_mode = getattr(grouping, "mode", "block")
+    merge_factor = int(getattr(grouping, "merge_factor", 1) or 1)
+    if merge_factor < 1:
+        merge_factor = 1
+
+    layers = extract_transformer_layers(model)
+    if layers is None:
+        if strategy.layer_overrides:
+            raise ValueError(
+                "layer_overrides 已设置，但没有找到 Transformer 层列表。"
+                "请根据你的模型结构修改 fsdp_apply._extract_transformer_layers()."
+            )
+    else:
+        group_size = merge_factor if grouping_mode == "merged" else 1
+        i = 0
+        while i < len(layers):
             layout = _pick_layout_for_layer(i, strategy)
+            group: List[nn.Module] = [layers[i]]
+            j = i + 1
+            while j < len(layers) and len(group) < group_size:
+                next_layout = _pick_layout_for_layer(j, strategy)
+                if next_layout != layout:
+                    break
+                group.append(layers[j])
+                j += 1
+
             mesh = get_mesh(layout.mesh_topology, world_size)
-            apply_layout_to_module(layer, layout, mesh, world_size)
-            applied.add(id(layer))
+            param_numel = sum(p.numel() for m in group for p in m.parameters(recurse=True))
+            bytes_per = 2 if layout.mp_policy == "bf16" else 4
+            wrap_plan.append(
+                {
+                    "kind": "layers",
+                    "indices": list(range(i, j)),
+                    "grouping": {"mode": grouping_mode, "merge_factor": merge_factor},
+                    "layout": asdict(layout),
+                    "param_numel": int(param_numel),
+                    "param_bytes_estimate": int(param_numel * bytes_per),
+                }
+            )
+            apply_layout_to_modules(group, layout, mesh, world_size)
+            for layer in group:
+                applied.add(id(layer))
+            i = j
 
     # 特殊模块覆盖（embed_tokens, lm_head 等）
     for name, mod in model.named_modules():
@@ -170,11 +241,25 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
         for key, layout in strategy.named_overrides.items():
             if key in name:
                 mesh = get_mesh(layout.mesh_topology, world_size)
+                param_numel = sum(p.numel() for p in mod.parameters(recurse=True))
+                bytes_per = 2 if layout.mp_policy == "bf16" else 4
+                wrap_plan.append(
+                    {
+                        "kind": "named",
+                        "module_name": name,
+                        "match_key": key,
+                        "layout": asdict(layout),
+                        "param_numel": int(param_numel),
+                        "param_bytes_estimate": int(param_numel * bytes_per),
+                    }
+                )
                 apply_layout_to_module(mod, layout, mesh, world_size)
                 applied.add(id(mod))
                 break
 
     # Root 包装，使用全局布局
     mesh_root = get_mesh(strategy.global_layout.mesh_topology, world_size)
+    wrap_plan.append({"kind": "root", "layout": asdict(strategy.global_layout)})
     apply_layout_to_module(model, strategy.global_layout, mesh_root, world_size)
+    model._fsdp_agent_wrap_plan = wrap_plan  # type: ignore[attr-defined]
     return model

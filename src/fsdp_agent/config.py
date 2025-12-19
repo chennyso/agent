@@ -37,6 +37,14 @@ class Fsdp2Layout:
 
 
 @dataclass
+class GroupingConfig:
+    """FSDP group 构造方式（对应 fully_shard 的调用粒度）。"""
+
+    mode: Literal["block", "merged"] = "block"
+    merge_factor: int = 1
+
+
+@dataclass
 class LayerOverride:
     start_layer: Optional[int]
     end_layer: Optional[int]
@@ -49,6 +57,7 @@ class Fsdp2Strategy:
     global_layout: Fsdp2Layout
     layer_overrides: List[LayerOverride] = field(default_factory=list)
     named_overrides: Dict[str, Fsdp2Layout] = field(default_factory=dict)
+    grouping: GroupingConfig = field(default_factory=GroupingConfig)
     schema_version: int = 2
     dataset_stats: Optional[DatasetStats] = None
 
@@ -67,6 +76,7 @@ class Fsdp2Strategy:
                 for o in self.layer_overrides
             ],
             "named_overrides": {k: asdict(v) for k, v in self.named_overrides.items()},
+            "grouping": asdict(self.grouping),
             "dataset_stats": asdict(self.dataset_stats) if self.dataset_stats else None,
         }
 
@@ -74,6 +84,7 @@ class Fsdp2Strategy:
     def from_dict(cls, payload: Dict) -> "Fsdp2Strategy":
         schema_version = payload.get("schema_version", 2)
         gl = Fsdp2Layout(**payload["global_layout"])
+        grouping = GroupingConfig(**payload.get("grouping", {})) if payload.get("grouping") else GroupingConfig()
         ovrs = []
         for o in payload.get("layer_overrides", []):
             ovrs.append(
@@ -87,7 +98,14 @@ class Fsdp2Strategy:
         named = {k: Fsdp2Layout(**v) for k, v in payload.get("named_overrides", {}).items()}
         ds = payload.get("dataset_stats")
         ds_obj = DatasetStats(**ds) if ds else None
-        return cls(global_layout=gl, layer_overrides=ovrs, named_overrides=named, schema_version=schema_version, dataset_stats=ds_obj)
+        return cls(
+            global_layout=gl,
+            layer_overrides=ovrs,
+            named_overrides=named,
+            grouping=grouping,
+            schema_version=schema_version,
+            dataset_stats=ds_obj,
+        )
 
     # -------- semantic normalization & hash --------
     def normalized(self) -> "Fsdp2Strategy":
@@ -159,6 +177,9 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
         raise ValueError(f"{context}.mesh_topology must be in {_ALLOWED_MESH}; got {l.mesh_topology}")
     if l.sharding_strategy not in _ALLOWED_SHARD:
         raise ValueError(f"{context}.sharding_strategy must be in {_ALLOWED_SHARD}; got {l.sharding_strategy}")
+    # Normalize redundant fields: mesh_topology is the actual control in FSDP2; sharding_strategy is derived.
+    if l.sharding_strategy != "NO":
+        l.sharding_strategy = "HYBRID" if l.mesh_topology == "2D" else "FULL"
     # Note: bool is a subclass of int in Python, so check bool before int.
     raf = l.reshard_after_forward
     if isinstance(raf, str):
@@ -178,8 +199,8 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
         # Allow 0 as a permissive encoding of False (common from LLMs / config UIs).
         if l.reshard_after_forward == 0:
             l.reshard_after_forward = False
-        elif l.reshard_after_forward < 1:
-            raise ValueError(f"{context}.reshard_after_forward int value must be >=1; got {l.reshard_after_forward}")
+        elif l.reshard_after_forward < 2:
+            raise ValueError(f"{context}.reshard_after_forward int value must be >=2; got {l.reshard_after_forward}")
     else:
         raise ValueError(
             f"{context}.reshard_after_forward must be bool or int; got {type(l.reshard_after_forward).__name__}"
@@ -208,6 +229,16 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> F
     """Lightweight sanity filter; does not estimate exact memory."""
     gl = _validate_layout(strategy.global_layout, "global_layout")
 
+    grouping = copy.deepcopy(strategy.grouping) if getattr(strategy, "grouping", None) else GroupingConfig()
+    if grouping.mode not in {"block", "merged"}:
+        raise ValueError("grouping.mode must be 'block' or 'merged'")
+    try:
+        grouping.merge_factor = int(grouping.merge_factor)
+    except Exception as exc:
+        raise ValueError("grouping.merge_factor must be an integer") from exc
+    if grouping.merge_factor < 1:
+        raise ValueError("grouping.merge_factor must be >= 1")
+
     ovrs: List[LayerOverride] = []
     for idx, o in enumerate(strategy.layer_overrides):
         ctx = f"layer_overrides[{idx}]"
@@ -228,7 +259,14 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> F
     named = {k: _validate_layout(v, f"named_overrides['{k}']") for k, v in strategy.named_overrides.items()}
     ds = strategy.dataset_stats
 
-    validated = Fsdp2Strategy(global_layout=gl, layer_overrides=ovrs, named_overrides=named, schema_version=strategy.schema_version, dataset_stats=ds)
+    validated = Fsdp2Strategy(
+        global_layout=gl,
+        layer_overrides=ovrs,
+        named_overrides=named,
+        grouping=grouping,
+        schema_version=strategy.schema_version,
+        dataset_stats=ds,
+    )
     return validated.normalized()
 
 
