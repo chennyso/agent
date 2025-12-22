@@ -45,6 +45,37 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     if layer_stats:
         confidence = max(confidence, 0.65)
 
+    trace = metrics.get("trace_summary") or {}
+    def _pick_metric(key: str, default=None):
+        val = metrics.get(key)
+        if val is None:
+            val = trace.get(key, default)
+        return val
+
+    determinism = {
+        "memory": {
+            "memory_headroom_mb": _pick_metric("memory_headroom_mb"),
+            "peak_unsharded_groups": _pick_metric("peak_unsharded_groups"),
+            "max_unsharded_numel": metrics.get("max_unsharded_numel_est") or _pick_metric("max_unsharded_numel"),
+            "alloc_free_spike_ratio": _pick_metric("alloc_free_spike_ratio"),
+            "mem_allocated_std_mb": _pick_metric("mem_allocated_std_mb"),
+            "mem_allocated_delta_std_mb": _pick_metric("mem_allocated_delta_std_mb"),
+            "reshard_calls_per_step_est": _pick_metric("reshard_calls_per_step_est"),
+        },
+        "communication": {
+            "all_gather_forward_late": _pick_metric("all_gather_forward_late"),
+            "overlap_ratio_var": _pick_metric("overlap_ratio_var"),
+            "overlap_ratio_std": _pick_metric("overlap_ratio_std"),
+            "collective_calls_per_step_est": _pick_metric("collective_calls_per_step_est"),
+            "collective_calls_step_jitter_est": _pick_metric("collective_calls_step_jitter_est"),
+        },
+        "execution": {
+            "step_time_std_ms": _pick_metric("step_time_ms_std"),
+            "step_time_p90_p50_ms": _pick_metric("step_time_ms_p90_p50"),
+            "kernel_bubble_ratio_std_est": _pick_metric("kernel_bubble_ratio_std_est"),
+        },
+    }
+
     return {
         "phase": phase.value,
         "profiling": profiling,
@@ -61,6 +92,7 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "host_overhead_ratio_est": metrics.get("host_overhead_ratio_est", None),
         "top_targets": top_targets,
         "action_cost": action_cost,
+        "determinism": determinism,
     }
 
 

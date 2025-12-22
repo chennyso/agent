@@ -167,13 +167,248 @@ def _parse_error(stderr: str) -> str:
     return f"Runtime Error: {tail}"
 
 
+def _metric_throughput(m: Dict) -> float:
+    v = m.get("throughput_effective_tokens_per_s")
+    if v is None:
+        v = m.get("throughput_tokens_per_s")
+    try:
+        return float(v or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _metric_headroom_gb(m: Dict) -> float:
+    try:
+        return float(m.get("oom_margin_gb") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _reshard_scope(strategy: Fsdp2Strategy) -> str:
+    gl = strategy.global_layout.reshard_after_forward
+    if gl is False:
+        return "global_off"
+    for o in strategy.layer_overrides:
+        if o.layout.reshard_after_forward is False:
+            return "partial_off"
+    for _, layout in strategy.named_overrides.items():
+        if layout.reshard_after_forward is False:
+            return "partial_off"
+    return "all_on"
+
+
+def _grouping_factor(strategy: Fsdp2Strategy) -> int:
+    try:
+        return int(strategy.grouping.merge_factor)
+    except Exception:
+        return 1
+
+
+def _grouping_mode(strategy: Fsdp2Strategy) -> str:
+    return getattr(strategy.grouping, "mode", "block")
+
+
+def _strategy_features(strategy: Fsdp2Strategy) -> Dict[str, object]:
+    return {
+        "reshard_scope": _reshard_scope(strategy),
+        "grouping_factor": _grouping_factor(strategy),
+        "grouping_mode": _grouping_mode(strategy),
+        "mesh_topology": strategy.global_layout.mesh_topology,
+        "offload": _strategy_uses_offload(strategy),
+    }
+
+
+def _build_causal_summary(history: List[Dict], hash_to_strategy: Dict[str, Dict], mem_limit_gb: float) -> Dict:
+    trials = []
+    for m in history:
+        if m.get("oom") or m.get("error") or m.get("diagnostic_only") or m.get("batch_probe"):
+            continue
+        h = m.get("strategy_hash")
+        if not h or h not in hash_to_strategy:
+            continue
+        try:
+            strat = Fsdp2Strategy.from_dict(hash_to_strategy[h])
+        except Exception:
+            continue
+        trials.append((m, strat, _strategy_features(strat)))
+
+    explored_dimensions = {
+        "reshard_scope": sorted({f["reshard_scope"] for _, __, f in trials}),
+        "grouping_factor": sorted({int(f["grouping_factor"]) for _, __, f in trials}),
+        "grouping_mode": sorted({str(f["grouping_mode"]) for _, __, f in trials}),
+        "mesh_topology": sorted({str(f["mesh_topology"]) for _, __, f in trials}),
+        "offload": sorted({bool(f["offload"]) for _, __, f in trials}),
+    }
+
+    confirmed_positive: List[str] = []
+    confirmed_negative: List[str] = []
+
+    headroom_floor = max(2.0, float(mem_limit_gb) * 0.05)
+    reshard_groups: Dict[str, List[Dict]] = {"global_off": [], "partial_off": [], "all_on": []}
+    for m, _, f in trials:
+        reshard_groups[f["reshard_scope"]].append(m)
+
+    if reshard_groups["global_off"]:
+        risky = [m for m in reshard_groups["global_off"] if _metric_headroom_gb(m) < headroom_floor]
+        if risky:
+            confirmed_negative.append("global reshard_off increases memory risk beyond headroom threshold")
+
+    if reshard_groups["partial_off"] and reshard_groups["all_on"]:
+        tp_partial = sorted(_metric_throughput(m) for m in reshard_groups["partial_off"])
+        tp_all = sorted(_metric_throughput(m) for m in reshard_groups["all_on"])
+        if tp_partial and tp_all:
+            p50_partial = tp_partial[len(tp_partial) // 2]
+            p50_all = tp_all[len(tp_all) // 2]
+            if p50_all > 0 and (p50_partial - p50_all) / p50_all >= 0.03:
+                safe = all(_metric_headroom_gb(m) >= headroom_floor for m in reshard_groups["partial_off"])
+                if safe:
+                    confirmed_positive.append("partial reshard_off improves throughput without violating headroom")
+
+    grouping_by_factor: Dict[int, List[Dict]] = {}
+    for m, _, f in trials:
+        factor = int(f["grouping_factor"])
+        grouping_by_factor.setdefault(factor, []).append(m)
+
+    big_factors = [k for k in grouping_by_factor.keys() if k > 4]
+    small_factors = [k for k in grouping_by_factor.keys() if k <= 4]
+    if big_factors and small_factors:
+        best_big = max((_metric_throughput(m) for k in big_factors for m in grouping_by_factor[k]), default=0.0)
+        best_small = max((_metric_throughput(m) for k in small_factors for m in grouping_by_factor[k]), default=0.0)
+        if best_small > 0 and (best_big - best_small) / best_small <= 0.01:
+            confirmed_negative.append("grouping factor > 4 shows no additional throughput gain")
+
+    jitter_by_factor: Dict[int, List[float]] = {}
+    for m, _, f in trials:
+        jitter = m.get("collective_calls_step_jitter_est")
+        if jitter is None:
+            continue
+        try:
+            jitter_by_factor.setdefault(int(f["grouping_factor"]), []).append(float(jitter))
+        except Exception:
+            continue
+    if 1 in jitter_by_factor and any(k > 1 for k in jitter_by_factor.keys()):
+        base = sorted(jitter_by_factor[1])[len(jitter_by_factor[1]) // 2]
+        for k, vals in jitter_by_factor.items():
+            if k <= 1:
+                continue
+            vals_sorted = sorted(vals)
+            p50 = vals_sorted[len(vals_sorted) // 2]
+            if p50 < base * 0.85:
+                confirmed_positive.append("grouping reduces collective jitter under similar settings")
+                break
+
+    return {
+        "confirmed_positive": confirmed_positive,
+        "confirmed_negative": confirmed_negative,
+        "explored_dimensions": explored_dimensions,
+    }
+
+
+_ACTION_SYNONYMS = {
+    "layer_reshard_toggle": "layer_override_reshard",
+    "layer_reshard": "layer_override_reshard",
+    "grouping": "change_grouping",
+    "grouping_change": "change_grouping",
+    "global_reshard_off": "set_root_reshard_false",
+    "global_reshard": "set_root_reshard_false",
+    "mesh": "change_mesh",
+    "mesh_change": "change_mesh",
+    "offload": "enable_cpu_offload",
+    "enable_offload": "enable_cpu_offload",
+    "shard_plan": "shard_plan",
+}
+
+
+def _normalize_actions(actions: Optional[List[str]]) -> set[str]:
+    out: set[str] = set()
+    for raw in actions or []:
+        key = str(raw).strip().lower().replace("-", "_")
+        if not key:
+            continue
+        out.add(_ACTION_SYNONYMS.get(key, key))
+    return out
+
+
+def _parse_judge_verdict(text: str) -> Optional[Dict]:
+    try:
+        payload = robust_parse_json(text)
+    except Exception:
+        return None
+    verdict = payload.get("judge_verdict", payload) if isinstance(payload, dict) else None
+    if not isinstance(verdict, dict):
+        return None
+    return {
+        "primary_bottleneck": verdict.get("primary_bottleneck"),
+        "memory_risk_level": verdict.get("memory_risk_level"),
+        "allowed_actions": verdict.get("allowed_actions", []),
+        "forbidden_actions": verdict.get("forbidden_actions", []),
+    }
+
+
+def _override_signature(strategy: Fsdp2Strategy) -> List[tuple]:
+    sigs = []
+    for o in strategy.layer_overrides:
+        layers = tuple(o.layers or [])
+        sigs.append(("range", o.start_layer, o.end_layer, layers, o.layout.reshard_after_forward))
+    for name, layout in strategy.named_overrides.items():
+        sigs.append(("named", name, layout.reshard_after_forward))
+    return sorted(sigs)
+
+
+def _shard_plan_signature(strategy: Fsdp2Strategy) -> List[tuple]:
+    sigs = [("global", strategy.global_layout.shard_plan)]
+    for o in strategy.layer_overrides:
+        sigs.append(("range", o.start_layer, o.end_layer, tuple(o.layers or []), o.layout.shard_plan))
+    for name, layout in strategy.named_overrides.items():
+        sigs.append(("named", name, layout.shard_plan))
+    return sorted(sigs)
+
+
+def _strategy_actions(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> set[str]:
+    actions: set[str] = set()
+    if candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
+        actions.add("change_mesh")
+    if _strategy_uses_offload(candidate) and not _strategy_uses_offload(baseline):
+        actions.add("enable_cpu_offload")
+    if (
+        candidate.grouping.mode != baseline.grouping.mode
+        or int(candidate.grouping.merge_factor) != int(baseline.grouping.merge_factor)
+    ):
+        actions.add("change_grouping")
+    if candidate.global_layout.reshard_after_forward is False and baseline.global_layout.reshard_after_forward is not False:
+        actions.add("set_root_reshard_false")
+    if _override_signature(candidate) != _override_signature(baseline):
+        actions.add("layer_override_reshard")
+    if _shard_plan_signature(candidate) != _shard_plan_signature(baseline):
+        actions.add("shard_plan")
+    return actions
+
+
+def _enforce_judge_verdict(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy, verdict: Optional[Dict]) -> None:
+    if not verdict:
+        return
+    allowed = _normalize_actions(verdict.get("allowed_actions"))
+    forbidden = _normalize_actions(verdict.get("forbidden_actions"))
+    actions = _strategy_actions(candidate, baseline)
+    if actions & forbidden:
+        raise ValueError(f"strategy violates forbidden_actions: {sorted(actions & forbidden)}")
+    if allowed and not actions.issubset(allowed):
+        raise ValueError(f"strategy uses actions outside allowed_actions: {sorted(actions - allowed)}")
+
+
 JUDGE_SYSTEM = (
     "You are a physics-informed reasoning engine for PyTorch FSDP2 training.\n"
     "You do NOT propose configurations.\n"
-    "You do NOT output JSON.\n"
     "You do NOT make execution decisions.\n"
+    "Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.\n"
+    "Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.\n"
     "Output format (strict):\n"
     "Bottleneck:\nTarget:\nHypothesis:\nExpected Effect:\nRisk Assessment:\n"
+    "Then include a JSON object in a ```json code fence with key \"judge_verdict\" and fields:\n"
+    "- primary_bottleneck (string)\n"
+    "- memory_risk_level (low|medium|high)\n"
+    "- allowed_actions (list)\n"
+    "- forbidden_actions (list)\n"
 )
 
 CODER_SYSTEM = (
@@ -184,6 +419,7 @@ CODER_SYSTEM = (
     "- Modify at most TWO atomic controls.\n"
     "- Prefer layer_overrides / named_overrides / grouping.\n"
     "- Respect forbidden_in_phase.\n"
+    "- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.\n"
     "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
     "Schema fields:\n"
     "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy\n"
@@ -192,16 +428,23 @@ CODER_SYSTEM = (
     "- grouping: {mode: block|merged, merge_factor>=1}\n"
     "If supports_merged_grouping=false, do not use grouping.mode='merged'.\n"
     "Prefer targeted layer_overrides over setting global reshard_after_forward=False for all layers.\n"
+    "Global reshard_after_forward=False is an extreme trade-off (high determinism/low comm/high memory risk). Only use it when headroom is clearly ample; otherwise prefer targeted overrides or grouping.\n"
     "Put the JSON inside a single ```json code fence.\n"
 )
 
 
-def build_judge_prompt(semantic_state: Dict, *, current_strategy: Fsdp2Strategy) -> str:
+def build_judge_prompt(
+    semantic_state: Dict,
+    *,
+    current_strategy: Fsdp2Strategy,
+    causal_summary: Optional[Dict] = None,
+) -> str:
     payload = {
         "SemanticState": semantic_state,
         "CurrentStrategy": current_strategy.to_dict(),
         "ActionCost": semantic_state.get("action_cost", {}),
         "Phase": semantic_state.get("phase"),
+        "CausalSummary": causal_summary or {},
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -211,13 +454,19 @@ def build_coder_prompt(
     *,
     semantic_state: Dict,
     current_strategy: Fsdp2Strategy,
+    judge_verdict: Optional[Dict] = None,
+    causal_summary: Optional[Dict] = None,
     failure_feedback: Optional[str] = None,
 ) -> str:
     sections = [
         "Judge hypothesis (trusted):",
         judge_hypothesis,
+        "Judge verdict (trusted):",
+        json.dumps(judge_verdict or {}, ensure_ascii=False, indent=2),
         "SemanticState (trusted):",
         json.dumps(semantic_state, ensure_ascii=False, indent=2),
+        "CausalSummary (trusted):",
+        json.dumps(causal_summary or {}, ensure_ascii=False, indent=2),
         "CurrentStrategy (baseline):",
         json.dumps(current_strategy.to_dict(), ensure_ascii=False, indent=2),
     ]
@@ -525,13 +774,21 @@ def main() -> None:
                 for t in history[-args.max_history :]
             ]
 
-        j_prompt = build_judge_prompt(semantic_state, current_strategy=best_strategy)
+        causal_summary = _build_causal_summary(history, hash_to_strategy, mem_limit_gb=args.mem_limit_gb)
+        j_prompt = build_judge_prompt(
+            semantic_state,
+            current_strategy=best_strategy,
+            causal_summary=causal_summary,
+        )
         judge_reply = call_llm(j_prompt, JUDGE_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+        judge_verdict = _parse_judge_verdict(judge_reply)
 
         c_prompt = build_coder_prompt(
             judge_reply,
             semantic_state=semantic_state,
             current_strategy=best_strategy,
+            judge_verdict=judge_verdict,
+            causal_summary=causal_summary,
             failure_feedback=pending_failure_feedback,
         )
         pending_failure_feedback = None
@@ -554,6 +811,7 @@ def main() -> None:
                     allow_mesh=bool(args.allow_mesh),
                     allow_offload=bool(args.allow_offload),
                 )
+                _enforce_judge_verdict(candidate, best_strategy, judge_verdict)
             except Exception as e:
                 last_parse_error = e
                 print(f"[controller] 策略解析/校验错误: {e}")
@@ -781,6 +1039,51 @@ def main() -> None:
                 best_y = y
         return front
 
+    def _has_determinism_metrics(m: Dict) -> bool:
+        keys = [
+            "step_time_ms_std",
+            "step_time_ms_p90_p50",
+            "overlap_ratio_var",
+            "alloc_free_spike_ratio",
+            "collective_calls_step_jitter_est",
+            "kernel_bubble_ratio_std_est",
+        ]
+        return any(m.get(k) is not None for k in keys)
+
+    def _determinism_score(m: Dict) -> float:
+        step_std = float(m.get("step_time_ms_std") or 0.0)
+        p90_p50 = float(m.get("step_time_ms_p90_p50") or 0.0)
+        overlap_var = float(m.get("overlap_ratio_var") or 0.0)
+        alloc_spike = float(m.get("alloc_free_spike_ratio") or 0.0)
+        collective_jitter = float(m.get("collective_calls_step_jitter_est") or 0.0)
+        kernel_bubble_std = float(m.get("kernel_bubble_ratio_std_est") or 0.0)
+        scale = max(float(m.get("step_time_ms_p50") or m.get("step_time_ms") or 1.0), 1.0)
+        ratio_penalty = scale * (overlap_var + alloc_spike + collective_jitter + kernel_bubble_std) * 10.0
+        return step_std + p90_p50 + ratio_penalty
+
+    def _pick_stable_candidate(points: List[Dict]) -> Optional[Dict]:
+        candidates = [
+            m for m in points if not (m.get("oom") or m.get("error") or m.get("diagnostic_only") or m.get("batch_probe"))
+        ]
+        if not candidates:
+            return None
+        def _tp(m: Dict) -> float:
+            v = m.get("throughput_effective_tokens_per_s")
+            if v is None:
+                v = m.get("throughput_tokens_per_s")
+            try:
+                return float(v or 0.0)
+            except Exception:
+                return 0.0
+
+        best_tp = max((_tp(m) for m in candidates), default=0.0)
+        tp_floor = best_tp * 0.9 if best_tp > 0 else 0.0
+        stable_pool = [m for m in candidates if _tp(m) >= tp_floor] or candidates
+        det_candidates = [m for m in stable_pool if _has_determinism_metrics(m)]
+        if det_candidates:
+            return min(det_candidates, key=lambda m: (_determinism_score(m), -float(m.get("oom_margin_gb") or 0.0)))
+        return max(stable_pool, key=lambda m: float(m.get("oom_margin_gb") or 0.0))
+
     # Top-k (unique strategy_hash) for "次优解"
     by_hash: Dict[str, Dict] = {}
     for m in history:
@@ -803,16 +1106,20 @@ def main() -> None:
     second_h = second_best.get("strategy_hash") if second_best else None
     pareto_mem = _pareto_front(history, "throughput_effective_tokens_per_s", "oom_margin_gb")
     pareto_comm = _pareto_front(history, "throughput_effective_tokens_per_s", "comm_ratio")
+    stable = _pick_stable_candidate(history)
     anchors = {
         "aggressive": pareto_mem[0] if pareto_mem else None,
         "conservative": max(pareto_mem, key=lambda x: x.get("oom_margin_gb", float("-inf"))) if pareto_mem else None,
         "balanced": best,
+        "stable": stable,
     }
     summary = {
         "best": best,
         "second_best": second_best,
+        "secondary_stable": stable,
         "best_strategy": hash_to_strategy.get(best_h, best_strategy.to_dict()) if best_h else best_strategy.to_dict(),
         "second_best_strategy": hash_to_strategy.get(second_h) if second_h else None,
+        "secondary_stable_strategy": hash_to_strategy.get(stable.get("strategy_hash")) if stable else None,
         "batch_probe": batch_probe_summary,
         "pareto": {
             "throughput_vs_headroom": [

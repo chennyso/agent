@@ -73,11 +73,12 @@ def run_steps(
     num_steps: int,
     profiler_ctx=None,
     layer_probe=None,
-) -> Tuple[List[float], List[float], List[int]]:
+) -> Tuple[List[float], List[float], List[int], List[float]]:
     it = iter(dataloader)
     losses: List[float] = []
     step_times_ms: List[float] = []
     effective_tokens_global: List[int] = []
+    mem_allocated_mb: List[float] = []
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -109,12 +110,13 @@ def run_steps(
             losses.append(loss)
             step_times_ms.append(iter_ms)
             effective_tokens_global.append(effective_tokens_global_step)
+            mem_allocated_mb.append(float(torch.cuda.memory_allocated()) / (1024 * 1024))
             if layer_probe is not None:
                 layer_probe.flush_step(record=True)
         else:
             if layer_probe is not None:
                 layer_probe.flush_step(record=False)
-    return losses, step_times_ms, effective_tokens_global
+    return losses, step_times_ms, effective_tokens_global, mem_allocated_mb
 
 
 class _LayerProbe:
@@ -250,6 +252,14 @@ def _percentile(values: List[float], q: float) -> float:
     return float(xs[idx])
 
 
+def _mean_std(values: List[float]) -> Tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    mean = sum(values) / len(values)
+    var = sum((x - mean) ** 2 for x in values) / len(values)
+    return mean, math.sqrt(var)
+
+
 def _gather_rank_stats(step_time_ms: float, max_mem_bytes: int) -> Optional[List[Dict[str, Any]]]:
     if not dist.is_initialized():
         return None
@@ -301,6 +311,30 @@ def _collect_execution_proof(model: nn.Module) -> Dict[str, Any]:
     return proof
 
 
+def _estimate_max_unsharded_numel(wrap_plan: Optional[List[Dict[str, Any]]]) -> int:
+    if not wrap_plan:
+        return 0
+    max_numel = 0
+    for entry in wrap_plan:
+        if entry.get("kind") not in {"layers", "named"}:
+            continue
+        layout = entry.get("layout") or {}
+        raf = layout.get("reshard_after_forward")
+        if raf is None:
+            continue
+        unsharded = False
+        if isinstance(raf, bool):
+            unsharded = not raf
+        elif isinstance(raf, int):
+            unsharded = (raf == 0)
+        if not unsharded:
+            continue
+        numel = entry.get("param_numel")
+        if isinstance(numel, (int, float)):
+            max_numel = max(max_numel, int(numel))
+    return max_numel
+
+
 def _extract_profiler_metrics(prof) -> Dict[str, float]:
     events = prof.key_averages()
     # 兼容不同版本的 profiler 字段命名：优先 device_time_total/self_device_time_total（2.0+）
@@ -338,14 +372,27 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
             all_reduce_calls += 1
     compute_time_ms = max(total_cuda_time - comm_time_ms, 0.0)
     idle_ratio = max(1.0 - (comm_time_ms + compute_time_ms) / max(total_cuda_time, 1e-6), 0.0)
+    steps = int(getattr(prof, "step_num", 0) or 0)
+    total_collective_calls = all_gather_calls + reduce_scatter_calls + all_reduce_calls
+    calls_per_step = (total_collective_calls / steps) if steps > 0 else None
+    calls_step_jitter = None
+    if steps > 0:
+        calls_step_jitter = abs(total_collective_calls - round(calls_per_step) * steps) / steps
+    reshard_calls_est = reduce_scatter_calls
+    reshard_calls_per_step = (reshard_calls_est / steps) if steps > 0 else None
     return {
         "step_time_ms": step_time_ms,
-        "profiler_steps": int(getattr(prof, "step_num", 0) or 0),
+        "profiler_steps": steps,
         "total_cuda_time_ms": total_cuda_time,
         "total_cpu_time_ms": total_cpu_time,
         "comm_time_ms": comm_time_ms,
         "compute_time_ms": compute_time_ms,
         "idle_ratio": idle_ratio,
+        "collective_calls_total": total_collective_calls,
+        "collective_calls_per_step_est": calls_per_step,
+        "collective_calls_step_jitter_est": calls_step_jitter,
+        "reshard_calls_est": reshard_calls_est,
+        "reshard_calls_per_step_est": reshard_calls_per_step,
         "fsdp_events": {
             "all_gather_calls": all_gather_calls,
             "reduce_scatter_calls": reduce_scatter_calls,
@@ -411,7 +458,7 @@ def run_trial(
         probe = _LayerProbe(layers) if layers is not None else None
         try:
             if prof is None:
-                losses, step_times_ms, effective_tokens_global = run_steps(
+                losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
                     model,
                     optimizer,
                     dataloader,
@@ -422,7 +469,7 @@ def run_trial(
                 )
             else:
                 with prof:
-                    losses, step_times_ms, effective_tokens_global = run_steps(
+                    losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
                         model,
                         optimizer,
                         dataloader,
@@ -453,6 +500,24 @@ def run_trial(
         prof_metrics["step_time_ms"] = mean_step_ms
         prof_metrics["step_time_ms_p50"] = mean_step_ms
         prof_metrics["step_time_ms_p90"] = _percentile(sane, 0.9) if sane else 0.0
+        _, step_time_std = _mean_std(sane)
+        prof_metrics["step_time_ms_std"] = float(step_time_std)
+        prof_metrics["step_time_ms_p90_p50"] = max(
+            float(prof_metrics["step_time_ms_p90"] or 0.0) - float(mean_step_ms or 0.0),
+            0.0,
+        )
+
+        mem_alloc_sane = [m for m in mem_allocated_mb if m >= 0.0]
+        _, mem_std = _mean_std(mem_alloc_sane)
+        mem_deltas = [mem_alloc_sane[i] - mem_alloc_sane[i - 1] for i in range(1, len(mem_alloc_sane))]
+        abs_deltas = [abs(x) for x in mem_deltas]
+        _, mem_abs_delta_std = _mean_std(abs_deltas)
+        median_abs_delta = _percentile(abs_deltas, 0.5) if abs_deltas else 0.0
+        spike_threshold_mb = max(16.0, 2.0 * median_abs_delta)
+        spike_ratio = (sum(1 for x in abs_deltas if x > spike_threshold_mb) / len(abs_deltas)) if abs_deltas else 0.0
+        prof_metrics["mem_allocated_std_mb"] = float(mem_std)
+        prof_metrics["mem_allocated_delta_std_mb"] = float(mem_abs_delta_std)
+        prof_metrics["alloc_free_spike_ratio"] = float(spike_ratio)
 
         eff_sane = [int(x) for x in effective_tokens_global if x > 0]
         eff_tokens_per_step = int(sorted(eff_sane)[len(eff_sane) // 2]) if eff_sane else 0
@@ -476,8 +541,23 @@ def run_trial(
                 gpu_busy_ratio_est = float(min(max(busy, 0.0), 1.0))
                 host_overhead_ratio_est = float(max(1.0 - gpu_busy_ratio_est, 0.0))
                 prof_metrics["cuda_kernel_ms_per_step_est"] = float(cuda_kernel_ms_per_step)
+                if sane:
+                    per_step_busy = [
+                        float(min(max(cuda_kernel_ms_per_step / t, 0.0), 1.0)) if t >= _MIN_STEP_TIME_MS else 0.0
+                        for t in sane
+                    ]
+                    busy_mean, busy_std = _mean_std(per_step_busy)
+                    overlap_var = sum((x - busy_mean) ** 2 for x in per_step_busy) / max(len(per_step_busy), 1)
+                    kernel_bubble = [max(1.0 - x, 0.0) for x in per_step_busy]
+                    _, bubble_std = _mean_std(kernel_bubble)
+                    prof_metrics["overlap_ratio_var"] = float(overlap_var)
+                    prof_metrics["overlap_ratio_std"] = float(busy_std)
+                    prof_metrics["kernel_bubble_ratio_std_est"] = float(bubble_std)
         prof_metrics["gpu_busy_ratio_est"] = gpu_busy_ratio_est
         prof_metrics["host_overhead_ratio_est"] = host_overhead_ratio_est
+        prof_metrics.setdefault("overlap_ratio_var", None)
+        prof_metrics.setdefault("overlap_ratio_std", None)
+        prof_metrics.setdefault("kernel_bubble_ratio_std_est", None)
 
         # comm_ratio：仅 heavy 下可靠
         if profiling == "heavy":
@@ -514,13 +594,23 @@ def run_trial(
                 "platform": platform.platform(),
             },
         }
-        prof_metrics["execution_proof"] = _collect_execution_proof(model)
+        execution_proof = _collect_execution_proof(model)
+        prof_metrics["execution_proof"] = execution_proof
+        prof_metrics["max_unsharded_numel_est"] = _estimate_max_unsharded_numel(execution_proof.get("wrap_plan"))
         if profiling != "heavy":
             prof_metrics.setdefault("total_cuda_time_ms", 0.0)
             prof_metrics.setdefault("total_cpu_time_ms", 0.0)
             prof_metrics.setdefault("comm_time_ms", 0.0)
             prof_metrics.setdefault("compute_time_ms", 0.0)
             prof_metrics.setdefault("idle_ratio", 0.0)
+            prof_metrics.setdefault("collective_calls_total", 0)
+            prof_metrics.setdefault("collective_calls_per_step_est", None)
+            prof_metrics.setdefault("collective_calls_step_jitter_est", None)
+            prof_metrics.setdefault("reshard_calls_est", None)
+            prof_metrics.setdefault("reshard_calls_per_step_est", None)
+            prof_metrics.setdefault("overlap_ratio_var", None)
+            prof_metrics.setdefault("overlap_ratio_std", None)
+            prof_metrics.setdefault("kernel_bubble_ratio_std_est", None)
             prof_metrics.setdefault("fsdp_events", {"all_gather_calls": 0, "reduce_scatter_calls": 0, "all_reduce_calls": 0})
 
         prof_metrics["oom"] = False
@@ -542,19 +632,32 @@ def run_trial(
     mem_limit_bytes = int(mem_limit_gb * 1024**3)
     headroom_mb = (mem_limit_bytes - best.get("max_mem_bytes", 0)) // (1024 * 1024)
     best["oom_margin_gb"] = float(headroom_mb) / 1024.0
+    best["memory_headroom_mb"] = int(headroom_mb)
     overlap_ratio = best.get("gpu_busy_ratio_est", None)
     peak_unsharded_groups = best.get("fsdp_events", {}).get("all_gather_calls", 0)
     best["trace_summary"] = {
         "all_gather_forward_late": (best.get("host_overhead_ratio_est") or 0.0) > 0.2,
         "overlap_ratio": overlap_ratio,
+        "overlap_ratio_var": best.get("overlap_ratio_var", None),
+        "overlap_ratio_std": best.get("overlap_ratio_std", None),
         "peak_unsharded_groups": peak_unsharded_groups,
+        "max_unsharded_numel": best.get("max_unsharded_numel_est", 0),
         "memory_headroom_mb": headroom_mb,
+        "mem_allocated_std_mb": best.get("mem_allocated_std_mb", None),
+        "mem_allocated_delta_std_mb": best.get("mem_allocated_delta_std_mb", None),
+        "alloc_free_spike_ratio": best.get("alloc_free_spike_ratio", None),
+        "reshard_calls_per_step_est": best.get("reshard_calls_per_step_est", None),
+        "collective_calls_per_step_est": best.get("collective_calls_per_step_est", None),
+        "collective_calls_step_jitter_est": best.get("collective_calls_step_jitter_est", None),
         "mfu_percent": best.get("mfu_percent", 0.0),
         "tokens_per_step": global_batch_size * seq_len,
         "world_size": world_size,
         "gpu_busy_ratio_est": best.get("gpu_busy_ratio_est", None),
         "host_overhead_ratio_est": best.get("host_overhead_ratio_est", None),
         "comm_ratio": best.get("comm_ratio", None),
+        "step_time_ms_std": best.get("step_time_ms_std", None),
+        "step_time_ms_p90_p50": best.get("step_time_ms_p90_p50", None),
+        "kernel_bubble_ratio_std_est": best.get("kernel_bubble_ratio_std_est", None),
     }
     return best
 
