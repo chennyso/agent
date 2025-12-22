@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
         help="LLM 服务 HTTP 接口",
     )
     p.add_argument("--show-progress", action="store_true", help="Stream trial stdout/stderr for live progress.")
+    p.add_argument("--log-llm", action="store_true", help="Print LLM prompts and responses each round.")
     return p.parse_args()
 
 
@@ -167,6 +168,15 @@ def _parse_error(stderr: str) -> str:
         return "CUDA Illegal Access (检查 sharding 策略)"
     tail = stderr[-200:] if stderr else ""
     return f"Runtime Error: {tail}"
+
+
+def _log_llm_exchange(label: str, prompt: str, reply: str, args: argparse.Namespace) -> None:
+    if not getattr(args, "log_llm", False):
+        return
+    print(f"[llm] {label} prompt >>>")
+    print(prompt)
+    print(f"[llm] {label} reply <<<")
+    print(reply)
 
 
 def _metric_throughput(m: Dict) -> float:
@@ -973,6 +983,7 @@ def main() -> None:
             causal_summary=causal_summary,
         )
         judge_reply = call_llm(j_prompt, JUDGE_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+        _log_llm_exchange("judge", j_prompt, judge_reply, args)
         judge_verdict = _parse_judge_verdict(judge_reply)
 
         c_prompt = build_coder_prompt(
@@ -985,6 +996,7 @@ def main() -> None:
         )
         pending_failure_feedback = None
         coder_reply = call_llm(c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+        _log_llm_exchange("coder", c_prompt, coder_reply, args)
 
         max_retry = 2
         attempt = 0
@@ -1010,6 +1022,7 @@ def main() -> None:
                 print(f"[controller] 策略解析/校验错误: {e}")
                 current_c_prompt = current_c_prompt + f"\n\n【格式错误】{e}"
                 coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+                _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
                 attempt += 1
                 continue
 
@@ -1025,6 +1038,7 @@ def main() -> None:
                 dedup_hint += f"\n重复策略摘要（hash={cand_hash}）：{prev_json}"
             current_c_prompt = current_c_prompt + "\n\n" + dedup_hint
             coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
+            _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
             attempt += 1
 
         if candidate is None:
