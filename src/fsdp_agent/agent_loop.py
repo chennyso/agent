@@ -734,6 +734,7 @@ def main() -> None:
     phase = Phase.MESH if args.allow_mesh else Phase.GROUPING
 
     for round_idx in range(args.rounds):
+        print(f"[controller] round {round_idx + 1}/{args.rounds} (phase={phase.value})")
         semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
         semantic_state["hardware"] = getattr(hardware, "__dict__", {})
         semantic_state["train_hyper"] = {
