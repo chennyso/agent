@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+import re
 from typing import Dict, List, Literal, Optional, Union
 
 
@@ -219,11 +220,29 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
     return l
 
 
+def _parse_layer_index(value: object, context: str) -> int:
+    if isinstance(value, int):
+        idx = value
+    else:
+        s = str(value).strip()
+        if s.isdigit():
+            idx = int(s)
+        else:
+            # Accept common strings like "layers.22" from LLM output.
+            matches = re.findall(r"\d+", s)
+            if not matches:
+                raise ValueError(f"{context}.layers must contain integers; got {value!r}")
+            idx = int(matches[-1])
+    if idx < 0:
+        raise ValueError(f"{context}.layers must contain non-negative integers; got {idx}")
+    return idx
+
+
 def _coerce_layers(layers: Optional[List[int]], context: str) -> Optional[List[int]]:
     if layers is None:
         return None
     try:
-        normalized = sorted({int(x) for x in layers if int(x) >= 0})
+        normalized = sorted({_parse_layer_index(x, context) for x in layers})
     except Exception as exc:
         raise ValueError(f"{context}.layers must be a list of non-negative integers") from exc
     if not normalized:

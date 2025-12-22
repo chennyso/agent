@@ -164,7 +164,24 @@ def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, 
             continue
         scored.append((fwd + bwd, mem, name))
     scored.sort(reverse=True)
+    top_time_layers = [n for _, __, n in scored[:topk]]
+    top_mem_layers = [n for _, m, n in sorted(scored, key=lambda x: x[1], reverse=True)[:topk]]
+
+    def _extract_ids(names: List[str]) -> List[int]:
+        out: List[int] = []
+        for name in names:
+            if not name:
+                continue
+            parts = str(name).replace("[", ".").replace("]", "").split(".")
+            for p in reversed(parts):
+                if p.isdigit():
+                    out.append(int(p))
+                    break
+        return out
+
     return {
-        "top_time_layers": [n for _, __, n in scored[:topk]],
-        "top_mem_layers": [n for _, m, n in sorted(scored, key=lambda x: x[1], reverse=True)[:topk]],
+        "top_time_layers": top_time_layers,
+        "top_mem_layers": top_mem_layers,
+        "top_time_layer_ids": _extract_ids(top_time_layers),
+        "top_mem_layer_ids": _extract_ids(top_mem_layers),
     }

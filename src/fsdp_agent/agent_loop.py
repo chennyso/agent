@@ -486,8 +486,8 @@ def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> No
     if not candidate.layer_overrides:
         return
     top = semantic_state.get("top_targets") or {}
-    top_time = _extract_layer_indices(top.get("top_time_layers") or [])
-    top_mem = _extract_layer_indices(top.get("top_mem_layers") or [])
+    top_time = top.get("top_time_layer_ids") or _extract_layer_indices(top.get("top_time_layers") or [])
+    top_mem = top.get("top_mem_layer_ids") or _extract_layer_indices(top.get("top_mem_layers") or [])
     targets = sorted(set(top_time + top_mem))
     if not targets:
         raise ValueError("layer_overrides require observed top_targets; no layer_stats available")
@@ -535,6 +535,7 @@ CODER_SYSTEM = (
     "- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.\n"
     "- If using layer_overrides, target layers must come from SemanticState.top_targets; avoid arbitrary index ranges.\n"
     "- If no layer_stats/top_targets are available, do not use layer_overrides.\n"
+    "- Use integer layer indices in layer_overrides (e.g., 22), not strings like 'layers.22'.\n"
     "- Use UpperBoundGap to select the smallest-risk action that meaningfully closes the gap.\n"
     "Evidence cues (non-binding):\n"
     "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
