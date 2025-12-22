@@ -31,6 +31,15 @@ def init_distributed() -> None:
     torch.cuda.set_device(local_rank)
 
 
+def _is_rank0() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _log_rank0(msg: str) -> None:
+    if _is_rank0():
+        print(msg, flush=True)
+
+
 def cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -78,11 +87,14 @@ def _load_strategy(args: argparse.Namespace) -> Fsdp2Strategy:
 def main() -> None:
     args = parse_args()
     init_distributed()
+    _log_rank0(f"[trial_runner] start trial {args.trial_id} (profile={args.profile}, repeats={args.repeats})")
 
     metrics: Dict
     try:
+        _log_rank0("[trial_runner] loading strategy")
         strategy = _load_strategy(args)
         ds_stats = load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
+        _log_rank0("[trial_runner] running trial")
         metrics = run_trial(
             strategy=strategy,
             global_batch_size=args.global_batch_size,
@@ -99,6 +111,7 @@ def main() -> None:
             mem_limit_gb=args.mem_limit_gb,
             profiling=args.profile,
         )
+        _log_rank0("[trial_runner] trial completed")
     except torch.cuda.OutOfMemoryError:
         metrics = {"oom": True, "score": float("-inf"), "error_msg": "CUDA out of memory (trial_runner)"}
     except Exception as exc:

@@ -22,6 +22,15 @@ from fsdp_agent.model_introspection import extract_transformer_layers
 _MIN_STEP_TIME_MS = 1e-3
 
 
+def _is_rank0() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _log_rank0(msg: str) -> None:
+    if _is_rank0():
+        print(msg, flush=True)
+
+
 def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -73,6 +82,7 @@ def run_steps(
     num_steps: int,
     profiler_ctx=None,
     layer_probe=None,
+    progress_every: int = 0,
 ) -> Tuple[List[float], List[float], List[int], List[float]]:
     it = iter(dataloader)
     losses: List[float] = []
@@ -82,7 +92,9 @@ def run_steps(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     world = dist.get_world_size() if dist.is_initialized() else 1
-    for step in range(num_warmup + num_steps):
+    total_steps = num_warmup + num_steps
+    progress_every = int(progress_every) if progress_every else 0
+    for step in range(total_steps):
         if profiler_ctx:
             profiler_ctx.step()
         try:
@@ -116,6 +128,11 @@ def run_steps(
         else:
             if layer_probe is not None:
                 layer_probe.flush_step(record=False)
+        if progress_every and _is_rank0():
+            current = step + 1
+            if current % progress_every == 0 or current == total_steps:
+                phase = "warmup" if current <= num_warmup else "train"
+                print(f"[train] step {current}/{total_steps} ({phase})", flush=True)
     return losses, step_times_ms, effective_tokens_global, mem_allocated_mb
 
 
@@ -426,7 +443,9 @@ def run_trial(
     for r in range(repeats):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
+        _log_rank0(f"[trial] run {r + 1}/{repeats}: loading model")
         model = load_model(model_name=model_name)
+        _log_rank0("[trial] applying strategy")
         model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
         optimizer = build_optimizer(model, lr=lr)
         # Ensure synthetic loader won't be empty with drop_last=True and won't exhaust during warmup+steps.
@@ -440,6 +459,7 @@ def run_trial(
             seq_len=seq_len,
             length=max(10_000, required_len),
         )
+        _log_rank0("[trial] dataloader ready")
 
         prof = None
         if profiling == "heavy":
@@ -457,6 +477,8 @@ def run_trial(
         layers = extract_transformer_layers(model)
         probe = _LayerProbe(layers) if layers is not None else None
         try:
+            progress_every = max(1, int(num_steps) // 5)
+            _log_rank0(f"[trial] start steps (warmup={num_warmup}, steps={num_steps}, profile={profiling})")
             if prof is None:
                 losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
                     model,
@@ -466,6 +488,7 @@ def run_trial(
                     num_steps=num_steps,
                     profiler_ctx=None,
                     layer_probe=probe,
+                    progress_every=progress_every,
                 )
             else:
                 with prof:
@@ -477,11 +500,13 @@ def run_trial(
                         num_steps=num_steps,
                         profiler_ctx=prof,
                         layer_probe=probe,
+                        progress_every=progress_every,
                     )
         finally:
             layer_summary = probe.summary() if probe is not None else {}
             if probe is not None:
                 probe.close()
+        _log_rank0("[trial] steps done")
 
         torch.cuda.synchronize()
         mem_bytes = torch.cuda.max_memory_allocated()

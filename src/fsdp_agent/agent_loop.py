@@ -6,6 +6,7 @@ import math
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -108,6 +109,7 @@ def parse_args() -> argparse.Namespace:
         default="http://10.100.1.93:12365/v1/chat/completions",
         help="LLM 服务 HTTP 接口",
     )
+    p.add_argument("--show-progress", action="store_true", help="Stream trial stdout/stderr for live progress.")
     return p.parse_args()
 
 
@@ -546,18 +548,50 @@ def _run_trial_subprocess(
     ]
 
     print(f"[controller] running trial {trial_id} via torchrun")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        print(proc.stdout)
-        print(proc.stderr, file=sys.stderr)
-        parsed = _parse_error(proc.stderr)
-        oom = "CUDA OOM" in parsed or "out of memory" in (proc.stderr or "")
+    if getattr(args, "show_progress", False):
+        stdout_buf: List[str] = []
+        stderr_buf: List[str] = []
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+
+        def _drain(stream, sink, buf: List[str]) -> None:
+            if stream is None:
+                return
+            for line in iter(stream.readline, ""):
+                buf.append(line)
+                sink.write(line)
+                sink.flush()
+            stream.close()
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, sys.stdout, stdout_buf))
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, sys.stderr, stderr_buf))
+        t_out.daemon = True
+        t_err.daemon = True
+        t_out.start()
+        t_err.start()
+        returncode = proc.wait()
+        t_out.join()
+        t_err.join()
+        stdout_text = "".join(stdout_buf)
+        stderr_text = "".join(stderr_buf)
+    else:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        returncode = proc.returncode
+        stdout_text = proc.stdout
+        stderr_text = proc.stderr
+
+    if returncode != 0:
+        if stdout_text:
+            print(stdout_text)
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
+        parsed = _parse_error(stderr_text)
+        oom = "CUDA OOM" in parsed or "out of memory" in (stderr_text or "")
         metrics: Dict = {
             "trial_id": trial_id,
             "score": float("-inf"),
             "oom": oom,
             "error_msg": parsed,
-            "returncode": proc.returncode,
+            "returncode": returncode,
         }
         if out_path.exists():
             try:
