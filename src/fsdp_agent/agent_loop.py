@@ -179,6 +179,27 @@ def _metric_throughput(m: Dict) -> float:
         return 0.0
 
 
+def _upper_bound_gap(baseline: Dict, upper: Optional[Dict]) -> Dict[str, object]:
+    if not upper:
+        return {"available": False}
+    base_tp = _metric_throughput(baseline)
+    upper_tp = _metric_throughput(upper)
+    gap_ratio = ((upper_tp - base_tp) / base_tp) if base_tp > 0 else None
+    base_headroom = _metric_headroom_gb(baseline)
+    upper_headroom = _metric_headroom_gb(upper)
+    return {
+        "available": True,
+        "baseline_throughput": base_tp,
+        "upper_bound_throughput": upper_tp,
+        "throughput_gap_abs": upper_tp - base_tp,
+        "throughput_gap_ratio": gap_ratio,
+        "baseline_headroom_gb": base_headroom,
+        "upper_bound_headroom_gb": upper_headroom,
+        "headroom_gap_gb": upper_headroom - base_headroom,
+        "upper_bound_oom": bool(upper.get("oom")),
+    }
+
+
 def _metric_headroom_gb(m: Dict) -> float:
     try:
         return float(m.get("oom_margin_gb") or 0.0)
@@ -386,6 +407,43 @@ def _strategy_actions(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> set[
     return actions
 
 
+def _format_layout(layout: Fsdp2Layout) -> str:
+    return (
+        f"mesh={layout.mesh_topology}, reshard={layout.reshard_after_forward}, shard_plan={layout.shard_plan}, "
+        f"offload={layout.offload_params}, mp={layout.mp_policy}"
+    )
+
+
+def _format_overrides(ovrs: List[LayerOverride]) -> str:
+    if not ovrs:
+        return "none"
+    parts = []
+    for o in ovrs:
+        if o.layers:
+            scope = f"layers={sorted(o.layers)}"
+        else:
+            scope = f"range={o.start_layer}:{o.end_layer}"
+        parts.append(f"{scope}({o.layout.reshard_after_forward},{o.layout.shard_plan})")
+    return "; ".join(parts)
+
+
+def _strategy_diff(before: Fsdp2Strategy, after: Fsdp2Strategy) -> List[str]:
+    changes: List[str] = []
+    if before.global_layout != after.global_layout:
+        changes.append(f"global_layout: {_format_layout(before.global_layout)} -> {_format_layout(after.global_layout)}")
+    if before.grouping != after.grouping:
+        changes.append(
+            f"grouping: {before.grouping.mode}/{before.grouping.merge_factor} -> {after.grouping.mode}/{after.grouping.merge_factor}"
+        )
+    if before.layer_overrides != after.layer_overrides:
+        changes.append(f"layer_overrides: {_format_overrides(before.layer_overrides)} -> {_format_overrides(after.layer_overrides)}")
+    if before.named_overrides != after.named_overrides:
+        before_keys = sorted(before.named_overrides.keys())
+        after_keys = sorted(after.named_overrides.keys())
+        changes.append(f"named_overrides: {before_keys} -> {after_keys}")
+    return changes or ["no changes"]
+
+
 def _enforce_judge_verdict(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy, verdict: Optional[Dict]) -> None:
     if not verdict:
         return
@@ -441,6 +499,12 @@ JUDGE_SYSTEM = (
     "You do NOT make execution decisions.\n"
     "Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.\n"
     "Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.\n"
+    "Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.\n"
+    "Evidence cues (non-binding):\n"
+    "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
+    "- merged grouping can improve overlap and reduce collective jitter.\n"
+    "- shard_plan='LARGEST' may reduce shard imbalance for large params.\n"
+    "- 2D mesh is primarily for multi-node; 1D is safer for single node.\n"
     "Output format (strict):\n"
     "Bottleneck:\nTarget:\nHypothesis:\nExpected Effect:\nRisk Assessment:\n"
     "Then include a JSON object in a ```json code fence with key \"judge_verdict\" and fields:\n"
@@ -461,6 +525,12 @@ CODER_SYSTEM = (
     "- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.\n"
     "- If using layer_overrides, target layers must come from SemanticState.top_targets; avoid arbitrary index ranges.\n"
     "- If no layer_stats/top_targets are available, do not use layer_overrides.\n"
+    "- Use UpperBoundGap to select the smallest-risk action that meaningfully closes the gap.\n"
+    "Evidence cues (non-binding):\n"
+    "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
+    "- merged grouping can improve overlap and reduce collective jitter.\n"
+    "- shard_plan='LARGEST' may reduce shard imbalance for large params.\n"
+    "- 2D mesh is primarily for multi-node; 1D is safer for single node.\n"
     "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
     "Schema fields:\n"
     "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy\n"
@@ -482,6 +552,7 @@ def build_judge_prompt(
 ) -> str:
     payload = {
         "SemanticState": semantic_state,
+        "UpperBoundGap": semantic_state.get("upper_bound_gap", {}),
         "CurrentStrategy": current_strategy.to_dict(),
         "ActionCost": semantic_state.get("action_cost", {}),
         "Phase": semantic_state.get("phase"),
@@ -506,6 +577,8 @@ def build_coder_prompt(
         json.dumps(judge_verdict or {}, ensure_ascii=False, indent=2),
         "SemanticState (trusted):",
         json.dumps(semantic_state, ensure_ascii=False, indent=2),
+        "UpperBoundGap (trusted):",
+        json.dumps(semantic_state.get("upper_bound_gap", {}), ensure_ascii=False, indent=2),
         "CausalSummary (trusted):",
         json.dumps(causal_summary or {}, ensure_ascii=False, indent=2),
         "CurrentStrategy (baseline):",
@@ -799,6 +872,10 @@ def main() -> None:
         pending_failure_feedback = _derive_failure_feedback(metrics)
         trial_id += 1
 
+    upper_bounds = [m for m in history if m.get("upper_bound") and not (m.get("oom") or m.get("error"))]
+    upper_bound_best_metric = max(upper_bounds, key=lambda m: _metric_throughput(m), default=None)
+    upper_bound_gap = _upper_bound_gap(baseline_metrics, upper_bound_best_metric)
+
     best_candidates = [m for m in history if not m.get("upper_bound")]
     best_entry = max(best_candidates or history, key=lambda x: x.get("score", float("-inf")))
     best_score = best_entry.get("score", float("-inf"))
@@ -812,6 +889,7 @@ def main() -> None:
     for round_idx in range(args.rounds):
         print(f"[controller] round {round_idx + 1}/{args.rounds} (phase={phase.value})")
         semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
+        semantic_state["upper_bound_gap"] = upper_bound_gap
         semantic_state["hardware"] = getattr(hardware, "__dict__", {})
         semantic_state["train_hyper"] = {
             "global_batch_size": args.global_batch_size,
@@ -856,6 +934,7 @@ def main() -> None:
             trial_id += 1
             best_metrics_for_state = diag
             semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
+            semantic_state["upper_bound_gap"] = upper_bound_gap
             semantic_state["hardware"] = getattr(hardware, "__dict__", {})
             semantic_state["train_hyper"] = {
                 "global_batch_size": args.global_batch_size,
@@ -967,6 +1046,8 @@ def main() -> None:
                 "score": float("-inf"),
             }
         else:
+            diff_lines = _strategy_diff(best_strategy, candidate)
+            print(f"[controller] strategy diff: {'; '.join(diff_lines)}")
             metrics = _run_trial_subprocess(args, candidate, trial_id=trial_id, profile="light")
             metrics["config_name"] = f"agent_round_{round_idx}"
             metrics["judge_note"] = judge_reply

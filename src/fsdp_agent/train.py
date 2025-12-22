@@ -653,6 +653,8 @@ def run_trial(
     best["dataset_stats"] = dataset_stats.__dict__
     best["score"] = score_strategy(best, mem_limit_bytes=int(mem_limit_gb * 1024**3))
 
+    _sanitize_metrics(best)
+
     # 结构化 trace summary，供 LLM 直接阅读
     mem_limit_bytes = int(mem_limit_gb * 1024**3)
     headroom_mb = (mem_limit_bytes - best.get("max_mem_bytes", 0)) // (1024 * 1024)
@@ -685,6 +687,21 @@ def run_trial(
         "kernel_bubble_ratio_std_est": best.get("kernel_bubble_ratio_std_est", None),
     }
     return best
+
+
+def _sanitize_metrics(metrics: Dict[str, Any]) -> None:
+    warnings: List[str] = []
+    mfu = metrics.get("mfu_percent")
+    if isinstance(mfu, (int, float)) and (mfu < 0 or mfu > 100):
+        metrics["mfu_percent"] = None
+        warnings.append("mfu_out_of_range")
+    total_cuda = float(metrics.get("total_cuda_time_ms", 0.0) or 0.0)
+    comm = float(metrics.get("comm_time_ms", 0.0) or 0.0)
+    if total_cuda > 0 and comm > total_cuda:
+        metrics["comm_time_ms"] = total_cuda
+        warnings.append("comm_time_clamped")
+    if warnings:
+        metrics["sanity_warnings"] = warnings
 
 
 def _estimate_tokens_per_s(step_time_ms: float, global_batch: int, seq_len: int) -> float:
