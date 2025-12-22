@@ -398,6 +398,43 @@ def _enforce_judge_verdict(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy, ve
         raise ValueError(f"strategy uses actions outside allowed_actions: {sorted(actions - allowed)}")
 
 
+def _extract_layer_indices(names: List[str]) -> List[int]:
+    out: List[int] = []
+    for name in names:
+        if not name:
+            continue
+        try:
+            parts = str(name).replace("[", ".").replace("]", "").split(".")
+            for p in reversed(parts):
+                if p.isdigit():
+                    out.append(int(p))
+                    break
+        except Exception:
+            continue
+    return out
+
+
+def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> None:
+    if not candidate.layer_overrides:
+        return
+    top = semantic_state.get("top_targets") or {}
+    top_time = _extract_layer_indices(top.get("top_time_layers") or [])
+    top_mem = _extract_layer_indices(top.get("top_mem_layers") or [])
+    targets = sorted(set(top_time + top_mem))
+    if not targets:
+        raise ValueError("layer_overrides require observed top_targets; no layer_stats available")
+
+    def _overlaps_override(ovr: LayerOverride) -> bool:
+        if ovr.layers:
+            return any(idx in ovr.layers for idx in targets)
+        if ovr.start_layer is not None and ovr.end_layer is not None:
+            return any(ovr.start_layer <= idx < ovr.end_layer for idx in targets)
+        return False
+
+    if not any(_overlaps_override(o) for o in candidate.layer_overrides):
+        raise ValueError("layer_overrides must overlap observed top_targets; avoid arbitrary indices")
+
+
 JUDGE_SYSTEM = (
     "You are a physics-informed reasoning engine for PyTorch FSDP2 training.\n"
     "You do NOT propose configurations.\n"
@@ -422,6 +459,8 @@ CODER_SYSTEM = (
     "- Prefer layer_overrides / named_overrides / grouping.\n"
     "- Respect forbidden_in_phase.\n"
     "- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.\n"
+    "- If using layer_overrides, target layers must come from SemanticState.top_targets; avoid arbitrary index ranges.\n"
+    "- If no layer_stats/top_targets are available, do not use layer_overrides.\n"
     "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
     "Schema fields:\n"
     "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy\n"
@@ -679,18 +718,52 @@ def main() -> None:
 
     # Phase 0：固定 baseline（不交给 LLM）
     # 1D + 层级 wrap（block）+ 非 root reshard=True / root reshard=False
-    gl = Fsdp2Layout(mesh_topology="1D", reshard_after_forward=False)
-    layer = Fsdp2Layout(mesh_topology="1D", reshard_after_forward=True)
+    gl = Fsdp2Layout(mesh_topology="1D", reshard_after_forward=None)
     baseline = Fsdp2Strategy(
         global_layout=gl,
-        layer_overrides=[LayerOverride(start_layer=0, end_layer=10**9, layout=layer)],
+        layer_overrides=[],
         grouping=GroupingConfig(mode="block", merge_factor=1),
     )
+    print("[controller] default baseline strategy (auto reshard):")
+    print(json.dumps(baseline.to_dict(), ensure_ascii=False, indent=2))
+
+    trial_id = 0
+    baseline_hash = _strategy_hash(baseline)
+    baseline_metrics = _run_trial_subprocess(args, baseline, trial_id=trial_id, profile="light")
+    baseline_metrics["config_name"] = "baseline_default"
+    baseline_metrics["strategy_hash"] = baseline_hash
+    history.append(baseline_metrics)
+    seen_hashes.add(baseline_hash)
+    hash_to_strategy[baseline_hash] = baseline.to_dict()
+    pending_failure_feedback = _derive_failure_feedback(baseline_metrics)
+    trial_id += 1
+
+    headroom_ratio = 0.0
+    if args.mem_limit_gb > 0:
+        headroom_ratio = float(baseline_metrics.get("oom_margin_gb") or 0.0) / float(args.mem_limit_gb)
+    upper_bound_ok = (not baseline_metrics.get("oom")) and headroom_ratio >= 0.2
 
     seeds: List[tuple[str, Fsdp2Strategy]] = [
-        ("safe", baseline),
         ("sandwich", sandwich_sample_strategy(num_layers=num_layers_hint, span=4)),
     ]
+    upper_bound_names: set[str] = set()
+    if upper_bound_ok:
+        upper_off = Fsdp2Strategy(
+            global_layout=Fsdp2Layout(mesh_topology=gl.mesh_topology, reshard_after_forward=False),
+            layer_overrides=[],
+            grouping=GroupingConfig(mode="block", merge_factor=1),
+        )
+        seeds.append(("upper_global_reshard_off", upper_off))
+        upper_bound_names.add("upper_global_reshard_off")
+        raf = _pick_nontrivial_divisor(int(args.nproc))
+        if raf:
+            upper_int = Fsdp2Strategy(
+                global_layout=Fsdp2Layout(mesh_topology=gl.mesh_topology, reshard_after_forward=raf),
+                layer_overrides=[],
+                grouping=GroupingConfig(mode="block", merge_factor=1),
+            )
+            seeds.append(("upper_global_reshard_int", upper_int))
+            upper_bound_names.add("upper_global_reshard_int")
 
     # HSDP-ish (multi-node only): 2D mesh + layer-level reshard True, root False.
     if args.allow_mesh and getattr(hardware, "num_nodes", 1) and int(getattr(hardware, "num_nodes", 1)) > 1:
@@ -712,19 +785,22 @@ def main() -> None:
         raf = _pick_nontrivial_divisor(int(args.nproc)) or True
         offload_global = Fsdp2Layout(mesh_topology="1D", offload_params=True, reshard_after_forward=raf)
         seeds.append(("cpu_offload", Fsdp2Strategy(global_layout=offload_global)))
-    trial_id = 0
+
     for name, strat in seeds:
         strat_hash = _strategy_hash(strat)
         metrics = _run_trial_subprocess(args, strat, trial_id=trial_id, profile="light")
         metrics["config_name"] = name
         metrics["strategy_hash"] = strat_hash
+        if name in upper_bound_names:
+            metrics["upper_bound"] = True
         history.append(metrics)
         seen_hashes.add(strat_hash)
         hash_to_strategy[strat_hash] = strat.to_dict()
         pending_failure_feedback = _derive_failure_feedback(metrics)
         trial_id += 1
 
-    best_entry = max(history, key=lambda x: x.get("score", float("-inf")))
+    best_candidates = [m for m in history if not m.get("upper_bound")]
+    best_entry = max(best_candidates or history, key=lambda x: x.get("score", float("-inf")))
     best_score = best_entry.get("score", float("-inf"))
     best_hash = best_entry.get("strategy_hash")
     best_strategy = Fsdp2Strategy.from_dict(hash_to_strategy[best_hash]) if best_hash in hash_to_strategy else baseline
@@ -762,6 +838,7 @@ def main() -> None:
                 "oom": t.get("oom"),
                 "error_msg": t.get("error_msg"),
                 "strategy_hash": t.get("strategy_hash"),
+                "upper_bound": t.get("upper_bound"),
             }
             for t in history[-args.max_history :]
         ]
@@ -805,6 +882,7 @@ def main() -> None:
                     "oom": t.get("oom"),
                     "error_msg": t.get("error_msg"),
                     "strategy_hash": t.get("strategy_hash"),
+                    "upper_bound": t.get("upper_bound"),
                 }
                 for t in history[-args.max_history :]
             ]
@@ -847,6 +925,7 @@ def main() -> None:
                     allow_offload=bool(args.allow_offload),
                 )
                 _enforce_judge_verdict(candidate, best_strategy, judge_verdict)
+                _enforce_layer_targets(candidate, semantic_state)
             except Exception as e:
                 last_parse_error = e
                 print(f"[controller] 策略解析/校验错误: {e}")
@@ -1098,7 +1177,9 @@ def main() -> None:
 
     def _pick_stable_candidate(points: List[Dict]) -> Optional[Dict]:
         candidates = [
-            m for m in points if not (m.get("oom") or m.get("error") or m.get("diagnostic_only") or m.get("batch_probe"))
+            m
+            for m in points
+            if not (m.get("oom") or m.get("error") or m.get("diagnostic_only") or m.get("batch_probe") or m.get("upper_bound"))
         ]
         if not candidates:
             return None
@@ -1131,6 +1212,8 @@ def main() -> None:
             continue
         if m.get("diagnostic_only"):
             continue
+        if m.get("upper_bound"):
+            continue
         if h not in by_hash or m.get("score", float("-inf")) > by_hash[h].get("score", float("-inf")):
             by_hash[h] = m
     ranked = sorted(by_hash.values(), key=lambda x: x.get("score", float("-inf")), reverse=True)
@@ -1142,16 +1225,30 @@ def main() -> None:
     pareto_mem = _pareto_front(history, "throughput_effective_tokens_per_s", "oom_margin_gb")
     pareto_comm = _pareto_front(history, "throughput_effective_tokens_per_s", "comm_ratio")
     stable = _pick_stable_candidate(history)
+    upper_bounds = [m for m in history if m.get("upper_bound") and not (m.get("oom") or m.get("error"))]
+    upper_bound_best = max(upper_bounds, key=lambda m: _metric_throughput(m), default=None)
     anchors = {
         "aggressive": pareto_mem[0] if pareto_mem else None,
         "conservative": max(pareto_mem, key=lambda x: x.get("oom_margin_gb", float("-inf"))) if pareto_mem else None,
         "balanced": best,
         "stable": stable,
+        "upper_bound": upper_bound_best,
     }
     summary = {
         "best": best,
         "second_best": second_best,
         "secondary_stable": stable,
+        "upper_bounds": [
+            {
+                "trial_id": m.get("trial_id"),
+                "config_name": m.get("config_name"),
+                "strategy_hash": m.get("strategy_hash"),
+                "throughput_effective_tokens_per_s": m.get("throughput_effective_tokens_per_s"),
+                "oom_margin_gb": m.get("oom_margin_gb"),
+                "score": m.get("score"),
+            }
+            for m in upper_bounds
+        ],
         "best_strategy": hash_to_strategy.get(best_h, best_strategy.to_dict()) if best_h else best_strategy.to_dict(),
         "second_best_strategy": hash_to_strategy.get(second_h) if second_h else None,
         "secondary_stable_strategy": hash_to_strategy.get(stable.get("strategy_hash")) if stable else None,

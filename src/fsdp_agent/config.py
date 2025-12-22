@@ -273,7 +273,35 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> F
         schema_version=strategy.schema_version,
         dataset_stats=ds,
     )
+    # Reject "explicit default mimic" via contradictory reshard config.
+    if _looks_like_default_mimic(validated):
+        raise ValueError(
+            "Invalid reshard configuration: do not simulate auto-reshard via overrides; use reshard_after_forward=None."
+        )
     return validated.normalized()
+
+
+def _looks_like_default_mimic(strategy: Fsdp2Strategy) -> bool:
+    gl = strategy.global_layout
+    if gl.reshard_after_forward is not False:
+        return False
+    if not strategy.layer_overrides:
+        return False
+    # Detect a full-range override that flips reshard back to True without other changes.
+    for o in strategy.layer_overrides:
+        if o.layout.reshard_after_forward is not True:
+            continue
+        same_other = (
+            o.layout.mesh_topology == gl.mesh_topology
+            and o.layout.shard_plan == gl.shard_plan
+            and o.layout.offload_params == gl.offload_params
+            and o.layout.mp_policy == gl.mp_policy
+        )
+        if not same_other:
+            continue
+        if o.start_layer == 0 and o.end_layer is not None and o.end_layer >= 10**8:
+            return True
+    return False
 
 
 # -----------------------------
