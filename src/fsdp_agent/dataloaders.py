@@ -37,6 +37,9 @@ def build_synthetic_loader(
     batch_size: int,
     length: int = 10_000,
     seed: int | None = None,
+    train_hyper: Optional[dict] = None,
+    **_: object,
 ) -> DataLoader:
+    _ = train_hyper
     dataset = SyntheticDataset(vocab_size=vocab_size, seq_len=seq_len, length=length, seed=seed)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True)
