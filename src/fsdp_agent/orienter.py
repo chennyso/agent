@@ -19,6 +19,8 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         comm_ratio = float(comm_time) / float(comm_time + compute_time)
 
     if metrics.get("oom"):
+        headroom_gb = -1.0
+        headroom_ratio = -1.0
         bottleneck = "MEMORY"
         confidence = 0.9
     elif headroom_gb < 2.0:

@@ -20,6 +20,16 @@ from fsdp_agent.metrics_utils import score_strategy
 from fsdp_agent.model_introspection import extract_transformer_layers
 
 _MIN_STEP_TIME_MS = 1e-3
+_CURRENT_STAGE = "init"
+
+
+def _set_stage(stage: str) -> None:
+    global _CURRENT_STAGE
+    _CURRENT_STAGE = stage
+
+
+def get_current_stage() -> str:
+    return _CURRENT_STAGE
 
 
 def _is_rank0() -> bool:
@@ -437,6 +447,7 @@ def run_trial(
     """
     执行单策略多次重复，取中位数吞吐，返回最佳一次的详细 metrics（含 trace_summary、MFU）。
     """
+    _set_stage("init")
     set_seeds(0)
     all_runs = []
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -444,15 +455,19 @@ def run_trial(
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         _log_rank0(f"[trial] run {r + 1}/{repeats}: loading model")
+        _set_stage("load_model")
         model = load_model(model_name=model_name)
         _log_rank0("[trial] applying strategy")
+        _set_stage("apply_strategy")
         model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
+        _set_stage("build_optimizer")
         optimizer = build_optimizer(model, lr=lr)
         # Ensure synthetic loader won't be empty with drop_last=True and won't exhaust during warmup+steps.
         world = dist.get_world_size() if dist.is_initialized() else 1
         per_rank_batch = int(math.ceil(global_batch_size / max(world, 1)))
         required_batches = num_warmup + num_steps + 1
         required_len = per_rank_batch * required_batches
+        _set_stage("build_dataloader")
         dataloader = build_synthetic_loader(
             train_hyper={"global_batch_size": global_batch_size},
             vocab_size=vocab_size,
@@ -479,6 +494,7 @@ def run_trial(
         try:
             progress_every = max(1, int(num_steps) // 5)
             _log_rank0(f"[trial] start steps (warmup={num_warmup}, steps={num_steps}, profile={profiling})")
+            _set_stage("train_steps")
             if prof is None:
                 losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
                     model,
@@ -503,6 +519,7 @@ def run_trial(
                         progress_every=progress_every,
                     )
         finally:
+            _set_stage("postprocess")
             layer_summary = probe.summary() if probe is not None else {}
             if probe is not None:
                 probe.close()

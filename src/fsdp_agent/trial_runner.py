@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from fsdp_agent.config import Fsdp2Strategy, validate_strategy
-from fsdp_agent.train import run_trial
+from fsdp_agent.train import run_trial, get_current_stage
 from fsdp_agent.dataset_stats import load_stats_from_file, DatasetStats
 
 
@@ -113,7 +113,13 @@ def main() -> None:
         )
         _log_rank0("[trial_runner] trial completed")
     except torch.cuda.OutOfMemoryError:
-        metrics = {"oom": True, "score": float("-inf"), "error_msg": "CUDA out of memory (trial_runner)"}
+        stage = get_current_stage()
+        metrics = {
+            "oom": True,
+            "score": float("-inf"),
+            "oom_stage": stage,
+            "error_msg": f"CUDA out of memory ({stage})",
+        }
     except Exception as exc:
         metrics = {
             "error": str(exc),

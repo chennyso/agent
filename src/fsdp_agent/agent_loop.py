@@ -111,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--show-progress", action="store_true", help="Stream trial stdout/stderr for live progress.")
     p.add_argument("--log-llm", action="store_true", help="Print LLM prompts and responses each round.")
+    p.add_argument(
+        "--force-heavy-every",
+        type=int,
+        default=0,
+        help="Force a heavy profile every N rounds (0 disables).",
+    )
     return p.parse_args()
 
 
@@ -417,6 +423,20 @@ def _strategy_actions(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> set[
     return actions
 
 
+def _uses_reshard_false(strategy: Fsdp2Strategy) -> bool:
+    if strategy.global_layout.reshard_after_forward is False:
+        return True
+    return any(o.layout.reshard_after_forward is False for o in strategy.layer_overrides)
+
+
+def _enforce_memory_guard(candidate: Fsdp2Strategy, semantic_state: Dict) -> None:
+    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
+    bottleneck = semantic_state.get("bottleneck")
+    if bottleneck == "MEMORY" or headroom_ratio < 0.05:
+        if _uses_reshard_false(candidate):
+            raise ValueError("memory_guard: reshard_after_forward=False is unsafe under low headroom")
+
+
 def _format_layout(layout: Fsdp2Layout) -> str:
     return (
         f"mesh={layout.mesh_topology}, reshard={layout.reshard_after_forward}, shard_plan={layout.shard_plan}, "
@@ -466,6 +486,35 @@ def _enforce_judge_verdict(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy, ve
         raise ValueError(f"strategy uses actions outside allowed_actions: {sorted(actions - allowed)}")
 
 
+def _coerce_judge_verdict(
+    verdict: Optional[Dict],
+    semantic_state: Dict,
+    *,
+    allow_offload: bool,
+) -> Optional[Dict]:
+    if not verdict:
+        return verdict
+    allowed = _normalize_actions(verdict.get("allowed_actions"))
+    forbidden = _normalize_actions(verdict.get("forbidden_actions"))
+    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
+    memory_critical = semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05
+
+    if memory_critical:
+        must_allow = {"layer_override_reshard", "change_grouping", "shard_plan"}
+        if allow_offload:
+            must_allow.add("enable_cpu_offload")
+        forbidden -= must_allow
+        if allowed:
+            allowed |= must_allow
+        forbidden |= {"set_root_reshard_false", "expand_unsharded_span"}
+
+    return {
+        **verdict,
+        "allowed_actions": sorted(allowed),
+        "forbidden_actions": sorted(forbidden),
+    }
+
+
 def _extract_layer_indices(names: List[str]) -> List[int]:
     out: List[int] = []
     for name in names:
@@ -503,6 +552,60 @@ def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> No
         raise ValueError("layer_overrides must overlap observed top_targets; avoid arbitrary indices")
 
 
+def _goal_mode(semantic_state: Dict, upper_bound_gap: Dict) -> str:
+    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
+    gap_ratio = float(upper_bound_gap.get("throughput_gap_ratio") or 0.0)
+    if semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05:
+        return "min_mem"
+    if gap_ratio >= 0.02 and headroom_ratio >= 0.15:
+        return "fastest"
+    return "min_mem_at_perf"
+
+
+def _anchor_view(entry: Optional[Dict]) -> Optional[Dict]:
+    if not entry:
+        return None
+    return {
+        "trial_id": entry.get("trial_id"),
+        "config_name": entry.get("config_name"),
+        "strategy_hash": entry.get("strategy_hash"),
+        "throughput_effective_tokens_per_s": entry.get("throughput_effective_tokens_per_s"),
+        "max_mem_gb": entry.get("max_mem_bytes", 0) / (1024**3) if entry.get("max_mem_bytes") is not None else None,
+        "score": entry.get("score"),
+    }
+
+
+def _fastest_safe(history: List[Dict]) -> Optional[Dict]:
+    candidates = [m for m in history if not (m.get("oom") or m.get("error") or m.get("upper_bound"))]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda m: _metric_throughput(m))
+
+
+def _min_mem_at_perf(history: List[Dict], baseline_tp: float, tol: float = 0.99) -> Optional[Dict]:
+    candidates = [
+        m
+        for m in history
+        if not (m.get("oom") or m.get("error") or m.get("upper_bound"))
+        and _metric_throughput(m) >= baseline_tp * tol
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda m: float(m.get("max_mem_bytes") or float("inf")))
+
+
+def _last_oom_info(history: List[Dict]) -> Optional[Dict]:
+    for m in reversed(history):
+        if m.get("oom"):
+            return {
+                "trial_id": m.get("trial_id"),
+                "config_name": m.get("config_name"),
+                "oom_stage": m.get("oom_stage"),
+                "error_msg": m.get("error_msg"),
+            }
+    return None
+
+
 JUDGE_SYSTEM = (
     "You are a physics-informed reasoning engine for PyTorch FSDP2 training.\n"
     "You do NOT propose configurations.\n"
@@ -510,6 +613,9 @@ JUDGE_SYSTEM = (
     "Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.\n"
     "Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.\n"
     "Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.\n"
+    "GoalMode is in SemanticState.goal_mode: fastest|min_mem_at_perf|min_mem.\n"
+    "If bottleneck==MEMORY or headroom_ratio is low, do not forbid enable_cpu_offload or layer_override_reshard; include them in allowed_actions when permitted by hard_constraints.\n"
+    "If recent_trials include OOM (see last_oom), treat it as memory-critical and prioritize memory-saving actions.\n"
     "Evidence cues (non-binding):\n"
     "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
     "- merged grouping can improve overlap and reduce collective jitter.\n"
@@ -537,6 +643,9 @@ CODER_SYSTEM = (
     "- If no layer_stats/top_targets are available, do not use layer_overrides.\n"
     "- Use integer layer indices in layer_overrides (e.g., 22), not strings like 'layers.22'.\n"
     "- Use UpperBoundGap to select the smallest-risk action that meaningfully closes the gap.\n"
+    "- If goal_mode=fastest, prioritize throughput even if memory rises modestly.\n"
+    "- If goal_mode=min_mem_at_perf, keep throughput within 1% of baseline while reducing max memory.\n"
+    "- If goal_mode=min_mem, prioritize headroom and avoid reshard_after_forward=False.\n"
     "Evidence cues (non-binding):\n"
     "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
     "- merged grouping can improve overlap and reduce collective jitter.\n"
@@ -886,6 +995,7 @@ def main() -> None:
     upper_bounds = [m for m in history if m.get("upper_bound") and not (m.get("oom") or m.get("error"))]
     upper_bound_best_metric = max(upper_bounds, key=lambda m: _metric_throughput(m), default=None)
     upper_bound_gap = _upper_bound_gap(baseline_metrics, upper_bound_best_metric)
+    baseline_tp = _metric_throughput(baseline_metrics)
 
     best_candidates = [m for m in history if not m.get("upper_bound")]
     best_entry = max(best_candidates or history, key=lambda x: x.get("score", float("-inf")))
@@ -901,6 +1011,12 @@ def main() -> None:
         print(f"[controller] round {round_idx + 1}/{args.rounds} (phase={phase.value})")
         semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
         semantic_state["upper_bound_gap"] = upper_bound_gap
+        semantic_state["goal_mode"] = _goal_mode(semantic_state, upper_bound_gap)
+        semantic_state["anchors"] = {
+            "fastest_safe": _anchor_view(_fastest_safe(history)),
+            "min_mem_at_perf": _anchor_view(_min_mem_at_perf(history, baseline_tp)),
+        }
+        semantic_state["last_oom"] = _last_oom_info(history)
         semantic_state["hardware"] = getattr(hardware, "__dict__", {})
         semantic_state["train_hyper"] = {
             "global_batch_size": args.global_batch_size,
@@ -925,6 +1041,7 @@ def main() -> None:
                 "max_mem_gb": (t.get("max_mem_bytes", 0) / 1024**3) if t.get("max_mem_bytes") else None,
                 "comm_ratio": t.get("comm_ratio"),
                 "oom": t.get("oom"),
+                "oom_stage": t.get("oom_stage"),
                 "error_msg": t.get("error_msg"),
                 "strategy_hash": t.get("strategy_hash"),
                 "upper_bound": t.get("upper_bound"),
@@ -933,7 +1050,16 @@ def main() -> None:
         ]
 
         # 不确定性高时，对当前 best 做一次 heavy 诊断（不改变 best 选择，仅补充可信观测）
-        if (semantic_state.get("confidence", 0.0) < 0.6) and (best_metrics_for_state.get("profiling") != "heavy"):
+        force_every = int(getattr(args, "force_heavy_every", 0) or 0)
+        should_force_heavy = (
+            force_every > 0
+            and (round_idx + 1) % force_every == 0
+            and (best_metrics_for_state.get("profiling") != "heavy")
+            and not best_metrics_for_state.get("oom")
+        )
+        if should_force_heavy or (
+            (semantic_state.get("confidence", 0.0) < 0.6) and (best_metrics_for_state.get("profiling") != "heavy")
+        ):
             diag = _run_trial_subprocess(args, best_strategy, trial_id=trial_id, profile="heavy")
             diag["config_name"] = f"diag_heavy_{round_idx}"
             diag["strategy_hash"] = best_hash
@@ -946,6 +1072,12 @@ def main() -> None:
             best_metrics_for_state = diag
             semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
             semantic_state["upper_bound_gap"] = upper_bound_gap
+            semantic_state["goal_mode"] = _goal_mode(semantic_state, upper_bound_gap)
+            semantic_state["anchors"] = {
+                "fastest_safe": _anchor_view(_fastest_safe(history)),
+                "min_mem_at_perf": _anchor_view(_min_mem_at_perf(history, baseline_tp)),
+            }
+            semantic_state["last_oom"] = _last_oom_info(history)
             semantic_state["hardware"] = getattr(hardware, "__dict__", {})
             semantic_state["train_hyper"] = {
                 "global_batch_size": args.global_batch_size,
@@ -970,6 +1102,7 @@ def main() -> None:
                     "max_mem_gb": (t.get("max_mem_bytes", 0) / 1024**3) if t.get("max_mem_bytes") else None,
                     "comm_ratio": t.get("comm_ratio"),
                     "oom": t.get("oom"),
+                    "oom_stage": t.get("oom_stage"),
                     "error_msg": t.get("error_msg"),
                     "strategy_hash": t.get("strategy_hash"),
                     "upper_bound": t.get("upper_bound"),
@@ -986,6 +1119,7 @@ def main() -> None:
         judge_reply = call_llm(j_prompt, JUDGE_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
         _log_llm_exchange("judge", j_prompt, judge_reply, args)
         judge_verdict = _parse_judge_verdict(judge_reply)
+        judge_verdict = _coerce_judge_verdict(judge_verdict, semantic_state, allow_offload=bool(args.allow_offload))
 
         c_prompt = build_coder_prompt(
             judge_reply,
@@ -1018,6 +1152,7 @@ def main() -> None:
                 )
                 _enforce_judge_verdict(candidate, best_strategy, judge_verdict)
                 _enforce_layer_targets(candidate, semantic_state)
+                _enforce_memory_guard(candidate, semantic_state)
             except Exception as e:
                 last_parse_error = e
                 print(f"[controller] 策略解析/校验错误: {e}")
