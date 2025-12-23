@@ -545,6 +545,7 @@ def run_trial(
             train_hyper={"global_batch_size": global_batch_size},
             vocab_size=vocab_size,
             seq_len=seq_len,
+            batch_size=per_rank_batch,
             length=max(10_000, required_len),
             seed=seed,
         )
