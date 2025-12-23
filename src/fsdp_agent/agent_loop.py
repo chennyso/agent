@@ -254,6 +254,7 @@ def _strategy_features(strategy: Fsdp2Strategy) -> Dict[str, object]:
         "grouping_mode": _grouping_mode(strategy),
         "mesh_topology": strategy.global_layout.mesh_topology,
         "offload": _strategy_uses_offload(strategy),
+        "offload_scope": _offload_scope(strategy),
     }
 
 
@@ -277,6 +278,7 @@ def _build_causal_summary(history: List[Dict], hash_to_strategy: Dict[str, Dict]
         "grouping_mode": sorted({str(f["grouping_mode"]) for _, __, f in trials}),
         "mesh_topology": sorted({str(f["mesh_topology"]) for _, __, f in trials}),
         "offload": sorted({bool(f["offload"]) for _, __, f in trials}),
+        "offload_scope": sorted({str(f["offload_scope"]) for _, __, f in trials}),
     }
 
     confirmed_positive: List[str] = []
@@ -423,6 +425,21 @@ def _strategy_actions(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> set[
     return actions
 
 
+def _offload_scope(strategy: Fsdp2Strategy) -> str:
+    if strategy.global_layout.offload_params:
+        return "global"
+    if any(o.layout.offload_params for o in strategy.layer_overrides):
+        return "partial"
+    if any(layout.offload_params for _, layout in strategy.named_overrides.items()):
+        return "partial"
+    return "none"
+
+
+def _is_memory_critical(semantic_state: Dict) -> bool:
+    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
+    return semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05
+
+
 def _uses_reshard_false(strategy: Fsdp2Strategy) -> bool:
     if strategy.global_layout.reshard_after_forward is False:
         return True
@@ -496,8 +513,7 @@ def _coerce_judge_verdict(
         return verdict
     allowed = _normalize_actions(verdict.get("allowed_actions"))
     forbidden = _normalize_actions(verdict.get("forbidden_actions"))
-    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
-    memory_critical = semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05
+    memory_critical = _is_memory_critical(semantic_state)
 
     if memory_critical:
         must_allow = {"layer_override_reshard", "change_grouping", "shard_plan"}
@@ -653,11 +669,12 @@ CODER_SYSTEM = (
     "- 2D mesh is primarily for multi-node; 1D is safer for single node.\n"
     "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
     "Schema fields:\n"
-    "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy\n"
+    "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, offload_pin_memory, mp_policy\n"
     "- layer_overrides: start_layer/end_layer or layers[] + layout\n"
     "- named_overrides: substring -> layout\n"
     "- grouping: {mode: block|merged, merge_factor>=1}\n"
     "If supports_merged_grouping=false, do not use grouping.mode='merged'.\n"
+    "You may set offload_params/offload_pin_memory at layer_overrides or named_overrides for targeted CPU offload.\n"
     "Prefer targeted layer_overrides over setting global reshard_after_forward=False for all layers.\n"
     "Global reshard_after_forward=False is an extreme trade-off (high determinism/low comm/high memory risk). Only use it when headroom is clearly ample; otherwise prefer targeted overrides or grouping.\n"
     "Put the JSON inside a single ```json code fence.\n"
@@ -873,6 +890,7 @@ def _enforce_phase_constraints(
     *,
     allow_mesh: bool,
     allow_offload: bool,
+    memory_critical: bool,
 ) -> None:
     # 硬门禁：按 phase 限制动作，避免空间爆炸
     if not allow_mesh and candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
@@ -883,7 +901,12 @@ def _enforce_phase_constraints(
     if not allow_offload and (not _strategy_uses_offload(baseline)) and _strategy_uses_offload(candidate):
         raise ValueError("offload is frozen (allow_offload=false)")
     # 早期阶段禁止“引入”offload，但不阻止在已启用 offload 的 anchor 上做局部微调
-    if phase != Phase.OFFLOAD and (not _strategy_uses_offload(baseline)) and _strategy_uses_offload(candidate):
+    if (
+        phase != Phase.OFFLOAD
+        and (not _strategy_uses_offload(baseline))
+        and _strategy_uses_offload(candidate)
+        and not memory_critical
+    ):
         raise ValueError("enable_cpu_offload is forbidden_in_phase")
     if getattr(candidate, "grouping", None) and candidate.grouping.mode == "merged" and not _supports_merged_grouping():
         raise ValueError("grouping.merged is unsupported by this torch build")
@@ -1149,6 +1172,7 @@ def main() -> None:
                     phase,
                     allow_mesh=bool(args.allow_mesh),
                     allow_offload=bool(args.allow_offload),
+                    memory_critical=_is_memory_critical(semantic_state),
                 )
                 _enforce_judge_verdict(candidate, best_strategy, judge_verdict)
                 _enforce_layer_targets(candidate, semantic_state)

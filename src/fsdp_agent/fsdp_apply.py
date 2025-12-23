@@ -148,7 +148,8 @@ def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size
         param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
         reduce_dtype=torch.float32,
     )
-    offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if layout.offload_params else OffloadPolicy()
+    pin_memory = bool(getattr(layout, "offload_pin_memory", True))
+    offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=pin_memory) if layout.offload_params else OffloadPolicy()
 
     kwargs = dict(
         mesh=mesh,
@@ -188,7 +189,8 @@ def apply_layout_to_modules(mods: List[nn.Module], layout: Fsdp2Layout, mesh, wo
         param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
         reduce_dtype=torch.float32,
     )
-    offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if layout.offload_params else OffloadPolicy()
+    pin_memory = bool(getattr(layout, "offload_pin_memory", True))
+    offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=pin_memory) if layout.offload_params else OffloadPolicy()
 
     kwargs = dict(mesh=mesh, reshard_after_forward=reshard, mp_policy=mp, offload_policy=offload)
     if "shard_placement_fn" in inspect.signature(fully_shard).parameters:

@@ -34,6 +34,7 @@ class Fsdp2Layout:
     reshard_after_forward: Optional[Union[bool, int]] = True
     shard_plan: Literal["DIM0", "DIM1", "LARGEST"] = "DIM0"
     offload_params: bool = False
+    offload_pin_memory: bool = True
     mp_policy: Literal["bf16", "fp32"] = "bf16"
 
 
@@ -217,6 +218,7 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
     if l.mp_policy not in _ALLOWED_MP:
         raise ValueError(f"{context}.mp_policy must be in {_ALLOWED_MP}; got {l.mp_policy}")
     l.offload_params = bool(l.offload_params)
+    l.offload_pin_memory = bool(l.offload_pin_memory)
     return l
 
 
