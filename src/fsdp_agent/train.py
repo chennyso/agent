@@ -17,11 +17,12 @@ from fsdp_agent.fsdp_apply import apply_strategy
 from fsdp_agent.dataloaders import build_synthetic_loader
 from fsdp_agent.dataset_stats import DatasetStats
 from fsdp_agent.metrics_utils import score_strategy
-from fsdp_agent.model_introspection import extract_transformer_layers
+from fsdp_agent.model_introspection import analyze_model_anatomy, extract_transformer_layers
 
 _MIN_STEP_TIME_MS = 1e-3
 _CURRENT_STAGE = "init"
 _LAST_STATIC_LAYER_STATS: Dict[str, Dict[str, float]] = {}
+_LAST_MODEL_ANATOMY: Dict[str, Any] = {}
 
 
 def _set_stage(stage: str) -> None:
@@ -40,6 +41,15 @@ def _set_last_static_layer_stats(stats: Dict[str, Dict[str, float]]) -> None:
 
 def get_last_static_layer_stats() -> Dict[str, Dict[str, float]]:
     return _LAST_STATIC_LAYER_STATS
+
+
+def _set_last_model_anatomy(anatomy: Dict[str, Any]) -> None:
+    global _LAST_MODEL_ANATOMY
+    _LAST_MODEL_ANATOMY = anatomy
+
+
+def get_last_model_anatomy() -> Dict[str, Any]:
+    return _LAST_MODEL_ANATOMY
 
 
 def _is_rank0() -> bool:
@@ -72,22 +82,46 @@ def build_optimizer(model: nn.Module, lr: float = 1e-4) -> Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=lr)
 
 
-def _collect_static_layer_stats(layers: nn.ModuleList) -> Dict[str, Dict[str, float]]:
+def _collect_static_layer_stats(layers: nn.ModuleList, world_size: int) -> Dict[str, Dict[str, float]]:
     stats: Dict[str, Dict[str, float]] = {}
+    shard_size = max(int(world_size), 1)
     for idx, layer in enumerate(layers):
         numel = 0
         bytes_total = 0
+        dim0_bytes = 0
+        dim1_bytes = 0
+        any_bytes = 0
         for p in layer.parameters(recurse=True):
             n = int(p.numel())
             numel += n
             try:
-                bytes_total += n * int(p.element_size())
+                bytes_val = n * int(p.element_size())
             except Exception:
-                bytes_total += n * 2
+                bytes_val = n * 2
+            bytes_total += bytes_val
+            if shard_size > 1 and getattr(p, "ndim", 0) >= 1:
+                try:
+                    shape = tuple(int(x) for x in p.shape)
+                except Exception:
+                    shape = ()
+                if shape:
+                    if shape[0] % shard_size == 0:
+                        dim0_bytes += bytes_val
+                    if len(shape) > 1 and shape[1] % shard_size == 0:
+                        dim1_bytes += bytes_val
+                    if any((d % shard_size) == 0 for d in shape):
+                        any_bytes += bytes_val
+        ratio = (float(bytes_total) if bytes_total > 0 else 1.0)
         stats[f"layers.{idx}"] = {
             "param_numel": float(numel),
             "param_bytes": float(bytes_total),
             "param_bytes_mb": float(bytes_total) / (1024.0 * 1024.0),
+            "divisible_dim0_bytes": float(dim0_bytes),
+            "divisible_dim1_bytes": float(dim1_bytes),
+            "divisible_any_bytes": float(any_bytes),
+            "divisible_dim0_ratio": float(dim0_bytes) / ratio,
+            "divisible_dim1_ratio": float(dim1_bytes) / ratio,
+            "divisible_any_ratio": float(any_bytes) / ratio,
         }
     return stats
 
@@ -473,12 +507,14 @@ def run_trial(
     repeats: int = 1,
     mem_limit_gb: float = 70.0,
     profiling: str = "light",
+    seed: Optional[int] = None,
 ) -> Dict:
     """
     执行单策略多次重复，取中位数吞吐，返回最佳一次的详细 metrics（含 trace_summary、MFU）。
     """
     _set_stage("init")
-    set_seeds(0)
+    if seed is not None:
+        set_seeds(int(seed))
     all_runs = []
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     for r in range(repeats):
@@ -488,8 +524,12 @@ def run_trial(
         _set_stage("load_model")
         model = load_model(model_name=model_name)
         layers_static = extract_transformer_layers(model)
-        static_layer_stats = _collect_static_layer_stats(layers_static) if layers_static is not None else {}
+        static_layer_stats = (
+            _collect_static_layer_stats(layers_static, world_size=world_size) if layers_static is not None else {}
+        )
         _set_last_static_layer_stats(static_layer_stats)
+        anatomy = analyze_model_anatomy(model)
+        _set_last_model_anatomy(anatomy)
         _log_rank0("[trial] applying strategy")
         _set_stage("apply_strategy")
         model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
@@ -506,6 +546,7 @@ def run_trial(
             vocab_size=vocab_size,
             seq_len=seq_len,
             length=max(10_000, required_len),
+            seed=seed,
         )
         _log_rank0("[trial] dataloader ready")
 
@@ -566,6 +607,7 @@ def run_trial(
         prof_metrics["loss_std"] = 0.0
         prof_metrics["layer_stats"] = layer_summary
         prof_metrics["layer_stats_static"] = static_layer_stats
+        prof_metrics["model_anatomy"] = anatomy
         # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差（用 median 抵抗偶发抖动/0ms）
         sane = [t for t in step_times_ms if t >= _MIN_STEP_TIME_MS]
         if not sane:

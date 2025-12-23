@@ -1,35 +1,42 @@
 from __future__ import annotations
 
-import math
-from typing import Dict
+from typing import Optional
 
 import torch
-import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 
 
 class SyntheticDataset(Dataset):
-    """可带 seq_len 分布的合成数据集，用于快速 profiling。"""
+    """Synthetic dataset with optional seq_len distribution for quick profiling."""
 
-    def __init__(self, vocab_size: int, seq_len: int, length: int = 10_000, seed: int = 0):
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
-        self.length = length
-        self.generator = torch.Generator().manual_seed(seed)
+    def __init__(self, vocab_size: int, seq_len: int, length: int = 10_000, seed: int | None = None):
+        self.vocab_size = int(vocab_size)
+        self.seq_len = int(seq_len)
+        self.length = int(length)
+        self.generator = torch.Generator()
+        if seed is not None:
+            self.generator.manual_seed(int(seed))
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx):
-        tokens = torch.randint(low=0, high=self.vocab_size, size=(self.seq_len,), generator=self.generator)
-        labels = tokens.clone()
-        return {"input_ids": tokens, "labels": labels}
+    def __getitem__(self, idx: int):
+        input_ids = torch.randint(
+            low=0,
+            high=self.vocab_size,
+            size=(self.seq_len,),
+            generator=self.generator,
+        )
+        labels = input_ids.clone()
+        return {"input_ids": input_ids, "labels": labels}
 
 
-def build_synthetic_loader(train_hyper: Dict, vocab_size: int, seq_len: int, length: int = 10_000):
-    batch = train_hyper.get("global_batch_size", 1)
-    world = dist.get_world_size() if dist.is_initialized() else 1
-    per_rank_batch = math.ceil(batch / world)
-    dataset = SyntheticDataset(vocab_size=vocab_size, seq_len=seq_len, length=length)
-    # drop_last=False to avoid silently yielding 0 batches when dataset length < batch_size
-    return DataLoader(dataset, batch_size=per_rank_batch, shuffle=True, drop_last=False, pin_memory=True)
+def build_synthetic_loader(
+    vocab_size: int,
+    seq_len: int,
+    batch_size: int,
+    length: int = 10_000,
+    seed: int | None = None,
+) -> DataLoader:
+    dataset = SyntheticDataset(vocab_size=vocab_size, seq_len=seq_len, length=length, seed=seed)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True)

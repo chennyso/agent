@@ -4,6 +4,7 @@ from enum import Enum
 
 
 class Phase(str, Enum):
+    FEASIBILITY = "FEASIBILITY"
     BASELINE = "BASELINE"
     MESH = "MESH"
     GROUPING = "GROUPING"
@@ -15,6 +16,8 @@ class Phase(str, Enum):
 def next_phase(current: Phase, improved: bool) -> Phase:
     if improved:
         return current
+    if current == Phase.FEASIBILITY:
+        return Phase.FEASIBILITY
     if current == Phase.BASELINE:
         return Phase.MESH
     if current == Phase.MESH:

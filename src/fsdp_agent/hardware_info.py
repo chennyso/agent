@@ -7,19 +7,19 @@ from typing import List, Optional
 
 @dataclass
 class HardwareInfo:
-    """硬件/拓扑摘要，供 Agent 提示词和 mesh 选择使用。"""
+    """Hardware/topology summary for prompts and mesh selection."""
 
     num_nodes: int = 1
     gpus_per_node: int = 4
     gpu_name: str = "Unknown"
     memory_gb: float = 0.0
-    interconnect: str = "NVLink"  # 可选 NVLink/PCIe/InfiniBand
+    interconnect: str = "NVLink"  # NVLink/PCIe/InfiniBand
     mesh_shape: Optional[List[int]] = None
     notes: str = ""
 
 
 def detect_hardware() -> HardwareInfo:
-    """尽力探测本机 GPU 信息；失败时返回占位。"""
+    """Best-effort local GPU detection; returns a placeholder on failure."""
     try:
         import torch
 

@@ -5,8 +5,8 @@ from typing import Dict
 
 def estimate_activation_mem_bytes(train_hyper: Dict, dataset_stats: Dict, model_cfg: Dict) -> int:
     """
-    粗略估算激活显存，避免明显越界的策略。
-    非精确，只做提前拒绝：batch * seq_len * hidden_size * num_layers * 2 bytes(bf16)
+    Rough activation memory estimate to reject obviously unsafe strategies.
+    Formula: batch * seq_len * hidden_size * num_layers * 2 bytes (bf16).
     """
     batch = train_hyper.get("global_batch_size", 1)
     seq = int(train_hyper.get("seq_len") or dataset_stats.get("seq_len_p90", 2048))
@@ -18,7 +18,7 @@ def estimate_activation_mem_bytes(train_hyper: Dict, dataset_stats: Dict, model_
 
 
 def score_strategy(metrics: Dict, mem_limit_bytes: int, weights: Dict = None) -> float:
-    """多目标打分（去数据分布影响）：有效 tokens 吞吐 + OOM margin + 通信占比惩罚。"""
+    """Multi-objective score: throughput + headroom bonus - comm ratio penalty."""
     weights = weights or {"comm": 0.5, "headroom": 0.02}
     if metrics.get("oom", False):
         return float("-inf")

@@ -22,12 +22,13 @@ from fsdp_agent.config import (
 )
 from fsdp_agent.dataset_stats import DatasetStats, load_stats_from_file
 from fsdp_agent.hardware_info import detect_hardware, load_hardware_info
+from fsdp_agent.metrics_utils import score_strategy
 from fsdp_agent.orienter import derive_semantic_state
 from fsdp_agent.phases import Phase, next_phase
 
 
 def _strategy_hash(strategy: Fsdp2Strategy) -> str:
-    """使用语义归一化后的哈希，避免等价区间扰动导致重复试验。"""
+    """Use semantic-normalized hash to avoid duplicate trials from equivalent configs."""
     return strategy.semantic_hash()
 
 
@@ -44,7 +45,7 @@ def _supports_merged_grouping() -> bool:
 
 
 def _infer_num_hidden_layers(model_name: str) -> Optional[int]:
-    """只读模型 config，不加载权重，用于生成更合理的 seed。"""
+    """Read model config only to infer layer count; no weights loaded."""
     try:
         from transformers import AutoConfig
 
@@ -59,7 +60,7 @@ def _infer_num_hidden_layers(model_name: str) -> Optional[int]:
 
 
 def _pick_nontrivial_divisor(n: int) -> Optional[int]:
-    """给 reshard_after_forward(int) 选一个合法值：必须是 n 的非平凡因子（排除 1 和 n）。"""
+    """Pick a valid reshard_after_forward(int): non-trivial divisor of n (exclude 1 and n)."""
     n = int(n)
     if n < 4:
         return None
@@ -70,11 +71,11 @@ def _pick_nontrivial_divisor(n: int) -> Optional[int]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="FSDP2 Agent（Controller + Judge/Coder + Executor）")
-    p.add_argument("--rounds", type=int, default=5, help="LLM 迭代轮数（不含种子）")
-    p.add_argument("--nproc", type=int, default=4, help="每节点 GPU 数")
-    p.add_argument("--mem-limit-gb", type=float, default=70.0, help="显存上限（过滤策略）")
-    p.add_argument("--model-name", type=str, required=True, help="HF Causal LM 名称或本地路径")
+    p = argparse.ArgumentParser(description="FSDP2 Agent (Controller + Judge/Coder + Executor)")
+    p.add_argument("--rounds", type=int, default=5, help="LLM rounds (excluding seeds).")
+    p.add_argument("--nproc", type=int, default=4, help="GPUs per node.")
+    p.add_argument("--mem-limit-gb", type=float, default=70.0, help="GPU memory limit for filtering.")
+    p.add_argument("--model-name", type=str, required=True, help="HF Causal LM name or local path.")
     p.add_argument("--global-batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--vocab-size", type=int, default=151936)
@@ -85,37 +86,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     p.add_argument("--llm-temperature", type=float, default=0.2)
     p.add_argument("--objective", type=str, default="throughput", choices=["throughput", "latency"])
-    p.add_argument("--max-history", type=int, default=6, help="提示中保留的最近 trial 数")
-    p.add_argument("--stop-drop", type=float, default=0.03, help="连续下降阈值，触发提前停止")
-    p.add_argument("--dataset-stats-file", type=str, default=None, help="数据集统计 JSON")
-    p.add_argument("--repeats", type=int, default=1, help="每个策略重复运行次数")
-    p.add_argument("--hardware-json", type=str, default=None, help="手动硬件拓扑 JSON，覆盖自动探测")
-    p.add_argument("--allow-mesh", action="store_true", help="允许探索 2D/HSDP 等 mesh 变化")
-    p.add_argument("--allow-offload", action="store_true", help="允许探索 CPU 参数 offload")
-    p.add_argument("--include-offload-seed", action="store_true", help="加入 CPU offload 种子（需要 --allow-offload）")
-    p.add_argument("--enable-batch-probe", action="store_true", help="满足 gate 条件后进入 Batch Probing Phase")
+    p.add_argument("--max-history", type=int, default=6, help="Number of recent trials in the prompt.")
+    p.add_argument("--stop-drop", type=float, default=0.03, help="Early stop on consecutive drops.")
+    p.add_argument("--dataset-stats-file", type=str, default=None, help="Dataset stats JSON.")
+    p.add_argument("--repeats", type=int, default=1, help="Repeat count per strategy.")
+    p.add_argument("--hardware-json", type=str, default=None, help="Override hardware info JSON.")
+    p.add_argument("--allow-mesh", action="store_true", help="Allow 2D/HSDP mesh changes.")
+    p.add_argument("--allow-2d-single-node", action="store_true", help="Allow 2D mesh on single node.")
+    p.add_argument("--allow-offload", action="store_true", help="Allow CPU parameter offload.")
+    p.add_argument("--include-offload-seed", action="store_true", help="Include CPU offload seed (requires --allow-offload).")
+    p.add_argument("--use-seeds", action="store_true", help="Enable preset seed strategies (default off).")
+    p.add_argument("--enable-batch-probe", action="store_true", help="Enter Batch Probing Phase when gated.")
     p.add_argument(
         "--batch-probe-sizes",
         type=str,
         default="",
-        help="Batch Probing 的 global_batch_size 列表（逗号分隔，空则自动生成）",
+        help="Batch probing global batch sizes (comma-separated).",
     )
-    p.add_argument("--batch-probe-plateau-window", type=int, default=3, help="吞吐平台期判定窗口")
-    p.add_argument("--batch-probe-plateau-tol", type=float, default=0.02, help="平台期判定相对阈值（默认 2%）")
-    p.add_argument("--batch-probe-min-headroom-ratio", type=float, default=0.3, help="进入 batch probing 的最小显存余量比例")
+    p.add_argument("--batch-probe-plateau-window", type=int, default=3, help="Throughput plateau window.")
+    p.add_argument("--batch-probe-plateau-tol", type=float, default=0.02, help="Plateau tolerance (relative).")
+    p.add_argument("--batch-probe-min-headroom-ratio", type=float, default=0.3, help="Headroom ratio gate.")
     p.add_argument(
         "--llm-endpoint",
         type=str,
         default="http://10.100.1.93:12365/v1/chat/completions",
-        help="LLM 服务 HTTP 接口",
+        help="LLM HTTP endpoint.",
     )
     p.add_argument("--show-progress", action="store_true", help="Stream trial stdout/stderr for live progress.")
     p.add_argument("--log-llm", action="store_true", help="Print LLM prompts and responses each round.")
+    p.add_argument("--force-heavy-every", type=int, default=0, help="Force a heavy profile every N rounds.")
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed (default: no manual seeding).")
     p.add_argument(
-        "--force-heavy-every",
-        type=int,
-        default=0,
-        help="Force a heavy profile every N rounds (0 disables).",
+        "--shard-plan-compat-threshold",
+        type=float,
+        default=0.2,
+        help="Min compat ratio for shard_plan changes (DIM1/LARGEST).",
     )
     return p.parse_args()
 
@@ -126,7 +131,7 @@ def _hardware_summary(hw) -> str:
 
 
 def call_llm(prompt: str, system_prompt: str, model: str, temperature: float, endpoint: str) -> str:
-    """调用内网 LLM HTTP 接口（兼容 openai chat/completions 风格）。"""
+    """Call internal LLM HTTP endpoint (OpenAI-style chat/completions)."""
     payload = {
         "model": model,
         "messages": [
@@ -146,7 +151,7 @@ def call_llm(prompt: str, system_prompt: str, model: str, temperature: float, en
 
 
 def robust_parse_json(text: str) -> Dict:
-    """尽量容错地从 LLM 回复中提取 JSON。"""
+    """Best-effort JSON extraction from LLM output."""
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```", "", text)
     start = text.find("{")
@@ -160,18 +165,18 @@ def robust_parse_json(text: str) -> Dict:
 
         return ast.literal_eval(text)
     except Exception as e:
-        raise ValueError(f"无法解析 JSON: {e}, 原始内容片段: {text[:200]}")
+        raise ValueError(f"Unable to parse JSON: {e}, raw snippet: {text[:200]}")
 
 
 def _parse_error(stderr: str) -> str:
-    """粗粒度解析错误，给 LLM 更多上下文。"""
+    """Coarse error parsing for LLM context."""
     if "CUDA out of memory" in stderr:
         match = re.search(r"Tried to allocate ([0-9\.]+) (MiB|GiB)", stderr)
         return f"CUDA OOM: {match.group(0) if match else 'unknown alloc size'}"
     if "NCCL" in stderr and ("Watchdog" in stderr or "timed out" in stderr):
-        return "NCCL Timeout (可能 OOM 或死锁)"
+        return "NCCL timeout (possible OOM or deadlock)"
     if "illegal memory access" in stderr:
-        return "CUDA Illegal Access (检查 sharding 策略)"
+        return "CUDA illegal access (check sharding strategy)"
     tail = stderr[-200:] if stderr else ""
     return f"Runtime Error: {tail}"
 
@@ -356,6 +361,9 @@ _ACTION_SYNONYMS = {
     "mesh_change": "change_mesh",
     "offload": "enable_cpu_offload",
     "enable_offload": "enable_cpu_offload",
+    "layer_override_offload": "enable_cpu_offload",
+    "layerwise_offload": "enable_cpu_offload",
+    "layer_offload": "enable_cpu_offload",
     "shard_plan": "shard_plan",
 }
 
@@ -442,6 +450,21 @@ def _is_memory_critical(semantic_state: Dict) -> bool:
     if semantic_state.get("last_oom"):
         return True
     return False
+
+
+def _apply_feasibility_score(metrics: Dict) -> None:
+    if metrics.get("oom"):
+        metrics["score"] = float("-inf")
+        metrics["score_mode"] = "feasibility"
+        return
+    mem = float(metrics.get("max_mem_bytes") or 0.0)
+    metrics["score"] = -mem if mem > 0 else float("-inf")
+    metrics["score_mode"] = "feasibility"
+
+
+def _apply_throughput_score(metrics: Dict, mem_limit_gb: float) -> None:
+    metrics["score"] = score_strategy(metrics, mem_limit_bytes=int(mem_limit_gb * 1024**3))
+    metrics["score_mode"] = "throughput"
 
 
 def _uses_reshard_false(strategy: Fsdp2Strategy) -> bool:
@@ -549,6 +572,53 @@ def _extract_layer_indices(names: List[str]) -> List[int]:
     return out
 
 
+def _top_layers_by_param_bytes(layer_stats: Dict[str, Dict], topk: int = 4) -> List[int]:
+    scored: List[tuple[float, int]] = []
+    for name, st in (layer_stats or {}).items():
+        idx = None
+        try:
+            parts = str(name).replace("[", ".").replace("]", "").split(".")
+            for p in reversed(parts):
+                if p.isdigit():
+                    idx = int(p)
+                    break
+        except Exception:
+            idx = None
+        if idx is None:
+            continue
+        bytes_mb = st.get("param_bytes_mb")
+        if bytes_mb is None:
+            bytes_val = st.get("param_bytes") or 0.0
+            try:
+                bytes_mb = float(bytes_val) / (1024.0 * 1024.0)
+            except Exception:
+                bytes_mb = 0.0
+        try:
+            scored.append((float(bytes_mb), idx))
+        except Exception:
+            continue
+    scored.sort(reverse=True)
+    return [idx for _, idx in scored[: max(int(topk), 1)]]
+
+
+def _build_layer_offload_seed(base: Fsdp2Strategy, layer_ids: List[int]) -> Fsdp2Strategy:
+    layout = Fsdp2Layout(
+        mesh_topology=base.global_layout.mesh_topology,
+        sharding_strategy=base.global_layout.sharding_strategy,
+        reshard_after_forward=base.global_layout.reshard_after_forward,
+        shard_plan=base.global_layout.shard_plan,
+        offload_params=True,
+        offload_pin_memory=base.global_layout.offload_pin_memory,
+        mp_policy=base.global_layout.mp_policy,
+    )
+    override = LayerOverride(start_layer=None, end_layer=None, layers=layer_ids, layout=layout)
+    return Fsdp2Strategy(
+        global_layout=base.global_layout,
+        layer_overrides=[override],
+        grouping=GroupingConfig(mode=base.grouping.mode, merge_factor=base.grouping.merge_factor),
+    )
+
+
 def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> None:
     if not candidate.layer_overrides:
         return
@@ -570,6 +640,110 @@ def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> No
         raise ValueError("layer_overrides must overlap observed top_targets; avoid arbitrary indices")
 
 
+def _enforce_feasibility_gate(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> None:
+    if candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
+        raise ValueError("feasibility_gate: change_mesh is forbidden")
+    if candidate.grouping != baseline.grouping:
+        raise ValueError("feasibility_gate: grouping changes are forbidden")
+    if candidate.global_layout.shard_plan != baseline.global_layout.shard_plan:
+        raise ValueError("feasibility_gate: shard_plan changes are forbidden")
+    if candidate.global_layout.reshard_after_forward != baseline.global_layout.reshard_after_forward:
+        raise ValueError("feasibility_gate: reshard_after_forward changes are forbidden")
+    if not _strategy_uses_offload(candidate):
+        raise ValueError("feasibility_gate: offload must be enabled (global or layerwise)")
+    for o in candidate.layer_overrides:
+        if o.layout.mesh_topology != baseline.global_layout.mesh_topology:
+            raise ValueError("feasibility_gate: layer override mesh_topology must match baseline")
+        if o.layout.shard_plan != baseline.global_layout.shard_plan:
+            raise ValueError("feasibility_gate: layer override shard_plan must match baseline")
+        if o.layout.reshard_after_forward != baseline.global_layout.reshard_after_forward:
+            raise ValueError("feasibility_gate: layer override reshard_after_forward must match baseline")
+
+
+def _enforce_semantic_noop(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> None:
+    if not _strategy_actions(candidate, baseline):
+        raise ValueError("strategy is a semantic no-op; modify at least one knob")
+
+
+def _enforce_layer_ranges(candidate: Fsdp2Strategy, num_layers_hint: Optional[int]) -> None:
+    if not num_layers_hint:
+        return
+    max_layers = int(num_layers_hint)
+    for o in candidate.layer_overrides:
+        if o.layers:
+            if any(idx < 0 or idx >= max_layers for idx in o.layers):
+                raise ValueError("layer_overrides contain indices outside model range")
+        if o.start_layer is not None and o.end_layer is not None:
+            if o.end_layer <= 0 or o.start_layer >= max_layers:
+                raise ValueError("layer_overrides range does not intersect model range")
+            if o.start_layer < 0 or o.end_layer > max_layers:
+                raise ValueError("layer_overrides range exceeds model bounds")
+
+
+def _enforce_named_override_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> None:
+    if not candidate.named_overrides:
+        return
+    anatomy = semantic_state.get("model_anatomy") or {}
+    comm = anatomy.get("comm_hotspots") or {}
+    latency = anatomy.get("latency_hotspots") or {}
+    allowed_keys = set((comm.get("named_override_keys") or []) + (latency.get("named_override_keys") or []))
+    allowed_paths = set((comm.get("paths") or []) + (latency.get("paths") or []))
+    if not allowed_keys and not allowed_paths:
+        return
+    for key in candidate.named_overrides.keys():
+        if key not in allowed_keys and key not in allowed_paths:
+            raise ValueError("named_overrides must use model_anatomy named_override_keys or paths")
+
+
+def _enforce_mesh_validity(candidate: Fsdp2Strategy, hardware: object, *, allow_2d_single_node: bool, nproc: int) -> None:
+    if candidate.global_layout.mesh_topology != "2D":
+        return
+    try:
+        num_nodes = int(getattr(hardware, "num_nodes", 1) or 1)
+    except Exception:
+        num_nodes = 1
+    if num_nodes <= 1 and not allow_2d_single_node:
+        raise ValueError("2D mesh requires multi-node; pass --allow-2d-single-node to override")
+    world_size = max(int(nproc), 1)
+    side = int(math.isqrt(world_size))
+    if side * side != world_size and (world_size < 4 or world_size % 2 != 0):
+        raise ValueError("2D mesh requires world_size square or even >=4")
+
+
+def _enforce_shard_plan_compat(
+    candidate: Fsdp2Strategy,
+    baseline: Fsdp2Strategy,
+    semantic_state: Dict,
+    *,
+    threshold: float,
+) -> None:
+    if _shard_plan_signature(candidate) == _shard_plan_signature(baseline):
+        return
+    compat = semantic_state.get("shard_plan_compat") or {}
+    if not compat:
+        return
+
+    def _ratio(plan: str) -> Optional[float]:
+        if plan == "DIM0":
+            return compat.get("dim0_ratio")
+        if plan == "DIM1":
+            return compat.get("dim1_ratio")
+        if plan == "LARGEST":
+            return compat.get("largest_ratio")
+        return None
+
+    layouts = [("global", candidate.global_layout)]
+    layouts += [("layer", o.layout) for o in candidate.layer_overrides]
+    layouts += [("named", v) for _, v in candidate.named_overrides.items()]
+    for scope, layout in layouts:
+        plan = layout.shard_plan
+        if plan not in {"DIM1", "LARGEST"}:
+            continue
+        ratio = _ratio(plan)
+        if ratio is not None and ratio < float(threshold):
+            raise ValueError(f"shard_plan {plan} has low divisibility ({ratio:.2f}) for {scope} scope")
+
+
 def _goal_mode(semantic_state: Dict, upper_bound_gap: Dict) -> str:
     headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
     gap_ratio = float(upper_bound_gap.get("throughput_gap_ratio") or 0.0)
@@ -578,6 +752,59 @@ def _goal_mode(semantic_state: Dict, upper_bound_gap: Dict) -> str:
     if gap_ratio >= 0.02 and headroom_ratio >= 0.15:
         return "fastest"
     return "min_mem_at_perf"
+
+
+def _triage_bottleneck(semantic_state: Dict, hardware: object) -> str:
+    if _is_memory_critical(semantic_state):
+        return "MEMORY_CRITICAL"
+    comm_share = (semantic_state.get("comm_estimator") or {}).get("comm_share")
+    idle_reason = (semantic_state.get("utilization_estimator") or {}).get("idle_reason")
+    kernel_frag = (semantic_state.get("utilization_estimator") or {}).get("kernel_fragmentation")
+    try:
+        num_nodes = int(getattr(hardware, "num_nodes", 1) or 1)
+    except Exception:
+        num_nodes = 1
+    if isinstance(comm_share, (int, float)) and comm_share >= 0.35:
+        return "COMM_BOUND_INTER" if num_nodes > 1 else "COMM_BOUND_INTRA"
+    if kernel_frag is not None and float(kernel_frag) >= 0.1:
+        return "KERNEL_FRAGMENTED"
+    if idle_reason in {"comm_wait", "cpu_wait", "unknown_wait"}:
+        return "SCHEDULING_BOUND"
+    return "COMPUTE_BOUND"
+
+
+def _action_mapping_for_triage(triage: str, semantic_state: Dict) -> List[Dict[str, str]]:
+    comm_est = semantic_state.get("comm_estimator") or {}
+    util = semantic_state.get("utilization_estimator") or {}
+    targets = semantic_state.get("offload_targets") or {}
+    comm_keys = targets.get("named_override_keys") or []
+    layer_ids = targets.get("layer_ids") or []
+    mapping: Dict[str, List[Dict[str, str]]] = {
+        "MEMORY_CRITICAL": [
+            {"action": "enable_cpu_offload", "path": "memory", "note": "reduce resident params/optimizer states"},
+            {"action": "enable_cpu_offload", "path": "memory", "note": f"layerwise offload for layers {layer_ids}"},
+            {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
+        ],
+        "COMM_BOUND_INTER": [
+            {"action": "change_mesh", "path": "comm", "note": "try 2D mesh to keep collectives intra-node"},
+            {"action": "layer_override_reshard", "path": "comm", "note": f"reshard=False for {comm_keys}"},
+        ],
+        "COMM_BOUND_INTRA": [
+            {"action": "layer_override_reshard", "path": "comm", "note": f"reshard=False for {comm_keys}"},
+            {"action": "change_grouping", "path": "comm", "note": "increase merge_factor to reduce collectives"},
+        ],
+        "SCHEDULING_BOUND": [
+            {"action": "change_grouping", "path": "overlap", "note": "adjust merge_factor to reduce kernel launch overhead"},
+            {"action": "layer_override_reshard", "path": "overlap", "note": "selective reshard to improve overlap"},
+        ],
+        "KERNEL_FRAGMENTED": [
+            {"action": "change_grouping", "path": "kernel", "note": "increase merge_factor to reduce fragmentation"},
+        ],
+        "COMPUTE_BOUND": [
+            {"action": "no_change", "path": "compute", "note": "avoid comm/memory knobs; consider compute optimizations"},
+        ],
+    }
+    return mapping.get(triage, [])
 
 
 def _anchor_view(entry: Optional[Dict]) -> Optional[Dict]:
@@ -624,63 +851,73 @@ def _last_oom_info(history: List[Dict]) -> Optional[Dict]:
     return None
 
 
-JUDGE_SYSTEM = (
-    "You are a physics-informed reasoning engine for PyTorch FSDP2 training.\n"
-    "You do NOT propose configurations.\n"
-    "You do NOT make execution decisions.\n"
-    "Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.\n"
-    "Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.\n"
-    "Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.\n"
-    "GoalMode is in SemanticState.goal_mode: fastest|min_mem_at_perf|min_mem.\n"
-    "If bottleneck==MEMORY or headroom_ratio is low, do not forbid enable_cpu_offload or layer_override_reshard; include them in allowed_actions when permitted by hard_constraints.\n"
-    "If recent_trials include OOM (see last_oom), treat it as memory-critical and prioritize memory-saving actions.\n"
-    "Evidence cues (non-binding):\n"
-    "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
-    "- merged grouping can improve overlap and reduce collective jitter.\n"
-    "- shard_plan='LARGEST' may reduce shard imbalance for large params.\n"
-    "- 2D mesh is primarily for multi-node; 1D is safer for single node.\n"
-    "Output format (strict):\n"
-    "Bottleneck:\nTarget:\nHypothesis:\nExpected Effect:\nRisk Assessment:\n"
-    "Then include a JSON object in a ```json code fence with key \"judge_verdict\" and fields:\n"
-    "- primary_bottleneck (string)\n"
-    "- memory_risk_level (low|medium|high)\n"
-    "- allowed_actions (list)\n"
-    "- forbidden_actions (list)\n"
-)
+JUDGE_SYSTEM = """You are a physics-informed reasoning engine for PyTorch FSDP2 training.
+You do NOT propose configurations.
+You do NOT make execution decisions.
+Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.
+If Phase==FEASIBILITY, prioritize making the run non-OOM. Only recommend offload (global or layerwise) and avoid reshard/grouping/shard_plan/mesh changes.
+Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.
+Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.
+GoalMode is in SemanticState.goal_mode: fastest|min_mem_at_perf|min_mem.
+BottleneckTriage is in SemanticState.bottleneck_triage (MEMORY_CRITICAL/COMM_BOUND_INTER/COMM_BOUND_INTRA/SCHEDULING_BOUND/KERNEL_FRAGMENTED/COMPUTE_BOUND).
+ActionMapping is in SemanticState.action_mapping (priors for knob choices).
+If bottleneck==MEMORY or headroom_ratio is low, do not forbid enable_cpu_offload or layer_override_reshard; include them in allowed_actions when permitted by hard_constraints.
+If recent_trials include OOM (see last_oom), treat it as memory-critical and prioritize memory-saving actions.
+ModelAnatomy lists comm_hotspots/latency_hotspots and named_override_keys for named_overrides.
+If shard_plan_compat indicates low divisibility, avoid shard_plan changes.
+Evidence cues (non-binding):
+- reshard_after_forward=False reduces backward all-gathers but increases memory.
+- merged grouping can improve overlap and reduce collective jitter.
+- shard_plan='LARGEST' may reduce shard imbalance for large params.
+- 2D mesh is primarily for multi-node; 1D is safer for single node.
+Output format (strict):
+Bottleneck:
+Target:
+Hypothesis:
+Expected Effect:
+Risk Assessment:
+Then include a JSON object in a ```json code fence with key "judge_verdict" and fields:
+- primary_bottleneck (string)
+- memory_risk_level (low|medium|high)
+- allowed_actions (list)
+- forbidden_actions (list)
+"""
 
-CODER_SYSTEM = (
-    "You are an FSDP2 experiment designer.\n"
-    "You do NOT search globally.\n"
-    "You test ONE hypothesis at a time.\n"
-    "Rules:\n"
-    "- Modify at most TWO atomic controls.\n"
-    "- Prefer layer_overrides / named_overrides / grouping.\n"
-    "- Respect forbidden_in_phase.\n"
-    "- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.\n"
-    "- If using layer_overrides, target layers must come from SemanticState.top_targets; avoid arbitrary index ranges.\n"
-    "- If no layer_stats/top_targets are available, do not use layer_overrides.\n"
-    "- Use integer layer indices in layer_overrides (e.g., 22), not strings like 'layers.22'.\n"
-    "- Use UpperBoundGap to select the smallest-risk action that meaningfully closes the gap.\n"
-    "- If goal_mode=fastest, prioritize throughput even if memory rises modestly.\n"
-    "- If goal_mode=min_mem_at_perf, keep throughput within 1% of baseline while reducing max memory.\n"
-    "- If goal_mode=min_mem, prioritize headroom and avoid reshard_after_forward=False.\n"
-    "Evidence cues (non-binding):\n"
-    "- reshard_after_forward=False reduces backward all-gathers but increases memory.\n"
-    "- merged grouping can improve overlap and reduce collective jitter.\n"
-    "- shard_plan='LARGEST' may reduce shard imbalance for large params.\n"
-    "- 2D mesh is primarily for multi-node; 1D is safer for single node.\n"
-    "- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.\n"
-    "Schema fields:\n"
-    "- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, offload_pin_memory, mp_policy\n"
-    "- layer_overrides: start_layer/end_layer or layers[] + layout\n"
-    "- named_overrides: substring -> layout\n"
-    "- grouping: {mode: block|merged, merge_factor>=1}\n"
-    "If supports_merged_grouping=false, do not use grouping.mode='merged'.\n"
-    "You may set offload_params/offload_pin_memory at layer_overrides or named_overrides for targeted CPU offload.\n"
-    "Prefer targeted layer_overrides over setting global reshard_after_forward=False for all layers.\n"
-    "Global reshard_after_forward=False is an extreme trade-off (high determinism/low comm/high memory risk). Only use it when headroom is clearly ample; otherwise prefer targeted overrides or grouping.\n"
-    "Put the JSON inside a single ```json code fence.\n"
-)
+CODER_SYSTEM = """You are an FSDP2 experiment designer.
+You do NOT search globally.
+You test ONE hypothesis at a time.
+Rules:
+- Modify at most TWO atomic controls.
+- Prefer layer_overrides / named_overrides / grouping.
+- Respect forbidden_in_phase.
+- Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.
+- If using layer_overrides, target layers must come from SemanticState.top_targets; avoid arbitrary index ranges.
+- If no layer_stats/top_targets are available, do not use layer_overrides.
+- Use integer layer indices in layer_overrides (e.g., 22), not strings like 'layers.22'.
+- Use UpperBoundGap to select the smallest-risk action that meaningfully closes the gap.
+- If goal_mode=fastest, prioritize throughput even if memory rises modestly.
+- If goal_mode=min_mem_at_perf, keep throughput within 1% of baseline while reducing max memory.
+- If goal_mode=min_mem, prioritize headroom and avoid reshard_after_forward=False.
+- If Phase==FEASIBILITY, only enable offload (global or layerwise) and do not change mesh/grouping/reshard/shard_plan.
+- Use SemanticState.offload_targets.layer_ids for layerwise offload (top-mem layers).
+- Use SemanticState.model_anatomy.*.named_override_keys for named_overrides (comm/latency hotspots).
+- If shard_plan_compat is low, do not change shard_plan.
+Evidence cues (non-binding):
+- reshard_after_forward=False reduces backward all-gathers but increases memory.
+- merged grouping can improve overlap and reduce collective jitter.
+- shard_plan='LARGEST' may reduce shard imbalance for large params.
+- 2D mesh is primarily for multi-node; 1D is safer for single node.
+- Output: short rationale (2-3 sentences) + ONE valid Fsdp2Strategy JSON.
+Schema fields:
+- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy
+- layer_overrides: start_layer/end_layer or layers[] + layout
+- named_overrides: substring -> layout
+- grouping: {mode: block|merged, merge_factor>=1}
+If supports_merged_grouping=false, do not use grouping.mode='merged'.
+Prefer targeted layer_overrides over setting global reshard_after_forward=False for all layers.
+Global reshard_after_forward=False is an extreme trade-off (high determinism/low comm/high memory risk). Only use it when headroom is clearly ample; otherwise prefer targeted overrides or grouping.
+Put the JSON inside a single ```json code fence.
+"""
 
 
 def build_judge_prompt(
@@ -735,11 +972,15 @@ def _derive_failure_feedback(metrics: Dict) -> Optional[str]:
     if metrics.get("error_msg"):
         return str(metrics["error_msg"])
     if metrics.get("error") == "duplicate_strategy":
-        return f"策略与历史重复 (hash={metrics.get('strategy_hash')}); 请修改 layer_overrides 或 reshard 方案。"
+        return f"Duplicate strategy (hash={metrics.get('strategy_hash')}); modify layer_overrides or reshard policy."
     if metrics.get("error"):
         return str(metrics["error"])
     if metrics.get("oom"):
-        return "CUDA OOM：请降低并行粒度或增大 reshard_after_forward 的延迟。"
+        layer_stats = metrics.get("layer_stats") or metrics.get("layer_stats_static") or {}
+        top_layers = _top_layers_by_param_bytes(layer_stats, topk=4) if layer_stats else []
+        if top_layers:
+            return f"CUDA OOM: enable offload (global or layers {top_layers}) and avoid reshard_after_forward=False."
+        return "CUDA OOM: enable CPU offload (global or layerwise) and avoid reshard_after_forward=False."
     return None
 
 
@@ -797,6 +1038,8 @@ def _run_trial_subprocess(
         "--profile",
         profile,
     ]
+    if getattr(args, "seed", None) is not None:
+        cmd.extend(["--seed", str(args.seed)])
 
     print(f"[controller] running trial {trial_id} via torchrun")
     if getattr(args, "show_progress", False):
@@ -855,7 +1098,7 @@ def _run_trial_subprocess(
     metrics["trial_id"] = trial_id
     metrics["mem_limit_gb"] = args.mem_limit_gb
     metrics.setdefault("trial_context", {})
-    # controller 侧也写一份，方便在 subprocess 异常时仍能对齐
+    # Also write context fields on controller side for subprocess failures.
     metrics["trial_context"].setdefault("requested_global_batch_size", gbs)
     if metrics.get("error") and not metrics.get("error_msg"):
         metrics["error_msg"] = str(metrics["error"])
@@ -894,7 +1137,7 @@ def _enforce_phase_constraints(
     allow_offload: bool,
     memory_critical: bool,
 ) -> None:
-    # 硬门禁：按 phase 限制动作，避免空间爆炸
+    # Hard gate: restrict actions by phase to avoid search explosion.
     if not allow_mesh and candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
         raise ValueError("mesh is frozen (allow_mesh=false)")
     if phase == Phase.BASELINE:
@@ -902,7 +1145,7 @@ def _enforce_phase_constraints(
             raise ValueError("change_mesh is forbidden_in_phase")
     if not allow_offload and (not _strategy_uses_offload(baseline)) and _strategy_uses_offload(candidate):
         raise ValueError("offload is frozen (allow_offload=false)")
-    # 早期阶段禁止“引入”offload，但不阻止在已启用 offload 的 anchor 上做局部微调
+    # Early phases forbid introducing offload, but allow tweaks if baseline already uses offload.
     if (
         phase != Phase.OFFLOAD
         and (not _strategy_uses_offload(baseline))
@@ -934,8 +1177,8 @@ def main() -> None:
 
     phase = Phase.BASELINE
 
-    # Phase 0：固定 baseline（不交给 LLM）
-    # 1D + 层级 wrap（block）+ 非 root reshard=True / root reshard=False
+    # Phase 0: fixed baseline (not LLM-driven).
+    # 1D + block wrapping + non-root reshard=True / root reshard=False (auto).
     gl = Fsdp2Layout(mesh_topology="1D", reshard_after_forward=None)
     baseline = Fsdp2Strategy(
         global_layout=gl,
@@ -950,6 +1193,11 @@ def main() -> None:
     baseline_metrics = _run_trial_subprocess(args, baseline, trial_id=trial_id, profile="light")
     baseline_metrics["config_name"] = "baseline_default"
     baseline_metrics["strategy_hash"] = baseline_hash
+    feasibility_mode = bool(baseline_metrics.get("oom"))
+    if feasibility_mode:
+        _apply_feasibility_score(baseline_metrics)
+        phase = Phase.FEASIBILITY
+        print("[controller] baseline OOM -> enter FEASIBILITY phase")
     history.append(baseline_metrics)
     seen_hashes.add(baseline_hash)
     hash_to_strategy[baseline_hash] = baseline.to_dict()
@@ -961,11 +1209,14 @@ def main() -> None:
         headroom_ratio = float(baseline_metrics.get("oom_margin_gb") or 0.0) / float(args.mem_limit_gb)
     upper_bound_ok = (not baseline_metrics.get("oom")) and headroom_ratio >= 0.2
 
-    seeds: List[tuple[str, Fsdp2Strategy]] = [
-        ("sandwich", sandwich_sample_strategy(num_layers=num_layers_hint, span=4)),
-    ]
+    seeds: List[tuple[str, Fsdp2Strategy]] = []
+    if feasibility_mode and not args.allow_offload:
+        print("[controller] FEASIBILITY requires --allow-offload; no viable actions available.")
+        sys.exit(1)
+    if args.use_seeds and not feasibility_mode:
+        seeds.append(("sandwich", sandwich_sample_strategy(num_layers=num_layers_hint, span=4)))
     upper_bound_names: set[str] = set()
-    if upper_bound_ok:
+    if args.use_seeds and upper_bound_ok:
         upper_off = Fsdp2Strategy(
             global_layout=Fsdp2Layout(mesh_topology=gl.mesh_topology, reshard_after_forward=False),
             layer_overrides=[],
@@ -984,7 +1235,7 @@ def main() -> None:
             upper_bound_names.add("upper_global_reshard_int")
 
     # HSDP-ish (multi-node only): 2D mesh + layer-level reshard True, root False.
-    if args.allow_mesh and getattr(hardware, "num_nodes", 1) and int(getattr(hardware, "num_nodes", 1)) > 1:
+    if args.use_seeds and args.allow_mesh and getattr(hardware, "num_nodes", 1) and int(getattr(hardware, "num_nodes", 1)) > 1:
         hsdp_global = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=False)
         hsdp_layer = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=True)
         seeds.append(
@@ -998,17 +1249,30 @@ def main() -> None:
             )
         )
 
-    # Conservative memory anchor: 1D + CPU param offload（默认不启用，避免污染“无 offload”阶段）
-    if args.allow_offload and args.include_offload_seed:
-        raf = _pick_nontrivial_divisor(int(args.nproc)) or True
-        offload_global = Fsdp2Layout(mesh_topology="1D", offload_params=True, reshard_after_forward=raf)
+    # Conservative memory anchor: 1D + CPU param offload
+    if args.use_seeds and args.allow_offload and args.include_offload_seed:
+        offload_global = Fsdp2Layout(
+            mesh_topology=gl.mesh_topology,
+            sharding_strategy=gl.sharding_strategy,
+            reshard_after_forward=gl.reshard_after_forward,
+            shard_plan=gl.shard_plan,
+            offload_params=True,
+            offload_pin_memory=gl.offload_pin_memory,
+            mp_policy=gl.mp_policy,
+        )
         seeds.append(("cpu_offload", Fsdp2Strategy(global_layout=offload_global)))
+        layer_stats = baseline_metrics.get("layer_stats") or baseline_metrics.get("layer_stats_static") or {}
+        top_ids = _top_layers_by_param_bytes(layer_stats, topk=4)
+        if top_ids:
+            seeds.append(("cpu_offload_topk", _build_layer_offload_seed(baseline, top_ids)))
 
     for name, strat in seeds:
         strat_hash = _strategy_hash(strat)
         metrics = _run_trial_subprocess(args, strat, trial_id=trial_id, profile="light")
         metrics["config_name"] = name
         metrics["strategy_hash"] = strat_hash
+        if feasibility_mode:
+            _apply_feasibility_score(metrics)
         if name in upper_bound_names:
             metrics["upper_bound"] = True
         history.append(metrics)
@@ -1016,6 +1280,14 @@ def main() -> None:
         hash_to_strategy[strat_hash] = strat.to_dict()
         pending_failure_feedback = _derive_failure_feedback(metrics)
         trial_id += 1
+
+    if feasibility_mode:
+        feasible = [m for m in history if not m.get("oom") and not m.get("error")]
+        if feasible:
+            for m in feasible:
+                _apply_throughput_score(m, mem_limit_gb=args.mem_limit_gb)
+            feasibility_mode = False
+            print("[controller] feasibility reached -> switch to normal optimization")
 
     upper_bounds = [m for m in history if m.get("upper_bound") and not (m.get("oom") or m.get("error"))]
     upper_bound_best_metric = max(upper_bounds, key=lambda m: _metric_throughput(m), default=None)
@@ -1030,7 +1302,10 @@ def main() -> None:
     best_metrics_for_score = best_entry
     best_metrics_for_state = best_entry
     drop_streak = 0
-    phase = Phase.MESH if args.allow_mesh else Phase.GROUPING
+    if feasibility_mode:
+        phase = Phase.FEASIBILITY
+    else:
+        phase = Phase.MESH if args.allow_mesh else Phase.GROUPING
 
     for round_idx in range(args.rounds):
         print(f"[controller] round {round_idx + 1}/{args.rounds} (phase={phase.value})")
@@ -1043,6 +1318,16 @@ def main() -> None:
         }
         semantic_state["last_oom"] = _last_oom_info(history)
         semantic_state["hardware"] = getattr(hardware, "__dict__", {})
+        comm_est = semantic_state.get("comm_estimator") or {}
+        if "comm_locality" not in comm_est:
+            try:
+                num_nodes = int(getattr(hardware, "num_nodes", 1) or 1)
+            except Exception:
+                num_nodes = 1
+            comm_est["comm_locality"] = "inter" if num_nodes > 1 else "intra"
+        semantic_state["comm_estimator"] = comm_est
+        semantic_state["bottleneck_triage"] = _triage_bottleneck(semantic_state, hardware)
+        semantic_state["action_mapping"] = _action_mapping_for_triage(semantic_state["bottleneck_triage"], semantic_state)
         semantic_state["train_hyper"] = {
             "global_batch_size": args.global_batch_size,
             "seq_len": args.seq_len,
@@ -1074,7 +1359,7 @@ def main() -> None:
             for t in history[-args.max_history :]
         ]
 
-        # 不确定性高时，对当前 best 做一次 heavy 诊断（不改变 best 选择，仅补充可信观测）
+        # If uncertainty is high, run one heavy profile for the current best (diagnostic only).
         force_every = int(getattr(args, "force_heavy_every", 0) or 0)
         should_force_heavy = (
             force_every > 0
@@ -1104,6 +1389,16 @@ def main() -> None:
             }
             semantic_state["last_oom"] = _last_oom_info(history)
             semantic_state["hardware"] = getattr(hardware, "__dict__", {})
+            comm_est = semantic_state.get("comm_estimator") or {}
+            if "comm_locality" not in comm_est:
+                try:
+                    num_nodes = int(getattr(hardware, "num_nodes", 1) or 1)
+                except Exception:
+                    num_nodes = 1
+                comm_est["comm_locality"] = "inter" if num_nodes > 1 else "intra"
+            semantic_state["comm_estimator"] = comm_est
+            semantic_state["bottleneck_triage"] = _triage_bottleneck(semantic_state, hardware)
+            semantic_state["action_mapping"] = _action_mapping_for_triage(semantic_state["bottleneck_triage"], semantic_state)
             semantic_state["train_hyper"] = {
                 "global_batch_size": args.global_batch_size,
                 "seq_len": args.seq_len,
@@ -1176,13 +1471,30 @@ def main() -> None:
                     allow_offload=bool(args.allow_offload),
                     memory_critical=_is_memory_critical(semantic_state),
                 )
+                if phase == Phase.FEASIBILITY:
+                    _enforce_feasibility_gate(candidate, baseline)
                 _enforce_judge_verdict(candidate, best_strategy, judge_verdict)
                 _enforce_layer_targets(candidate, semantic_state)
                 _enforce_memory_guard(candidate, semantic_state)
+                _enforce_semantic_noop(candidate, best_strategy)
+                _enforce_layer_ranges(candidate, num_layers_hint)
+                _enforce_named_override_targets(candidate, semantic_state)
+                _enforce_mesh_validity(
+                    candidate,
+                    hardware,
+                    allow_2d_single_node=bool(getattr(args, "allow_2d_single_node", False)),
+                    nproc=int(args.nproc),
+                )
+                _enforce_shard_plan_compat(
+                    candidate,
+                    best_strategy,
+                    semantic_state,
+                    threshold=float(getattr(args, "shard_plan_compat_threshold", 0.2)),
+                )
             except Exception as e:
                 last_parse_error = e
-                print(f"[controller] 策略解析/校验错误: {e}")
-                current_c_prompt = current_c_prompt + f"\n\n【格式错误】{e}"
+                print(f"[controller] strategy parse/validation error: {e}")
+                current_c_prompt = current_c_prompt + f"\n\n[format error] {e}"
                 coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
                 _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
                 attempt += 1
@@ -1192,12 +1504,12 @@ def main() -> None:
             if cand_hash not in seen_hashes:
                 break
 
-            print(f"[controller] 策略重复 (attempt {attempt})，要求 LLM 生成新策略")
+            print(f"[controller] duplicate strategy (attempt {attempt}); requesting a new strategy")
             prev = hash_to_strategy.get(cand_hash)
-            dedup_hint = "【错误】你生成的策略与历史重复，请修改 layer_overrides、mesh_topology 或 reshard 等核心字段。"
+            dedup_hint = "[error] duplicate strategy; modify layer_overrides, mesh_topology, or reshard policy."
             if prev:
                 prev_json = json.dumps(prev, ensure_ascii=False)
-                dedup_hint += f"\n重复策略摘要（hash={cand_hash}）：{prev_json}"
+                dedup_hint += f"\nDuplicate strategy summary (hash={cand_hash}): {prev_json}"
             current_c_prompt = current_c_prompt + "\n\n" + dedup_hint
             coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
             _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
@@ -1232,11 +1544,28 @@ def main() -> None:
                 seen_hashes.add(cand_hash)
                 hash_to_strategy[cand_hash] = candidate.to_dict()
 
+        if feasibility_mode:
+            _apply_feasibility_score(metrics)
+
         history.append(metrics)
         trial_id += 1
         feedback = _derive_failure_feedback(metrics)
         if feedback:
             pending_failure_feedback = feedback
+
+        if feasibility_mode and not metrics.get("oom") and not metrics.get("error"):
+            feasibility_mode = False
+            _apply_throughput_score(metrics, mem_limit_gb=args.mem_limit_gb)
+            best_score = metrics.get("score", float("-inf"))
+            best_hash = metrics.get("strategy_hash")
+            if candidate is not None:
+                best_strategy = candidate
+            best_metrics_for_score = metrics
+            best_metrics_for_state = metrics
+            drop_streak = 0
+            phase = _initial_phase_for_strategy(best_strategy, baseline)
+            print("[controller] feasibility achieved -> switch to normal optimization")
+            continue
 
         cur_score = metrics.get("score", float("-inf"))
         improved = cur_score > best_score
@@ -1251,7 +1580,7 @@ def main() -> None:
             if best_score > 0 and (best_score - cur_score) / best_score >= args.stop_drop:
                 drop_streak += 1
             if drop_streak >= 2:
-                print("[controller] 连续下降，提前止损。")
+                print("[controller] consecutive drops; early stop.")
                 break
         phase = next_phase(phase, improved=improved)
 
@@ -1284,7 +1613,7 @@ def main() -> None:
         trials = _strategy_trials_for_plateau(xs)
         if len(trials) < 2:
             return False
-        # 取最近 window 个“不同 hash”的策略
+        # Take the most recent window strategies with unique hashes.
         uniq: List[Dict] = []
         seen: set[str] = set()
         for m in reversed(trials):
@@ -1330,7 +1659,7 @@ def main() -> None:
         hr = _headroom_ratio(best_metrics_for_score)
         hr_ok = hr >= float(args.batch_probe_min_headroom_ratio)
         if plateau and hr_ok:
-            # Batch Probing Phase：固定 best_strategy，只探 batch，不改变 FSDP 参数
+            # Batch probing: fix best_strategy and only vary batch size.
             diag = _run_trial_subprocess(args, best_strategy, trial_id=trial_id, profile="heavy")
             diag["config_name"] = "batch_probe_heavy_confirm"
             diag["strategy_hash"] = best_hash
@@ -1457,7 +1786,7 @@ def main() -> None:
             return min(det_candidates, key=lambda m: (_determinism_score(m), -float(m.get("oom_margin_gb") or 0.0)))
         return max(stable_pool, key=lambda m: float(m.get("oom_margin_gb") or 0.0))
 
-    # Top-k (unique strategy_hash) for "次优解"
+    # Top-k (unique strategy_hash) for second-best selection.
     by_hash: Dict[str, Dict] = {}
     for m in history:
         h = m.get("strategy_hash")

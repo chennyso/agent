@@ -30,8 +30,8 @@ class DatasetStats:
 class Fsdp2Layout:
     mesh_topology: Literal["1D", "2D"] = "1D"
     sharding_strategy: Literal["FULL", "HYBRID", "NO"] = "FULL"
-    # bool / int / None: None 表示 FSDP2 auto（root=False, others=True）
-    reshard_after_forward: Optional[Union[bool, int]] = True
+    # bool / int / None: None means FSDP2 auto (root=False, others=True).
+    reshard_after_forward: Optional[Union[bool, int]] = None
     shard_plan: Literal["DIM0", "DIM1", "LARGEST"] = "DIM0"
     offload_params: bool = False
     offload_pin_memory: bool = True
@@ -40,7 +40,7 @@ class Fsdp2Layout:
 
 @dataclass
 class GroupingConfig:
-    """FSDP group 构造方式（对应 fully_shard 的调用粒度）。"""
+    """FSDP grouping mode (controls fully_shard call granularity)."""
 
     mode: Literal["block", "merged"] = "block"
     merge_factor: int = 1
@@ -158,7 +158,7 @@ class Fsdp2Strategy:
     def semantic_hash(self) -> str:
         norm = self.normalized()
         payload = norm.to_dict()
-        # dataset_stats 不影响策略语义，避免噪声字段导致“伪去重失败”
+        # dataset_stats does not affect strategy semantics; exclude to avoid noisy hashes.
         payload["dataset_stats"] = None
         blob = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -334,10 +334,9 @@ def default_strategy() -> Fsdp2Strategy:
 
 
 def sandwich_sample_strategy(num_layers: Optional[int] = None, span: int = 4) -> Fsdp2Strategy:
-    """异构 seed：两头更偏性能（unsharded），中间更偏省显存（reshard）。
-
-    - num_layers=None 时使用保守默认（24），避免 controller 侧需要加载模型。
-    - span 表示两头保留的层数（默认 4）。
+    """Heterogeneous seed: edges favor speed (unsharded), middle favors memory (reshard).
+    - num_layers=None uses a conservative default (24) to avoid loading the model in controller.
+    - span is the edge layer count (default 4).
     """
     span = int(span)
     if span < 1:
@@ -355,13 +354,13 @@ def sandwich_sample_strategy(num_layers: Optional[int] = None, span: int = 4) ->
     ovrs = []
     if head_end > 0:
         ovrs.append(LayerOverride(start_layer=0, end_layer=head_end, layout=fast))
-    # n 较小时避免重复覆盖
+    # Avoid duplicate ranges when n is small.
     if tail_start < n and tail_start >= head_end:
         ovrs.append(LayerOverride(start_layer=tail_start, end_layer=n, layout=fast))
     return Fsdp2Strategy(global_layout=gl, layer_overrides=ovrs)
 
 
-# 可选：性能优先候选，用于提示或枚举
+# Optional performance-first candidates for prompting or search.
 def perf_tier_candidates() -> List[Fsdp2Strategy]:
     fast = Fsdp2Layout(reshard_after_forward=False)
     overlap = Fsdp2Layout(reshard_after_forward=False, shard_plan="DIM0")

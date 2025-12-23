@@ -84,6 +84,63 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         },
     }
 
+    fsdp_events = metrics.get("fsdp_events") or {}
+    total_collectives = (
+        int(fsdp_events.get("all_gather_calls", 0))
+        + int(fsdp_events.get("reduce_scatter_calls", 0))
+        + int(fsdp_events.get("all_reduce_calls", 0))
+    )
+    collective_mix = {
+        "all_gather": int(fsdp_events.get("all_gather_calls", 0)),
+        "reduce_scatter": int(fsdp_events.get("reduce_scatter_calls", 0)),
+        "all_reduce": int(fsdp_events.get("all_reduce_calls", 0)),
+    }
+    if total_collectives > 0:
+        collective_mix["all_gather_ratio"] = collective_mix["all_gather"] / total_collectives
+        collective_mix["reduce_scatter_ratio"] = collective_mix["reduce_scatter"] / total_collectives
+        collective_mix["all_reduce_ratio"] = collective_mix["all_reduce"] / total_collectives
+
+    anatomy = metrics.get("model_anatomy") or {}
+    latency_hotspots = ((anatomy.get("latency_hotspots") or {}).get("paths") or [])
+    packetization_risk = "high" if latency_hotspots else "low"
+
+    comm_estimator = {
+        "comm_share": comm_ratio,
+        "collective_type_mix": collective_mix,
+        "packetization_risk": packetization_risk,
+    }
+
+    gpu_busy = metrics.get("gpu_busy_ratio_est")
+    host_overhead = metrics.get("host_overhead_ratio_est")
+    kernel_frag = metrics.get("kernel_bubble_ratio_std_est")
+    idle_reason = None
+    if gpu_busy is not None and float(gpu_busy) < 0.7:
+        if comm_ratio is not None and comm_ratio >= 0.35:
+            idle_reason = "comm_wait"
+        elif host_overhead is not None and float(host_overhead) >= 0.25:
+            idle_reason = "cpu_wait"
+        elif kernel_frag is not None and float(kernel_frag) >= 0.1:
+            idle_reason = "kernel_fragmented"
+        else:
+            idle_reason = "unknown_wait"
+    utilization_estimator = {
+        "gpu_idle_ratio": metrics.get("idle_ratio"),
+        "gpu_busy_ratio_est": gpu_busy,
+        "host_overhead_ratio_est": host_overhead,
+        "overlap_headroom": (1.0 - float(gpu_busy)) if gpu_busy is not None else None,
+        "kernel_fragmentation": kernel_frag,
+        "idle_reason": idle_reason,
+    }
+
+    shard_plan_compat = _shard_plan_compat(layer_stats)
+    comm_keys = (anatomy.get("comm_hotspots") or {}).get("named_override_keys") or []
+    latency_keys = (anatomy.get("latency_hotspots") or {}).get("named_override_keys") or []
+    offload_targets = {
+        "layer_ids": top_targets.get("top_mem_layer_ids", []),
+        "named_override_keys": sorted(set(comm_keys + latency_keys)),
+        "source": layer_stats_source or None,
+    }
+
     return {
         "phase": phase.value,
         "profiling": profiling,
@@ -101,10 +158,24 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "top_targets": top_targets,
         "action_cost": action_cost,
         "determinism": determinism,
+        "comm_estimator": comm_estimator,
+        "utilization_estimator": utilization_estimator,
+        "model_anatomy": anatomy,
+        "shard_plan_compat": shard_plan_compat,
+        "offload_targets": offload_targets,
     }
 
 
 def _action_cost_map(phase: Phase) -> Dict[str, str]:
+    if phase == Phase.FEASIBILITY:
+        return {
+            "change_mesh": "forbidden_in_phase",
+            "enable_cpu_offload": "low",
+            "change_grouping": "forbidden_in_phase",
+            "set_root_reshard_false": "forbidden_in_phase",
+            "layer_override_reshard": "low",
+            "shard_plan": "forbidden_in_phase",
+        }
     if phase == Phase.BASELINE:
         return {
             "change_mesh": "forbidden_in_phase",
@@ -210,4 +281,29 @@ def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, 
         "top_mem_layers": top_mem_layers,
         "top_time_layer_ids": _extract_ids(top_time_layers),
         "top_mem_layer_ids": _extract_ids(top_mem_layers),
+    }
+
+
+def _shard_plan_compat(layer_stats: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    if not layer_stats:
+        return None
+    total_bytes = 0.0
+    dim0_bytes = 0.0
+    dim1_bytes = 0.0
+    any_bytes = 0.0
+    for _, st in layer_stats.items():
+        try:
+            total = float(st.get("param_bytes") or 0.0)
+            total_bytes += total
+            dim0_bytes += float(st.get("divisible_dim0_bytes") or 0.0)
+            dim1_bytes += float(st.get("divisible_dim1_bytes") or 0.0)
+            any_bytes += float(st.get("divisible_any_bytes") or 0.0)
+        except Exception:
+            continue
+    if total_bytes <= 0:
+        return None
+    return {
+        "dim0_ratio": dim0_bytes / total_bytes,
+        "dim1_ratio": dim1_bytes / total_bytes,
+        "largest_ratio": any_bytes / total_bytes,
     }

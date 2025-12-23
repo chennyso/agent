@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from fsdp_agent.config import Fsdp2Strategy, validate_strategy
-from fsdp_agent.train import run_trial, get_current_stage, get_last_static_layer_stats
+from fsdp_agent.train import run_trial, get_current_stage, get_last_static_layer_stats, get_last_model_anatomy
 from fsdp_agent.dataset_stats import load_stats_from_file, DatasetStats
 
 
@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trial-id", type=int, default=0)
     p.add_argument("--dataset-stats-file", type=str, default=None, help="Path to dataset stats JSON.")
     p.add_argument("--repeats", type=int, default=1, help="Repeat runs and take median throughput.")
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed (default: no manual seeding).")
     p.add_argument(
         "--profile",
         type=str,
@@ -110,6 +111,7 @@ def main() -> None:
             repeats=args.repeats,
             mem_limit_gb=args.mem_limit_gb,
             profiling=args.profile,
+            seed=args.seed,
         )
         _log_rank0("[trial_runner] trial completed")
     except torch.cuda.OutOfMemoryError:
@@ -130,6 +132,9 @@ def main() -> None:
     static_stats = get_last_static_layer_stats()
     if static_stats and not metrics.get("layer_stats_static"):
         metrics["layer_stats_static"] = static_stats
+    anatomy = get_last_model_anatomy()
+    if anatomy and not metrics.get("model_anatomy"):
+        metrics["model_anatomy"] = anatomy
 
     if dist.get_rank() == 0:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
