@@ -437,7 +437,11 @@ def _offload_scope(strategy: Fsdp2Strategy) -> str:
 
 def _is_memory_critical(semantic_state: Dict) -> bool:
     headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
-    return semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05
+    if semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05:
+        return True
+    if semantic_state.get("last_oom"):
+        return True
+    return False
 
 
 def _uses_reshard_false(strategy: Fsdp2Strategy) -> bool:
@@ -447,9 +451,7 @@ def _uses_reshard_false(strategy: Fsdp2Strategy) -> bool:
 
 
 def _enforce_memory_guard(candidate: Fsdp2Strategy, semantic_state: Dict) -> None:
-    headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
-    bottleneck = semantic_state.get("bottleneck")
-    if bottleneck == "MEMORY" or headroom_ratio < 0.05:
+    if _is_memory_critical(semantic_state):
         if _uses_reshard_false(candidate):
             raise ValueError("memory_guard: reshard_after_forward=False is unsafe under low headroom")
 
@@ -571,7 +573,7 @@ def _enforce_layer_targets(candidate: Fsdp2Strategy, semantic_state: Dict) -> No
 def _goal_mode(semantic_state: Dict, upper_bound_gap: Dict) -> str:
     headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
     gap_ratio = float(upper_bound_gap.get("throughput_gap_ratio") or 0.0)
-    if semantic_state.get("bottleneck") == "MEMORY" or headroom_ratio < 0.05:
+    if _is_memory_critical(semantic_state):
         return "min_mem"
     if gap_ratio >= 0.02 and headroom_ratio >= 0.15:
         return "fastest"

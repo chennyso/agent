@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from fsdp_agent.config import Fsdp2Strategy, validate_strategy
-from fsdp_agent.train import run_trial, get_current_stage
+from fsdp_agent.train import run_trial, get_current_stage, get_last_static_layer_stats
 from fsdp_agent.dataset_stats import load_stats_from_file, DatasetStats
 
 
@@ -127,6 +127,9 @@ def main() -> None:
             "score": float("-inf"),
             "error_msg": str(exc),
         }
+    static_stats = get_last_static_layer_stats()
+    if static_stats and not metrics.get("layer_stats_static"):
+        metrics["layer_stats_static"] = static_stats
 
     if dist.get_rank() == 0:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)

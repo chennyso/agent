@@ -21,6 +21,7 @@ from fsdp_agent.model_introspection import extract_transformer_layers
 
 _MIN_STEP_TIME_MS = 1e-3
 _CURRENT_STAGE = "init"
+_LAST_STATIC_LAYER_STATS: Dict[str, Dict[str, float]] = {}
 
 
 def _set_stage(stage: str) -> None:
@@ -30,6 +31,15 @@ def _set_stage(stage: str) -> None:
 
 def get_current_stage() -> str:
     return _CURRENT_STAGE
+
+
+def _set_last_static_layer_stats(stats: Dict[str, Dict[str, float]]) -> None:
+    global _LAST_STATIC_LAYER_STATS
+    _LAST_STATIC_LAYER_STATS = stats
+
+
+def get_last_static_layer_stats() -> Dict[str, Dict[str, float]]:
+    return _LAST_STATIC_LAYER_STATS
 
 
 def _is_rank0() -> bool:
@@ -60,6 +70,26 @@ def load_model(model_name: str, dtype: torch.dtype = torch.bfloat16) -> nn.Modul
 
 def build_optimizer(model: nn.Module, lr: float = 1e-4) -> Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=lr)
+
+
+def _collect_static_layer_stats(layers: nn.ModuleList) -> Dict[str, Dict[str, float]]:
+    stats: Dict[str, Dict[str, float]] = {}
+    for idx, layer in enumerate(layers):
+        numel = 0
+        bytes_total = 0
+        for p in layer.parameters(recurse=True):
+            n = int(p.numel())
+            numel += n
+            try:
+                bytes_total += n * int(p.element_size())
+            except Exception:
+                bytes_total += n * 2
+        stats[f"layers.{idx}"] = {
+            "param_numel": float(numel),
+            "param_bytes": float(bytes_total),
+            "param_bytes_mb": float(bytes_total) / (1024.0 * 1024.0),
+        }
+    return stats
 
 
 def train_step(
@@ -457,6 +487,9 @@ def run_trial(
         _log_rank0(f"[trial] run {r + 1}/{repeats}: loading model")
         _set_stage("load_model")
         model = load_model(model_name=model_name)
+        layers_static = extract_transformer_layers(model)
+        static_layer_stats = _collect_static_layer_stats(layers_static) if layers_static is not None else {}
+        _set_last_static_layer_stats(static_layer_stats)
         _log_rank0("[trial] applying strategy")
         _set_stage("apply_strategy")
         model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
@@ -532,6 +565,7 @@ def run_trial(
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
         prof_metrics["layer_stats"] = layer_summary
+        prof_metrics["layer_stats_static"] = static_layer_stats
         # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差（用 median 抵抗偶发抖动/0ms）
         sane = [t for t in step_times_ms if t >= _MIN_STEP_TIME_MS]
         if not sane:

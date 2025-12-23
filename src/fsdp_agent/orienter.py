@@ -43,9 +43,15 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     else:
         action_cost["expand_unsharded_span"] = "high"
     layer_stats = metrics.get("layer_stats") or {}
+    layer_stats_source = "dynamic" if layer_stats else ""
+    if not layer_stats:
+        layer_stats = metrics.get("layer_stats_static") or {}
+        layer_stats_source = "static" if layer_stats else ""
     top_targets = _top_layer_targets(layer_stats)
+    if layer_stats_source:
+        top_targets["source"] = layer_stats_source
     if layer_stats:
-        confidence = max(confidence, 0.65)
+        confidence = max(confidence, 0.6 if layer_stats_source == "static" else 0.65)
 
     trace = metrics.get("trace_summary") or {}
     def _pick_metric(key: str, default=None):
@@ -157,14 +163,32 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
 def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, Any]:
     # layer_stats: {"layers.17": {"fwd_ms": [...], "bwd_ms": [...], "mem_delta_mb": [...]}, ...}
     scored = []
+
+    def _as_float(val: Any) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
     for name, st in layer_stats.items():
         try:
-            fwd = float(st.get("fwd_ms_p50") or 0.0)
-            bwd = float(st.get("bwd_ms_p50") or 0.0)
-            mem = float(st.get("mem_delta_mb_p50") or 0.0)
+            fwd = _as_float(st.get("fwd_ms_p50") or 0.0)
+            bwd = _as_float(st.get("bwd_ms_p50") or 0.0)
+            mem = _as_float(st.get("mem_delta_mb_p50") or 0.0)
+            if mem <= 0.0:
+                mem = _as_float(st.get("param_bytes_mb") or 0.0)
+            if mem <= 0.0:
+                param_bytes = _as_float(st.get("param_bytes") or 0.0)
+                if param_bytes > 0.0:
+                    mem = param_bytes / (1024.0 * 1024.0)
+            if mem <= 0.0:
+                param_numel = _as_float(st.get("param_numel") or 0.0)
+                if param_numel > 0.0:
+                    mem = (param_numel * 2.0) / (1024.0 * 1024.0)
         except Exception:
             continue
-        scored.append((fwd + bwd, mem, name))
+        time_score = (fwd + bwd) if (fwd + bwd) > 0.0 else mem
+        scored.append((time_score, mem, name))
     scored.sort(reverse=True)
     top_time_layers = [n for _, __, n in scored[:topk]]
     top_mem_layers = [n for _, m, n in sorted(scored, key=lambda x: x[1], reverse=True)[:topk]]
