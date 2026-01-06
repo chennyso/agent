@@ -2357,8 +2357,12 @@ def main() -> None:
 
     seeds: List[tuple[str, Fsdp2Strategy]] = []
     if feasibility_mode and not args.allow_offload:
-        print("[controller] FEASIBILITY requires --allow-offload; no viable actions available.")
-        sys.exit(1)
+        allow_parallel = any(
+            bool(v) for v in (args.allow_tp, args.allow_pp, args.allow_ep, args.allow_cp, args.allow_sp)
+        )
+        if not allow_parallel:
+            print("[controller] FEASIBILITY without offload requires parallel or batch-size actions; enable --allow-tp/pp/ep/cp/sp.")
+            sys.exit(1)
     if args.use_seeds and not feasibility_mode:
         seeds.append(("sandwich", sandwich_sample_strategy(num_layers=num_layers_hint, span=4)))
     upper_bound_names: set[str] = set()
