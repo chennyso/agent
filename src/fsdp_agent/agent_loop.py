@@ -74,6 +74,70 @@ def _log_llm_event(
     _append_event(event_log, payload)
 
 
+def _infer_failure_stage(metrics: Dict[str, object]) -> Optional[str]:
+    if metrics.get("oom_stage"):
+        return str(metrics.get("oom_stage"))
+    stdout_tail = str(metrics.get("stdout_tail") or "")
+    if "[trial] run" in stdout_tail and "loading model" in stdout_tail:
+        return "load_model"
+    if "[trial] applying strategy" in stdout_tail:
+        return "apply_strategy"
+    if "[trial] dataloader ready" in stdout_tail:
+        return "build_dataloader"
+    if "[trial] start steps" in stdout_tail:
+        return "train_steps"
+    if metrics.get("oom"):
+        return "oom_unknown_stage"
+    return None
+
+
+def _summarize_semantic_state(semantic_state: Dict[str, object], *, candidate_count: int = 0, doe_count: int = 0) -> str:
+    phase = str(semantic_state.get("phase") or "")
+    goal = str(semantic_state.get("goal_mode") or "")
+    bottleneck = str(semantic_state.get("bottleneck") or "")
+    headroom_ratio = semantic_state.get("headroom_ratio")
+    comm_ratio = semantic_state.get("comm_ratio")
+    last_oom = semantic_state.get("last_oom") or {}
+    last_oom_stage = last_oom.get("oom_stage")
+    last_oom_msg = last_oom.get("error_msg")
+    parts = [
+        f"phase={phase}",
+        f"goal={goal}",
+        f"bottleneck={bottleneck}",
+        f"headroom_ratio={headroom_ratio:.2f}" if isinstance(headroom_ratio, (int, float)) else "headroom_ratio=NA",
+        f"comm_ratio={comm_ratio:.2f}" if isinstance(comm_ratio, (int, float)) else "comm_ratio=NA",
+        f"last_oom_stage={last_oom_stage or 'NA'}",
+        f"last_oom_msg={(str(last_oom_msg)[:160] + '...') if last_oom_msg else 'NA'}",
+        f"candidates={int(candidate_count)}",
+        f"doe={int(doe_count)}",
+    ]
+    return ", ".join(parts)
+
+
+def _summarize_judge_verdict(verdict: Optional[Dict[str, object]]) -> str:
+    if not verdict:
+        return "judge_verdict=unavailable"
+    hyp = verdict.get("hypothesis_id")
+    primary = verdict.get("primary_bottleneck")
+    mem_risk = verdict.get("memory_risk_level")
+    allowed = verdict.get("allowed_actions") or []
+    forbidden = verdict.get("forbidden_actions") or []
+    must_improve = verdict.get("must_improve") or []
+    return (
+        f"hypothesis={hyp}, primary_bottleneck={primary}, memory_risk={mem_risk}, "
+        f"allowed={allowed}, forbidden={forbidden}, must_improve={must_improve}"
+    )
+
+
+def _summarize_coder_plan(plan: Optional[Dict[str, object]]) -> str:
+    if not plan:
+        return "coder_plan=unavailable"
+    hyp = plan.get("hypothesis")
+    action = plan.get("proposed_action")
+    fallback = plan.get("fallback_if_wrong")
+    return f"hypothesis={hyp}, proposed_action={action}, fallback={fallback}"
+
+
 def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
     keys = [
         "trial_id",
@@ -100,6 +164,9 @@ def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
         "determinism_score",
     ]
     out = {k: metrics.get(k) for k in keys if k in metrics}
+    failure_stage_est = _infer_failure_stage(metrics)
+    if failure_stage_est:
+        out["failure_stage_est"] = failure_stage_est
     if metrics.get("trace_summary") is not None:
         out["trace_summary"] = metrics.get("trace_summary")
     if metrics.get("stderr_tail"):
@@ -666,7 +733,14 @@ def _build_hypothesis_graph(semantic_state: Dict, causal_summary: Optional[Dict]
                     "peak_unsharded_groups": peak_unsharded,
                     "max_unsharded_numel": diag.get("max_unsharded_numel"),
                 },
-                "actions": ["batch_size", "layer_override_reshard", "change_grouping", "shard_plan", "enable_cpu_offload"],
+                "actions": [
+                    "batch_size",
+                    "layer_override_reshard",
+                    "change_grouping",
+                    "shard_plan",
+                    "enable_cpu_offload",
+                    "set_parallel",
+                ],
                 "expected": {"memory_headroom_mb": "up", "step_time_ms_p50": "up_or_flat"},
                 "confidence": 0.7 if headroom < 0.1 else 0.55,
             }
@@ -764,6 +838,7 @@ def _experiment_templates() -> List[Dict[str, object]]:
             "hypotheses": ["mem_peak_unsharded", "mem_allocator_thrashing"],
             "experiments": [
                 {"action": "batch_size", "note": "reduce micro-batch/peak activations"},
+                {"action": "set_parallel", "note": "reduce per-rank parameter/activation footprint"},
                 {"action": "layer_override_reshard", "note": "force reshard on top layers"},
                 {"action": "enable_cpu_offload", "note": "offload top params"},
             ],
@@ -1078,15 +1153,26 @@ def _coerce_judge_verdict(
     allowed = _normalize_actions(verdict.get("allowed_actions"))
     forbidden = _normalize_actions(verdict.get("forbidden_actions"))
     memory_critical = _is_memory_critical(semantic_state)
+    hard_constraints = semantic_state.get("hard_constraints") or {}
+    allow_parallel = any(
+        bool(hard_constraints.get(key))
+        for key in ("allow_tp", "allow_pp", "allow_ep", "allow_cp", "allow_sp")
+    )
 
     if memory_critical:
         must_allow = {"layer_override_reshard", "change_grouping", "shard_plan"}
         if allow_offload:
             must_allow.add("enable_cpu_offload")
+        if allow_parallel:
+            must_allow.add("set_parallel")
         forbidden -= must_allow
         if allowed:
             allowed |= must_allow
         forbidden |= {"set_root_reshard_false", "expand_unsharded_span"}
+    if allow_parallel:
+        forbidden.discard("set_parallel")
+        if allowed:
+            allowed.add("set_parallel")
 
     return {
         **verdict,
@@ -1348,9 +1434,10 @@ def _action_mapping_for_triage(triage: object, semantic_state: Dict) -> List[Dic
     primary = triage.get("primary") if isinstance(triage, dict) else str(triage)
     mapping: Dict[str, List[Dict[str, str]]] = {
         "MEMORY_CRITICAL": [
+            {"action": "set_parallel", "path": "memory", "note": "enable TP/PP/CP to lower per-rank memory"},
+            {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
             {"action": "enable_cpu_offload", "path": "memory", "note": "reduce resident params/optimizer states"},
             {"action": "enable_cpu_offload", "path": "memory", "note": f"layerwise offload for layers {layer_ids}"},
-            {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
         ],
         "COMM_BOUND_INTER": [
             {"action": "change_mesh", "path": "comm", "note": "try 2D mesh to keep collectives intra-node"},
@@ -1404,8 +1491,11 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
         score += 1.0
         reasons.append("helps comm")
     if "offload" in cand_id and primary == "MEMORY_CRITICAL":
+        score += 2.0
+        reasons.append("reduces resident params")
+    if cand_id.startswith("parallel") and primary == "MEMORY_CRITICAL":
         score += 3.0
-        reasons.append("required for memory")
+        reasons.append("reduces per-rank memory")
     if cand_id.startswith("parallel") and primary == "COMPUTE_BOUND":
         score += 2.0
         reasons.append("matches compute-bound")
@@ -1530,7 +1620,7 @@ def _candidate_pool(
         _add("mesh_2d", Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping), "prefer intra-node collectives")
 
     # Parallel candidates (TP/PP/EP/CP/SP) on 1D mesh only.
-    if (phase != Phase.FEASIBILITY or memory_critical) and base.global_layout.mesh_topology == "1D":
+    if base.global_layout.mesh_topology == "1D":
         world_size = max(int(args.nproc), 1)
         degrees = sorted({d for d in _divisors(world_size) if d > 1})
         if world_size > 1:
@@ -1777,7 +1867,7 @@ Signal Priority:
 - DERIVED: bottleneck_triage, shard_plan_compat
 - HEURISTIC: action_mapping, causal_summary
 Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.
-If Phase==FEASIBILITY, prioritize making the run non-OOM. Only recommend batch_size reductions or offload (global or layerwise) and avoid reshard/grouping/shard_plan/mesh changes.
+If Phase==FEASIBILITY, prioritize making the run non-OOM. Parallel expansion (set_parallel) is allowed as a feasibility action when it improves memory safety; do not forbid it by default. After OOMs, consider set_parallel as a memory-reduction option before defaulting to offload.
 Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.
 Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.
 GoalMode is in SemanticState.goal_mode: fastest|min_mem_at_perf|min_mem.
@@ -1842,7 +1932,7 @@ If you do so, briefly explain why.
 - If goal_mode=fastest, prioritize throughput even if memory rises modestly.
 - If goal_mode=min_mem_at_perf, keep throughput within 1% of baseline while reducing max memory.
 - If goal_mode=min_mem, prioritize headroom and avoid reshard_after_forward=False.
-- If Phase==FEASIBILITY, only choose batch_size or offload (global or layerwise) and do not change mesh/grouping/reshard/shard_plan.
+- If Phase==FEASIBILITY, you may choose batch_size, set_parallel, or offload (global or layerwise); avoid mesh/grouping/reshard/shard_plan unless explicitly allowed.
 - Use SemanticState.offload_targets.layer_ids for layerwise offload (top-mem layers).
 - Use SemanticState.model_anatomy.*.named_override_keys for named_overrides (comm/latency hotspots).
 - If shard_plan_compat is low, do not change shard_plan.
@@ -2135,8 +2225,6 @@ def _enforce_phase_constraints(
         if candidate.global_layout.mesh_topology != baseline.global_layout.mesh_topology:
             raise ValueError("change_mesh is forbidden_in_phase")
     if _parallel_signature(candidate) != _parallel_signature(baseline):
-        if phase == Phase.FEASIBILITY and not memory_critical:
-            raise ValueError("parallel changes are forbidden_in_phase")
         if candidate.global_layout.mesh_topology != "1D":
             raise ValueError("parallel changes require mesh_topology=1D")
         p = candidate.parallel
@@ -2587,8 +2675,6 @@ def main() -> None:
         candidates = strategy_candidates + batch_candidates
         candidate_hashes = {c.get("strategy_hash") for c in strategy_candidates if c.get("strategy_hash")}
         allow_parallel = bool(args.allow_tp or args.allow_pp or args.allow_ep or args.allow_cp or args.allow_sp)
-        if feasibility_mode and not _is_memory_critical(semantic_state):
-            allow_parallel = False
         doe = _design_minimal_experiments(
             hypothesis_graph,
             candidates,
