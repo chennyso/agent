@@ -76,8 +76,10 @@ def build_global_mesh(
     if world_size % total != 0:
         raise ValueError(f"world_size {world_size} not divisible by tp*pp*ep*cp={total}")
     dp = world_size // total
-    mesh_shape = (dp, pp, tp, ep, cp)
-    mesh_dim_names = ("dp", "pp", "tp", "ep", "cp")
+    # Canonical mesh order: outermost -> innermost.
+    # Higher-frequency comm dims go innermost (TP last).
+    mesh_shape = (pp, dp, ep, cp, tp)
+    mesh_dim_names = ("pp", "dp", "ep", "cp", "tp")
     mesh = init_device_mesh("cuda", mesh_shape, mesh_dim_names=mesh_dim_names)
     return mesh, int(dp)
 

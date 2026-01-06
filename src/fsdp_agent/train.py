@@ -911,6 +911,8 @@ def run_trial(
             {
                 "world_size_total": int(world_size_total),
                 "dp_world_size": int(dp_world_size),
+                "mesh_dim_names": ["pp", "dp", "ep", "cp", "tp"],
+                "mesh_shape": [int(pp_degree), int(dp_world_size), int(ep_degree), int(cp_degree), int(tp_degree)],
             }
         )
     for r in range(repeats):

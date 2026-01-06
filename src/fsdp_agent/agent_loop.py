@@ -442,6 +442,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-llm", action="store_true", help="Print LLM prompts and responses each round.")
     p.add_argument("--event-log", type=str, default=None, help="Optional JSONL log for LLM I/O and trial results.")
     p.add_argument("--force-heavy-every", type=int, default=0, help="Force a heavy profile every N rounds.")
+    p.add_argument(
+        "--force-parallel-doe",
+        action="store_true",
+        help="Force at least one set_parallel candidate into DoE (default: LLM decides).",
+    )
     p.add_argument("--seed", type=int, default=None, help="Optional RNG seed (default: no manual seeding).")
     p.add_argument(
         "--shard-plan-compat-threshold",
@@ -2114,6 +2119,12 @@ Signal Priority:
 - HARD: OOM, headroom_ratio, comm_ratio
 - DERIVED: bottleneck_triage, shard_plan_compat
 - HEURISTIC: action_mapping, causal_summary
+Distributed reasoning (first principles):
+- Bandwidth-Frequency Law: higher-frequency comm dims must be more "inner" on device mesh. Canonical order (outer -> inner): PP, DP, EP, CP, TP. TP must be innermost.
+- Memory Safety Margin: estimate per-rank sharded state ~= total_state_bytes / (dp_degree * pp_degree). Keep it < 75% VRAM; if exceeded, increase PP or DP, or reduce batch/seq.
+- Single-node locality: prefer tp*cp*ep <= gpus_per_node to keep high-frequency comm intra-node; treat violations as high risk unless multi-node.
+- Prefer 2D mixes (e.g., PP+TP or DP+TP) before complex 4D unless memory is critical.
+You reason in intent terms; the system canonicalizes mesh ordering to the above rule.
 Prefer strategies that reduce variability across steps and layers, even if the average throughput improvement is modest.
 If Phase==FEASIBILITY, prioritize making the run non-OOM. Parallel expansion (set_parallel) is allowed as a feasibility action when it improves memory safety; do not forbid it by default. After OOMs, consider set_parallel as a memory-reduction option before defaulting to offload.
 Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.
@@ -2162,6 +2173,12 @@ Rules:
   - HARD: OOM, headroom_ratio, comm_ratio
   - DERIVED: bottleneck_triage, shard_plan_compat
   - HEURISTIC: action_mapping, causal_summary
+Distributed reasoning (first principles):
+- Bandwidth-Frequency Law: higher-frequency comm dims must be more "inner" on device mesh. Canonical order (outer -> inner): PP, DP, EP, CP, TP. TP must be innermost.
+- Memory Safety Margin: estimate per-rank sharded state ~= total_state_bytes / (dp_degree * pp_degree). Keep it < 75% VRAM; if exceeded, increase PP or DP, or reduce batch/seq.
+- Single-node locality: prefer tp*cp*ep <= gpus_per_node to keep high-frequency comm intra-node; treat violations as high risk unless multi-node.
+- Prefer 2D mixes (e.g., PP+TP or DP+TP) before complex 4D unless memory is critical.
+You reason in intent terms; the system canonicalizes mesh ordering to the above rule.
 Candidates include a `priority_hint` computed by the system.
 This is NOT a rule.
 You may ignore or contradict it if your reasoning disagrees.
@@ -2945,7 +2962,7 @@ def main() -> None:
             allow_parallel=allow_parallel,
             allow_offload=bool(args.allow_offload),
         )
-        if allow_parallel:
+        if allow_parallel and bool(getattr(args, "force_parallel_doe", False)):
             doe = _force_parallel_in_doe(
                 doe,
                 candidates,
