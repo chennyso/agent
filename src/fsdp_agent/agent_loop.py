@@ -138,6 +138,30 @@ def _summarize_coder_plan(plan: Optional[Dict[str, object]]) -> str:
     return f"hypothesis={hyp}, proposed_action={action}, fallback={fallback}"
 
 
+def _extract_judge_summary(text: str) -> Dict[str, str]:
+    summary: Dict[str, str] = {}
+    if not text:
+        return summary
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for key in ("Bottleneck", "Target", "Hypothesis", "Expected Effect", "Risk Assessment"):
+            prefix = f"{key}:"
+            if line.lower().startswith(prefix.lower()):
+                summary[key] = line.split(":", 1)[1].strip()
+    return summary
+
+
+def _extract_coder_rationale(text: str) -> str:
+    if not text:
+        return ""
+    idx = text.find("```")
+    chunk = text[:idx] if idx != -1 else text
+    chunk = re.sub(r"\s+", " ", chunk).strip()
+    return chunk[:400]
+
+
 def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
     keys = [
         "trial_id",
@@ -716,6 +740,7 @@ def _build_hypothesis_graph(semantic_state: Dict, causal_summary: Optional[Dict]
     peak_unsharded = diag.get("peak_unsharded_groups")
     alloc_spike = diag.get("alloc_free_spike_ratio")
     collective_jitter = diag.get("collective_jitter")
+    allow_offload = bool((semantic_state.get("hard_constraints") or {}).get("allow_offload", False))
 
     hypotheses: List[Dict[str, object]] = []
 
@@ -723,6 +748,10 @@ def _build_hypothesis_graph(semantic_state: Dict, causal_summary: Optional[Dict]
         hypotheses.append(h)
 
     if headroom < 0.1 or diag.get("bottleneck") == "MEMORY":
+        actions = ["batch_size", "layer_override_reshard", "change_grouping", "shard_plan"]
+        if allow_offload:
+            actions.append("enable_cpu_offload")
+        actions.append("set_parallel")
         _add(
             {
                 "id": "mem_peak_unsharded",
@@ -733,26 +762,22 @@ def _build_hypothesis_graph(semantic_state: Dict, causal_summary: Optional[Dict]
                     "peak_unsharded_groups": peak_unsharded,
                     "max_unsharded_numel": diag.get("max_unsharded_numel"),
                 },
-                "actions": [
-                    "batch_size",
-                    "layer_override_reshard",
-                    "change_grouping",
-                    "shard_plan",
-                    "enable_cpu_offload",
-                    "set_parallel",
-                ],
+                "actions": actions,
                 "expected": {"memory_headroom_mb": "up", "step_time_ms_p50": "up_or_flat"},
                 "confidence": 0.7 if headroom < 0.1 else 0.55,
             }
         )
         if alloc_spike is not None and float(alloc_spike) >= 0.15:
+            actions = ["change_grouping"]
+            if allow_offload:
+                actions.append("enable_cpu_offload")
             _add(
                 {
                     "id": "mem_allocator_thrashing",
                     "primary": "MEMORY",
                     "subtypes": ["allocator_thrashing"],
                     "evidence": {"alloc_free_spike_ratio": alloc_spike},
-                    "actions": ["change_grouping", "enable_cpu_offload"],
+                    "actions": actions,
                     "expected": {"alloc_free_spike_ratio": "down", "determinism_score": "down"},
                     "confidence": 0.6,
                 }
@@ -852,6 +877,7 @@ def _design_minimal_experiments(
     *,
     feasibility_mode: bool,
     allow_parallel: bool,
+    allow_offload: bool,
 ) -> List[Dict[str, object]]:
     """Map hypotheses to minimal experiments based on available candidates."""
     nodes = hypothesis_graph.get("nodes") or []
@@ -904,15 +930,52 @@ def _design_minimal_experiments(
                     break
 
     if feasibility_mode:
-        allowed = {"batch_size", "enable_cpu_offload", "layer_override_reshard", "change_grouping", "shard_plan"}
+        allowed = {"batch_size", "layer_override_reshard", "change_grouping", "shard_plan"}
         if allow_parallel:
             allowed.add("set_parallel")
+        if allow_offload:
+            allowed.add("enable_cpu_offload")
         doe = [
             d
             for d in doe
             if str(d.get("action")) in allowed
         ]
     return doe[:8]
+
+
+def _force_parallel_in_doe(
+    doe: List[Dict[str, object]],
+    candidates: List[Dict[str, object]],
+    hypothesis_graph: Dict[str, object],
+    *,
+    judge_verdict: Optional[Dict],
+) -> List[Dict[str, object]]:
+    if any(d.get("action") == "set_parallel" for d in doe):
+        return doe
+    if not candidates:
+        return doe
+    allowed = _normalize_actions((judge_verdict or {}).get("allowed_actions"))
+    forbidden = _normalize_actions((judge_verdict or {}).get("forbidden_actions"))
+    if "set_parallel" in forbidden:
+        return doe
+    if allowed and "set_parallel" not in allowed:
+        return doe
+    parallel_candidates = [c for c in candidates if c.get("primary_action") == "set_parallel"]
+    if not parallel_candidates:
+        return doe
+    chosen = max(parallel_candidates, key=lambda c: c.get("priority_hint", {}).get("score", 0.0))
+    nodes = hypothesis_graph.get("nodes") or []
+    hyp_id = next((n.get("id") for n in nodes if "set_parallel" in (n.get("actions") or [])), None)
+    if not hyp_id and nodes:
+        hyp_id = nodes[0].get("id")
+    forced = {
+        "experiment_id": f"parallel_force::{chosen.get('id')}",
+        "hypothesis_id": hyp_id,
+        "action": "set_parallel",
+        "candidate_id": chosen.get("id"),
+        "note": "forced parallel coverage",
+    }
+    return [forced] + doe
 
 
 _ACTION_SYNONYMS = {
@@ -1158,6 +1221,10 @@ def _coerce_judge_verdict(
         bool(hard_constraints.get(key))
         for key in ("allow_tp", "allow_pp", "allow_ep", "allow_cp", "allow_sp")
     )
+
+    if not allow_offload:
+        allowed.discard("enable_cpu_offload")
+        forbidden.add("enable_cpu_offload")
 
     if memory_critical:
         must_allow = {"layer_override_reshard", "change_grouping", "shard_plan"}
@@ -1431,14 +1498,19 @@ def _action_mapping_for_triage(triage: object, semantic_state: Dict) -> List[Dic
     targets = semantic_state.get("offload_targets") or {}
     comm_keys = targets.get("named_override_keys") or []
     layer_ids = targets.get("layer_ids") or []
+    allow_offload = bool((semantic_state.get("hard_constraints") or {}).get("allow_offload", False))
     primary = triage.get("primary") if isinstance(triage, dict) else str(triage)
-    mapping: Dict[str, List[Dict[str, str]]] = {
-        "MEMORY_CRITICAL": [
-            {"action": "set_parallel", "path": "memory", "note": "enable TP/PP/CP to lower per-rank memory"},
-            {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
+    memory_actions = [
+        {"action": "set_parallel", "path": "memory", "note": "enable TP/PP/CP to lower per-rank memory"},
+        {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
+    ]
+    if allow_offload:
+        memory_actions += [
             {"action": "enable_cpu_offload", "path": "memory", "note": "reduce resident params/optimizer states"},
             {"action": "enable_cpu_offload", "path": "memory", "note": f"layerwise offload for layers {layer_ids}"},
-        ],
+        ]
+    mapping: Dict[str, List[Dict[str, str]]] = {
+        "MEMORY_CRITICAL": memory_actions,
         "COMM_BOUND_INTER": [
             {"action": "change_mesh", "path": "comm", "note": "try 2D mesh to keep collectives intra-node"},
             {"action": "layer_override_reshard", "path": "comm", "note": f"reshard=False for {comm_keys}"},
@@ -1537,13 +1609,29 @@ def _candidate_pool(
 ) -> List[Dict[str, object]]:
     pool: List[Dict[str, object]] = []
     seen: set[str] = set()
+    parallel_specs: List[tuple[str, ParallelSpec, str]] = []
     scale = semantic_state.get("scale_policy") or {}
     reshard_ints = scale.get("reshard_int_candidates") or []
     reshard_int = int(reshard_ints[0]) if reshard_ints else _pick_nontrivial_divisor(int(args.nproc), prefer=scale.get("dp_shard"))
+    reshard_int_choices = []
+    for val in reshard_ints[:3]:
+        try:
+            v = int(val)
+        except Exception:
+            continue
+        if v not in reshard_int_choices and v > 1:
+            reshard_int_choices.append(v)
+    if not reshard_int_choices and reshard_int:
+        reshard_int_choices = [int(reshard_int)]
     memory_critical = _is_memory_critical(semantic_state)
     top = semantic_state.get("top_targets") or {}
     top_mem_layers = top.get("top_mem_layer_ids") or []
     top_comm_layers = top.get("top_comm_layer_ids") or []
+    top_time_layers = top.get("top_time_layer_ids") or []
+    anatomy = semantic_state.get("model_anatomy") or {}
+    comm_hotspots = anatomy.get("comm_hotspots") or {}
+    latency_hotspots = anatomy.get("latency_hotspots") or {}
+    named_hotspots = (comm_hotspots.get("named_override_keys") or []) + (latency_hotspots.get("named_override_keys") or [])
 
     def _add(name: str, strat: Fsdp2Strategy, note: str) -> None:
         if strat.global_layout.reshard_after_forward is False and int(strat.grouping.merge_factor) > 2:
@@ -1610,12 +1698,42 @@ def _candidate_pool(
             }
         )
 
+    def _parallel_complexity(spec: ParallelSpec) -> int:
+        count = 0
+        for deg in (spec.tp_degree, spec.pp_degree, spec.ep_degree, spec.cp_degree):
+            try:
+                if int(deg) > 1:
+                    count += 1
+            except Exception:
+                continue
+        if bool(getattr(spec, "sp_enabled", False)):
+            count += 1
+        return count
+
+    def _pick_parallel_hybrids(limit: int) -> List[tuple[str, ParallelSpec, str]]:
+        ranked = sorted(
+            parallel_specs,
+            key=lambda item: (-_parallel_complexity(item[1]), _parallel_product(item[1]), item[0]),
+        )
+        return ranked[: max(int(limit), 0)]
+
+    def _pick_parallel_coverage() -> List[tuple[str, ParallelSpec, str]]:
+        coverage: List[tuple[str, ParallelSpec, str]] = []
+        dims = ("tp_degree", "pp_degree", "ep_degree", "cp_degree")
+        for dim in dims:
+            bucket = [item for item in parallel_specs if int(getattr(item[1], dim, 1)) > 1]
+            if not bucket:
+                continue
+            bucket.sort(key=lambda item: (-_parallel_complexity(item[1]), _parallel_product(item[1]), item[0]))
+            coverage.append(bucket[0])
+        return coverage
+
     # Mesh change: 1D -> 2D when multi-node and allowed.
     try:
         num_nodes = int(getattr(hardware, "num_nodes", 1) or 1)
     except Exception:
         num_nodes = 1
-    if bool(args.allow_mesh) and base.global_layout.mesh_topology == "1D" and num_nodes > 1:
+    if bool(args.allow_mesh) and base.global_layout.mesh_topology == "1D" and (num_nodes > 1 or bool(args.allow_2d_single_node)):
         layout = _clone_layout(base.global_layout, mesh_topology="2D")
         _add("mesh_2d", Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping), "prefer intra-node collectives")
 
@@ -1672,6 +1790,7 @@ def _candidate_pool(
                 pp_schedule=pp_schedule,
                 pp_stages=pp_stages,
             )
+            parallel_specs.append((name, spec, note))
             strat = _clone_strategy(base)
             strat.parallel = spec
             _add(name, strat, note)
@@ -1719,15 +1838,91 @@ def _candidate_pool(
                         note=f"enable TP x{tp} + PP x{pp} + CP x{cp}",
                     )
 
+    # Hybrid parallel + other knobs (limited, to keep search compact).
+    hybrid_specs = []
+    hybrid_specs.extend(_pick_parallel_coverage())
+    hybrid_specs.extend(_pick_parallel_hybrids(18))
+    seen_parallel = set()
+    deduped_specs: List[tuple[str, ParallelSpec, str]] = []
+    for name, spec, note in hybrid_specs:
+        sig = tuple(asdict(spec).items())
+        if sig in seen_parallel:
+            continue
+        seen_parallel.add(sig)
+        deduped_specs.append((name, spec, note))
+    hybrid_specs = deduped_specs[:20]
+    for name, spec, note in hybrid_specs:
+        if memory_critical:
+            if int(base.grouping.merge_factor) > 1:
+                grouping = GroupingConfig(mode=base.grouping.mode, merge_factor=1)
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.grouping = grouping
+                _add(f"{name}_grouping_min", strat, f"{note}; reduce memory peaks")
+            if base.global_layout.reshard_after_forward is not True:
+                layout = _clone_layout(base.global_layout, reshard_after_forward=True)
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.global_layout = layout
+                _add(f"{name}_reshard_on", strat, f"{note}; reduce memory pressure")
+            if top_mem_layers:
+                layout = _clone_layout(base.global_layout, reshard_after_forward=True)
+                override = LayerOverride(start_layer=None, end_layer=None, layers=top_mem_layers[:2], layout=layout)
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.layer_overrides = [override]
+                _add(f"{name}_layer_reshard_mem", strat, f"{note}; reshard top-mem layers")
+        else:
+            for raf in reshard_int_choices[:2]:
+                if base.global_layout.reshard_after_forward != raf:
+                    layout = _clone_layout(base.global_layout, reshard_after_forward=int(raf))
+                    strat = _clone_strategy(base)
+                    strat.parallel = spec
+                    strat.global_layout = layout
+                    _add(f"{name}_reshard_int_{raf}", strat, f"{note}; balance comm and memory")
+            if _supports_merged_grouping() and base.grouping.mode != "merged":
+                grouping = GroupingConfig(mode="merged", merge_factor=max(int(base.grouping.merge_factor), 2))
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.grouping = grouping
+                _add(f"{name}_grouping_merged", strat, f"{note}; reduce collectives")
+            elif int(base.grouping.merge_factor) < 4:
+                for factor in (2, 4, 8):
+                    target = min(int(base.grouping.merge_factor) * factor, 8)
+                    grouping = GroupingConfig(mode=base.grouping.mode, merge_factor=target)
+                    strat = _clone_strategy(base)
+                    strat.parallel = spec
+                    strat.grouping = grouping
+                    _add(f"{name}_grouping_x{target}", strat, f"{note}; reduce collective overhead")
+            if top_comm_layers:
+                layout = _clone_layout(base.global_layout, reshard_after_forward=reshard_int or False)
+                override = LayerOverride(start_layer=None, end_layer=None, layers=top_comm_layers[:2], layout=layout)
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.layer_overrides = [override]
+                _add(f"{name}_layer_reshard_comm", strat, f"{note}; target comm hotspots")
+            if named_hotspots:
+                layout = _clone_layout(base.global_layout, reshard_after_forward=reshard_int or False)
+                named = {str(named_hotspots[0]): layout}
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                strat.named_overrides = named
+                _add(f"{name}_named_reshard_hotspot", strat, f"{note}; target named hotspots")
+
     # Reshard adjustments.
     if memory_critical:
         if base.global_layout.reshard_after_forward is not True:
             layout = _clone_layout(base.global_layout, reshard_after_forward=True)
             _add("reshard_on", Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping), "reduce memory pressure")
     else:
-        if reshard_int and base.global_layout.reshard_after_forward != reshard_int:
-            layout = _clone_layout(base.global_layout, reshard_after_forward=int(reshard_int))
-            _add("reshard_int", Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping), "balance comm and memory")
+        for raf in reshard_int_choices[:2]:
+            if base.global_layout.reshard_after_forward != raf:
+                layout = _clone_layout(base.global_layout, reshard_after_forward=int(raf))
+                _add(
+                    f"reshard_int_{raf}",
+                    Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping),
+                    "balance comm and memory",
+                )
         headroom_ratio = float(semantic_state.get("headroom_ratio") or 0.0)
         comm_ratio = float(semantic_state.get("comm_ratio") or 0.0)
         if (
@@ -1780,6 +1975,32 @@ def _candidate_pool(
             Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=[override], named_overrides=base.named_overrides, grouping=base.grouping),
             "target comm hotspots",
         )
+    # Layer overrides for memory/time hotspots.
+    if top_mem_layers:
+        layout = _clone_layout(base.global_layout, reshard_after_forward=True)
+        override = LayerOverride(start_layer=None, end_layer=None, layers=top_mem_layers[:2], layout=layout)
+        _add(
+            "layer_reshard_topmem",
+            Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=[override], named_overrides=base.named_overrides, grouping=base.grouping),
+            "target top-mem layers",
+        )
+    if top_time_layers and not memory_critical:
+        layout = _clone_layout(base.global_layout, reshard_after_forward=reshard_int or False)
+        override = LayerOverride(start_layer=None, end_layer=None, layers=top_time_layers[:2], layout=layout)
+        _add(
+            "layer_reshard_toptime",
+            Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=[override], named_overrides=base.named_overrides, grouping=base.grouping),
+            "target top-time layers",
+        )
+    # Named overrides for model hotspots.
+    if named_hotspots:
+        layout = _clone_layout(base.global_layout, reshard_after_forward=reshard_int or False)
+        named = {str(named_hotspots[0]): layout}
+        _add(
+            "named_reshard_hotspot",
+            Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=base.layer_overrides, named_overrides=named, grouping=base.grouping),
+            "target model_anatomy hotspots",
+        )
 
     # Fallback: ensure at least one candidate.
     if not pool:
@@ -1790,8 +2011,30 @@ def _candidate_pool(
             grouping = GroupingConfig(mode=base.grouping.mode, merge_factor=1)
             _add("fallback_grouping_min", Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=grouping), "fallback grouping")
 
+    def _parallel_complexity_from_id(name: str) -> int:
+        count = 0
+        for _, value in re.findall(r"(tp|pp|ep|cp)(\d+)", name):
+            try:
+                if int(value) > 1:
+                    count += 1
+            except Exception:
+                continue
+        if re.search(r"(?:^|_)sp(?:_|$)", name):
+            count += 1
+        return count
+
     pool = [_attach_priority_hint(c, semantic_state) for c in pool]
-    return pool[:30]
+    mixed_parallel = [
+        c
+        for c in pool
+        if c.get("primary_action") == "set_parallel"
+        and ("grouping" in str(c.get("id")) or "reshard" in str(c.get("id")))
+    ]
+    parallel_only = [c for c in pool if c.get("primary_action") == "set_parallel" and c not in mixed_parallel]
+    parallel_only.sort(key=lambda c: (-_parallel_complexity_from_id(str(c.get("id"))), str(c.get("id"))))
+    others = [c for c in pool if c.get("primary_action") != "set_parallel"]
+    pool = mixed_parallel + others + parallel_only
+    return pool[:80]
 
 
 def _batch_size_candidates(base: Fsdp2Strategy, args: argparse.Namespace) -> List[Dict[str, object]]:
@@ -1885,6 +2128,7 @@ If num_layers_hint is known, require pp_degree <= num_layers_hint.
 EP requires MoE support and CP requires context_parallel support; if unknown, treat as higher risk.
 LayerProfile is in SemanticState.layer_profile with per-layer compute/memory/comm estimates.
 If bottleneck==MEMORY or headroom_ratio is low, do not forbid enable_cpu_offload or layer_override_reshard; include them in allowed_actions when permitted by hard_constraints.
+If hard_constraints.allow_offload==false, forbid enable_cpu_offload and do not include it in allowed_actions.
 If recent_trials include OOM (see last_oom), treat it as memory-critical and prioritize memory-saving actions.
 ModelAnatomy lists comm_hotspots/latency_hotspots and named_override_keys for named_overrides.
 If shard_plan_compat indicates low divisibility, avoid shard_plan changes.
@@ -1937,7 +2181,7 @@ If you do so, briefly explain why.
 - If goal_mode=fastest, prioritize throughput even if memory rises modestly.
 - If goal_mode=min_mem_at_perf, keep throughput within 1% of baseline while reducing max memory.
 - If goal_mode=min_mem, prioritize headroom and avoid reshard_after_forward=False.
-- If Phase==FEASIBILITY, you may choose batch_size, set_parallel, or offload (global or layerwise); avoid mesh/grouping/reshard/shard_plan unless explicitly allowed.
+- If Phase==FEASIBILITY, you may choose batch_size or set_parallel; only use offload when hard_constraints.allow_offload==true.
 - Use SemanticState.offload_targets.layer_ids for layerwise offload (top-mem layers).
 - Use SemanticState.model_anatomy.*.named_override_keys for named_overrides (comm/latency hotspots).
 - If shard_plan_compat is low, do not change shard_plan.
@@ -2038,7 +2282,7 @@ def build_coder_prompt(
     return "\n".join(sections)
 
 
-def _derive_failure_feedback(metrics: Dict) -> Optional[str]:
+def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[str]:
     if not metrics:
         return None
     if metrics.get("error_msg"):
@@ -2050,9 +2294,11 @@ def _derive_failure_feedback(metrics: Dict) -> Optional[str]:
     if metrics.get("oom"):
         layer_stats = metrics.get("layer_stats") or metrics.get("layer_stats_static") or {}
         top_layers = _top_layers_by_param_bytes(layer_stats, topk=4) if layer_stats else []
-        if top_layers:
-            return f"CUDA OOM: enable offload (global or layers {top_layers}) and avoid reshard_after_forward=False."
-        return "CUDA OOM: enable CPU offload (global or layerwise) and avoid reshard_after_forward=False."
+        if allow_offload:
+            if top_layers:
+                return f"CUDA OOM: enable offload (global or layers {top_layers}) and avoid reshard_after_forward=False."
+            return "CUDA OOM: enable CPU offload (global or layerwise) and avoid reshard_after_forward=False."
+        return "CUDA OOM: try set_parallel, lower batch size, or reshard_after_forward=True; avoid reshard_after_forward=False."
     return None
 
 
@@ -2290,6 +2536,8 @@ def main() -> None:
         args.allow_ep = True
         args.allow_cp = True
         args.allow_sp = True
+    if args.allow_mesh and not args.allow_2d_single_node:
+        args.allow_2d_single_node = True
     rag_cards = _load_rag_cards()
     hardware = load_hardware_info(args.hardware_json) if args.hardware_json else detect_hardware()
     dataset_stats = load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
@@ -2339,7 +2587,7 @@ def main() -> None:
     history.append(baseline_metrics)
     seen_hashes.add(baseline_hash)
     hash_to_strategy[baseline_hash] = baseline.to_dict()
-    pending_failure_feedback = _derive_failure_feedback(baseline_metrics)
+    pending_failure_feedback = _derive_failure_feedback(baseline_metrics, allow_offload=bool(args.allow_offload))
     _append_event(
         event_log_path,
         {
@@ -2428,7 +2676,7 @@ def main() -> None:
         history.append(metrics)
         seen_hashes.add(strat_hash)
         hash_to_strategy[strat_hash] = strat.to_dict()
-        pending_failure_feedback = _derive_failure_feedback(metrics)
+        pending_failure_feedback = _derive_failure_feedback(metrics, allow_offload=bool(args.allow_offload))
         _append_event(
             event_log_path,
             {
@@ -2654,6 +2902,7 @@ def main() -> None:
         _log_llm_exchange("judge", j_prompt, judge_reply, args)
         judge_verdict = _parse_judge_verdict(judge_reply)
         judge_verdict = _coerce_judge_verdict(judge_verdict, semantic_state, allow_offload=bool(args.allow_offload))
+        judge_summary = _extract_judge_summary(judge_reply)
         _log_llm_event(
             event_log_path,
             "judge",
@@ -2663,8 +2912,13 @@ def main() -> None:
                 "round": round_idx,
                 "phase": phase.value,
                 "judge_verdict": judge_verdict,
+                "judge_summary": judge_summary,
             },
         )
+        if judge_summary:
+            ordered = [f"{k}={judge_summary.get(k)}" for k in ("Bottleneck", "Target", "Hypothesis") if judge_summary.get(k)]
+            extra = [f"risk={judge_summary.get('Risk Assessment')}" for _ in [0] if judge_summary.get("Risk Assessment")]
+            print(f"[judge] {', '.join(ordered + extra)}")
 
         candidates = _candidate_pool(
             best_strategy,
@@ -2689,6 +2943,18 @@ def main() -> None:
             candidates,
             feasibility_mode=feasibility_mode,
             allow_parallel=allow_parallel,
+            allow_offload=bool(args.allow_offload),
+        )
+        if allow_parallel:
+            doe = _force_parallel_in_doe(
+                doe,
+                candidates,
+                hypothesis_graph,
+                judge_verdict=judge_verdict,
+            )
+        doe = doe[:8]
+        print(
+            f"[state] {_summarize_semantic_state(semantic_state, candidate_count=len(candidates), doe_count=len(doe))}"
         )
 
         c_prompt = build_coder_prompt(
@@ -2706,6 +2972,7 @@ def main() -> None:
         pending_failure_feedback = None
         coder_reply = call_llm(c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
         _log_llm_exchange("coder", c_prompt, coder_reply, args)
+        coder_rationale = _extract_coder_rationale(coder_reply)
         _log_llm_event(
             event_log_path,
             "coder",
@@ -2716,8 +2983,11 @@ def main() -> None:
                 "phase": phase.value,
                 "candidate_count": len(candidates),
                 "doe_count": len(doe),
+                "coder_rationale": coder_rationale,
             },
         )
+        if coder_rationale:
+            print(f"[coder] rationale={coder_rationale}")
 
         max_retry = 2
         attempt = 0
@@ -2935,7 +3205,7 @@ def main() -> None:
             },
         )
         trial_id += 1
-        feedback = _derive_failure_feedback(metrics)
+        feedback = _derive_failure_feedback(metrics, allow_offload=bool(args.allow_offload))
         if feedback:
             pending_failure_feedback = feedback
 
