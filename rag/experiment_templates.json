@@ -1,0 +1,21 @@
+﻿[
+  {
+    "id": "comm_path_vs_fragment",
+    "description": "Distinguish critical path comm vs fragmented collectives.",
+    "hypotheses": ["comm_overlap_failure", "scheduling_or_kernel_frag"],
+    "experiments": [
+      {"action": "change_grouping", "note": "reduce collective count"},
+      {"action": "set_root_reshard_false", "note": "reduce backward all-gather"}
+    ]
+  },
+  {
+    "id": "oom_param_vs_activation",
+    "description": "Identify whether peak memory is param or activation dominated.",
+    "hypotheses": ["mem_peak_unsharded", "mem_allocator_thrashing"],
+    "experiments": [
+      {"action": "batch_size", "note": "reduce activation peak"},
+      {"action": "layer_override_reshard", "note": "force reshard on top layers"},
+      {"action": "enable_cpu_offload", "note": "offload top params"}
+    ]
+  }
+]

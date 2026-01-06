@@ -17,7 +17,7 @@ try:
     from torch.distributed._tensor import Replicate, Shard
 except Exception:  # pragma: no cover
     from torch.distributed.tensor import Replicate, Shard  # type: ignore[attr-defined]
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from dataclasses import asdict
 
@@ -207,7 +207,13 @@ def _pick_layout_for_layer(idx: int, strategy: Fsdp2Strategy) -> Fsdp2Layout:
     return strategy.global_layout
 
 
-def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -> nn.Module:
+def apply_strategy(
+    model: nn.Module,
+    strategy: Fsdp2Strategy,
+    world_size: int,
+    *,
+    dp_mesh: Optional[DeviceMesh] = None,
+) -> nn.Module:
     """
     遍历模型，分层应用策略：
     1) Transformer layers 按 layer_overrides 覆盖
@@ -223,7 +229,14 @@ def apply_strategy(model: nn.Module, strategy: Fsdp2Strategy, world_size: int) -
     if merge_factor < 1:
         merge_factor = 1
     mesh_cache: dict[str, object] = {}
+    if dp_mesh is not None:
+        layouts = [strategy.global_layout] + [o.layout for o in strategy.layer_overrides] + list(strategy.named_overrides.values())
+        if any(layout.mesh_topology != "1D" for layout in layouts):
+            raise ValueError("dp_mesh provided; mesh_topology must be '1D' for all layouts")
+
     def _mesh_for(topology: str):
+        if dp_mesh is not None:
+            return dp_mesh
         if topology not in mesh_cache:
             mesh_cache[topology] = get_mesh(topology, world_size)
         return mesh_cache[topology]

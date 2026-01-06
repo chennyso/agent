@@ -3,14 +3,20 @@ from __future__ import annotations
 import os
 import math
 import platform
+from dataclasses import asdict
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.optim import Optimizer
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
+try:  # pragma: no cover
+    from torch.profiler import record_function
+except Exception:  # pragma: no cover
+    from torch.autograd.profiler import record_function
 
 from fsdp_agent.config import Fsdp2Strategy
 from fsdp_agent.fsdp_apply import apply_strategy
@@ -18,6 +24,38 @@ from fsdp_agent.dataloaders import build_synthetic_loader
 from fsdp_agent.dataset_stats import DatasetStats
 from fsdp_agent.metrics_utils import score_strategy
 from fsdp_agent.model_introspection import analyze_model_anatomy, extract_transformer_layers
+from fsdp_agent.parallel_runtime import (
+    apply_tp_sp,
+    build_global_mesh,
+    infer_tp_plan_id,
+    summarize_parallel_spec,
+)
+
+try:  # pragma: no cover
+    from torch.distributed.pipelining import (
+        PipelineStage,
+        Schedule1F1B,
+        ScheduleGPipe,
+        ScheduleInterleaved1F1B,
+        ScheduleLoopedBFS,
+        SplitPoint,
+        pipeline,
+    )
+    from torch.distributed.pipelining.microbatch import TensorChunkSpec
+except Exception:  # pragma: no cover
+    PipelineStage = None
+    Schedule1F1B = None
+    ScheduleGPipe = None
+    ScheduleInterleaved1F1B = None
+    ScheduleLoopedBFS = None
+    SplitPoint = None
+    pipeline = None
+    TensorChunkSpec = None
+
+try:  # pragma: no cover
+    from torch.distributed.tensor.experimental._context_parallel._attention import context_parallel
+except Exception:  # pragma: no cover
+    context_parallel = None
 
 _MIN_STEP_TIME_MS = 1e-3
 _CURRENT_STAGE = "init"
@@ -82,6 +120,146 @@ def build_optimizer(model: nn.Module, lr: float = 1e-4) -> Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=lr)
 
 
+def _pipeline_loss_fn(output: Any, target: Optional[torch.Tensor]) -> torch.Tensor:
+    if output is None:
+        raise ValueError("pipeline output is None")
+    if hasattr(output, "loss") and getattr(output, "loss") is not None:
+        return output.loss
+    logits = None
+    if hasattr(output, "logits"):
+        logits = output.logits
+    elif isinstance(output, (tuple, list)) and output:
+        logits = output[0]
+    elif torch.is_tensor(output):
+        logits = output
+    if logits is None:
+        raise ValueError("pipeline output has no logits for loss computation")
+    if target is None:
+        raise ValueError("pipeline loss requires target labels")
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = target[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
+def _build_pp_split_spec(
+    layer_paths: Dict[str, str],
+    pp_degree: int,
+    pp_stages: Optional[List[List[int]]],
+) -> Dict[str, Any]:
+    if SplitPoint is None:
+        raise RuntimeError("torch.distributed.pipelining is unavailable")
+    layers: List[Tuple[int, str]] = []
+    for name, path in (layer_paths or {}).items():
+        if not name.startswith("layers."):
+            continue
+        try:
+            idx = int(name.split(".")[1])
+        except Exception:
+            continue
+        layers.append((idx, path))
+    layers.sort(key=lambda x: x[0])
+    if len(layers) < int(pp_degree):
+        raise ValueError("pp_degree exceeds available transformer layers")
+    split_spec: Dict[str, Any] = {}
+    if pp_stages:
+        for stage_idx, stage in enumerate(pp_stages):
+            if stage_idx == 0:
+                continue
+            try:
+                start = int(stage[0])
+            except Exception:
+                continue
+            key = layer_paths.get(f"layers.{start}", f"layers.{start}")
+            split_spec[key] = SplitPoint.BEGINNING
+        return split_spec
+    step = len(layers) / float(pp_degree)
+    for stage in range(1, int(pp_degree)):
+        split_idx = layers[int(stage * step)][0]
+        key = layer_paths.get(f"layers.{split_idx}", f"layers.{split_idx}")
+        split_spec[key] = SplitPoint.BEGINNING
+    return split_spec
+
+
+def _run_steps_pipeline(
+    schedule,
+    optimizer: Optimizer,
+    dataloader,
+    num_warmup: int,
+    num_steps: int,
+    profiler_ctx=None,
+    progress_every: int = 0,
+    dp_world_size: int = 1,
+    pp_rank: int = 0,
+    num_stages: int = 1,
+    cp_context_factory=None,
+) -> Tuple[List[float], List[float], List[int], List[float]]:
+    it = iter(dataloader)
+    losses: List[float] = []
+    step_times_ms: List[float] = []
+    effective_tokens_global: List[int] = []
+    mem_allocated_mb: List[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    total_steps = num_warmup + num_steps
+    progress_every = int(progress_every) if progress_every else 0
+    for step in range(total_steps):
+        if profiler_ctx:
+            profiler_ctx.step()
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(dataloader)
+            try:
+                batch = next(it)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "dataloader produced 0 batches; check SyntheticDataset length/global_batch_size configuration"
+                ) from exc
+        input_ids = batch["input_ids"] if pp_rank == 0 else None
+        target = batch["labels"] if pp_rank == (num_stages - 1) else None
+        if input_ids is not None:
+            input_ids = input_ids.cuda()
+        if target is not None:
+            target = target.cuda()
+        if input_ids is not None and "attention_mask" in batch:
+            eff = int(batch["attention_mask"].sum().item())
+        elif input_ids is not None:
+            eff = int(input_ids.numel())
+        else:
+            eff = 0
+        effective_tokens_global_step = eff * int(dp_world_size)
+        optimizer.zero_grad(set_to_none=True)
+        start_event.record()
+        mb_losses: List[float] = []
+        if cp_context_factory is not None:
+            with cp_context_factory():
+                schedule.step(input_ids, target=target, losses=mb_losses)
+        else:
+            schedule.step(input_ids, target=target, losses=mb_losses)
+        optimizer.step()
+        end_event.record()
+        end_event.synchronize()
+        iter_ms = start_event.elapsed_time(end_event)
+        if step >= num_warmup:
+            if mb_losses:
+                loss_avg = sum(float(x) for x in mb_losses) / max(len(mb_losses), 1)
+                losses.append(float(loss_avg))
+            step_times_ms.append(iter_ms)
+            if effective_tokens_global_step > 0:
+                effective_tokens_global.append(int(effective_tokens_global_step))
+            mem_allocated_mb.append(float(torch.cuda.memory_allocated()) / (1024 * 1024))
+        if progress_every and _is_rank0():
+            current = step + 1
+            if current % progress_every == 0 or current == total_steps:
+                phase = "warmup" if current <= num_warmup else "train"
+                print(f"[train] step {current}/{total_steps} ({phase})", flush=True)
+    return losses, step_times_ms, effective_tokens_global, mem_allocated_mb
+
+
 def _collect_static_layer_stats(layers: nn.ModuleList, world_size: int) -> Dict[str, Dict[str, float]]:
     stats: Dict[str, Dict[str, float]] = {}
     shard_size = max(int(world_size), 1)
@@ -126,6 +304,112 @@ def _collect_static_layer_stats(layers: nn.ModuleList, world_size: int) -> Dict[
     return stats
 
 
+def _infer_layer_type(name: Optional[str]) -> str:
+    if not name:
+        return "unknown"
+    low = str(name).lower()
+    if "attn" in low or "attention" in low:
+        return "attn"
+    if "mlp" in low or "ffn" in low or "feed_forward" in low:
+        return "mlp"
+    if "moe" in low or "expert" in low:
+        return "moe"
+    if "norm" in low:
+        return "norm"
+    if "embed" in low:
+        return "embed"
+    return "other"
+
+
+def _has_moe_experts(model: nn.Module) -> bool:
+    for name, module in model.named_modules():
+        low = f"{name}.{module.__class__.__name__}".lower()
+        if "moe" in low or "expert" in low:
+            return True
+    return False
+
+
+def _estimate_comm_split(total_comm_ms: float, fsdp_events: Dict[str, Any]) -> Dict[str, float]:
+    if total_comm_ms <= 0:
+        return {}
+    counts = {
+        "all_gather": int(fsdp_events.get("all_gather_calls", 0) or 0),
+        "reduce_scatter": int(fsdp_events.get("reduce_scatter_calls", 0) or 0),
+        "all_reduce": int(fsdp_events.get("all_reduce_calls", 0) or 0),
+    }
+    total = sum(counts.values())
+    if total <= 0:
+        return {}
+    return {k: total_comm_ms * (v / total) for k, v in counts.items()}
+
+
+def _augment_layer_stats(
+    layer_stats: Dict[str, Dict[str, float]],
+    static_stats: Dict[str, Dict[str, float]],
+    layer_paths: Dict[str, str],
+    comm_split_ms: Dict[str, float],
+    layer_comm_stats: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    if not layer_stats:
+        return layer_stats
+    total_param_bytes = 0.0
+    total_time_ms = 0.0
+    for st in static_stats.values():
+        try:
+            total_param_bytes += float(st.get("param_bytes") or 0.0)
+        except Exception:
+            continue
+    for st in layer_stats.values():
+        try:
+            fwd = float(st.get("fwd_ms_p50") or 0.0)
+            bwd = float(st.get("bwd_ms_p50") or 0.0)
+            total_time_ms += (fwd + bwd)
+        except Exception:
+            continue
+    out: Dict[str, Dict[str, float]] = {}
+    for name, st in layer_stats.items():
+        merged = dict(st)
+        static = static_stats.get(name, {})
+        param_bytes = float(static.get("param_bytes") or 0.0)
+        merged["param_bytes"] = param_bytes
+        merged["param_bytes_mb"] = param_bytes / (1024.0 * 1024.0) if param_bytes > 0 else 0.0
+        layer_path = layer_paths.get(name)
+        merged["layer_path"] = layer_path or ""
+        merged["layer_type"] = _infer_layer_type(layer_path or name)
+        comm_override = layer_comm_stats.get(name) if layer_comm_stats else None
+        if comm_override:
+            merged["all_gather_ms_est"] = float(comm_override.get("all_gather_ms") or 0.0)
+            merged["reduce_scatter_ms_est"] = float(comm_override.get("reduce_scatter_ms") or 0.0)
+            merged["all_reduce_ms_est"] = float(comm_override.get("all_reduce_ms") or 0.0)
+            merged["comm_time_ms_est"] = float(comm_override.get("comm_time_ms") or 0.0)
+            merged["comm_est_source"] = "profiler_stack"
+        elif comm_split_ms and (total_time_ms > 0 or total_param_bytes > 0):
+            if total_time_ms > 0:
+                try:
+                    weight = (float(st.get("fwd_ms_p50") or 0.0) + float(st.get("bwd_ms_p50") or 0.0)) / total_time_ms
+                except Exception:
+                    weight = 0.0
+                comm_source = "global_time_weighted"
+            else:
+                weight = param_bytes / total_param_bytes
+                comm_source = "global_param_weighted"
+            merged["all_gather_ms_est"] = comm_split_ms.get("all_gather", 0.0) * weight
+            merged["reduce_scatter_ms_est"] = comm_split_ms.get("reduce_scatter", 0.0) * weight
+            merged["all_reduce_ms_est"] = comm_split_ms.get("all_reduce", 0.0) * weight
+            merged["comm_time_ms_est"] = (
+                merged["all_gather_ms_est"] + merged["reduce_scatter_ms_est"] + merged["all_reduce_ms_est"]
+            )
+            merged["comm_est_source"] = comm_source
+        else:
+            merged["all_gather_ms_est"] = 0.0
+            merged["reduce_scatter_ms_est"] = 0.0
+            merged["all_reduce_ms_est"] = 0.0
+            merged["comm_time_ms_est"] = 0.0
+            merged["comm_est_source"] = "none"
+        out[name] = merged
+    return out
+
+
 def train_step(
     model: nn.Module,
     optimizer: Optimizer,
@@ -157,6 +441,8 @@ def run_steps(
     profiler_ctx=None,
     layer_probe=None,
     progress_every: int = 0,
+    world_size: Optional[int] = None,
+    cp_context_factory=None,
 ) -> Tuple[List[float], List[float], List[int], List[float]]:
     it = iter(dataloader)
     losses: List[float] = []
@@ -165,7 +451,7 @@ def run_steps(
     mem_allocated_mb: List[float] = []
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    world = dist.get_world_size() if dist.is_initialized() else 1
+    world = int(world_size or (dist.get_world_size() if dist.is_initialized() else 1))
     total_steps = num_warmup + num_steps
     progress_every = int(progress_every) if progress_every else 0
     for step in range(total_steps):
@@ -188,7 +474,11 @@ def run_steps(
             eff = int(input_ids.numel())
         effective_tokens_global_step = eff * world
         start_event.record()
-        loss = train_step(model, optimizer, batch, scaler=None)
+        if cp_context_factory is not None:
+            with cp_context_factory():
+                loss = train_step(model, optimizer, batch, scaler=None)
+        else:
+            loss = train_step(model, optimizer, batch, scaler=None)
         end_event.record()
         end_event.synchronize()
         iter_ms = start_event.elapsed_time(end_event)
@@ -213,7 +503,7 @@ def run_steps(
 class _LayerProbe:
     """轻量 layer hooks：记录 forward/backward CUDA event 时间与显存变化（只用于诊断）。"""
 
-    def __init__(self, layers: nn.ModuleList):
+    def __init__(self, layers: nn.ModuleList, *, record_ranges: bool = False):
         self._handles = []
         self._fwd_pending = {}
         self._bwd_pending = {}
@@ -224,11 +514,18 @@ class _LayerProbe:
         self._mem_delta_mb = {}
         self._fwd_mem_delta_mb = {}
         self._bwd_mem_delta_mb = {}
+        self._record_ranges = record_ranges
+        self._fwd_ranges = {}
+        self._bwd_ranges = {}
 
         for idx, layer in enumerate(layers):
             name = f"layers.{idx}"
 
             def _fwd_pre(_, __, layer_name=name):
+                if self._record_ranges:
+                    ctx = record_function(f"layer::{layer_name}::fwd")
+                    ctx.__enter__()
+                    self._fwd_ranges[layer_name] = ctx
                 s = torch.cuda.Event(enable_timing=True)
                 s.record()
                 mem0 = torch.cuda.memory_allocated()
@@ -241,6 +538,10 @@ class _LayerProbe:
                 start, mem0 = self._fwd_pending.pop(layer_name, (None, None))
                 if start is not None:
                     self._fwd_pairs.append((layer_name, start, e, mem0, mem1))
+                if self._record_ranges:
+                    ctx = self._fwd_ranges.pop(layer_name, None)
+                    if ctx is not None:
+                        ctx.__exit__(None, None, None)
 
             self._handles.append(layer.register_forward_pre_hook(_fwd_pre))
             self._handles.append(layer.register_forward_hook(_fwd_post))
@@ -248,6 +549,10 @@ class _LayerProbe:
             if hasattr(layer, "register_full_backward_pre_hook") and hasattr(layer, "register_full_backward_hook"):
 
                 def _bwd_pre(_, __, layer_name=name):
+                    if self._record_ranges:
+                        ctx = record_function(f"layer::{layer_name}::bwd")
+                        ctx.__enter__()
+                        self._bwd_ranges[layer_name] = ctx
                     s = torch.cuda.Event(enable_timing=True)
                     s.record()
                     mem0 = torch.cuda.memory_allocated()
@@ -260,6 +565,10 @@ class _LayerProbe:
                     start, mem0 = self._bwd_pending.pop(layer_name, (None, None))
                     if start is not None:
                         self._bwd_pairs.append((layer_name, start, e, mem0, mem1))
+                    if self._record_ranges:
+                        ctx = self._bwd_ranges.pop(layer_name, None)
+                        if ctx is not None:
+                            ctx.__exit__(None, None, None)
 
                 self._handles.append(layer.register_full_backward_pre_hook(_bwd_pre))
                 self._handles.append(layer.register_full_backward_hook(_bwd_post))
@@ -417,7 +726,7 @@ def _estimate_max_unsharded_numel(wrap_plan: Optional[List[Dict[str, Any]]]) -> 
         if isinstance(raf, bool):
             unsharded = not raf
         elif isinstance(raf, int):
-            unsharded = (raf == 0)
+            unsharded = True
         if not unsharded:
             continue
         numel = entry.get("param_numel")
@@ -462,7 +771,7 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
             comm_time_ms += _get_cuda_time(e) / 1e3
             all_reduce_calls += 1
     compute_time_ms = max(total_cuda_time - comm_time_ms, 0.0)
-    idle_ratio = max(1.0 - (comm_time_ms + compute_time_ms) / max(total_cuda_time, 1e-6), 0.0)
+    idle_ratio = None
     steps = int(getattr(prof, "step_num", 0) or 0)
     total_collective_calls = all_gather_calls + reduce_scatter_calls + all_reduce_calls
     calls_per_step = (total_collective_calls / steps) if steps > 0 else None
@@ -492,6 +801,53 @@ def _extract_profiler_metrics(prof) -> Dict[str, float]:
     }
 
 
+def _extract_layer_comm_from_profiler(prof, layer_names: List[str]) -> Dict[str, Dict[str, float]]:
+    if prof is None or not layer_names:
+        return {}
+    try:
+        events = prof.key_averages(group_by_stack_n=5)
+    except Exception:
+        return {}
+
+    def _get_cuda_time(evt) -> float:
+        return (
+            getattr(evt, "device_time_total", None)
+            or getattr(evt, "self_device_time_total", None)
+            or getattr(evt, "cuda_time_total", None)
+            or getattr(evt, "self_cuda_time_total", 0.0)
+            or 0.0
+        )
+
+    layer_comm: Dict[str, Dict[str, float]] = {}
+    needle = {name: f"layer::{name}::" for name in layer_names}
+    for evt in events:
+        key = evt.key
+        if "all_gather" in key:
+            kind = "all_gather"
+        elif "reduce_scatter" in key:
+            kind = "reduce_scatter"
+        elif "all_reduce" in key:
+            kind = "all_reduce"
+        else:
+            continue
+        stack = getattr(evt, "stack", None)
+        if not stack:
+            continue
+        stack_text = "\n".join(stack)
+        target = None
+        for name, marker in needle.items():
+            if marker in stack_text:
+                target = name
+                break
+        if not target:
+            continue
+        stats = layer_comm.setdefault(target, {"all_gather_ms": 0.0, "reduce_scatter_ms": 0.0, "all_reduce_ms": 0.0})
+        stats[f"{kind}_ms"] = stats.get(f"{kind}_ms", 0.0) + (_get_cuda_time(evt) / 1e3)
+    for name, stats in layer_comm.items():
+        stats["comm_time_ms"] = float(stats.get("all_gather_ms", 0.0) + stats.get("reduce_scatter_ms", 0.0) + stats.get("all_reduce_ms", 0.0))
+    return layer_comm
+
+
 def run_trial(
     strategy: Fsdp2Strategy,
     global_batch_size: int,
@@ -516,7 +872,47 @@ def run_trial(
     if seed is not None:
         set_seeds(int(seed))
     all_runs = []
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    world_size_total = dist.get_world_size() if dist.is_initialized() else 1
+    parallel_spec = asdict(getattr(strategy, "parallel", None) or {})
+    tp_degree = int(parallel_spec.get("tp_degree", 1) or 1)
+    pp_degree = int(parallel_spec.get("pp_degree", 1) or 1)
+    ep_degree = int(parallel_spec.get("ep_degree", 1) or 1)
+    cp_degree = int(parallel_spec.get("cp_degree", 1) or 1)
+    sp_enabled = bool(parallel_spec.get("sp_enabled", False))
+    if sp_enabled and tp_degree <= 1:
+        raise ValueError("sp_enabled requires tp_degree > 1")
+    mesh = None
+    dp_mesh = None
+    tp_mesh = None
+    pp_mesh = None
+    ep_mesh = None
+    cp_mesh = None
+    dp_world_size = int(world_size_total)
+    parallel_report_base = summarize_parallel_spec(parallel_spec) if parallel_spec else {}
+    if tp_degree > 1 or pp_degree > 1 or ep_degree > 1 or cp_degree > 1 or sp_enabled:
+        mesh, dp_world_size = build_global_mesh(
+            world_size_total,
+            tp_degree=tp_degree,
+            pp_degree=pp_degree,
+            ep_degree=ep_degree,
+            cp_degree=cp_degree,
+        )
+        if mesh is not None:
+            dp_mesh = mesh["dp"]
+            pp_mesh = mesh["pp"]
+            tp_mesh = mesh["tp"]
+            ep_mesh = mesh["ep"]
+            cp_mesh = mesh["cp"]
+        if parallel_report_base:
+            parallel_report_base = dict(parallel_report_base)
+        else:
+            parallel_report_base = {}
+        parallel_report_base.update(
+            {
+                "world_size_total": int(world_size_total),
+                "dp_world_size": int(dp_world_size),
+            }
+        )
     for r in range(repeats):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
@@ -524,20 +920,102 @@ def run_trial(
         _set_stage("load_model")
         model = load_model(model_name=model_name)
         layers_static = extract_transformer_layers(model)
+        layer_paths: Dict[str, str] = {}
+        if layers_static is not None:
+            name_by_id = {id(m): name for name, m in model.named_modules()}
+            for idx, layer in enumerate(layers_static):
+                name = name_by_id.get(id(layer))
+                if name:
+                    layer_paths[f"layers.{idx}"] = name
         static_layer_stats = (
-            _collect_static_layer_stats(layers_static, world_size=world_size) if layers_static is not None else {}
+            _collect_static_layer_stats(layers_static, world_size=dp_world_size) if layers_static is not None else {}
         )
         _set_last_static_layer_stats(static_layer_stats)
         anatomy = analyze_model_anatomy(model)
         _set_last_model_anatomy(anatomy)
+        parallel_report = dict(parallel_report_base) if parallel_report_base else {}
+        if tp_mesh is not None:
+            plan_id = infer_tp_plan_id(model, model_name, parallel_spec.get("tp_plan", "auto"))
+            tp_report = apply_tp_sp(model, tp_mesh, plan_id=plan_id, sp_enabled=sp_enabled)
+            parallel_report["tp_plan_id"] = plan_id
+            parallel_report["tp_sp_report"] = tp_report
+        if ep_degree > 1 and not _has_moe_experts(model):
+            raise ValueError("ep_degree>1 requested but model has no MoE experts")
+        cp_context_factory = None
+        if cp_degree > 1:
+            if context_parallel is None or cp_mesh is None:
+                raise RuntimeError("cp_degree>1 requires context_parallel and cp_mesh")
+            cp_context_factory = lambda: context_parallel(cp_mesh)
         _log_rank0("[trial] applying strategy")
         _set_stage("apply_strategy")
-        model = apply_strategy(model, strategy, world_size=dist.get_world_size() if dist.is_initialized() else 1)
-        _set_stage("build_optimizer")
-        optimizer = build_optimizer(model, lr=lr)
-        # Ensure synthetic loader won't be empty with drop_last=True and won't exhaust during warmup+steps.
-        world = dist.get_world_size() if dist.is_initialized() else 1
+        model = apply_strategy(model, strategy, world_size=dp_world_size, dp_mesh=dp_mesh)
+        world = int(dp_world_size)
         per_rank_batch = int(math.ceil(global_batch_size / max(world, 1)))
+        use_pipeline = bool(pp_degree > 1)
+        schedule = None
+        pp_rank = 0
+        num_stages = 1
+        if use_pipeline:
+            if pipeline is None or PipelineStage is None:
+                raise RuntimeError("pp_degree>1 requires torch.distributed.pipelining")
+            if pp_mesh is None:
+                raise RuntimeError("pp_degree>1 requires pp_mesh")
+            if per_rank_batch < 1:
+                raise ValueError("per_rank_batch must be >=1 for pipeline")
+            split_spec = _build_pp_split_spec(layer_paths, pp_degree, parallel_spec.get("pp_stages"))
+            device = torch.device("cuda")
+            dummy_input = torch.zeros((per_rank_batch, seq_len), device=device, dtype=torch.long)
+            pipe = pipeline(model, mb_args=(dummy_input,), split_spec=split_spec)
+            pp_group = pp_mesh.get_group()
+            pp_rank = dist.get_rank(pp_group)
+            stage = pipe.build_stage(pp_rank, device, group=pp_group)
+            num_stages = int(pp_degree)
+            pp_microbatches = int(parallel_spec.get("pp_microbatches", 1) or 1)
+            if pp_microbatches < 1:
+                pp_microbatches = 1
+            if pp_microbatches > per_rank_batch:
+                raise ValueError("pp_microbatches cannot exceed per_rank_batch")
+            schedule_name = str(parallel_spec.get("pp_schedule", "1f1b")).lower()
+            chunk_spec = None
+            if pp_microbatches > 1:
+                if TensorChunkSpec is None:
+                    raise RuntimeError("pp_microbatches>1 requires TensorChunkSpec")
+                chunk_spec = TensorChunkSpec(0)
+            if schedule_name in {"gpipe"}:
+                schedule = ScheduleGPipe(
+                    stage,
+                    pp_microbatches,
+                    loss_fn=_pipeline_loss_fn,
+                    args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                    kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+                )
+            elif schedule_name in {"interleaved1f1b", "interleaved"}:
+                schedule = ScheduleInterleaved1F1B(
+                    [stage],
+                    pp_microbatches,
+                    loss_fn=_pipeline_loss_fn,
+                    args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                    kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+                )
+            elif schedule_name in {"looped_bfs", "loopedbfs"}:
+                schedule = ScheduleLoopedBFS([stage], pp_microbatches, loss_fn=_pipeline_loss_fn)
+            else:
+                schedule = Schedule1F1B(
+                    stage,
+                    pp_microbatches,
+                    loss_fn=_pipeline_loss_fn,
+                    args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                    kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+                )
+            model_for_optimizer = getattr(stage, "submod", stage)
+            _set_stage("build_optimizer")
+            optimizer = build_optimizer(model_for_optimizer, lr=lr)
+            parallel_report["pp_rank"] = int(pp_rank)
+            parallel_report["pp_schedule"] = schedule_name
+            parallel_report["pp_microbatches"] = int(pp_microbatches)
+        else:
+            _set_stage("build_optimizer")
+            optimizer = build_optimizer(model, lr=lr)
         required_batches = num_warmup + num_steps + 1
         required_len = per_rank_batch * required_batches
         _set_stage("build_dataloader")
@@ -552,7 +1030,9 @@ def run_trial(
         _log_rank0("[trial] dataloader ready")
 
         prof = None
+        record_ranges = False
         if profiling == "heavy":
+            record_ranges = bool(os.environ.get("FSDP_AGENT_LAYER_COMM_STACK"))
             activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
             os.makedirs(trace_dir, exist_ok=True)
             trace_path = os.path.join(trace_dir, f"trial_{trial_id}_run{r}")
@@ -562,40 +1042,82 @@ def run_trial(
                 on_trace_ready=tensorboard_trace_handler(trace_path),
                 record_shapes=False,
                 profile_memory=True,
+                with_stack=record_ranges,
             )
 
-        layers = extract_transformer_layers(model)
-        probe = _LayerProbe(layers) if layers is not None else None
+        layers = extract_transformer_layers(model) if not use_pipeline else None
+        probe = _LayerProbe(layers, record_ranges=record_ranges) if layers is not None else None
+        layer_stats_coverage = None
+        layer_stats_incomplete = None
         try:
             progress_every = max(1, int(num_steps) // 5)
             _log_rank0(f"[trial] start steps (warmup={num_warmup}, steps={num_steps}, profile={profiling})")
             _set_stage("train_steps")
             if prof is None:
-                losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
-                    model,
-                    optimizer,
-                    dataloader,
-                    num_warmup=num_warmup,
-                    num_steps=num_steps,
-                    profiler_ctx=None,
-                    layer_probe=probe,
-                    progress_every=progress_every,
-                )
-            else:
-                with prof:
+                if use_pipeline:
+                    losses, step_times_ms, effective_tokens_global, mem_allocated_mb = _run_steps_pipeline(
+                        schedule,
+                        optimizer,
+                        dataloader,
+                        num_warmup=num_warmup,
+                        num_steps=num_steps,
+                        profiler_ctx=None,
+                        progress_every=progress_every,
+                        dp_world_size=dp_world_size,
+                        pp_rank=pp_rank,
+                        num_stages=num_stages,
+                        cp_context_factory=cp_context_factory,
+                    )
+                else:
                     losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
                         model,
                         optimizer,
                         dataloader,
                         num_warmup=num_warmup,
                         num_steps=num_steps,
-                        profiler_ctx=prof,
+                        profiler_ctx=None,
                         layer_probe=probe,
                         progress_every=progress_every,
+                        world_size=dp_world_size,
+                        cp_context_factory=cp_context_factory,
                     )
+            else:
+                with prof:
+                    if use_pipeline:
+                        losses, step_times_ms, effective_tokens_global, mem_allocated_mb = _run_steps_pipeline(
+                            schedule,
+                            optimizer,
+                            dataloader,
+                            num_warmup=num_warmup,
+                            num_steps=num_steps,
+                            profiler_ctx=prof,
+                            progress_every=progress_every,
+                            dp_world_size=dp_world_size,
+                            pp_rank=pp_rank,
+                            num_stages=num_stages,
+                            cp_context_factory=cp_context_factory,
+                        )
+                    else:
+                        losses, step_times_ms, effective_tokens_global, mem_allocated_mb = run_steps(
+                            model,
+                            optimizer,
+                            dataloader,
+                            num_warmup=num_warmup,
+                            num_steps=num_steps,
+                            profiler_ctx=prof,
+                            layer_probe=probe,
+                            progress_every=progress_every,
+                            world_size=dp_world_size,
+                            cp_context_factory=cp_context_factory,
+                        )
         finally:
             _set_stage("postprocess")
             layer_summary = probe.summary() if probe is not None else {}
+            if layers is not None:
+                total_layers = len(layers)
+                if total_layers > 0:
+                    layer_stats_coverage = len(layer_summary) / total_layers
+                    layer_stats_incomplete = layer_stats_coverage < 0.8
             if probe is not None:
                 probe.close()
         _log_rank0("[trial] steps done")
@@ -603,11 +1125,25 @@ def run_trial(
         torch.cuda.synchronize()
         mem_bytes = torch.cuda.max_memory_allocated()
         prof_metrics = _extract_profiler_metrics(prof) if prof is not None else {}
+        comm_split = _estimate_comm_split(
+            float(prof_metrics.get("comm_time_ms", 0.0) or 0.0),
+            prof_metrics.get("fsdp_events") or {},
+        )
+        layer_comm_stats = _extract_layer_comm_from_profiler(prof, list(layer_paths.keys())) if record_ranges else {}
         prof_metrics["max_mem_bytes"] = mem_bytes
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
-        prof_metrics["layer_stats"] = layer_summary
+        prof_metrics["layer_stats"] = _augment_layer_stats(
+            layer_summary,
+            static_layer_stats,
+            layer_paths,
+            comm_split,
+            layer_comm_stats=layer_comm_stats,
+        )
+        prof_metrics["layer_stats_coverage"] = layer_stats_coverage
+        prof_metrics["layer_stats_incomplete"] = layer_stats_incomplete
         prof_metrics["layer_stats_static"] = static_layer_stats
+        prof_metrics["layer_paths"] = layer_paths
         prof_metrics["model_anatomy"] = anatomy
         # 只用 CUDA event 的实测步时，避免 profiler 聚合带来的偏差（用 median 抵抗偶发抖动/0ms）
         sane = [t for t in step_times_ms if t >= _MIN_STEP_TIME_MS]
@@ -679,12 +1215,14 @@ def run_trial(
         prof_metrics.setdefault("kernel_bubble_ratio_std_est", None)
 
         # comm_ratio：仅 heavy 下可靠
+        comm_ratio_valid = profiling == "heavy"
         if profiling == "heavy":
             total = float(prof_metrics.get("total_cuda_time_ms", 0.0) or 0.0)
             comm = float(prof_metrics.get("comm_time_ms", 0.0) or 0.0)
             prof_metrics["comm_ratio"] = (comm / total) if total > 0 else None
         else:
             prof_metrics.setdefault("comm_ratio", None)
+        prof_metrics["comm_ratio_valid"] = comm_ratio_valid
 
         # MFU 暂不可信，置空，避免误导
         prof_metrics["mfu_percent"] = None
@@ -693,7 +1231,7 @@ def run_trial(
         prof_metrics["profiling"] = profiling
         prof_metrics["trial_context"] = {
             "requested_global_batch_size": int(global_batch_size),
-            "effective_global_batch_size": int(per_rank_batch * world_size),
+            "effective_global_batch_size": int(per_rank_batch * dp_world_size),
             "per_rank_batch_size": int(per_rank_batch),
             "seq_len": int(seq_len),
             "vocab_size": int(vocab_size),
@@ -713,6 +1251,11 @@ def run_trial(
                 "platform": platform.platform(),
             },
         }
+        prof_metrics["trial_context"]["dp_world_size"] = int(dp_world_size)
+        prof_metrics["trial_context"]["world_size_total"] = int(world_size_total)
+        if parallel_report:
+            prof_metrics["parallel"] = parallel_report
+            prof_metrics["trial_context"]["parallel"] = parallel_report
         execution_proof = _collect_execution_proof(model)
         prof_metrics["execution_proof"] = execution_proof
         prof_metrics["max_unsharded_numel_est"] = _estimate_max_unsharded_numel(execution_proof.get("wrap_plan"))
@@ -721,7 +1264,7 @@ def run_trial(
             prof_metrics.setdefault("total_cpu_time_ms", 0.0)
             prof_metrics.setdefault("comm_time_ms", 0.0)
             prof_metrics.setdefault("compute_time_ms", 0.0)
-            prof_metrics.setdefault("idle_ratio", 0.0)
+            prof_metrics.setdefault("idle_ratio", None)
             prof_metrics.setdefault("collective_calls_total", 0)
             prof_metrics.setdefault("collective_calls_per_step_est", None)
             prof_metrics.setdefault("collective_calls_step_jitter_est", None)
@@ -772,7 +1315,8 @@ def run_trial(
         "collective_calls_step_jitter_est": best.get("collective_calls_step_jitter_est", None),
         "mfu_percent": best.get("mfu_percent", 0.0),
         "tokens_per_step": global_batch_size * seq_len,
-        "world_size": world_size,
+        "world_size": int(dp_world_size),
+        "world_size_total": int(world_size_total),
         "gpu_busy_ratio_est": best.get("gpu_busy_ratio_est", None),
         "host_overhead_ratio_est": best.get("host_overhead_ratio_est", None),
         "comm_ratio": best.get("comm_ratio", None),

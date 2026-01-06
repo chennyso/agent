@@ -8,6 +8,7 @@ Modules:
 - train: training loop and profiling harness.
 - agent_loop: LLM-driven search scaffold.
 - utils: dataloaders/dataset_stats/hardware_info/metrics_utils.
+- strategy_dsl: DSL/transform helpers for strategy logging.
 """
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "dataset_stats",
     "hardware_info",
     "metrics_utils",
+    "strategy_dsl",
 ]

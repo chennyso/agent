@@ -25,7 +25,7 @@ def next_phase(current: Phase, improved: bool) -> Phase:
     if current == Phase.GROUPING:
         return Phase.LIFECYCLE
     if current == Phase.LIFECYCLE:
-        return Phase.PLACEMENT
+        return Phase.OFFLOAD
     if current == Phase.PLACEMENT:
         return Phase.OFFLOAD
     return Phase.OFFLOAD

@@ -1,0 +1,51 @@
+﻿[
+  {
+    "primary": "COMM",
+    "subtype": "all_gather_forward_late",
+    "signals": ["trace_summary.all_gather_forward_late == true", "comm_ratio >= 0.35"],
+    "actions": ["change_grouping", "set_root_reshard_false", "layer_override_reshard"],
+    "confidence_hint": "high"
+  },
+  {
+    "primary": "COMM",
+    "subtype": "collective_calls_too_many",
+    "signals": ["collective_calls_per_step_est high", "collective_calls_step_jitter_est high"],
+    "actions": ["change_grouping"],
+    "confidence_hint": "medium"
+  },
+  {
+    "primary": "COMM",
+    "subtype": "cross_node_penalty",
+    "signals": ["comm_locality == inter", "comm_ratio >= threshold"],
+    "actions": ["change_mesh"],
+    "confidence_hint": "medium"
+  },
+  {
+    "primary": "MEMORY",
+    "subtype": "peak_unsharded_groups",
+    "signals": ["headroom_ratio < 0.1", "peak_unsharded_groups high"],
+    "actions": ["batch_size", "layer_override_reshard", "shard_plan", "enable_cpu_offload"],
+    "confidence_hint": "high"
+  },
+  {
+    "primary": "MEMORY",
+    "subtype": "allocator_thrashing",
+    "signals": ["alloc_free_spike_ratio >= 0.15"],
+    "actions": ["change_grouping", "enable_cpu_offload"],
+    "confidence_hint": "medium"
+  },
+  {
+    "primary": "CPU_OR_WAIT",
+    "subtype": "host_overhead",
+    "signals": ["host_overhead_ratio_est >= 0.25"],
+    "actions": ["change_grouping", "layer_override_reshard"],
+    "confidence_hint": "medium"
+  },
+  {
+    "primary": "COMPUTE",
+    "subtype": "kernel_bound",
+    "signals": ["gpu_busy_ratio_est >= 0.85", "comm_ratio < 0.2"],
+    "actions": ["no_change"],
+    "confidence_hint": "low"
+  }
+]

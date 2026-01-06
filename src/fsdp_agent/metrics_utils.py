@@ -23,13 +23,10 @@ def score_strategy(metrics: Dict, mem_limit_bytes: int, weights: Dict = None) ->
     if metrics.get("oom", False):
         return float("-inf")
     mem = metrics.get("max_mem_bytes", 0)
-    throughput = metrics.get("throughput_effective_tokens_per_s", None)
-    if throughput is None:
-        throughput = metrics.get("throughput_tokens_per_s", 0.0)
-    comm = metrics.get("comm_time_ms", 0.0)
-    compute = metrics.get("compute_time_ms", 0.0)
-    total = max(comm + compute, 1e-6)
-    comm_ratio = comm / total
+    throughput = metrics.get("throughput_effective_tokens_per_s", 0.0) or 0.0
+    comm_ratio = 0.0
+    if metrics.get("comm_ratio_valid") and metrics.get("comm_ratio") is not None:
+        comm_ratio = float(metrics.get("comm_ratio") or 0.0)
     if mem > mem_limit_bytes:
         over = mem / mem_limit_bytes
         return throughput / (1.0 + 5.0 * (over - 1.0))

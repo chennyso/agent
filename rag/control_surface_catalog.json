@@ -1,0 +1,252 @@
+﻿[
+  {
+    "knob": "mesh",
+    "category": "device_mesh",
+    "agent_support": "partial",
+    "fsdp2_support": true,
+    "effects": ["sharding placement", "comm locality"],
+    "risks": ["2d mesh requires mesh_dim_names and valid world_size"],
+    "guards": ["allow_mesh", "allow_2d_single_node"],
+    "fsdp2_refs": ["_fully_shard.py:136-204"]
+  },
+  {
+    "knob": "reshard_after_forward",
+    "category": "reshard",
+    "agent_support": "yes",
+    "fsdp2_support": true,
+    "effects": ["param lifetime", "all_gather/backward pressure"],
+    "risks": ["false increases memory", "int requires shard divisor"],
+    "guards": ["memory_guard", "_validate_reshard_after_forward"],
+    "fsdp2_refs": ["_fully_shard.py:144-160"]
+  },
+  {
+    "knob": "shard_placement_fn",
+    "category": "shard_dim",
+    "agent_support": "via shard_plan",
+    "fsdp2_support": true,
+    "effects": ["parameter sharding dimension"],
+    "risks": ["requires divisible shard dim"],
+    "guards": ["shard_plan_compat"],
+    "fsdp2_refs": ["_fully_shard.py:168-175"]
+  },
+  {
+    "knob": "mp_policy",
+    "category": "mixed_precision",
+    "agent_support": "partial",
+    "fsdp2_support": true,
+    "effects": ["param dtype", "compute dtype", "reduction dtype"],
+    "risks": ["precision loss", "overflow"],
+    "guards": [],
+    "fsdp2_refs": ["_fully_shard.py:176-178", "_fsdp_api.py:28-53"]
+  },
+  {
+    "knob": "offload_policy",
+    "category": "offload",
+    "agent_support": "partial",
+    "fsdp2_support": true,
+    "effects": ["reduce resident params", "reduce optimizer memory"],
+    "risks": ["cpu bandwidth bound", "pinned memory pressure"],
+    "guards": ["allow_offload"],
+    "fsdp2_refs": ["_fully_shard.py:179-181"]
+  },
+  {
+    "knob": "ignored_params",
+    "category": "exclude_params",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["exclude params from sharding"],
+    "risks": ["manual consistency required"],
+    "guards": [],
+    "fsdp2_refs": ["_fully_shard.py:182-184"]
+  },
+  {
+    "knob": "param_dtype",
+    "category": "mixed_precision",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["unsharded param dtype"],
+    "risks": ["precision loss"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_api.py:28-33"]
+  },
+  {
+    "knob": "reduce_dtype",
+    "category": "mixed_precision",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["grad reduction dtype"],
+    "risks": ["precision loss"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_api.py:34-41"]
+  },
+  {
+    "knob": "output_dtype",
+    "category": "mixed_precision",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["forward output dtype"],
+    "risks": ["precision loss"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_api.py:42-45"]
+  },
+  {
+    "knob": "cast_forward_inputs",
+    "category": "mixed_precision",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["input casting policy"],
+    "risks": ["precision loss"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_api.py:46-53"]
+  },
+  {
+    "knob": "reduce_grads",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["enable/disable grad reduce"],
+    "risks": ["incorrect training if disabled"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:184-185"]
+  },
+  {
+    "knob": "all_reduce_grads",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["enable HSDP all-reduce"],
+    "risks": ["extra comm"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:186-189"]
+  },
+  {
+    "knob": "reshard_after_backward",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["post-backward reshard"],
+    "risks": ["higher memory if false"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:190-192"]
+  },
+  {
+    "knob": "gradient_divide_factor",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["custom grad scaling"],
+    "risks": ["numerical errors"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:193-195"]
+  },
+  {
+    "knob": "force_sum_reduction_for_comms",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["force sum reduction"],
+    "risks": ["potential scaling issues"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:196-198"]
+  },
+  {
+    "knob": "unshard_async_op",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["async unshard prefetch"],
+    "risks": ["stream fragmentation"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:199-202"]
+  },
+  {
+    "knob": "unshard_in_backward",
+    "category": "comm_overlap",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["skip unshard in backward"],
+    "risks": ["incorrect grads if needed"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:203-205"]
+  },
+  {
+    "knob": "_StridedShard",
+    "category": "tp_composition",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["right-to-left sharding for TP+FSDP"],
+    "risks": ["requires DTensor placements"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param.py:311-318"]
+  },
+  {
+    "knob": "_spmd_mesh",
+    "category": "spmd",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["multi-dim mesh (2-4D)"],
+    "risks": ["complex placement constraints"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param.py:304-308"]
+  },
+  {
+    "knob": "_tp_spec",
+    "category": "tp_ep",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["TP/EP composition"],
+    "risks": ["mesh alignment required"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param.py:290-302"]
+  },
+  {
+    "knob": "_spmd_placements",
+    "category": "spmd",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["DTensor placement control"],
+    "risks": ["invalid placements"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param.py:309-331"]
+  },
+  {
+    "knob": "comm_ctx",
+    "category": "comm_context",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["communication context control"],
+    "risks": ["complexity"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:180-181"]
+  },
+  {
+    "knob": "_post_reduce_event",
+    "category": "stream_sync",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["cuda event sync"],
+    "risks": ["stream ordering issues"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param_group.py:210-213"]
+  },
+  {
+    "knob": "_extensions_data",
+    "category": "extensions",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["user metadata across all-gather"],
+    "risks": ["custom coupling"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_param.py:182-190"]
+  },
+  {
+    "knob": "share_comm_ctx",
+    "category": "comm_context",
+    "agent_support": "no",
+    "fsdp2_support": true,
+    "effects": ["share comm context across modules"],
+    "risks": ["debug complexity"],
+    "guards": [],
+    "fsdp2_refs": ["test_fully_shard_training.py:1513-1514"]
+  }
+]

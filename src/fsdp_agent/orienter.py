@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fsdp_agent.phases import Phase
 
@@ -14,9 +14,18 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
 
     comm_time = metrics.get("comm_time_ms", None)
     compute_time = metrics.get("compute_time_ms", None)
+    comm_ratio_valid = bool(metrics.get("comm_ratio_valid", profiling == "heavy"))
     comm_ratio: Optional[float] = None
-    if isinstance(comm_time, (int, float)) and isinstance(compute_time, (int, float)) and (comm_time + compute_time) > 0:
-        comm_ratio = float(comm_time) / float(comm_time + compute_time)
+    if comm_ratio_valid:
+        raw_comm_ratio = metrics.get("comm_ratio")
+        if isinstance(raw_comm_ratio, (int, float)):
+            comm_ratio = float(raw_comm_ratio)
+        elif (
+            isinstance(comm_time, (int, float))
+            and isinstance(compute_time, (int, float))
+            and (comm_time + compute_time) > 0
+        ):
+            comm_ratio = float(comm_time) / float(comm_time + compute_time)
 
     if metrics.get("oom"):
         headroom_gb = -1.0
@@ -47,9 +56,11 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     if not layer_stats:
         layer_stats = metrics.get("layer_stats_static") or {}
         layer_stats_source = "static" if layer_stats else ""
+    layer_paths = metrics.get("layer_paths") or {}
     top_targets = _top_layer_targets(layer_stats)
     if layer_stats_source:
         top_targets["source"] = layer_stats_source
+    layer_profile = _summarize_layer_profile(layer_stats, layer_paths, top_targets)
     if layer_stats:
         confidence = max(confidence, 0.6 if layer_stats_source == "static" else 0.65)
 
@@ -105,7 +116,7 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
     packetization_risk = "high" if latency_hotspots else "low"
 
     comm_estimator = {
-        "comm_share": comm_ratio,
+        "comm_share": comm_ratio if comm_ratio_valid else None,
         "collective_type_mix": collective_mix,
         "packetization_risk": packetization_risk,
     }
@@ -149,6 +160,7 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "headroom_gb": headroom_gb,
         "headroom_ratio": headroom_ratio,
         "comm_ratio": comm_ratio,
+        "comm_ratio_valid": comm_ratio_valid,
         "tokens_per_s": float(metrics.get("throughput_tokens_per_s") or 0.0),
         "throughput_effective_tokens_per_s": float(metrics.get("throughput_effective_tokens_per_s") or 0.0),
         "effective_tokens_per_step": int(metrics.get("effective_tokens_per_step") or 0),
@@ -156,6 +168,7 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "gpu_busy_ratio_est": metrics.get("gpu_busy_ratio_est", None),
         "host_overhead_ratio_est": metrics.get("host_overhead_ratio_est", None),
         "top_targets": top_targets,
+        "layer_profile": layer_profile,
         "action_cost": action_cost,
         "determinism": determinism,
         "comm_estimator": comm_estimator,
@@ -171,6 +184,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "forbidden_in_phase",
             "enable_cpu_offload": "low",
+            "set_parallel": "forbidden_in_phase",
             "change_grouping": "forbidden_in_phase",
             "set_root_reshard_false": "forbidden_in_phase",
             "layer_override_reshard": "low",
@@ -180,6 +194,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "forbidden_in_phase",
             "enable_cpu_offload": "forbidden_in_phase",
+            "set_parallel": "high",
             "change_grouping": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "low",
@@ -189,6 +204,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "low",
             "enable_cpu_offload": "forbidden_in_phase",
+            "set_parallel": "medium",
             "change_grouping": "medium",
             "set_root_reshard_false": "medium",
             "layer_override_reshard": "medium",
@@ -198,6 +214,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "medium",
             "enable_cpu_offload": "forbidden_in_phase",
+            "set_parallel": "medium",
             "change_grouping": "low",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "medium",
@@ -207,6 +224,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "medium",
             "enable_cpu_offload": "high",
+            "set_parallel": "medium",
             "change_grouping": "low",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "low",
@@ -216,6 +234,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "low",
             "enable_cpu_offload": "high",
+            "set_parallel": "medium",
             "change_grouping": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "medium",
@@ -224,6 +243,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
     return {
         "change_mesh": "low",
         "enable_cpu_offload": "low",
+        "set_parallel": "medium",
         "change_grouping": "medium",
         "set_root_reshard_false": "medium",
         "layer_override_reshard": "medium",
@@ -234,6 +254,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
 def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, Any]:
     # layer_stats: {"layers.17": {"fwd_ms": [...], "bwd_ms": [...], "mem_delta_mb": [...]}, ...}
     scored = []
+    comm_scored = []
 
     def _as_float(val: Any) -> float:
         try:
@@ -258,11 +279,15 @@ def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, 
                     mem = (param_numel * 2.0) / (1024.0 * 1024.0)
         except Exception:
             continue
-        time_score = (fwd + bwd) if (fwd + bwd) > 0.0 else mem
-        scored.append((time_score, mem, name))
+            time_score = (fwd + bwd) if (fwd + bwd) > 0.0 else mem
+            comm_score = _as_float(st.get("comm_time_ms_est") or 0.0)
+            scored.append((time_score, mem, name))
+            if comm_score > 0.0:
+                comm_scored.append((comm_score, name))
     scored.sort(reverse=True)
     top_time_layers = [n for _, __, n in scored[:topk]]
     top_mem_layers = [n for _, m, n in sorted(scored, key=lambda x: x[1], reverse=True)[:topk]]
+    top_comm_layers = [n for _, n in sorted(comm_scored, key=lambda x: x[0], reverse=True)[:topk]]
 
     def _extract_ids(names: List[str]) -> List[int]:
         out: List[int] = []
@@ -279,8 +304,10 @@ def _top_layer_targets(layer_stats: Dict[str, Any], topk: int = 3) -> Dict[str, 
     return {
         "top_time_layers": top_time_layers,
         "top_mem_layers": top_mem_layers,
+        "top_comm_layers": top_comm_layers,
         "top_time_layer_ids": _extract_ids(top_time_layers),
         "top_mem_layer_ids": _extract_ids(top_mem_layers),
+        "top_comm_layer_ids": _extract_ids(top_comm_layers),
     }
 
 
@@ -307,3 +334,40 @@ def _shard_plan_compat(layer_stats: Dict[str, Any]) -> Optional[Dict[str, float]
         "dim1_ratio": dim1_bytes / total_bytes,
         "largest_ratio": any_bytes / total_bytes,
     }
+
+
+def _summarize_layer_profile(
+    layer_stats: Dict[str, Any],
+    layer_paths: Dict[str, str],
+    top_targets: Dict[str, Any],
+    topk: int = 6,
+) -> List[Dict[str, Any]]:
+    if not layer_stats:
+        return []
+    ordered: List[str] = []
+    for key in ("top_time_layers", "top_mem_layers", "top_comm_layers"):
+        for name in top_targets.get(key, []) or []:
+            if name not in ordered:
+                ordered.append(name)
+    if topk > 0:
+        ordered = ordered[:topk]
+    out = []
+    for name in ordered:
+        st = layer_stats.get(name) or {}
+        scope = layer_paths.get(name) or name
+        out.append(
+            {
+                "layer": name,
+                "scope": scope,
+                "type": st.get("layer_type"),
+                "fwd_ms_p50": st.get("fwd_ms_p50"),
+                "bwd_ms_p50": st.get("bwd_ms_p50"),
+                "mem_delta_mb_p50": st.get("mem_delta_mb_p50"),
+                "param_bytes_mb": st.get("param_bytes_mb"),
+                "comm_time_ms_est": st.get("comm_time_ms_est"),
+                "all_gather_ms_est": st.get("all_gather_ms_est"),
+                "reduce_scatter_ms_est": st.get("reduce_scatter_ms_est"),
+                "comm_est_source": st.get("comm_est_source"),
+            }
+        )
+    return out

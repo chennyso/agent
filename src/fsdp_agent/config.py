@@ -55,11 +55,25 @@ class LayerOverride:
 
 
 @dataclass
+class ParallelSpec:
+    tp_degree: int = 1
+    pp_degree: int = 1
+    ep_degree: int = 1
+    cp_degree: int = 1
+    sp_enabled: bool = False
+    tp_plan: str = "auto"
+    pp_microbatches: int = 1
+    pp_schedule: str = "1f1b"
+    pp_stages: Optional[List[List[int]]] = None
+
+
+@dataclass
 class Fsdp2Strategy:
     global_layout: Fsdp2Layout
     layer_overrides: List[LayerOverride] = field(default_factory=list)
     named_overrides: Dict[str, Fsdp2Layout] = field(default_factory=dict)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
+    parallel: ParallelSpec = field(default_factory=ParallelSpec)
     schema_version: int = 2
     dataset_stats: Optional[DatasetStats] = None
 
@@ -79,6 +93,7 @@ class Fsdp2Strategy:
             ],
             "named_overrides": {k: asdict(v) for k, v in self.named_overrides.items()},
             "grouping": asdict(self.grouping),
+            "parallel": asdict(self.parallel),
             "dataset_stats": asdict(self.dataset_stats) if self.dataset_stats else None,
         }
 
@@ -100,11 +115,24 @@ class Fsdp2Strategy:
         named = {k: Fsdp2Layout(**v) for k, v in payload.get("named_overrides", {}).items()}
         ds = payload.get("dataset_stats")
         ds_obj = DatasetStats(**ds) if ds else None
+        parallel_payload = payload.get("parallel") or {}
+        parallel = ParallelSpec(
+            tp_degree=parallel_payload.get("tp_degree", 1),
+            pp_degree=parallel_payload.get("pp_degree", 1),
+            ep_degree=parallel_payload.get("ep_degree", 1),
+            cp_degree=parallel_payload.get("cp_degree", 1),
+            sp_enabled=parallel_payload.get("sp_enabled", False),
+            tp_plan=parallel_payload.get("tp_plan", "auto"),
+            pp_microbatches=parallel_payload.get("pp_microbatches", 1),
+            pp_schedule=parallel_payload.get("pp_schedule", "1f1b"),
+            pp_stages=parallel_payload.get("pp_stages"),
+        )
         return cls(
             global_layout=gl,
             layer_overrides=ovrs,
             named_overrides=named,
             grouping=grouping,
+            parallel=parallel,
             schema_version=schema_version,
             dataset_stats=ds_obj,
         )
@@ -160,6 +188,7 @@ class Fsdp2Strategy:
         payload = norm.to_dict()
         # dataset_stats does not affect strategy semantics; exclude to avoid noisy hashes.
         payload["dataset_stats"] = None
+        payload["_hash_salt"] = _SEMANTIC_HASH_SALT
         blob = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -171,6 +200,7 @@ _ALLOWED_MESH = {"1D", "2D"}
 _ALLOWED_SHARD = {"FULL", "HYBRID", "NO"}
 _ALLOWED_PLAN = {"DIM0", "DIM1", "LARGEST"}
 _ALLOWED_MP = {"bf16", "fp32"}
+_SEMANTIC_HASH_SALT = "fsdp2_strategy_v3"
 
 
 def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layout:
@@ -220,6 +250,36 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
     l.offload_params = bool(l.offload_params)
     l.offload_pin_memory = bool(l.offload_pin_memory)
     return l
+
+
+def _validate_parallel(parallel: ParallelSpec) -> ParallelSpec:
+    p = copy.deepcopy(parallel) if parallel is not None else ParallelSpec()
+    try:
+        p.tp_degree = int(p.tp_degree)
+        p.pp_degree = int(p.pp_degree)
+        p.ep_degree = int(p.ep_degree)
+        p.cp_degree = int(p.cp_degree)
+        p.pp_microbatches = int(p.pp_microbatches)
+    except Exception as exc:
+        raise ValueError("parallel degrees and pp_microbatches must be integers") from exc
+    if p.tp_degree < 1 or p.pp_degree < 1 or p.ep_degree < 1 or p.cp_degree < 1:
+        raise ValueError("parallel degrees must be >= 1")
+    if p.pp_microbatches < 1:
+        raise ValueError("parallel.pp_microbatches must be >= 1")
+    p.sp_enabled = bool(p.sp_enabled)
+    p.tp_plan = str(p.tp_plan or "auto")
+    p.pp_schedule = str(p.pp_schedule or "1f1b")
+    if p.pp_stages is not None:
+        stages = []
+        for idx, item in enumerate(p.pp_stages):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(f"parallel.pp_stages[{idx}] must be a [start, end] list")
+            start, end = int(item[0]), int(item[1])
+            if start < 0 or end < start:
+                raise ValueError(f"parallel.pp_stages[{idx}] must satisfy 0 <= start <= end")
+            stages.append([start, end])
+        p.pp_stages = stages
+    return p
 
 
 def _parse_layer_index(value: object, context: str) -> int:
@@ -284,6 +344,7 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> F
         ovrs.append(LayerOverride(start_layer=start, end_layer=end, layout=layout, layers=layers_list))
 
     named = {k: _validate_layout(v, f"named_overrides['{k}']") for k, v in strategy.named_overrides.items()}
+    parallel = _validate_parallel(strategy.parallel)
     ds = strategy.dataset_stats
 
     validated = Fsdp2Strategy(
@@ -291,6 +352,7 @@ def validate_strategy(strategy: Fsdp2Strategy, mem_limit_gb: float = 999.0) -> F
         layer_overrides=ovrs,
         named_overrides=named,
         grouping=grouping,
+        parallel=parallel,
         schema_version=strategy.schema_version,
         dataset_stats=ds,
     )
