@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -44,6 +45,68 @@ def _load_rag_cards() -> Dict[str, object]:
         except Exception:
             data[name] = []
     return data
+
+
+def _append_event(event_log: Optional[Path], payload: Dict[str, object]) -> None:
+    if event_log is None:
+        return
+    record = dict(payload)
+    record.setdefault("ts", time.time())
+    try:
+        event_log.parent.mkdir(parents=True, exist_ok=True)
+        with event_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        return
+
+
+def _log_llm_event(
+    event_log: Optional[Path],
+    label: str,
+    prompt: str,
+    reply: str,
+    *,
+    extra: Optional[Dict[str, object]] = None,
+) -> None:
+    payload = {"event": "llm_exchange", "label": label, "prompt": prompt, "reply": reply}
+    if extra:
+        payload.update(extra)
+    _append_event(event_log, payload)
+
+
+def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
+    keys = [
+        "trial_id",
+        "config_name",
+        "strategy_hash",
+        "score",
+        "score_mode",
+        "oom",
+        "oom_stage",
+        "error",
+        "error_msg",
+        "returncode",
+        "profiling",
+        "trace_dir",
+        "trace_path",
+        "metrics_path",
+        "strategy_path",
+        "throughput_effective_tokens_per_s",
+        "throughput_tokens_per_s",
+        "step_time_ms_p50",
+        "comm_ratio",
+        "oom_margin_gb",
+        "max_mem_bytes",
+        "determinism_score",
+    ]
+    out = {k: metrics.get(k) for k in keys if k in metrics}
+    if metrics.get("trace_summary") is not None:
+        out["trace_summary"] = metrics.get("trace_summary")
+    if metrics.get("stderr_tail"):
+        out["stderr_tail"] = metrics.get("stderr_tail")
+    if metrics.get("stdout_tail"):
+        out["stdout_tail"] = metrics.get("stdout_tail")
+    return out
 
 def _strategy_hash(strategy: Fsdp2Strategy) -> str:
     """Use semantic-normalized hash to avoid duplicate trials from equivalent configs."""
@@ -286,6 +349,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--show-progress", action="store_true", help="Stream trial stdout/stderr for live progress.")
     p.add_argument("--log-llm", action="store_true", help="Print LLM prompts and responses each round.")
+    p.add_argument("--event-log", type=str, default=None, help="Optional JSONL log for LLM I/O and trial results.")
     p.add_argument("--force-heavy-every", type=int, default=0, help="Force a heavy profile every N rounds.")
     p.add_argument("--seed", type=int, default=None, help="Optional RNG seed (default: no manual seeding).")
     p.add_argument(
@@ -1999,6 +2063,12 @@ def _run_trial_subprocess(
             "oom": oom,
             "error_msg": parsed,
             "returncode": returncode,
+            "profiling": profile,
+            "metrics_path": str(out_path),
+            "strategy_path": str(strat_path),
+            "trace_dir": str(workdir / "traces"),
+            "stderr_tail": (stderr_text or "")[-2000:],
+            "stdout_tail": (stdout_text or "")[-2000:],
         }
         if out_path.exists():
             try:
@@ -2010,6 +2080,9 @@ def _run_trial_subprocess(
     metrics = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
     metrics["trial_id"] = trial_id
     metrics["mem_limit_gb"] = args.mem_limit_gb
+    metrics["metrics_path"] = str(out_path)
+    metrics["strategy_path"] = str(strat_path)
+    metrics.setdefault("trace_dir", str(workdir / "traces"))
     metrics.setdefault("trial_context", {})
     # Also write context fields on controller side for subprocess failures.
     metrics["trial_context"].setdefault("requested_global_batch_size", gbs)
@@ -2114,6 +2187,10 @@ def _initial_phase_for_strategy(
 
 def main() -> None:
     args = parse_args()
+    event_log_path = Path(args.event_log) if args.event_log else None
+    if event_log_path:
+        print(f"[controller] event log -> {event_log_path}")
+        _append_event(event_log_path, {"event": "run_start", "args": vars(args), "cwd": str(Path.cwd())})
     if not (args.allow_tp or args.allow_pp or args.allow_ep or args.allow_cp or args.allow_sp):
         args.allow_tp = True
         args.allow_pp = True
@@ -2123,6 +2200,14 @@ def main() -> None:
     rag_cards = _load_rag_cards()
     hardware = load_hardware_info(args.hardware_json) if args.hardware_json else detect_hardware()
     dataset_stats = load_stats_from_file(args.dataset_stats_file) if args.dataset_stats_file else DatasetStats()
+    _append_event(
+        event_log_path,
+        {
+            "event": "hardware_detected",
+            "hardware": getattr(hardware, "__dict__", {}),
+            "hardware_summary": _hardware_summary(hardware),
+        },
+    )
     scale_policy = _scale_policy(hardware, nproc=int(args.nproc))
     comm_ratio_baseline: Optional[float] = None
     comm_ratio_source: Optional[str] = None
@@ -2162,6 +2247,14 @@ def main() -> None:
     seen_hashes.add(baseline_hash)
     hash_to_strategy[baseline_hash] = baseline.to_dict()
     pending_failure_feedback = _derive_failure_feedback(baseline_metrics)
+    _append_event(
+        event_log_path,
+        {
+            "event": "trial_result",
+            "phase": phase.value,
+            "summary": _summarize_metrics_for_log(baseline_metrics),
+        },
+    )
     trial_id += 1
 
     headroom_ratio = 0.0
@@ -2239,6 +2332,14 @@ def main() -> None:
         seen_hashes.add(strat_hash)
         hash_to_strategy[strat_hash] = strat.to_dict()
         pending_failure_feedback = _derive_failure_feedback(metrics)
+        _append_event(
+            event_log_path,
+            {
+                "event": "trial_result",
+                "phase": phase.value,
+                "summary": _summarize_metrics_for_log(metrics),
+            },
+        )
         trial_id += 1
 
     if feasibility_mode:
@@ -2362,6 +2463,14 @@ def main() -> None:
                 comm_ratio_source = "heavy_profile"
             history.append(diag)
             trial_id += 1
+            _append_event(
+                event_log_path,
+                {
+                    "event": "trial_result",
+                    "phase": phase.value,
+                    "summary": _summarize_metrics_for_log(diag),
+                },
+            )
             best_metrics_for_state = diag
             semantic_state = derive_semantic_state(best_metrics_for_state, mem_limit_gb=args.mem_limit_gb, phase=phase)
             semantic_state["upper_bound_gap"] = upper_bound_gap
@@ -2448,6 +2557,17 @@ def main() -> None:
         _log_llm_exchange("judge", j_prompt, judge_reply, args)
         judge_verdict = _parse_judge_verdict(judge_reply)
         judge_verdict = _coerce_judge_verdict(judge_verdict, semantic_state, allow_offload=bool(args.allow_offload))
+        _log_llm_event(
+            event_log_path,
+            "judge",
+            j_prompt,
+            judge_reply,
+            extra={
+                "round": round_idx,
+                "phase": phase.value,
+                "judge_verdict": judge_verdict,
+            },
+        )
 
         candidates = _candidate_pool(
             best_strategy,
@@ -2491,6 +2611,18 @@ def main() -> None:
         pending_failure_feedback = None
         coder_reply = call_llm(c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
         _log_llm_exchange("coder", c_prompt, coder_reply, args)
+        _log_llm_event(
+            event_log_path,
+            "coder",
+            c_prompt,
+            coder_reply,
+            extra={
+                "round": round_idx,
+                "phase": phase.value,
+                "candidate_count": len(candidates),
+                "doe_count": len(doe),
+            },
+        )
 
         max_retry = 2
         attempt = 0
@@ -2564,6 +2696,13 @@ def main() -> None:
                 current_c_prompt = current_c_prompt + f"\n\n[format error] {e}"
                 coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
                 _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
+                _log_llm_event(
+                    event_log_path,
+                    f"coder_retry_{attempt}",
+                    current_c_prompt,
+                    coder_reply,
+                    extra={"round": round_idx, "phase": phase.value, "error": str(e)},
+                )
                 attempt += 1
                 continue
 
@@ -2581,6 +2720,13 @@ def main() -> None:
                         args.llm_endpoint,
                     )
                     _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
+                    _log_llm_event(
+                        event_log_path,
+                        f"coder_retry_{attempt}",
+                        current_c_prompt,
+                        coder_reply,
+                        extra={"round": round_idx, "phase": phase.value, "error": str(last_parse_error)},
+                    )
                     attempt += 1
                     continue
             if cand_hash not in seen_hashes or (chosen_experiment and chosen_experiment.get("allow_duplicate")):
@@ -2595,7 +2741,27 @@ def main() -> None:
             current_c_prompt = current_c_prompt + "\n\n" + dedup_hint
             coder_reply = call_llm(current_c_prompt, CODER_SYSTEM, args.llm_model, args.llm_temperature, args.llm_endpoint)
             _log_llm_exchange(f"coder_retry_{attempt}", current_c_prompt, coder_reply, args)
+            _log_llm_event(
+                event_log_path,
+                f"coder_retry_{attempt}",
+                current_c_prompt,
+                coder_reply,
+                extra={"round": round_idx, "phase": phase.value, "error": "duplicate_strategy"},
+            )
             attempt += 1
+
+        _append_event(
+            event_log_path,
+            {
+                "event": "strategy_selection",
+                "round": round_idx,
+                "phase": phase.value,
+                "candidate_hash": cand_hash,
+                "candidate_from_plan_strategy": candidate_from_plan_strategy,
+                "chosen_experiment": chosen_experiment,
+                "coder_plan": coder_plan,
+            },
+        )
 
         if candidate is None:
             metrics = {
@@ -2662,6 +2828,17 @@ def main() -> None:
             _apply_feasibility_score(metrics)
 
         history.append(metrics)
+        _append_event(
+            event_log_path,
+            {
+                "event": "trial_result",
+                "phase": phase.value,
+                "summary": _summarize_metrics_for_log(metrics),
+                "coder_plan": metrics.get("coder_plan"),
+                "experiment_id": metrics.get("experiment_id"),
+                "experiment_kind": metrics.get("experiment_kind"),
+            },
+        )
         trial_id += 1
         feedback = _derive_failure_feedback(metrics)
         if feedback:
@@ -2787,6 +2964,14 @@ def main() -> None:
             diag["score"] = float("-inf")
             history.append(diag)
             trial_id += 1
+            _append_event(
+                event_log_path,
+                {
+                    "event": "trial_result",
+                    "phase": phase.value,
+                    "summary": _summarize_metrics_for_log(diag),
+                },
+            )
 
             sizes = _parse_batch_probe_sizes(args.batch_probe_sizes)
             if not sizes:
@@ -2812,6 +2997,14 @@ def main() -> None:
                 m["score"] = float("-inf")
                 history.append(m)
                 results.append(m)
+                _append_event(
+                    event_log_path,
+                    {
+                        "event": "trial_result",
+                        "phase": phase.value,
+                        "summary": _summarize_metrics_for_log(m),
+                    },
+                )
                 trial_id += 1
 
             batch_probe_summary = {

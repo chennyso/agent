@@ -1031,6 +1031,7 @@ def run_trial(
 
         prof = None
         record_ranges = False
+        trace_path = None
         if profiling == "heavy":
             record_ranges = bool(os.environ.get("FSDP_AGENT_LAYER_COMM_STACK"))
             activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -1133,6 +1134,8 @@ def run_trial(
         prof_metrics["max_mem_bytes"] = mem_bytes
         prof_metrics["loss_mean"] = float(sum(losses) / max(len(losses), 1))
         prof_metrics["loss_std"] = 0.0
+        prof_metrics["trace_dir"] = trace_dir
+        prof_metrics["trace_path"] = trace_path
         prof_metrics["layer_stats"] = _augment_layer_stats(
             layer_summary,
             static_layer_stats,
@@ -1236,6 +1239,8 @@ def run_trial(
             "seq_len": int(seq_len),
             "vocab_size": int(vocab_size),
             "grad_accum": 1,
+            "trace_dir": trace_dir,
+            "trace_path": trace_path,
             "microbatch_shape_bsh": [
                 int(per_rank_batch),
                 int(seq_len),
