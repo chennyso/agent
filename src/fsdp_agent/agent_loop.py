@@ -1750,11 +1750,16 @@ def _candidate_pool(
         grouping = GroupingConfig(mode=base.grouping.mode, merge_factor=1)
         _add("grouping_min", Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=grouping), "reduce memory peaks")
 
-    # Offload adjustments.
-    if bool(args.allow_offload) and not _strategy_uses_offload(base):
+    # Offload adjustments: only propose when memory is critical or in feasibility mode.
+    allow_offload_candidates = bool(args.allow_offload) and (memory_critical or phase == Phase.FEASIBILITY)
+    if allow_offload_candidates and not _strategy_uses_offload(base):
         layout = _clone_layout(base.global_layout, offload_params=True)
-        _add("offload_global", Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping), "reduce resident params")
-    if bool(args.allow_offload) and top_mem_layers:
+        _add(
+            "offload_global",
+            Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping),
+            "reduce resident params",
+        )
+    if allow_offload_candidates and top_mem_layers:
         _add("offload_topk", _build_layer_offload_seed(base, top_mem_layers[:2]), "offload top-mem layers")
 
     # Shard plan adjustment.
