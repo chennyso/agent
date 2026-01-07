@@ -1550,6 +1550,18 @@ def _candidate_summary(strategy: Fsdp2Strategy) -> str:
     )
 
 
+def _candidate_parallel_degrees(cand: Dict[str, object]) -> Dict[str, int]:
+    cfg = (cand.get("strategy") or {}).get("parallel") or {}
+    out = {}
+    for key in ("tp_degree", "pp_degree", "ep_degree", "cp_degree"):
+        try:
+            out[key] = int(cfg.get(key, 1) or 1)
+        except Exception:
+            out[key] = 1
+    out["sp_enabled"] = 1 if bool(cfg.get("sp_enabled", False)) else 0
+    return out
+
+
 def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict[str, object]:
     triage = semantic_state.get("bottleneck_triage") or {}
     primary = str(triage.get("primary") or "")
@@ -1557,6 +1569,16 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     score = 0.0
     reasons: List[str] = []
     cand_id = str(cand.get("id") or "")
+    degrees = _candidate_parallel_degrees(cand)
+    tp = degrees.get("tp_degree", 1)
+    pp = degrees.get("pp_degree", 1)
+    ep = degrees.get("ep_degree", 1)
+    cp = degrees.get("cp_degree", 1)
+    sp = bool(degrees.get("sp_enabled", 0))
+    last_oom = semantic_state.get("last_oom") or {}
+    oom_stage = str(last_oom.get("oom_stage") or "")
+    hardware = semantic_state.get("hardware") or {}
+    gpus_per_node = int(hardware.get("gpus_per_node") or 0)
 
     if cand_id.startswith("mesh") and primary.startswith("COMM"):
         score += 2.0
@@ -1576,6 +1598,27 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     if cand_id.startswith("parallel") and primary == "COMPUTE_BOUND":
         score += 2.0
         reasons.append("matches compute-bound")
+
+    if primary == "MEMORY_CRITICAL" or oom_stage in {"load_model", "apply_strategy"}:
+        if tp > 1:
+            score += 1.5
+            reasons.append(f"tp={tp} shards weight-heavy ops")
+        if pp >= 4:
+            score += 1.0
+            reasons.append(f"pp={pp} increases layer partitioning")
+        if ep > 1:
+            score += 0.5
+            reasons.append(f"ep={ep} shards experts")
+        if cp > 1:
+            score += 0.5
+            reasons.append(f"cp={cp} shards sequence")
+        if sp and tp > 1:
+            score += 0.3
+            reasons.append("sp helps tp memory/comm")
+
+    if gpus_per_node and (tp * ep * cp) > gpus_per_node:
+        score -= 1.5
+        reasons.append("tp*ep*cp exceeds intra-node budget")
 
     for sec in secondary:
         if sec and str(sec) in cand_id:
@@ -2308,6 +2351,9 @@ def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[
         return f"Duplicate strategy (hash={metrics.get('strategy_hash')}); modify layer_overrides or reshard policy."
     if metrics.get("error"):
         return str(metrics["error"])
+    err_tail = str(metrics.get("stderr_tail") or "")
+    if "innermost" in err_tail.lower() and "tp" in err_tail.lower():
+        return "Mesh topology invalid: TP must be innermost. Use canonical order PP->DP->EP->CP->TP."
     if metrics.get("oom"):
         layer_stats = metrics.get("layer_stats") or metrics.get("layer_stats_static") or {}
         top_layers = _top_layers_by_param_bytes(layer_stats, topk=4) if layer_stats else []
