@@ -151,6 +151,59 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "named_override_keys": sorted(set(comm_keys + latency_keys)),
         "source": layer_stats_source or None,
     }
+    has_moe_experts = metrics.get("has_moe_experts") if "has_moe_experts" in metrics else None
+    trial_context = metrics.get("trial_context") or {}
+    parallel_ctx = metrics.get("parallel") or trial_context.get("parallel") or {}
+    tp_degree = int(parallel_ctx.get("tp_degree", 1) or 1)
+    pp_degree = int(parallel_ctx.get("pp_degree", 1) or 1)
+    ep_degree = int(parallel_ctx.get("ep_degree", 1) or 1)
+    cp_degree = int(parallel_ctx.get("cp_degree", 1) or 1)
+    sp_enabled = bool(parallel_ctx.get("sp_enabled", False))
+    world_size_total = trial_context.get("world_size_total")
+    dp_degree = trial_context.get("dp_world_size")
+    if dp_degree is None and world_size_total:
+        try:
+            prod = max(tp_degree, 1) * max(pp_degree, 1) * max(ep_degree, 1) * max(cp_degree, 1)
+            if prod > 0 and int(world_size_total) % prod == 0:
+                dp_degree = int(world_size_total) // prod
+        except Exception:
+            dp_degree = None
+    dp_degree = int(dp_degree or 1)
+    total_params = metrics.get("total_params")
+    physical_budget = None
+    if isinstance(total_params, (int, float)) and total_params > 0:
+        total_params = int(total_params)
+        bytes_per_param_lower = 12  # bf16 params + bf16 grads + fp32 Adam states (m,v)
+        bytes_per_param_upper = 16  # fp32 params + fp32 grads + fp32 Adam states
+        state_bytes_lower = total_params * bytes_per_param_lower
+        state_bytes_upper = total_params * bytes_per_param_upper
+        shard_factor = max(int(dp_degree) * int(pp_degree), 1)
+        per_rank_lower = state_bytes_lower / shard_factor
+        per_rank_upper = state_bytes_upper / shard_factor
+        mem_limit_bytes = float(mem_limit_gb) * 1024**3 if mem_limit_gb > 0 else 0.0
+        physical_budget = {
+            "total_params": total_params,
+            "bytes_per_param_lower": bytes_per_param_lower,
+            "bytes_per_param_upper": bytes_per_param_upper,
+            "state_bytes_lower": state_bytes_lower,
+            "state_bytes_upper": state_bytes_upper,
+            "per_rank_state_bytes_lower": per_rank_lower,
+            "per_rank_state_bytes_upper": per_rank_upper,
+            "per_rank_state_fraction_vram_lower": (per_rank_lower / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+            "per_rank_state_fraction_vram_upper": (per_rank_upper / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+            "assumptions": {
+                "lower": "bf16 params + bf16 grads + fp32 Adam states",
+                "upper": "fp32 params + fp32 grads + fp32 Adam states",
+            },
+            "parallel_degrees": {
+                "dp": dp_degree,
+                "pp": pp_degree,
+                "tp": tp_degree,
+                "ep": ep_degree,
+                "cp": cp_degree,
+                "sp": sp_enabled,
+            },
+        }
 
     return {
         "phase": phase.value,
@@ -176,6 +229,9 @@ def derive_semantic_state(metrics: Dict[str, Any], *, mem_limit_gb: float, phase
         "model_anatomy": anatomy,
         "shard_plan_compat": shard_plan_compat,
         "offload_targets": offload_targets,
+        "has_moe_experts": has_moe_experts,
+        "physical_budget": physical_budget,
+        "oom_stage": metrics.get("oom_stage"),
     }
 
 
@@ -184,8 +240,9 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         return {
             "change_mesh": "forbidden_in_phase",
             "enable_cpu_offload": "low",
-            "set_parallel": "forbidden_in_phase",
+            "set_parallel": "medium",
             "change_grouping": "forbidden_in_phase",
+            "mixed_precision": "low",
             "set_root_reshard_false": "forbidden_in_phase",
             "layer_override_reshard": "low",
             "shard_plan": "forbidden_in_phase",
@@ -196,6 +253,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
             "enable_cpu_offload": "forbidden_in_phase",
             "set_parallel": "high",
             "change_grouping": "medium",
+            "mixed_precision": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "low",
             "shard_plan": "high",
@@ -206,6 +264,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
             "enable_cpu_offload": "forbidden_in_phase",
             "set_parallel": "medium",
             "change_grouping": "medium",
+            "mixed_precision": "medium",
             "set_root_reshard_false": "medium",
             "layer_override_reshard": "medium",
             "shard_plan": "high",
@@ -216,6 +275,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
             "enable_cpu_offload": "forbidden_in_phase",
             "set_parallel": "medium",
             "change_grouping": "low",
+            "mixed_precision": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "medium",
             "shard_plan": "high",
@@ -226,6 +286,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
             "enable_cpu_offload": "high",
             "set_parallel": "medium",
             "change_grouping": "low",
+            "mixed_precision": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "low",
             "shard_plan": "high",
@@ -236,6 +297,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
             "enable_cpu_offload": "high",
             "set_parallel": "medium",
             "change_grouping": "medium",
+            "mixed_precision": "medium",
             "set_root_reshard_false": "low",
             "layer_override_reshard": "medium",
             "shard_plan": "low",
@@ -245,6 +307,7 @@ def _action_cost_map(phase: Phase) -> Dict[str, str]:
         "enable_cpu_offload": "low",
         "set_parallel": "medium",
         "change_grouping": "medium",
+        "mixed_precision": "medium",
         "set_root_reshard_false": "medium",
         "layer_override_reshard": "medium",
         "shard_plan": "low",

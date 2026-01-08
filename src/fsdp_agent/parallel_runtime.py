@@ -65,6 +65,7 @@ def build_global_mesh(
     pp_degree: int,
     ep_degree: int,
     cp_degree: int,
+    mesh_dim_names: Optional[List[str]] = None,
 ) -> Tuple[Optional[DeviceMesh], int]:
     tp = max(int(tp_degree), 1)
     pp = max(int(pp_degree), 1)
@@ -76,11 +77,19 @@ def build_global_mesh(
     if world_size % total != 0:
         raise ValueError(f"world_size {world_size} not divisible by tp*pp*ep*cp={total}")
     dp = world_size // total
-    # Canonical mesh order: outermost -> innermost.
-    # Higher-frequency comm dims go innermost (TP last).
-    mesh_shape = (pp, dp, ep, cp, tp)
-    mesh_dim_names = ("pp", "dp", "ep", "cp", "tp")
-    mesh = init_device_mesh("cuda", mesh_shape, mesh_dim_names=mesh_dim_names)
+    # Canonical mesh order: outermost -> innermost (TP last).
+    default_names = ("pp", "dp", "ep", "cp", "tp")
+    if mesh_dim_names:
+        names = tuple(str(x) for x in mesh_dim_names)
+        if set(names) != set(default_names) or len(names) != len(set(names)):
+            raise ValueError("mesh_dim_names must contain unique dims: pp, dp, ep, cp, tp")
+        if names[-1] != "tp":
+            raise ValueError("mesh_dim_names must place 'tp' as the innermost dim")
+    else:
+        names = default_names
+    shape_map = {"pp": pp, "dp": dp, "ep": ep, "cp": cp, "tp": tp}
+    mesh_shape = tuple(int(shape_map[name]) for name in names)
+    mesh = init_device_mesh("cuda", mesh_shape, mesh_dim_names=names)
     return mesh, int(dp)
 
 
@@ -114,6 +123,7 @@ def _build_tp_mapping(
     *,
     plan_id: str,
     sp_enabled: bool,
+    tp_use_local_output: Optional[bool] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if ColwiseParallel is None or RowwiseParallel is None or parallelize_module is None:
         raise RuntimeError("torch.distributed.tensor.parallel is unavailable in this torch build")
@@ -121,10 +131,16 @@ def _build_tp_mapping(
     mapping: Dict[str, Any] = {}
     report: Dict[str, Any] = {"plan_id": plan_id, "tp_matches": 0, "sp_matches": 0, "warnings": []}
 
+    colwise_kwargs: Dict[str, Any] = {}
+    if tp_use_local_output is not None:
+        colwise_kwargs["use_local_output"] = bool(tp_use_local_output)
+    else:
+        colwise_kwargs["use_local_output"] = True
+
     for name, mod in model.named_modules():
         if isinstance(mod, nn.Linear):
             if _matches_suffix(name, patterns["colwise"]):
-                mapping[name] = ColwiseParallel()
+                mapping[name] = ColwiseParallel(**colwise_kwargs)
                 report["tp_matches"] += 1
             elif _matches_suffix(name, patterns["rowwise"]):
                 mapping[name] = RowwiseParallel()
@@ -145,9 +161,17 @@ def _build_tp_mapping(
     return mapping, report
 
 
-def _fallback_tp_mapping(model: nn.Module, *, max_modules: int = 8) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _fallback_tp_mapping(
+    model: nn.Module,
+    *,
+    max_modules: int = 8,
+    tp_use_local_output: Optional[bool] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if ColwiseParallel is None or parallelize_module is None:
         raise RuntimeError("torch.distributed.tensor.parallel is unavailable in this torch build")
+    colwise_kwargs: Dict[str, Any] = {}
+    if tp_use_local_output is not None:
+        colwise_kwargs["use_local_output"] = bool(tp_use_local_output)
     scored: List[Tuple[int, str]] = []
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -160,7 +184,7 @@ def _fallback_tp_mapping(model: nn.Module, *, max_modules: int = 8) -> Tuple[Dic
     scored.sort(reverse=True)
     mapping: Dict[str, Any] = {}
     for _, name in scored[: max(int(max_modules), 1)]:
-        mapping[name] = ColwiseParallel(output_layouts=Replicate(), use_local_output=True)
+        mapping[name] = ColwiseParallel(output_layouts=Replicate(), **colwise_kwargs)
     report = {
         "plan_id": "fallback_colwise",
         "tp_matches": len(mapping),
@@ -176,12 +200,18 @@ def apply_tp_sp(
     *,
     plan_id: str,
     sp_enabled: bool,
+    tp_use_local_output: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if parallelize_module is None:
         return {"tp_applied": False, "sp_applied": False, "warnings": ["tensor_parallel_unavailable"]}
-    mapping, report = _build_tp_mapping(model, plan_id=plan_id, sp_enabled=sp_enabled)
+    mapping, report = _build_tp_mapping(
+        model,
+        plan_id=plan_id,
+        sp_enabled=sp_enabled,
+        tp_use_local_output=tp_use_local_output,
+    )
     if not mapping:
-        mapping, fallback_report = _fallback_tp_mapping(model)
+        mapping, fallback_report = _fallback_tp_mapping(model, tp_use_local_output=tp_use_local_output)
         report["warnings"] = (report.get("warnings") or []) + (fallback_report.get("warnings") or [])
         report["tp_matches"] = int(fallback_report.get("tp_matches", 0))
         report["plan_id"] = fallback_report.get("plan_id", report.get("plan_id"))
@@ -189,6 +219,8 @@ def apply_tp_sp(
     report["tp_applied"] = True
     report["sp_applied"] = bool(sp_enabled and report.get("sp_matches", 0) > 0)
     report["tp_mapping_size"] = len(mapping)
+    if tp_use_local_output is not None:
+        report["tp_use_local_output"] = bool(tp_use_local_output)
     return report
 
 
@@ -206,6 +238,8 @@ def summarize_parallel_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         "pp_microbatches",
         "pp_schedule",
         "pp_stages",
+        "mesh_dim_names",
+        "tp_use_local_output",
     ):
         if key in spec:
             out[key] = spec.get(key)

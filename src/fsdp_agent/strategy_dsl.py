@@ -29,6 +29,8 @@ def fsdp2_to_dsl(
         "pp_microbatches": int(getattr(parallel, "pp_microbatches", 1) or 1),
         "pp_schedule": getattr(parallel, "pp_schedule", "1f1b"),
         "pp_stages": getattr(parallel, "pp_stages", None),
+        "mesh_dim_names": getattr(parallel, "mesh_dim_names", None),
+        "tp_use_local_output": getattr(parallel, "tp_use_local_output", None),
     }
     dsl = {
         "strategy": {
@@ -45,11 +47,17 @@ def fsdp2_to_dsl(
             },
             "model": model_meta or {},
             "parallel": {
-                "tp": {"enabled": parallel_cfg["tp_degree"] > 1, "plan": parallel_cfg["tp_plan"], "sequence_parallel": parallel_cfg["sp_enabled"]},
+                "tp": {
+                    "enabled": parallel_cfg["tp_degree"] > 1,
+                    "plan": parallel_cfg["tp_plan"],
+                    "sequence_parallel": parallel_cfg["sp_enabled"],
+                    "use_local_output": parallel_cfg["tp_use_local_output"],
+                },
                 "pp": {"enabled": parallel_cfg["pp_degree"] > 1, "stages": parallel_cfg["pp_stages"] or [], "microbatches": parallel_cfg["pp_microbatches"], "schedule": parallel_cfg["pp_schedule"], "max_active_stages": 1},
                 "ep": {"enabled": parallel_cfg["ep_degree"] > 1, "ep_size": parallel_cfg["ep_degree"], "ep_tp_size": 1},
                 "cp": {"enabled": parallel_cfg["cp_degree"] > 1, "cp_size": parallel_cfg["cp_degree"]},
                 "sp": {"enabled": parallel_cfg["sp_enabled"]},
+                "mesh_dim_names": parallel_cfg["mesh_dim_names"],
             },
             "fsdp2": {
                 "enabled": True,
@@ -85,6 +93,8 @@ def fsdp2_diff_to_transform(
         ops.append({"set_offload_params": {"offload_params": a["global_layout"]["offload_params"]}})
     if b["global_layout"]["mp_policy"] != a["global_layout"]["mp_policy"]:
         ops.append({"set_mp_policy": {"mp_policy": a["global_layout"]["mp_policy"]}})
+    if b["global_layout"].get("mp_reduce_dtype") != a["global_layout"].get("mp_reduce_dtype"):
+        ops.append({"set_mp_reduce_dtype": {"mp_reduce_dtype": a["global_layout"].get("mp_reduce_dtype")}})
     if b["grouping"]["mode"] != a["grouping"]["mode"]:
         ops.append({"set_grouping_mode": {"mode": a["grouping"]["mode"]}})
     if int(b["grouping"]["merge_factor"]) != int(a["grouping"]["merge_factor"]):
@@ -118,6 +128,8 @@ def apply_transform_to_fsdp2(base: Fsdp2Strategy, transform: Dict[str, Any]) -> 
             data["global_layout"]["offload_params"] = op["set_offload_params"]["offload_params"]
         elif "set_mp_policy" in op:
             data["global_layout"]["mp_policy"] = op["set_mp_policy"]["mp_policy"]
+        elif "set_mp_reduce_dtype" in op:
+            data["global_layout"]["mp_reduce_dtype"] = op["set_mp_reduce_dtype"]["mp_reduce_dtype"]
         elif "set_grouping_mode" in op:
             data["grouping"]["mode"] = op["set_grouping_mode"]["mode"]
         elif "set_merge_factor" in op:

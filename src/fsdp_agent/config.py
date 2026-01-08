@@ -36,6 +36,7 @@ class Fsdp2Layout:
     offload_params: bool = False
     offload_pin_memory: bool = True
     mp_policy: Literal["bf16", "fp32"] = "bf16"
+    mp_reduce_dtype: Literal["bf16", "fp32"] = "fp32"
 
 
 @dataclass
@@ -65,6 +66,8 @@ class ParallelSpec:
     pp_microbatches: int = 1
     pp_schedule: str = "1f1b"
     pp_stages: Optional[List[List[int]]] = None
+    mesh_dim_names: Optional[List[str]] = None
+    tp_use_local_output: Optional[bool] = None
 
 
 @dataclass
@@ -126,6 +129,8 @@ class Fsdp2Strategy:
             pp_microbatches=parallel_payload.get("pp_microbatches", 1),
             pp_schedule=parallel_payload.get("pp_schedule", "1f1b"),
             pp_stages=parallel_payload.get("pp_stages"),
+            mesh_dim_names=parallel_payload.get("mesh_dim_names"),
+            tp_use_local_output=parallel_payload.get("tp_use_local_output"),
         )
         return cls(
             global_layout=gl,
@@ -200,6 +205,7 @@ _ALLOWED_MESH = {"1D", "2D"}
 _ALLOWED_SHARD = {"FULL", "HYBRID", "NO"}
 _ALLOWED_PLAN = {"DIM0", "DIM1", "LARGEST"}
 _ALLOWED_MP = {"bf16", "fp32"}
+_ALLOWED_MP_REDUCE = {"bf16", "fp32"}
 _SEMANTIC_HASH_SALT = "fsdp2_strategy_v3"
 
 
@@ -247,6 +253,8 @@ def _validate_layout(layout: Fsdp2Layout, context: str = "layout") -> Fsdp2Layou
         raise ValueError(f"{context}.shard_plan must be in {_ALLOWED_PLAN}; got {l.shard_plan}")
     if l.mp_policy not in _ALLOWED_MP:
         raise ValueError(f"{context}.mp_policy must be in {_ALLOWED_MP}; got {l.mp_policy}")
+    if l.mp_reduce_dtype not in _ALLOWED_MP_REDUCE:
+        raise ValueError(f"{context}.mp_reduce_dtype must be in {_ALLOWED_MP_REDUCE}; got {l.mp_reduce_dtype}")
     l.offload_params = bool(l.offload_params)
     l.offload_pin_memory = bool(l.offload_pin_memory)
     return l
@@ -269,6 +277,20 @@ def _validate_parallel(parallel: ParallelSpec) -> ParallelSpec:
     p.sp_enabled = bool(p.sp_enabled)
     p.tp_plan = str(p.tp_plan or "auto")
     p.pp_schedule = str(p.pp_schedule or "1f1b")
+    if p.mesh_dim_names is not None:
+        if not isinstance(p.mesh_dim_names, (list, tuple)) or not p.mesh_dim_names:
+            raise ValueError("parallel.mesh_dim_names must be a non-empty list")
+        names = [str(x) for x in p.mesh_dim_names]
+        required = {"pp", "dp", "ep", "cp", "tp"}
+        if set(names) != required:
+            raise ValueError("parallel.mesh_dim_names must contain {pp, dp, ep, cp, tp}")
+        if len(names) != len(set(names)):
+            raise ValueError("parallel.mesh_dim_names must not contain duplicates")
+        if names[-1] != "tp":
+            raise ValueError("parallel.mesh_dim_names must place 'tp' as the innermost dim")
+        p.mesh_dim_names = names
+    if p.tp_use_local_output is not None:
+        p.tp_use_local_output = bool(p.tp_use_local_output)
     if p.pp_stages is not None:
         stages = []
         for idx, item in enumerate(p.pp_stages):

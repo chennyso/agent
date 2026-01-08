@@ -46,7 +46,7 @@ def get_mesh(topology: str, world_size: int):
                     return init_device_mesh(
                         "cuda",
                         (num_nodes, gpus_per_node),
-                        mesh_dim_names=("replicate", "shard"),
+                        mesh_dim_names=("dp_replicate", "dp_shard"),
                     )
 
         # 单机 fallback：优先使用方阵；否则退化为 (2, world_size//2)
@@ -57,7 +57,7 @@ def get_mesh(topology: str, world_size: int):
             shape = (2, world_size // 2)
         else:
             raise ValueError(f"2D mesh 需要 world_size 为方数或可被 2 整除，当前 world_size={world_size}")
-        return init_device_mesh("cuda", shape, mesh_dim_names=("replicate", "shard"))
+        return init_device_mesh("cuda", shape, mesh_dim_names=("dp_replicate", "dp_shard"))
     raise ValueError(f"Unknown mesh_topology: {topology}")
 
 
@@ -137,6 +137,24 @@ def resolve_shard_fn(plan: str, shard_mesh_size: int):
     return _placement
 
 
+def _resolve_mp_dtype(name: object) -> torch.dtype:
+    label = str(name or "fp32").lower()
+    return torch.bfloat16 if label == "bf16" else torch.float32
+
+
+def _build_mp_policy(layout: Fsdp2Layout) -> MixedPrecisionPolicy:
+    param_dtype = _resolve_mp_dtype(layout.mp_policy)
+    reduce_dtype = _resolve_mp_dtype(getattr(layout, "mp_reduce_dtype", "fp32"))
+    kwargs = {"param_dtype": param_dtype}
+    try:
+        sig = inspect.signature(MixedPrecisionPolicy)
+        if "reduce_dtype" in sig.parameters:
+            kwargs["reduce_dtype"] = reduce_dtype
+    except Exception:
+        kwargs["reduce_dtype"] = reduce_dtype
+    return MixedPrecisionPolicy(**kwargs)
+
+
 def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size: int) -> None:
     """把单个 layout 编译成 fully_shard 调用。"""
     if getattr(layout, "sharding_strategy", "FULL") == "NO":
@@ -144,10 +162,7 @@ def apply_layout_to_module(mod: nn.Module, layout: Fsdp2Layout, mesh, world_size
 
     shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
     reshard = _validate_reshard_after_forward(layout.reshard_after_forward, shard_size)
-    mp = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
-        reduce_dtype=torch.float32,
-    )
+    mp = _build_mp_policy(layout)
     pin_memory = bool(getattr(layout, "offload_pin_memory", True))
     offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=pin_memory) if layout.offload_params else OffloadPolicy()
 
@@ -185,10 +200,7 @@ def apply_layout_to_modules(mods: List[nn.Module], layout: Fsdp2Layout, mesh, wo
 
     shard_size = _shard_mesh_size(layout.mesh_topology, world_size)
     reshard = _validate_reshard_after_forward(layout.reshard_after_forward, shard_size)
-    mp = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16 if layout.mp_policy == "bf16" else torch.float32,
-        reduce_dtype=torch.float32,
-    )
+    mp = _build_mp_policy(layout)
     pin_memory = bool(getattr(layout, "offload_pin_memory", True))
     offload: OffloadPolicy = CPUOffloadPolicy(pin_memory=pin_memory) if layout.offload_params else OffloadPolicy()
 

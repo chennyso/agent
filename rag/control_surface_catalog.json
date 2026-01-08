@@ -40,6 +40,16 @@
     "fsdp2_refs": ["_fully_shard.py:176-178", "_fsdp_api.py:28-53"]
   },
   {
+    "knob": "mp_reduce_dtype",
+    "category": "mixed_precision",
+    "agent_support": "yes",
+    "fsdp2_support": true,
+    "effects": ["grad reduction bandwidth"],
+    "risks": ["precision loss"],
+    "guards": [],
+    "fsdp2_refs": ["_fsdp_api.py:34-41"]
+  },
+  {
     "knob": "offload_policy",
     "category": "offload",
     "agent_support": "partial",

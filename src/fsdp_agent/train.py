@@ -879,6 +879,8 @@ def run_trial(
     ep_degree = int(parallel_spec.get("ep_degree", 1) or 1)
     cp_degree = int(parallel_spec.get("cp_degree", 1) or 1)
     sp_enabled = bool(parallel_spec.get("sp_enabled", False))
+    mesh_dim_names = parallel_spec.get("mesh_dim_names")
+    tp_use_local_output = parallel_spec.get("tp_use_local_output")
     if sp_enabled and tp_degree <= 1:
         raise ValueError("sp_enabled requires tp_degree > 1")
     mesh = None
@@ -896,6 +898,7 @@ def run_trial(
             pp_degree=pp_degree,
             ep_degree=ep_degree,
             cp_degree=cp_degree,
+            mesh_dim_names=mesh_dim_names,
         )
         if mesh is not None:
             dp_mesh = mesh["dp"]
@@ -907,12 +910,20 @@ def run_trial(
             parallel_report_base = dict(parallel_report_base)
         else:
             parallel_report_base = {}
+        names = list(mesh_dim_names) if mesh_dim_names else ["pp", "dp", "ep", "cp", "tp"]
+        shape_map = {
+            "pp": int(pp_degree),
+            "dp": int(dp_world_size),
+            "ep": int(ep_degree),
+            "cp": int(cp_degree),
+            "tp": int(tp_degree),
+        }
         parallel_report_base.update(
             {
                 "world_size_total": int(world_size_total),
                 "dp_world_size": int(dp_world_size),
-                "mesh_dim_names": ["pp", "dp", "ep", "cp", "tp"],
-                "mesh_shape": [int(pp_degree), int(dp_world_size), int(ep_degree), int(cp_degree), int(tp_degree)],
+                "mesh_dim_names": names,
+                "mesh_shape": [shape_map[n] for n in names],
             }
         )
     for r in range(repeats):
@@ -938,7 +949,13 @@ def run_trial(
         parallel_report = dict(parallel_report_base) if parallel_report_base else {}
         if tp_mesh is not None:
             plan_id = infer_tp_plan_id(model, model_name, parallel_spec.get("tp_plan", "auto"))
-            tp_report = apply_tp_sp(model, tp_mesh, plan_id=plan_id, sp_enabled=sp_enabled)
+            tp_report = apply_tp_sp(
+                model,
+                tp_mesh,
+                plan_id=plan_id,
+                sp_enabled=sp_enabled,
+                tp_use_local_output=tp_use_local_output,
+            )
             parallel_report["tp_plan_id"] = plan_id
             parallel_report["tp_sp_report"] = tp_report
         if ep_degree > 1 and not _has_moe_experts(model):
@@ -1260,11 +1277,12 @@ def run_trial(
         }
         prof_metrics["trial_context"]["dp_world_size"] = int(dp_world_size)
         prof_metrics["trial_context"]["world_size_total"] = int(world_size_total)
-        if parallel_report:
-            prof_metrics["parallel"] = parallel_report
-            prof_metrics["trial_context"]["parallel"] = parallel_report
+            if parallel_report:
+                prof_metrics["parallel"] = parallel_report
+                prof_metrics["trial_context"]["parallel"] = parallel_report
         execution_proof = _collect_execution_proof(model)
         prof_metrics["execution_proof"] = execution_proof
+        prof_metrics["has_moe_experts"] = _has_moe_experts(model)
         prof_metrics["max_unsharded_numel_est"] = _estimate_max_unsharded_numel(execution_proof.get("wrap_plan"))
         if profiling != "heavy":
             prof_metrics.setdefault("total_cuda_time_ms", 0.0)

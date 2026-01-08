@@ -199,6 +199,63 @@ def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
         out["stdout_tail"] = metrics.get("stdout_tail")
     return out
 
+
+def _oom_sensors(semantic_state: Dict[str, object], current_strategy: Fsdp2Strategy) -> Dict[str, object]:
+    last_oom = semantic_state.get("last_oom") or {}
+    stage = last_oom.get("oom_stage") or semantic_state.get("oom_stage")
+    train_hyper = semantic_state.get("train_hyper") or {}
+    mem_limit_gb = semantic_state.get("mem_limit_gb")
+    current_parallel = semantic_state.get("current_parallel") or {}
+    dp = int(current_parallel.get("dp_degree") or 1)
+    pp = int(current_parallel.get("pp_degree") or 1)
+    tp = int(current_parallel.get("tp_degree") or 1)
+    cp = int(current_parallel.get("cp_degree") or 1)
+    sp = bool(current_parallel.get("sp_enabled") or False)
+    parallel = getattr(current_strategy, "parallel", None)
+    pp_microbatches = int(getattr(parallel, "pp_microbatches", 1) or 1) if parallel is not None else 1
+    gbs = train_hyper.get("global_batch_size")
+    seq_len = train_hyper.get("seq_len")
+    per_rank_batch = None
+    microbatch_size = None
+    if isinstance(gbs, (int, float)) and dp > 0:
+        try:
+            per_rank_batch = int(math.ceil(float(gbs) / float(dp)))
+            microbatch_size = int(math.ceil(float(per_rank_batch) / float(max(pp_microbatches, 1))))
+        except Exception:
+            per_rank_batch = None
+            microbatch_size = None
+
+    total_params = (semantic_state.get("physical_budget") or {}).get("total_params")
+    mp_policy = str(getattr(current_strategy.global_layout, "mp_policy", "bf16") or "bf16").lower()
+    bytes_per_param = 2 if mp_policy == "bf16" else 4
+    static_per_rank_gb = None
+    if isinstance(total_params, (int, float)) and total_params > 0:
+        try:
+            static_per_rank_gb = (float(total_params) * float(bytes_per_param)) / (max(dp * pp, 1) * 1024**3)
+        except Exception:
+            static_per_rank_gb = None
+    threshold_gb = float(mem_limit_gb) * 0.7 if isinstance(mem_limit_gb, (int, float)) else None
+    status = None
+    if static_per_rank_gb is not None and threshold_gb is not None:
+        status = "critical" if static_per_rank_gb > threshold_gb else "ok"
+
+    return {
+        "oom_stage": stage,
+        "static_weight_per_rank_gb": static_per_rank_gb,
+        "static_threshold_gb": threshold_gb,
+        "static_load_status": status,
+        "dp_degree": dp,
+        "pp_degree": pp,
+        "tp_degree": tp,
+        "cp_degree": cp,
+        "sp_enabled": sp,
+        "pp_microbatches": pp_microbatches,
+        "per_rank_batch": per_rank_batch,
+        "microbatch_size": microbatch_size,
+        "seq_len": seq_len,
+        "mem_limit_gb": mem_limit_gb,
+    }
+
 def _strategy_hash(strategy: Fsdp2Strategy) -> str:
     """Use semantic-normalized hash to avoid duplicate trials from equivalent configs."""
     return strategy.semantic_hash()
@@ -283,7 +340,8 @@ def _parallel_summary(strategy: Fsdp2Strategy) -> str:
         if int(p.tp_degree) > 1:
             parts.append(f"tp={int(p.tp_degree)}")
         if int(p.pp_degree) > 1:
-            parts.append(f"pp={int(p.pp_degree)}")
+            pp_mb = int(getattr(p, "pp_microbatches", 1) or 1)
+            parts.append(f"pp={int(p.pp_degree)}(mb={pp_mb})")
         if int(p.ep_degree) > 1:
             parts.append(f"ep={int(p.ep_degree)}")
         if int(p.cp_degree) > 1:
@@ -799,7 +857,7 @@ def _build_hypothesis_graph(semantic_state: Dict, causal_summary: Optional[Dict]
                     "comm_share": comm_share,
                     "all_gather_forward_late": all_gather_late,
                 },
-                "actions": ["change_grouping", "layer_override_reshard", "set_root_reshard_false"],
+                "actions": ["change_grouping", "layer_override_reshard", "set_root_reshard_false", "mixed_precision"],
                 "expected": {"comm_ratio": "down", "step_time_ms_p50": "down", "collective_calls_per_step_est": "down"},
                 "confidence": 0.65,
             }
@@ -998,6 +1056,9 @@ _ACTION_SYNONYMS = {
     "layerwise_offload": "enable_cpu_offload",
     "layer_offload": "enable_cpu_offload",
     "shard_plan": "shard_plan",
+    "mp_policy": "mixed_precision",
+    "mixed_precision": "mixed_precision",
+    "reduce_dtype": "mixed_precision",
     "parallel": "set_parallel",
     "mixed_parallel": "set_parallel",
 }
@@ -1022,6 +1083,7 @@ def _primary_action(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> str:
         "set_parallel",
         "enable_cpu_offload",
         "change_grouping",
+        "mixed_precision",
         "set_root_reshard_false",
         "layer_override_reshard",
         "shard_plan",
@@ -1081,6 +1143,26 @@ def _override_signature(strategy: Fsdp2Strategy) -> List[tuple]:
     return sorted(sigs)
 
 
+def _mp_signature(strategy: Fsdp2Strategy) -> List[tuple]:
+    sigs = []
+    gl = strategy.global_layout
+    sigs.append(("global", gl.mp_policy, getattr(gl, "mp_reduce_dtype", "fp32")))
+    for o in strategy.layer_overrides:
+        sigs.append(
+            (
+                "range",
+                o.start_layer,
+                o.end_layer,
+                tuple(o.layers or []),
+                o.layout.mp_policy,
+                getattr(o.layout, "mp_reduce_dtype", "fp32"),
+            )
+        )
+    for name, layout in strategy.named_overrides.items():
+        sigs.append(("named", name, layout.mp_policy, getattr(layout, "mp_reduce_dtype", "fp32")))
+    return sorted(sigs)
+
+
 def _shard_plan_signature(strategy: Fsdp2Strategy) -> List[tuple]:
     sigs = [("global", strategy.global_layout.shard_plan)]
     for o in strategy.layer_overrides:
@@ -1103,6 +1185,8 @@ def _strategy_actions(candidate: Fsdp2Strategy, baseline: Fsdp2Strategy) -> set[
         or int(candidate.grouping.merge_factor) != int(baseline.grouping.merge_factor)
     ):
         actions.add("change_grouping")
+    if _mp_signature(candidate) != _mp_signature(baseline):
+        actions.add("mixed_precision")
     if candidate.global_layout.reshard_after_forward is False and baseline.global_layout.reshard_after_forward is not False:
         actions.add("set_root_reshard_false")
     if _override_signature(candidate) != _override_signature(baseline):
@@ -1162,7 +1246,7 @@ def _enforce_memory_guard(candidate: Fsdp2Strategy, semantic_state: Dict, verdic
 def _format_layout(layout: Fsdp2Layout) -> str:
     return (
         f"mesh={layout.mesh_topology}, reshard={layout.reshard_after_forward}, shard_plan={layout.shard_plan}, "
-        f"offload={layout.offload_params}, mp={layout.mp_policy}"
+        f"offload={layout.offload_params}, mp={layout.mp_policy}/{getattr(layout, 'mp_reduce_dtype', 'fp32')}"
     )
 
 
@@ -1175,7 +1259,8 @@ def _format_overrides(ovrs: List[LayerOverride]) -> str:
             scope = f"layers={sorted(o.layers)}"
         else:
             scope = f"range={o.start_layer}:{o.end_layer}"
-        parts.append(f"{scope}({o.layout.reshard_after_forward},{o.layout.shard_plan})")
+        mp_reduce = getattr(o.layout, "mp_reduce_dtype", "fp32")
+        parts.append(f"{scope}({o.layout.reshard_after_forward},{o.layout.shard_plan},{o.layout.mp_policy}/{mp_reduce})")
     return "; ".join(parts)
 
 
@@ -1232,7 +1317,7 @@ def _coerce_judge_verdict(
         forbidden.add("enable_cpu_offload")
 
     if memory_critical:
-        must_allow = {"layer_override_reshard", "change_grouping", "shard_plan"}
+        must_allow = {"layer_override_reshard", "change_grouping", "shard_plan", "mixed_precision"}
         if allow_offload:
             must_allow.add("enable_cpu_offload")
         if allow_parallel:
@@ -1301,15 +1386,7 @@ def _top_layers_by_param_bytes(layer_stats: Dict[str, Dict], topk: int = 4) -> L
 
 
 def _build_layer_offload_seed(base: Fsdp2Strategy, layer_ids: List[int]) -> Fsdp2Strategy:
-    layout = Fsdp2Layout(
-        mesh_topology=base.global_layout.mesh_topology,
-        sharding_strategy=base.global_layout.sharding_strategy,
-        reshard_after_forward=base.global_layout.reshard_after_forward,
-        shard_plan=base.global_layout.shard_plan,
-        offload_params=True,
-        offload_pin_memory=base.global_layout.offload_pin_memory,
-        mp_policy=base.global_layout.mp_policy,
-    )
+    layout = _clone_layout(base.global_layout, offload_params=True)
     override = LayerOverride(start_layer=None, end_layer=None, layers=layer_ids, layout=layout)
     return Fsdp2Strategy(
         global_layout=base.global_layout,
@@ -1507,6 +1584,7 @@ def _action_mapping_for_triage(triage: object, semantic_state: Dict) -> List[Dic
     primary = triage.get("primary") if isinstance(triage, dict) else str(triage)
     memory_actions = [
         {"action": "set_parallel", "path": "memory", "note": "enable TP/PP/CP to lower per-rank memory"},
+        {"action": "mixed_precision", "path": "memory", "note": "bf16 params/reduce to cut memory"},
         {"action": "change_grouping", "path": "memory", "note": "merge_factor down to reduce peaks"},
     ]
     if allow_offload:
@@ -1519,10 +1597,12 @@ def _action_mapping_for_triage(triage: object, semantic_state: Dict) -> List[Dic
         "COMM_BOUND_INTER": [
             {"action": "change_mesh", "path": "comm", "note": "try 2D mesh to keep collectives intra-node"},
             {"action": "layer_override_reshard", "path": "comm", "note": f"reshard=False for {comm_keys}"},
+            {"action": "mixed_precision", "path": "comm", "note": "reduce grad comm via bf16 reduction"},
         ],
         "COMM_BOUND_INTRA": [
             {"action": "layer_override_reshard", "path": "comm", "note": f"reshard=False for {comm_keys}"},
             {"action": "change_grouping", "path": "comm", "note": "increase merge_factor to reduce collectives"},
+            {"action": "mixed_precision", "path": "comm", "note": "reduce grad comm via bf16 reduction"},
         ],
         "SCHEDULING_BOUND": [
             {"action": "change_grouping", "path": "overlap", "note": "adjust merge_factor to reduce kernel launch overhead"},
@@ -1545,6 +1625,7 @@ def _candidate_summary(strategy: Fsdp2Strategy) -> str:
     return (
         f"mesh={layout.mesh_topology}, reshard={layout.reshard_after_forward}, "
         f"plan={layout.shard_plan}, offload={layout.offload_params}, "
+        f"mp={layout.mp_policy}/{getattr(layout, 'mp_reduce_dtype', 'fp32')}, "
         f"grouping={strategy.grouping.mode}x{int(strategy.grouping.merge_factor)}, "
         f"parallel={parallel}"
     )
@@ -1579,6 +1660,16 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     oom_stage = str(last_oom.get("oom_stage") or "")
     hardware = semantic_state.get("hardware") or {}
     gpus_per_node = int(hardware.get("gpus_per_node") or 0)
+    has_moe = semantic_state.get("has_moe_experts")
+    interconnect = str(hardware.get("interconnect") or "").lower()
+    gpu_name = str(hardware.get("gpu_name") or "").lower()
+    if "4090" in gpu_name and "nvlink" in interconnect:
+        interconnect = "pcie"
+    scale = semantic_state.get("scale_policy") or {}
+    world_size = int(scale.get("world_size") or 1)
+    cur_parallel = semantic_state.get("current_parallel") or {}
+    cur_dp = int(cur_parallel.get("dp_degree") or 1)
+    cur_pp = int(cur_parallel.get("pp_degree") or 1)
 
     if cand_id.startswith("mesh") and primary.startswith("COMM"):
         score += 2.0
@@ -1589,6 +1680,9 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     if "reshard" in cand_id and primary.startswith("COMM"):
         score += 1.0
         reasons.append("helps comm")
+    if "mp_reduce" in cand_id and primary.startswith("COMM"):
+        score += 1.0
+        reasons.append("reduce grad comm")
     if "offload" in cand_id and primary == "MEMORY_CRITICAL":
         score += 2.0
         reasons.append("reduces resident params")
@@ -1598,6 +1692,9 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     if cand_id.startswith("parallel") and primary == "COMPUTE_BOUND":
         score += 2.0
         reasons.append("matches compute-bound")
+    if "microbatches" in cand_id and oom_stage == "train_steps":
+        score += 1.5
+        reasons.append("runtime oom: raise microbatches")
 
     if primary == "MEMORY_CRITICAL" or oom_stage in {"load_model", "apply_strategy"}:
         if tp > 1:
@@ -1616,9 +1713,50 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
             score += 0.3
             reasons.append("sp helps tp memory/comm")
 
+    if ep > 1 and has_moe is False:
+        score -= 2.0
+        reasons.append("ep without moe experts is high risk")
+
+    if world_size > 0:
+        prod = max(tp, 1) * max(pp, 1) * max(ep, 1) * max(cp, 1)
+        dp = world_size // prod if prod > 0 and world_size % prod == 0 else 1
+        if oom_stage == "load_model":
+            if dp * pp <= cur_dp * cur_pp:
+                score -= 2.5
+                reasons.append("load_model oom: no increase in dp*pp sharding")
+            else:
+                score += 1.0
+                reasons.append("load_model oom: increased dp*pp sharding")
+    else:
+        dp = 1
+
     if gpus_per_node and (tp * ep * cp) > gpus_per_node:
         score -= 1.5
         reasons.append("tp*ep*cp exceeds intra-node budget")
+
+    if gpus_per_node and tp > gpus_per_node:
+        score -= 2.5
+        reasons.append("tp spans nodes; avoid cross-node tp")
+    if "nvlink" not in interconnect and tp > 2:
+        score -= 0.7
+        reasons.append("no nvlink; high tp is costly")
+
+    physical = semantic_state.get("physical_budget") or {}
+    state_bytes_upper = physical.get("state_bytes_upper")
+    mem_limit_gb = semantic_state.get("mem_limit_gb")
+    if state_bytes_upper and mem_limit_gb:
+        try:
+            shard_factor = max(int(dp) * int(pp), 1)
+            per_rank_upper = float(state_bytes_upper) / shard_factor
+            per_rank_frac = per_rank_upper / (float(mem_limit_gb) * 1024**3)
+            if per_rank_frac >= 0.9:
+                score -= 1.5
+                reasons.append("static state near vram limit")
+            elif per_rank_frac <= 0.7:
+                score += 0.5
+                reasons.append("static state below vram target")
+        except Exception:
+            pass
 
     for sec in secondary:
         if sec and str(sec) in cand_id:
@@ -1672,6 +1810,9 @@ def _candidate_pool(
     if not reshard_int_choices and reshard_int:
         reshard_int_choices = [int(reshard_int)]
     memory_critical = _is_memory_critical(semantic_state)
+    last_oom = semantic_state.get("last_oom") or {}
+    oom_stage = str(last_oom.get("oom_stage") or semantic_state.get("oom_stage") or "")
+    runtime_oom = oom_stage == "train_steps"
     top = semantic_state.get("top_targets") or {}
     top_mem_layers = top.get("top_mem_layer_ids") or []
     top_comm_layers = top.get("top_comm_layer_ids") or []
@@ -1681,12 +1822,48 @@ def _candidate_pool(
     latency_hotspots = anatomy.get("latency_hotspots") or {}
     named_hotspots = (comm_hotspots.get("named_override_keys") or []) + (latency_hotspots.get("named_override_keys") or [])
 
+    def _is_physically_viable(strat: Fsdp2Strategy) -> bool:
+        mem_limit = float(args.mem_limit_gb or 0.0)
+        if mem_limit <= 0:
+            return True
+        has_moe = semantic_state.get("has_moe_experts")
+        p = getattr(strat, "parallel", None)
+        ep = int(getattr(p, "ep_degree", 1) or 1) if p is not None else 1
+        if ep > 1 and has_moe is False:
+            return False
+        physical = semantic_state.get("physical_budget") or {}
+        total_params = physical.get("total_params")
+        if not isinstance(total_params, (int, float)) or total_params <= 0:
+            total_params = _infer_params_from_model_name(args.model_name)
+        if not total_params:
+            return True
+        bytes_per_param_upper = int(physical.get("bytes_per_param_upper") or 16)
+        tp = int(getattr(p, "tp_degree", 1) or 1) if p is not None else 1
+        pp = int(getattr(p, "pp_degree", 1) or 1) if p is not None else 1
+        cp = int(getattr(p, "cp_degree", 1) or 1) if p is not None else 1
+        prod = max(tp, 1) * max(pp, 1) * max(ep, 1) * max(cp, 1)
+        world = int(args.nproc)
+        if prod <= 0 or world % prod != 0:
+            return False
+        dp = world // prod
+        shard_factor = max(dp * pp, 1)
+        state_bytes_upper = int(total_params) * bytes_per_param_upper
+        per_rank_upper = float(state_bytes_upper) / float(shard_factor)
+        mem_limit_bytes = mem_limit * 1024**3
+        if mem_limit_bytes <= 0:
+            return True
+        if (per_rank_upper / mem_limit_bytes) > 0.75:
+            return False
+        return True
+
     def _add(name: str, strat: Fsdp2Strategy, note: str) -> None:
         if strat.global_layout.reshard_after_forward is False and int(strat.grouping.merge_factor) > 2:
             return
         if strat.global_layout.shard_plan != "DIM0" and isinstance(strat.global_layout.reshard_after_forward, int):
             return
         if memory_critical and strat.global_layout.shard_plan != "DIM0":
+            return
+        if not _is_physically_viable(strat):
             return
         try:
             strat = validate_strategy(strat, mem_limit_gb=args.mem_limit_gb)
@@ -1793,13 +1970,28 @@ def _candidate_pool(
             degrees = sorted({*degrees, world_size})
         base_parallel = getattr(base, "parallel", ParallelSpec())
         tp_plan = getattr(base_parallel, "tp_plan", "auto")
-        pp_microbatches = max(int(getattr(base_parallel, "pp_microbatches", 1) or 1), 4)
+        base_pp_microbatches = max(int(getattr(base_parallel, "pp_microbatches", 1) or 1), 1)
         pp_schedule = getattr(base_parallel, "pp_schedule", "1f1b")
         pp_stages = getattr(base_parallel, "pp_stages", None)
+        base_pp = int(getattr(base_parallel, "pp_degree", 1) or 1)
+        base_tp = int(getattr(base_parallel, "tp_degree", 1) or 1)
+        base_ep = int(getattr(base_parallel, "ep_degree", 1) or 1)
+        base_cp = int(getattr(base_parallel, "cp_degree", 1) or 1)
 
         def _can_factor(tp: int, pp: int, ep: int, cp: int) -> bool:
             product = max(int(tp), 1) * max(int(pp), 1) * max(int(ep), 1) * max(int(cp), 1)
             return world_size % product == 0
+
+        def _suggest_pp_microbatches(tp: int, pp: int, ep: int, cp: int) -> int:
+            if pp <= 1:
+                return 1
+            target = max(base_pp_microbatches, 4 * int(pp))
+            product = max(int(tp), 1) * max(int(pp), 1) * max(int(ep), 1) * max(int(cp), 1)
+            dp_world = max(int(world_size) // product, 1)
+            per_rank_batch = int(math.ceil(int(args.global_batch_size) / float(dp_world)))
+            if per_rank_batch <= 0:
+                per_rank_batch = 1
+            return max(1, min(int(target), int(per_rank_batch)))
 
         def _add_parallel(
             name: str,
@@ -1827,6 +2019,9 @@ def _candidate_pool(
                 return
             if not _can_factor(tp, pp, ep, cp):
                 return
+            tp_use_local_output = getattr(base_parallel, "tp_use_local_output", None)
+            if tp > 1 and tp_use_local_output is None:
+                tp_use_local_output = False
             spec = ParallelSpec(
                 tp_degree=int(tp),
                 pp_degree=int(pp),
@@ -1834,9 +2029,11 @@ def _candidate_pool(
                 cp_degree=int(cp),
                 sp_enabled=bool(sp),
                 tp_plan=tp_plan,
-                pp_microbatches=int(pp_microbatches if pp > 1 else 1),
+                pp_microbatches=int(_suggest_pp_microbatches(tp, pp, ep, cp)),
                 pp_schedule=pp_schedule,
                 pp_stages=pp_stages,
+                mesh_dim_names=getattr(base_parallel, "mesh_dim_names", None),
+                tp_use_local_output=tp_use_local_output,
             )
             parallel_specs.append((name, spec, note))
             strat = _clone_strategy(base)
@@ -1885,6 +2082,31 @@ def _candidate_pool(
                         cp=cp,
                         note=f"enable TP x{tp} + PP x{pp} + CP x{cp}",
                     )
+
+        if runtime_oom and base_pp > 1 and _can_factor(base_tp, base_pp, base_ep, base_cp):
+            product = max(base_tp, 1) * max(base_pp, 1) * max(base_ep, 1) * max(base_cp, 1)
+            dp_world = world_size // product if product > 0 and world_size % product == 0 else world_size
+            per_rank_batch = int(math.ceil(float(args.global_batch_size) / float(max(dp_world, 1))))
+            target = max(base_pp_microbatches, 4 * base_pp)
+            target = max(target, base_pp_microbatches * 2)
+            target = min(target, max(per_rank_batch, 1))
+            if target > base_pp_microbatches:
+                spec = ParallelSpec(
+                    tp_degree=base_tp,
+                    pp_degree=base_pp,
+                    ep_degree=base_ep,
+                    cp_degree=base_cp,
+                    sp_enabled=bool(getattr(base_parallel, "sp_enabled", False)),
+                    tp_plan=tp_plan,
+                    pp_microbatches=int(target),
+                    pp_schedule=pp_schedule,
+                    pp_stages=pp_stages,
+                    mesh_dim_names=getattr(base_parallel, "mesh_dim_names", None),
+                    tp_use_local_output=getattr(base_parallel, "tp_use_local_output", None),
+                )
+                strat = _clone_strategy(base)
+                strat.parallel = spec
+                _add("parallel_pp_microbatches_up", strat, "increase microbatches to reduce activation peak")
 
     # Hybrid parallel + other knobs (limited, to keep search compact).
     hybrid_specs = []
@@ -1992,6 +2214,19 @@ def _candidate_pool(
     if memory_critical and int(base.grouping.merge_factor) != 1:
         grouping = GroupingConfig(mode=base.grouping.mode, merge_factor=1)
         _add("grouping_min", Fsdp2Strategy(global_layout=base.global_layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=grouping), "reduce memory peaks")
+
+    # Mixed precision reduce dtype for comm-bound PCIe paths.
+    comm_ratio = float(semantic_state.get("comm_ratio") or 0.0)
+    bottleneck = str(semantic_state.get("bottleneck") or "")
+    interconnect = str(getattr(hardware, "interconnect", "") or "").lower()
+    if ("pcie" in interconnect or "pci" in interconnect) and (comm_ratio >= 0.25 or "COMM" in bottleneck):
+        if getattr(base.global_layout, "mp_reduce_dtype", "fp32") != "bf16":
+            layout = _clone_layout(base.global_layout, mp_reduce_dtype="bf16")
+            _add(
+                "mp_reduce_bf16",
+                Fsdp2Strategy(global_layout=layout, layer_overrides=base.layer_overrides, named_overrides=base.named_overrides, grouping=base.grouping),
+                "reduce grad comm volume",
+            )
 
     # Offload adjustments: only propose when memory is critical or in feasibility mode.
     allow_offload_candidates = bool(args.allow_offload) and (memory_critical or phase == Phase.FEASIBILITY)
@@ -2172,9 +2407,20 @@ Prefer strategies that reduce variability across steps and layers, even if the a
 If Phase==FEASIBILITY, prioritize making the run non-OOM. Parallel expansion (set_parallel) is allowed as a feasibility action when it improves memory safety; do not forbid it by default. After OOMs, consider set_parallel as a memory-reduction option before defaulting to offload.
 Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.
 Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.
+Use OOMSensors to separate static vs dynamic OOMs and quantify per-rank load.
+OOM Decision Tree (strict):
+- If SemanticState.oom_stage or OOMSensors.oom_stage in {load_model, apply_strategy}:
+  - Treat as static weight OOM.
+  - Prefer set_parallel (increase pp_degree first), mixed_precision (mp_policy bf16, mp_reduce_dtype bf16), enable_cpu_offload (if allowed), reshard_after_forward=True/int.
+  - Do NOT prioritize batch_size or pp_microbatches.
+- If stage == train_steps:
+  - Treat as activation OOM.
+  - Prefer set_parallel (tp_degree up, sp_enabled=true, cp_degree up for long seq), increase pp_microbatches (if pp_degree>1), or batch_size down.
 GoalMode is in SemanticState.goal_mode: fastest|min_mem_at_perf|min_mem.
 BottleneckTriage is in SemanticState.bottleneck_triage with fields {primary, secondary, confidence}.
 ActionMapping is in SemanticState.action_mapping (priors for knob choices).
+PhysicalBudget is in SemanticState.physical_budget with total_params and state_bytes estimates; use it to reason about dp*pp sharding vs VRAM.
+SemanticState.oom_stage (if present) indicates whether OOM happened during load_model/apply_strategy/train_steps.
 ScalePolicy is in SemanticState.scale_policy; adapt to num_nodes/gpus_per_node and avoid hardcoded assumptions.
 ParallelSearchSpace is in SemanticState.parallel_search_space; only recommend parallel degrees that divide world_size.
 If recommending set_parallel, require tp*pp*ep*cp divides world_size and sp_enabled implies tp_degree>1.
@@ -2191,6 +2437,7 @@ Evidence cues (non-binding):
 - reshard_after_forward=False reduces backward all-gathers but increases memory.
 - merged grouping can improve overlap and reduce collective jitter.
 - shard_plan='LARGEST' may reduce shard imbalance for large params.
+- mp_reduce_dtype='bf16' can reduce grad comm volume on PCIe.
 - 2D mesh is primarily for multi-node; 1D is safer for single node.
 Output format (strict):
 Bottleneck:
@@ -2222,11 +2469,26 @@ Distributed reasoning (first principles):
 - Single-node locality: prefer tp*cp*ep <= gpus_per_node to keep high-frequency comm intra-node; treat violations as high risk unless multi-node.
 - Prefer 2D mixes (e.g., PP+TP or DP+TP) before complex 4D unless memory is critical.
 You reason in intent terms; the system canonicalizes mesh ordering to the above rule.
+PhysicalBudget is in SemanticState.physical_budget with total_params and state_bytes estimates; use it to reason about dp*pp sharding vs VRAM.
+SemanticState.oom_stage (if present) indicates whether OOM happened during load_model/apply_strategy/train_steps.
+OOMSensors gives per-rank static load estimates and microbatch sizing.
+OOM Decision Tree (strict):
+- If SemanticState.oom_stage or OOMSensors.oom_stage in {load_model, apply_strategy}:
+  - Treat as static weight OOM.
+  - Prefer set_parallel (increase pp_degree first), mixed_precision (mp_policy bf16, mp_reduce_dtype bf16), enable_cpu_offload (if allowed), reshard_after_forward=True/int.
+  - Do NOT prioritize batch_size or pp_microbatches.
+- If stage == train_steps:
+  - Treat as activation OOM.
+  - Prefer set_parallel (tp_degree up, sp_enabled=true, cp_degree up for long seq), increase pp_microbatches (if pp_degree>1), or batch_size down.
+Knobs you can modify (when allowed):
+- ParallelSpec: pp_degree, tp_degree, ep_degree, cp_degree, sp_enabled, pp_microbatches, mesh_dim_names, tp_use_local_output
+- Fsdp2Layout: reshard_after_forward, mp_policy, mp_reduce_dtype, offload_params
+- Batch: global_batch_size (batch_size action)
 Candidates include a `priority_hint` computed by the system.
 This is NOT a rule.
 You may ignore or contradict it if your reasoning disagrees.
 If you do so, briefly explain why.
-- Modify at most TWO atomic controls.
+- Modify at most TWO atomic controls. set_parallel may adjust multiple degrees and counts as one control; in severe OOM you may pair set_parallel with one memory knob (e.g., reshard/grouping/batch).
 - Prefer layer_overrides / named_overrides / grouping.
 - Respect forbidden_in_phase.
 - Respect Judge verdict: only choose actions from allowed_actions and avoid forbidden_actions.
@@ -2251,6 +2513,7 @@ Evidence cues (non-binding):
 - reshard_after_forward=False reduces backward all-gathers but increases memory.
 - merged grouping can improve overlap and reduce collective jitter.
 - shard_plan='LARGEST' may reduce shard imbalance for large params.
+- mp_reduce_dtype='bf16' can reduce grad comm volume on PCIe.
 - 2D mesh is primarily for multi-node; 1D is safer for single node.
 - Output: short rationale (2-3 sentences) + ONE JSON object in a ```json code fence with keys:
   - hypothesis
@@ -2260,7 +2523,7 @@ Evidence cues (non-binding):
   - fallback_if_wrong (template_id or hypothesis_id)
   - strategy (optional Fsdp2Strategy JSON for robustness)
 Schema fields:
-- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy
+- global_layout: mesh_topology(1D/2D), sharding_strategy(FULL/HYBRID/NO), reshard_after_forward(bool/int>=2/None), shard_plan, offload_params, mp_policy, mp_reduce_dtype
 - layer_overrides: start_layer/end_layer or layers[] + layout
 - named_overrides: substring -> layout
 - grouping: {mode: block|merged, merge_factor>=1}
@@ -2282,6 +2545,7 @@ def build_judge_prompt(
 ) -> str:
     payload = {
         "SemanticState": semantic_state,
+        "OOMSensors": _oom_sensors(semantic_state, current_strategy),
         "UpperBoundGap": semantic_state.get("upper_bound_gap", {}),
         "CurrentStrategy": current_strategy.to_dict(),
         "ActionCost": semantic_state.get("action_cost", {}),
@@ -2308,6 +2572,7 @@ def build_coder_prompt(
     failure_feedback: Optional[str] = None,
     candidates: Optional[List[Dict[str, object]]] = None,
 ) -> str:
+    oom_sensors = _oom_sensors(semantic_state, current_strategy)
     sections = [
         "Judge hypothesis (trusted):",
         judge_hypothesis,
@@ -2321,6 +2586,8 @@ def build_coder_prompt(
         json.dumps(rag_cards or {}, ensure_ascii=False, indent=2),
         "SemanticState (trusted):",
         json.dumps(semantic_state, ensure_ascii=False, indent=2),
+        "OOMSensors (trusted):",
+        json.dumps(oom_sensors, ensure_ascii=False, indent=2),
         "UpperBoundGap (trusted):",
         json.dumps(semantic_state.get("upper_bound_gap", {}), ensure_ascii=False, indent=2),
         "CausalSummary (trusted):",
@@ -2355,6 +2622,26 @@ def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[
     if "innermost" in err_tail.lower() and "tp" in err_tail.lower():
         return "Mesh topology invalid: TP must be innermost. Use canonical order PP->DP->EP->CP->TP."
     if metrics.get("oom"):
+        stage = str(metrics.get("oom_stage") or "")
+        if stage == "load_model":
+            return (
+                "CUDA OOM during load_model: weights/materialization only (no activations). "
+                "Increase pp_degree first (set_parallel), keep reshard_after_forward=True/int, "
+                "set mp_policy=bf16 and mp_reduce_dtype=bf16, enable CPU offload if allowed. "
+                "Batch/seq changes have limited effect."
+            )
+        if stage == "apply_strategy":
+            return (
+                "CUDA OOM while applying strategy (likely shard gather). "
+                "Increase pp_degree or dp_degree (set_parallel), set reshard_after_forward=True/int, "
+                "avoid reshard_after_forward=False."
+            )
+        if stage == "train_steps":
+            return (
+                "CUDA OOM during train_steps: activation/optimizer peaks. "
+                "Increase pp_microbatches, enable sp_enabled (if tp>1), increase tp_degree/cp_degree, "
+                "or reduce batch/seq; keep reshard_after_forward=True."
+            )
         layer_stats = metrics.get("layer_stats") or metrics.get("layer_stats_static") or {}
         top_layers = _top_layers_by_param_bytes(layer_stats, topk=4) if layer_stats else []
         if allow_offload:
@@ -2363,6 +2650,21 @@ def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[
             return "CUDA OOM: enable CPU offload (global or layerwise) and avoid reshard_after_forward=False."
         return "CUDA OOM: try set_parallel, lower batch size, or reshard_after_forward=True; avoid reshard_after_forward=False."
     return None
+
+
+def _infer_params_from_model_name(model_name: str) -> Optional[int]:
+    if not model_name:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]\b", str(model_name))
+    if not match:
+        return None
+    try:
+        val = float(match.group(1))
+    except Exception:
+        return None
+    if val <= 0:
+        return None
+    return int(val * 1e9)
 
 
 def _run_trial_subprocess(
@@ -2679,7 +2981,7 @@ def main() -> None:
     upper_bound_names: set[str] = set()
     if args.use_seeds and upper_bound_ok:
         upper_off = Fsdp2Strategy(
-            global_layout=Fsdp2Layout(mesh_topology=gl.mesh_topology, reshard_after_forward=False),
+            global_layout=_clone_layout(gl, reshard_after_forward=False),
             layer_overrides=[],
             grouping=GroupingConfig(mode="block", merge_factor=1),
         )
@@ -2688,7 +2990,7 @@ def main() -> None:
         raf = _pick_nontrivial_divisor(int(args.nproc), prefer=scale_policy.get("dp_shard"))
         if raf:
             upper_int = Fsdp2Strategy(
-                global_layout=Fsdp2Layout(mesh_topology=gl.mesh_topology, reshard_after_forward=raf),
+                global_layout=_clone_layout(gl, reshard_after_forward=raf),
                 layer_overrides=[],
                 grouping=GroupingConfig(mode="block", merge_factor=1),
             )
@@ -2697,8 +2999,8 @@ def main() -> None:
 
     # HSDP-ish (multi-node only): 2D mesh + layer-level reshard True, root False.
     if args.use_seeds and args.allow_mesh and getattr(hardware, "num_nodes", 1) and int(getattr(hardware, "num_nodes", 1)) > 1:
-        hsdp_global = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=False)
-        hsdp_layer = Fsdp2Layout(mesh_topology="2D", reshard_after_forward=True)
+        hsdp_global = _clone_layout(gl, mesh_topology="2D", reshard_after_forward=False)
+        hsdp_layer = _clone_layout(gl, mesh_topology="2D", reshard_after_forward=True)
         seeds.append(
             (
                 "hsdp_layered",
@@ -2712,15 +3014,7 @@ def main() -> None:
 
     # Conservative memory anchor: 1D + CPU param offload
     if args.use_seeds and args.allow_offload and args.include_offload_seed:
-        offload_global = Fsdp2Layout(
-            mesh_topology=gl.mesh_topology,
-            sharding_strategy=gl.sharding_strategy,
-            reshard_after_forward=gl.reshard_after_forward,
-            shard_plan=gl.shard_plan,
-            offload_params=True,
-            offload_pin_memory=gl.offload_pin_memory,
-            mp_policy=gl.mp_policy,
-        )
+        offload_global = _clone_layout(gl, offload_params=True)
         seeds.append(("cpu_offload", Fsdp2Strategy(global_layout=offload_global)))
         layer_stats = baseline_metrics.get("layer_stats") or baseline_metrics.get("layer_stats_static") or {}
         top_ids = _top_layers_by_param_bytes(layer_stats, topk=4)
@@ -2816,6 +3110,50 @@ def main() -> None:
             "num_steps": args.num_steps,
             "nproc_per_node": args.nproc,
         }
+        cur_parallel = getattr(best_strategy, "parallel", None)
+        cur_tp = int(getattr(cur_parallel, "tp_degree", 1) or 1) if cur_parallel is not None else 1
+        cur_pp = int(getattr(cur_parallel, "pp_degree", 1) or 1) if cur_parallel is not None else 1
+        cur_ep = int(getattr(cur_parallel, "ep_degree", 1) or 1) if cur_parallel is not None else 1
+        cur_cp = int(getattr(cur_parallel, "cp_degree", 1) or 1) if cur_parallel is not None else 1
+        prod = max(cur_tp, 1) * max(cur_pp, 1) * max(cur_ep, 1) * max(cur_cp, 1)
+        cur_dp = int(args.nproc) // prod if prod > 0 and int(args.nproc) % prod == 0 else int(args.nproc)
+        semantic_state["current_parallel"] = {
+            "tp_degree": cur_tp,
+            "pp_degree": cur_pp,
+            "ep_degree": cur_ep,
+            "cp_degree": cur_cp,
+            "dp_degree": cur_dp,
+            "sp_enabled": bool(getattr(cur_parallel, "sp_enabled", False)) if cur_parallel is not None else False,
+        }
+        semantic_state["mem_limit_gb"] = float(args.mem_limit_gb)
+        if semantic_state.get("physical_budget") is None:
+            est_params = _infer_params_from_model_name(args.model_name)
+            if est_params:
+                bytes_per_param_lower = 12
+                bytes_per_param_upper = 16
+                state_bytes_lower = est_params * bytes_per_param_lower
+                state_bytes_upper = est_params * bytes_per_param_upper
+                shard_factor = max(cur_dp * cur_pp, 1)
+                per_rank_lower = state_bytes_lower / shard_factor
+                per_rank_upper = state_bytes_upper / shard_factor
+                mem_limit_bytes = float(args.mem_limit_gb) * 1024**3 if args.mem_limit_gb > 0 else 0.0
+                semantic_state["physical_budget"] = {
+                    "total_params": est_params,
+                    "bytes_per_param_lower": bytes_per_param_lower,
+                    "bytes_per_param_upper": bytes_per_param_upper,
+                    "state_bytes_lower": state_bytes_lower,
+                    "state_bytes_upper": state_bytes_upper,
+                    "per_rank_state_bytes_lower": per_rank_lower,
+                    "per_rank_state_bytes_upper": per_rank_upper,
+                    "per_rank_state_fraction_vram_lower": (per_rank_lower / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+                    "per_rank_state_fraction_vram_upper": (per_rank_upper / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+                    "assumptions": {
+                        "lower": "bf16 params + bf16 grads + fp32 Adam states",
+                        "upper": "fp32 params + fp32 grads + fp32 Adam states",
+                        "source": "model_name_heuristic",
+                    },
+                    "parallel_degrees": semantic_state["current_parallel"],
+                }
         semantic_state["dataset_stats"] = getattr(dataset_stats, "__dict__", {})
         semantic_state["capabilities"] = {
             "supports_merged_grouping": _supports_merged_grouping(),
@@ -2918,6 +3256,50 @@ def main() -> None:
                 "num_steps": args.num_steps,
                 "nproc_per_node": args.nproc,
             }
+            cur_parallel = getattr(best_strategy, "parallel", None)
+            cur_tp = int(getattr(cur_parallel, "tp_degree", 1) or 1) if cur_parallel is not None else 1
+            cur_pp = int(getattr(cur_parallel, "pp_degree", 1) or 1) if cur_parallel is not None else 1
+            cur_ep = int(getattr(cur_parallel, "ep_degree", 1) or 1) if cur_parallel is not None else 1
+            cur_cp = int(getattr(cur_parallel, "cp_degree", 1) or 1) if cur_parallel is not None else 1
+            prod = max(cur_tp, 1) * max(cur_pp, 1) * max(cur_ep, 1) * max(cur_cp, 1)
+            cur_dp = int(args.nproc) // prod if prod > 0 and int(args.nproc) % prod == 0 else int(args.nproc)
+            semantic_state["current_parallel"] = {
+                "tp_degree": cur_tp,
+                "pp_degree": cur_pp,
+                "ep_degree": cur_ep,
+                "cp_degree": cur_cp,
+                "dp_degree": cur_dp,
+                "sp_enabled": bool(getattr(cur_parallel, "sp_enabled", False)) if cur_parallel is not None else False,
+            }
+            semantic_state["mem_limit_gb"] = float(args.mem_limit_gb)
+            if semantic_state.get("physical_budget") is None:
+                est_params = _infer_params_from_model_name(args.model_name)
+                if est_params:
+                    bytes_per_param_lower = 12
+                    bytes_per_param_upper = 16
+                    state_bytes_lower = est_params * bytes_per_param_lower
+                    state_bytes_upper = est_params * bytes_per_param_upper
+                    shard_factor = max(cur_dp * cur_pp, 1)
+                    per_rank_lower = state_bytes_lower / shard_factor
+                    per_rank_upper = state_bytes_upper / shard_factor
+                    mem_limit_bytes = float(args.mem_limit_gb) * 1024**3 if args.mem_limit_gb > 0 else 0.0
+                    semantic_state["physical_budget"] = {
+                        "total_params": est_params,
+                        "bytes_per_param_lower": bytes_per_param_lower,
+                        "bytes_per_param_upper": bytes_per_param_upper,
+                        "state_bytes_lower": state_bytes_lower,
+                        "state_bytes_upper": state_bytes_upper,
+                        "per_rank_state_bytes_lower": per_rank_lower,
+                        "per_rank_state_bytes_upper": per_rank_upper,
+                        "per_rank_state_fraction_vram_lower": (per_rank_lower / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+                        "per_rank_state_fraction_vram_upper": (per_rank_upper / mem_limit_bytes) if mem_limit_bytes > 0 else None,
+                        "assumptions": {
+                            "lower": "bf16 params + bf16 grads + fp32 Adam states",
+                            "upper": "fp32 params + fp32 grads + fp32 Adam states",
+                            "source": "model_name_heuristic",
+                        },
+                        "parallel_degrees": semantic_state["current_parallel"],
+                    }
             semantic_state["dataset_stats"] = getattr(dataset_stats, "__dict__", {})
             semantic_state["capabilities"] = {
                 "supports_merged_grouping": _supports_merged_grouping(),
