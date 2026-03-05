@@ -514,6 +514,17 @@ def main() -> None:
         device_map="cpu",
     )
     model.train()
+    # torch.export (used by torch.distributed.pipelining) cannot handle HF cache objects like DynamicCache in outputs.
+    # Force-disable KV cache so outputs are pure tensors/tuples during tracing.
+    try:
+        if getattr(getattr(model, "config", None), "use_cache", None) is not None:
+            model.config.use_cache = False
+        if getattr(getattr(model, "config", None), "return_dict", None) is not None:
+            model.config.return_dict = False
+        if getattr(model, "generation_config", None) is not None and getattr(model.generation_config, "use_cache", None) is not None:
+            model.generation_config.use_cache = False
+    except Exception:
+        pass
 
     # Total params for MFU (same for all ranks).
     total_params = int(sum(int(p.numel()) for p in model.parameters()))
@@ -562,7 +573,12 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     dummy_input = torch.zeros((per_rank_batch, seq_len), device="cpu", dtype=torch.long)
     dummy_attn = torch.ones((per_rank_batch, seq_len), device="cpu", dtype=torch.long)
-    pipe = pipeline(model, mb_args=(dummy_input,), mb_kwargs={"attention_mask": dummy_attn}, split_spec=split_spec)
+    pipe = pipeline(
+        model,
+        mb_args=(dummy_input,),
+        mb_kwargs={"attention_mask": dummy_attn, "use_cache": False, "return_dict": False},
+        split_spec=split_spec,
+    )
 
     pp_rank = dist.get_rank(pp_group)
 
