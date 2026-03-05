@@ -360,9 +360,20 @@ def main() -> None:
     model_cfg = cfg.get("model") or {}
     model_path_raw = str(model_cfg.get("path") or "")
     model_path = os.path.expandvars(os.path.expanduser(model_path_raw))
-    # If user passed a local path with "~", expand it; otherwise allow HF repo ids.
-    if model_path and Path(model_path).exists():
+    # Prefer local paths (ModelScope cache, etc.). Only treat as HF repo id if it is not path-like.
+    # This avoids HFValidationError when users pass "~/.cache/...".
+    is_path_like = False
+    if model_path_raw:
+        if model_path_raw.startswith(("~", "/", ".", "$")):
+            is_path_like = True
+        elif "/" in model_path_raw or "\\" in model_path_raw:
+            is_path_like = True
+    if is_path_like:
         model_path_for_load = model_path
+        if model_path_for_load and not Path(model_path_for_load).exists():
+            raise FileNotFoundError(
+                f"model.path looks like a local path but does not exist: raw={model_path_raw!r} expanded={model_path_for_load!r}"
+            )
     else:
         model_path_for_load = model_path_raw
     dtype = _infer_dtype(model_cfg.get("dtype") or "bf16")
