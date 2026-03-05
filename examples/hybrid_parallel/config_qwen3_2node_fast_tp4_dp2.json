@@ -1,0 +1,61 @@
+{
+  "model": {
+    "path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B",
+    "dtype": "bf16",
+    "seq_len": 1024,
+    "vocab_size_override": null
+  },
+  "train": {
+    "steps": 50,
+    "warmup_steps": 5,
+    "seed": 42,
+    "global_batch_size": 32,
+    "grad_accum_steps": 2,
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "log_every": 1
+    ,
+    "mfu": {
+      "flops_per_param_per_token": 6.0,
+      "model_params": null
+    }
+  },
+  "parallel": {
+    "pp": {
+      "degree": 2,
+      "vpp": 2,
+      "microbatches": 8,
+      "schedule": "interleaved1f1b",
+      "stages": "auto",
+      "auto_mem_gb": [24, 32],
+      "auto_bias_stage0": -0.08
+    },
+    "tp": {
+      "degree": 4,
+      "enabled": true
+    },
+    "fsdp2": {
+      "enabled": true,
+      "param_dtype": "bf16",
+      "reduce_dtype": "bf16",
+      "reshard_after_forward": true
+    }
+  },
+  "runtime": {
+    "cuda_alloc_conf": "expandable_segments:True",
+    "peak_tflops_per_gpu": []
+  },
+  "profile": {
+    "enabled": false,
+    "trace_dir": "tb_traces",
+    "wait": 1,
+    "warmup": 1,
+    "active": 5,
+    "repeat": 1,
+    "record_shapes": false,
+    "profile_memory": true,
+    "with_stack": false,
+    "with_flops": true
+  }
+}

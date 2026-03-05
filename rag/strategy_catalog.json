@@ -1,0 +1,211 @@
+{
+  "version": 1,
+  "field_hints": {
+    "tp_head_grouping": {
+      "description": "Optional GQA/MQA head grouping. Provide num_attention_heads and num_key_value_heads (or num_kv_heads).",
+      "fields": ["num_attention_heads", "num_key_value_heads", "num_kv_heads"]
+    }
+  },
+  "families": [
+    {
+      "family_id": "llama",
+      "aliases": ["llama", "llama2", "llama3", "vicuna"],
+      "strategies": [
+        {
+          "strategy_id": "tp_attn_only",
+          "tp_plan": "llama_attn",
+          "description": "TP only attention projections (q/k/v/o)."
+        },
+        {
+          "strategy_id": "tp_mlp_only",
+          "tp_plan": "llama_mlp",
+          "description": "TP only MLP projections (gate/up/down)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp",
+          "tp_plan": "llama",
+          "description": "TP attention + MLP projections."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_sp",
+          "tp_plan": "llama",
+          "sp_enabled": true,
+          "description": "TP attention + MLP with SP enabled."
+        },
+        {
+          "strategy_id": "pp_layered",
+          "pp_degree": "auto",
+          "pp_schedule": "1f1b",
+          "description": "Pipeline parallel layered split (uniform stages)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_keep_dp",
+          "tp_plan": "llama",
+          "keep_embeddings_dp": true,
+          "keep_lm_head_dp": true,
+          "description": "TP for transformer blocks; keep embedding/LM head DP."
+        }
+      ]
+    },
+    {
+      "family_id": "qwen",
+      "aliases": ["qwen", "qwen2", "qwen2.5"],
+      "strategies": [
+        {
+          "strategy_id": "tp_attn_only",
+          "tp_plan": "qwen_attn",
+          "description": "TP only attention projections (q/k/v/o)."
+        },
+        {
+          "strategy_id": "tp_mlp_only",
+          "tp_plan": "qwen_mlp",
+          "description": "TP only MLP projections (gate/up/down)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp",
+          "tp_plan": "qwen",
+          "description": "TP attention + MLP projections."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_sp",
+          "tp_plan": "qwen",
+          "sp_enabled": true,
+          "description": "TP attention + MLP with SP enabled."
+        },
+        {
+          "strategy_id": "pp_layered",
+          "pp_degree": "auto",
+          "pp_schedule": "1f1b",
+          "description": "Pipeline parallel layered split (uniform stages)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_keep_dp",
+          "tp_plan": "qwen",
+          "keep_embeddings_dp": true,
+          "keep_lm_head_dp": true,
+          "description": "TP for transformer blocks; keep embedding/LM head DP."
+        }
+      ]
+    },
+    {
+      "family_id": "mistral",
+      "aliases": ["mistral", "mixtral"],
+      "strategies": [
+        {
+          "strategy_id": "tp_attn_only",
+          "tp_plan": "mistral_attn",
+          "description": "TP only attention projections (q/k/v/o)."
+        },
+        {
+          "strategy_id": "tp_mlp_only",
+          "tp_plan": "mistral_mlp",
+          "description": "TP only MLP projections (gate/up/down)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp",
+          "tp_plan": "mistral",
+          "description": "TP attention + MLP projections."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_sp",
+          "tp_plan": "mistral",
+          "sp_enabled": true,
+          "description": "TP attention + MLP with SP enabled."
+        },
+        {
+          "strategy_id": "pp_layered",
+          "pp_degree": "auto",
+          "pp_schedule": "1f1b",
+          "description": "Pipeline parallel layered split (uniform stages)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_keep_dp",
+          "tp_plan": "mistral",
+          "keep_embeddings_dp": true,
+          "keep_lm_head_dp": true,
+          "description": "TP for transformer blocks; keep embedding/LM head DP."
+        }
+      ]
+    },
+    {
+      "family_id": "neox",
+      "aliases": ["neox", "gpt-neox", "pythia"],
+      "strategies": [
+        {
+          "strategy_id": "tp_attn_only",
+          "tp_plan": "neox_attn",
+          "description": "TP only attention projections (qkv/dense)."
+        },
+        {
+          "strategy_id": "tp_mlp_only",
+          "tp_plan": "neox_mlp",
+          "description": "TP only MLP projections (dense_h_to_4h/dense_4h_to_h)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp",
+          "tp_plan": "neox",
+          "description": "TP attention + MLP projections."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_sp",
+          "tp_plan": "neox",
+          "sp_enabled": true,
+          "description": "TP attention + MLP with SP enabled."
+        },
+        {
+          "strategy_id": "pp_layered",
+          "pp_degree": "auto",
+          "pp_schedule": "1f1b",
+          "description": "Pipeline parallel layered split (uniform stages)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_keep_dp",
+          "tp_plan": "neox",
+          "keep_embeddings_dp": true,
+          "keep_lm_head_dp": true,
+          "description": "TP for transformer blocks; keep embedding/LM head DP."
+        }
+      ]
+    },
+    {
+      "family_id": "opt",
+      "aliases": ["opt"],
+      "strategies": [
+        {
+          "strategy_id": "tp_attn_only",
+          "tp_plan": "opt_attn",
+          "description": "TP only attention projections (q/k/v/out)."
+        },
+        {
+          "strategy_id": "tp_mlp_only",
+          "tp_plan": "opt_mlp",
+          "description": "TP only MLP projections (fc1/fc2)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp",
+          "tp_plan": "opt",
+          "description": "TP attention + MLP projections."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_sp",
+          "tp_plan": "opt",
+          "sp_enabled": true,
+          "description": "TP attention + MLP with SP enabled."
+        },
+        {
+          "strategy_id": "pp_layered",
+          "pp_degree": "auto",
+          "pp_schedule": "1f1b",
+          "description": "Pipeline parallel layered split (uniform stages)."
+        },
+        {
+          "strategy_id": "tp_attn_mlp_keep_dp",
+          "tp_plan": "opt",
+          "keep_embeddings_dp": true,
+          "keep_lm_head_dp": true,
+          "description": "TP for transformer blocks; keep embedding/LM head DP."
+        }
+      ]
+    }
+  ]
+}

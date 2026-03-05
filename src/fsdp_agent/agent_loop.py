@@ -29,6 +29,7 @@ from fsdp_agent.hardware_info import detect_hardware, load_hardware_info
 from fsdp_agent.metrics_utils import score_strategy
 from fsdp_agent.orienter import derive_semantic_state
 from fsdp_agent.phases import Phase, next_phase
+from fsdp_agent.strategy_catalog import build_catalog_candidates
 from fsdp_agent.strategy_dsl import fsdp2_diff_to_transform, fsdp2_to_dsl, suggest_parallel_transforms
 
 
@@ -36,7 +37,7 @@ def _load_rag_cards() -> Dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     rag_dir = root / "rag"
     data: Dict[str, object] = {}
-    for name in ("control_surface_catalog", "diagnosis_playbook", "experiment_templates"):
+    for name in ("control_surface_catalog", "diagnosis_playbook", "experiment_templates", "strategy_catalog"):
         path = rag_dir / f"{name}.json"
         if not path.exists():
             continue
@@ -89,6 +90,17 @@ def _infer_failure_stage(metrics: Dict[str, object]) -> Optional[str]:
     if metrics.get("oom"):
         return "oom_unknown_stage"
     return None
+
+
+def _normalize_oom_stage(stage: Optional[str]) -> Optional[str]:
+    if not stage:
+        return None
+    low = str(stage).strip().lower()
+    if low in {"postprocess", "preprocess"}:
+        return "load_model"
+    if low in {"load_model", "apply_strategy", "train_steps", "oom_unknown_stage"}:
+        return low
+    return low
 
 
 def _summarize_semantic_state(semantic_state: Dict[str, object], *, candidate_count: int = 0, doe_count: int = 0) -> str:
@@ -202,7 +214,7 @@ def _summarize_metrics_for_log(metrics: Dict) -> Dict[str, object]:
 
 def _oom_sensors(semantic_state: Dict[str, object], current_strategy: Fsdp2Strategy) -> Dict[str, object]:
     last_oom = semantic_state.get("last_oom") or {}
-    stage = last_oom.get("oom_stage") or semantic_state.get("oom_stage")
+    stage = _normalize_oom_stage(last_oom.get("oom_stage") or semantic_state.get("oom_stage"))
     train_hyper = semantic_state.get("train_hyper") or {}
     mem_limit_gb = semantic_state.get("mem_limit_gb")
     current_parallel = semantic_state.get("current_parallel") or {}
@@ -255,6 +267,7 @@ def _oom_sensors(semantic_state: Dict[str, object], current_strategy: Fsdp2Strat
         "seq_len": seq_len,
         "mem_limit_gb": mem_limit_gb,
     }
+
 
 def _strategy_hash(strategy: Fsdp2Strategy) -> str:
     """Use semantic-normalized hash to avoid duplicate trials from equivalent configs."""
@@ -312,6 +325,115 @@ def _divisors(n: int) -> List[int]:
         if n % d == 0:
             out.append(d)
     return out
+
+
+def _pick_megatron_degrees(
+    world_size: int,
+    *,
+    gpus_per_node: Optional[int],
+    num_layers_hint: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Pick TP+PP degrees for Megatron-style parallelism."""
+    world = max(int(world_size), 1)
+    divisors = sorted({*(_divisors(world) or []), world})
+    if world <= 1 or not divisors:
+        return None
+    tp_cap = int(gpus_per_node) if gpus_per_node and int(gpus_per_node) > 0 else world
+    tp_candidates = [d for d in divisors if d > 1 and d <= tp_cap]
+    if not tp_candidates:
+        return None
+    tp_candidates.sort(reverse=True)
+    best: Optional[tuple[int, int]] = None
+    best_score = -1
+    for tp in tp_candidates:
+        if world % tp != 0:
+            continue
+        remaining = world // tp
+        pp_divs = sorted({*(_divisors(remaining) or []), remaining}, reverse=True)
+        pp_candidates = [d for d in pp_divs if d > 1]
+        if num_layers_hint is not None:
+            pp_candidates = [d for d in pp_candidates if int(d) <= int(num_layers_hint)]
+        for pp in pp_candidates:
+            if remaining % pp != 0:
+                continue
+            score = int(tp) * int(pp)
+            if score > best_score:
+                best = (int(tp), int(pp))
+                best_score = score
+        if best:
+            break
+    return best
+
+
+def _suggest_pp_microbatches_for_megatron(
+    *,
+    world_size: int,
+    tp: int,
+    pp: int,
+    ep: int,
+    cp: int,
+    global_batch_size: int,
+    base_microbatches: int = 1,
+) -> int:
+    if int(pp) <= 1:
+        return 1
+    target = max(int(base_microbatches), 4 * int(pp))
+    product = max(int(tp), 1) * max(int(pp), 1) * max(int(ep), 1) * max(int(cp), 1)
+    dp_world = int(world_size) // product if product > 0 and int(world_size) % product == 0 else int(world_size)
+    per_rank_batch = int(global_batch_size) if global_batch_size is not None else 0
+    if dp_world > 0 and per_rank_batch > 0:
+        per_rank_batch = int(math.ceil(float(per_rank_batch) / float(dp_world)))
+    if per_rank_batch <= 0:
+        per_rank_batch = 1
+    return max(1, min(int(target), int(per_rank_batch)))
+
+
+def _build_megatron_baseline(
+    args: argparse.Namespace,
+    *,
+    base_layout: Fsdp2Layout,
+    num_layers_hint: Optional[int],
+    hardware: object,
+) -> Optional[Fsdp2Strategy]:
+    world = max(int(args.nproc), 1)
+    try:
+        gpus_per_node = int(getattr(hardware, "gpus_per_node", 0) or 0)
+    except Exception:
+        gpus_per_node = 0
+    degrees = _pick_megatron_degrees(world, gpus_per_node=gpus_per_node, num_layers_hint=num_layers_hint)
+    if not degrees:
+        return None
+    tp, pp = degrees
+    if tp <= 1 or pp <= 1:
+        return None
+    sp_enabled = bool(getattr(args, "allow_sp", False)) and tp > 1
+    tp_use_local_output = False if tp > 1 else None
+    pp_microbatches = _suggest_pp_microbatches_for_megatron(
+        world_size=world,
+        tp=tp,
+        pp=pp,
+        ep=1,
+        cp=1,
+        global_batch_size=int(args.global_batch_size),
+        base_microbatches=1,
+    )
+    parallel = ParallelSpec(
+        tp_degree=int(tp),
+        pp_degree=int(pp),
+        ep_degree=1,
+        cp_degree=1,
+        sp_enabled=bool(sp_enabled),
+        tp_plan="auto",
+        pp_microbatches=int(pp_microbatches),
+        pp_schedule="1f1b",
+        tp_use_local_output=tp_use_local_output,
+    )
+    return Fsdp2Strategy(
+        global_layout=base_layout,
+        layer_overrides=[],
+        grouping=GroupingConfig(mode="block", merge_factor=1),
+        parallel=parallel,
+    )
 
 
 def _clone_layout(layout: Fsdp2Layout, **overrides) -> Fsdp2Layout:
@@ -457,6 +579,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-name", type=str, required=True, help="HF Causal LM name or local path.")
     p.add_argument("--global-batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--seq-len-min", type=int, default=None)
+    p.add_argument("--seq-len-max", type=int, default=None)
+    p.add_argument("--dynamic-batch-tokens", type=int, default=None)
+    p.add_argument("--dynamic-pad-to-max", action="store_true")
     p.add_argument("--vocab-size", type=int, default=151936)
     p.add_argument("--num-warmup", type=int, default=5)
     p.add_argument("--num-steps", type=int, default=30)
@@ -465,6 +591,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     p.add_argument("--llm-temperature", type=float, default=0.2)
     p.add_argument("--objective", type=str, default="throughput", choices=["throughput", "latency"])
+    p.add_argument(
+        "--prefer-megatron-fsdp",
+        action="store_true",
+        help="Prefer Megatron-style TP+PP candidates and baseline for large-model throughput.",
+    )
     p.add_argument("--max-history", type=int, default=6, help="Number of recent trials in the prompt.")
     p.add_argument("--stop-drop", type=float, default=0.03, help="Early stop on consecutive drops.")
     p.add_argument("--dataset-stats-file", type=str, default=None, help="Dataset stats JSON.")
@@ -671,6 +802,63 @@ def _strategy_features(strategy: Fsdp2Strategy) -> Dict[str, object]:
         "cp_degree": cp_degree,
         "sp_enabled": sp_enabled,
     }
+
+
+def _scale_backtrack(history: List[Dict], hash_to_strategy: Dict[str, Dict], limit: int = 8) -> List[Dict[str, object]]:
+    """Record recent scale attempts for LLM reasoning; no hard constraints applied."""
+    out: List[Dict[str, object]] = []
+    for m in reversed(history):
+        h = m.get("strategy_hash")
+        if not h or h not in hash_to_strategy:
+            continue
+        try:
+            strat = Fsdp2Strategy.from_dict(hash_to_strategy[h])
+        except Exception:
+            continue
+        p = getattr(strat, "parallel", None)
+        entry = {
+            "trial_id": m.get("trial_id"),
+            "config_name": m.get("config_name"),
+            "oom": bool(m.get("oom")),
+            "oom_stage": _normalize_oom_stage(m.get("oom_stage") or _infer_failure_stage(m)),
+            "error_msg": m.get("error_msg"),
+            "score": m.get("score"),
+            "throughput_tokens_per_s": m.get("throughput_tokens_per_s"),
+            "max_mem_gb": (m.get("max_mem_bytes", 0) / (1024**3)) if m.get("max_mem_bytes") else None,
+            "parallel": {
+                "tp_degree": int(getattr(p, "tp_degree", 1) or 1) if p is not None else 1,
+                "pp_degree": int(getattr(p, "pp_degree", 1) or 1) if p is not None else 1,
+                "ep_degree": int(getattr(p, "ep_degree", 1) or 1) if p is not None else 1,
+                "cp_degree": int(getattr(p, "cp_degree", 1) or 1) if p is not None else 1,
+                "sp_enabled": bool(getattr(p, "sp_enabled", False)) if p is not None else False,
+            },
+            "layout": {
+                "mesh_topology": strat.global_layout.mesh_topology,
+                "reshard_after_forward": strat.global_layout.reshard_after_forward,
+                "mp_policy": strat.global_layout.mp_policy,
+            },
+        }
+        out.append(entry)
+        if len(out) >= max(int(limit), 1):
+            break
+    return list(reversed(out))
+
+
+def _backtrack_flags(semantic_state: Dict[str, object]) -> Dict[str, bool]:
+    flags = {"cp_blocked": False, "ep_blocked": False, "sp_blocked": False, "tp_blocked": False}
+    for entry in semantic_state.get("scale_backtrack") or []:
+        msg = str(entry.get("error_msg") or "").lower()
+        if not msg:
+            continue
+        if "context_parallel" in msg or "cp_degree" in msg or "cp_mesh" in msg:
+            flags["cp_blocked"] = True
+        if "moe" in msg and "expert" in msg:
+            flags["ep_blocked"] = True
+        if "cannot capture your model as a full graph" in msg or "torch.compile" in msg:
+            flags["sp_blocked"] = True
+        if "replicate" in msg and "no attribute" in msg and "dim" in msg:
+            flags["tp_blocked"] = True
+    return flags
 
 
 def _build_causal_summary(history: List[Dict], hash_to_strategy: Dict[str, Dict], mem_limit_gb: float) -> Dict:
@@ -1012,6 +1200,7 @@ def _force_parallel_in_doe(
     hypothesis_graph: Dict[str, object],
     *,
     judge_verdict: Optional[Dict],
+    prefer_megatron: bool = False,
 ) -> List[Dict[str, object]]:
     if any(d.get("action") == "set_parallel" for d in doe):
         return doe
@@ -1024,6 +1213,10 @@ def _force_parallel_in_doe(
     if allowed and "set_parallel" not in allowed:
         return doe
     parallel_candidates = [c for c in candidates if c.get("primary_action") == "set_parallel"]
+    if prefer_megatron:
+        megatron_candidates = [c for c in parallel_candidates if _is_megatron_parallel_candidate(c)]
+        if megatron_candidates:
+            parallel_candidates = megatron_candidates
     if not parallel_candidates:
         return doe
     chosen = max(parallel_candidates, key=lambda c: c.get("priority_hint", {}).get("score", 0.0))
@@ -1643,10 +1836,16 @@ def _candidate_parallel_degrees(cand: Dict[str, object]) -> Dict[str, int]:
     return out
 
 
+def _is_megatron_parallel_candidate(cand: Dict[str, object]) -> bool:
+    degrees = _candidate_parallel_degrees(cand)
+    return int(degrees.get("tp_degree", 1)) > 1 and int(degrees.get("pp_degree", 1)) > 1
+
+
 def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict[str, object]:
     triage = semantic_state.get("bottleneck_triage") or {}
     primary = str(triage.get("primary") or "")
     secondary = triage.get("secondary") or []
+    prefer_megatron = bool(semantic_state.get("prefer_megatron_fsdp"))
     score = 0.0
     reasons: List[str] = []
     cand_id = str(cand.get("id") or "")
@@ -1670,6 +1869,15 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     cur_parallel = semantic_state.get("current_parallel") or {}
     cur_dp = int(cur_parallel.get("dp_degree") or 1)
     cur_pp = int(cur_parallel.get("pp_degree") or 1)
+    backtrack = _backtrack_flags(semantic_state)
+
+    if prefer_megatron:
+        if tp > 1 and pp > 1:
+            score += 2.5
+            reasons.append("prefer_megatron: tp+pp")
+        elif tp > 1 or pp > 1:
+            score += 0.5
+            reasons.append("prefer_megatron: partial_parallel")
 
     if cand_id.startswith("mesh") and primary.startswith("COMM"):
         score += 2.0
@@ -1716,6 +1924,18 @@ def _attach_priority_hint(cand: Dict[str, object], semantic_state: Dict) -> Dict
     if ep > 1 and has_moe is False:
         score -= 2.0
         reasons.append("ep without moe experts is high risk")
+    if backtrack.get("cp_blocked") and cp > 1:
+        score -= 3.0
+        reasons.append("cp failed previously (context_parallel)")
+    if backtrack.get("ep_blocked") and ep > 1:
+        score -= 3.0
+        reasons.append("ep failed previously (no moe experts)")
+    if backtrack.get("sp_blocked") and sp:
+        score -= 2.5
+        reasons.append("sp failed previously (graph capture)")
+    if backtrack.get("tp_blocked") and tp > 1:
+        score -= 2.0
+        reasons.append("tp failed previously (replicate dim)")
 
     if world_size > 0:
         prod = max(tp, 1) * max(pp, 1) * max(ep, 1) * max(cp, 1)
@@ -1796,6 +2016,7 @@ def _candidate_pool(
     pool: List[Dict[str, object]] = []
     seen: set[str] = set()
     parallel_specs: List[tuple[str, ParallelSpec, str]] = []
+    world_size = max(int(args.nproc), 1)
     scale = semantic_state.get("scale_policy") or {}
     reshard_ints = scale.get("reshard_int_candidates") or []
     reshard_int = int(reshard_ints[0]) if reshard_ints else _pick_nontrivial_divisor(int(args.nproc), prefer=scale.get("dp_shard"))
@@ -1811,8 +2032,12 @@ def _candidate_pool(
         reshard_int_choices = [int(reshard_int)]
     memory_critical = _is_memory_critical(semantic_state)
     last_oom = semantic_state.get("last_oom") or {}
-    oom_stage = str(last_oom.get("oom_stage") or semantic_state.get("oom_stage") or "")
+    oom_stage = _normalize_oom_stage(str(last_oom.get("oom_stage") or semantic_state.get("oom_stage") or ""))
     runtime_oom = oom_stage == "train_steps"
+    try:
+        gpus_per_node = int(getattr(hardware, "gpus_per_node", 0) or 0)
+    except Exception:
+        gpus_per_node = 0
     top = semantic_state.get("top_targets") or {}
     top_mem_layers = top.get("top_mem_layer_ids") or []
     top_comm_layers = top.get("top_comm_layer_ids") or []
@@ -1826,11 +2051,7 @@ def _candidate_pool(
         mem_limit = float(args.mem_limit_gb or 0.0)
         if mem_limit <= 0:
             return True
-        has_moe = semantic_state.get("has_moe_experts")
         p = getattr(strat, "parallel", None)
-        ep = int(getattr(p, "ep_degree", 1) or 1) if p is not None else 1
-        if ep > 1 and has_moe is False:
-            return False
         physical = semantic_state.get("physical_budget") or {}
         total_params = physical.get("total_params")
         if not isinstance(total_params, (int, float)) or total_params <= 0:
@@ -1842,10 +2063,9 @@ def _candidate_pool(
         pp = int(getattr(p, "pp_degree", 1) or 1) if p is not None else 1
         cp = int(getattr(p, "cp_degree", 1) or 1) if p is not None else 1
         prod = max(tp, 1) * max(pp, 1) * max(ep, 1) * max(cp, 1)
-        world = int(args.nproc)
-        if prod <= 0 or world % prod != 0:
+        if prod <= 0 or world_size % prod != 0:
             return False
-        dp = world // prod
+        dp = world_size // prod
         shard_factor = max(dp * pp, 1)
         state_bytes_upper = int(total_params) * bytes_per_param_upper
         per_rank_upper = float(state_bytes_upper) / float(shard_factor)
@@ -2108,6 +2328,16 @@ def _candidate_pool(
                 strat.parallel = spec
                 _add("parallel_pp_microbatches_up", strat, "increase microbatches to reduce activation peak")
 
+        catalog_candidates = build_catalog_candidates(
+            base,
+            model_name=str(args.model_name),
+            semantic_state=semantic_state,
+            num_layers_hint=num_layers_hint,
+            gpus_per_node=gpus_per_node,
+        )
+        for name, strat, note in catalog_candidates:
+            _add(name, strat, note)
+
     # Hybrid parallel + other knobs (limited, to keep search compact).
     hybrid_specs = []
     hybrid_specs.extend(_pick_parallel_coverage())
@@ -2307,14 +2537,26 @@ def _candidate_pool(
         return count
 
     pool = [_attach_priority_hint(c, semantic_state) for c in pool]
+    prefer_megatron = bool(semantic_state.get("prefer_megatron_fsdp"))
     mixed_parallel = [
         c
         for c in pool
         if c.get("primary_action") == "set_parallel"
         and ("grouping" in str(c.get("id")) or "reshard" in str(c.get("id")))
     ]
+    if prefer_megatron:
+        mixed_parallel.sort(key=lambda c: (0 if _is_megatron_parallel_candidate(c) else 1, str(c.get("id"))))
     parallel_only = [c for c in pool if c.get("primary_action") == "set_parallel" and c not in mixed_parallel]
-    parallel_only.sort(key=lambda c: (-_parallel_complexity_from_id(str(c.get("id"))), str(c.get("id"))))
+    if prefer_megatron:
+        parallel_only.sort(
+            key=lambda c: (
+                0 if _is_megatron_parallel_candidate(c) else 1,
+                -_parallel_complexity_from_id(str(c.get("id"))),
+                str(c.get("id")),
+            )
+        )
+    else:
+        parallel_only.sort(key=lambda c: (-_parallel_complexity_from_id(str(c.get("id"))), str(c.get("id"))))
     others = [c for c in pool if c.get("primary_action") != "set_parallel"]
     pool = mixed_parallel + others + parallel_only
     return pool[:80]
@@ -2381,10 +2623,13 @@ def _min_mem_at_perf(history: List[Dict], baseline_tp: float, tol: float = 0.99)
 def _last_oom_info(history: List[Dict]) -> Optional[Dict]:
     for m in reversed(history):
         if m.get("oom"):
+            stage = m.get("oom_stage")
+            if stage is None:
+                stage = _infer_failure_stage(m)
             return {
                 "trial_id": m.get("trial_id"),
                 "config_name": m.get("config_name"),
-                "oom_stage": m.get("oom_stage"),
+                "oom_stage": _normalize_oom_stage(str(stage)) if stage is not None else None,
                 "error_msg": m.get("error_msg"),
             }
     return None
@@ -2397,6 +2642,7 @@ Signal Priority:
 - HARD: OOM, headroom_ratio, comm_ratio
 - DERIVED: bottleneck_triage, shard_plan_compat
 - HEURISTIC: action_mapping, causal_summary
+If SemanticState.prefer_megatron_fsdp is true, prefer Megatron-style TP+PP (and optional SP) for large-model throughput, subject to memory safety.
 Distributed reasoning (first principles):
 - Bandwidth-Frequency Law: higher-frequency comm dims must be more "inner" on device mesh. Canonical order (outer -> inner): PP, DP, EP, CP, TP. TP must be innermost.
 - Memory Safety Margin: estimate per-rank sharded state ~= total_state_bytes / (dp_degree * pp_degree). Keep it < 75% VRAM; if exceeded, increase PP or DP, or reduce batch/seq.
@@ -2408,11 +2654,12 @@ If Phase==FEASIBILITY, prioritize making the run non-OOM. Parallel expansion (se
 Treat global reshard_after_forward=False as an extreme point: highest determinism and lowest communication, but highest memory risk. Recommend it only when memory headroom is strong and grouping already reduces peaks; otherwise seek safer alternatives.
 Use UpperBoundGap to gauge how far current throughput is from the feasible ceiling; prioritize actions that close the gap without violating memory safety or stability.
 Use OOMSensors to separate static vs dynamic OOMs and quantify per-rank load.
-OOM Decision Tree (strict):
+ScaleBacktrack lists recent parallel configs and outcomes; use it as evidence, not a hard constraint.
+OOM Decision Tree (guideline):
 - If SemanticState.oom_stage or OOMSensors.oom_stage in {load_model, apply_strategy}:
   - Treat as static weight OOM.
   - Prefer set_parallel (increase pp_degree first), mixed_precision (mp_policy bf16, mp_reduce_dtype bf16), enable_cpu_offload (if allowed), reshard_after_forward=True/int.
-  - Do NOT prioritize batch_size or pp_microbatches.
+  - Avoid batch_size or pp_microbatches unless you justify why.
 - If stage == train_steps:
   - Treat as activation OOM.
   - Prefer set_parallel (tp_degree up, sp_enabled=true, cp_degree up for long seq), increase pp_microbatches (if pp_degree>1), or batch_size down.
@@ -2433,6 +2680,7 @@ If recent_trials include OOM (see last_oom), treat it as memory-critical and pri
 ModelAnatomy lists comm_hotspots/latency_hotspots and named_override_keys for named_overrides.
 If shard_plan_compat indicates low divisibility, avoid shard_plan changes.
 You must choose ONE hypothesis from HypothesisGraph and constrain the action space for DoE.
+If ScaleBacktrack shows explicit capability errors (context_parallel, no MoE experts, graph capture, Replicate.dim), avoid repeating those knobs unless you explain why.
 Evidence cues (non-binding):
 - reshard_after_forward=False reduces backward all-gathers but increases memory.
 - merged grouping can improve overlap and reduce collective jitter.
@@ -2463,6 +2711,7 @@ Rules:
   - HARD: OOM, headroom_ratio, comm_ratio
   - DERIVED: bottleneck_triage, shard_plan_compat
   - HEURISTIC: action_mapping, causal_summary
+If SemanticState.prefer_megatron_fsdp is true, prioritize Megatron-style TP+PP (and optional SP) when chasing throughput on large models.
 Distributed reasoning (first principles):
 - Bandwidth-Frequency Law: higher-frequency comm dims must be more "inner" on device mesh. Canonical order (outer -> inner): PP, DP, EP, CP, TP. TP must be innermost.
 - Memory Safety Margin: estimate per-rank sharded state ~= total_state_bytes / (dp_degree * pp_degree). Keep it < 75% VRAM; if exceeded, increase PP or DP, or reduce batch/seq.
@@ -2472,11 +2721,12 @@ You reason in intent terms; the system canonicalizes mesh ordering to the above 
 PhysicalBudget is in SemanticState.physical_budget with total_params and state_bytes estimates; use it to reason about dp*pp sharding vs VRAM.
 SemanticState.oom_stage (if present) indicates whether OOM happened during load_model/apply_strategy/train_steps.
 OOMSensors gives per-rank static load estimates and microbatch sizing.
-OOM Decision Tree (strict):
+ScaleBacktrack lists recent parallel configs and outcomes; use it as evidence, not a hard constraint.
+OOM Decision Tree (guideline):
 - If SemanticState.oom_stage or OOMSensors.oom_stage in {load_model, apply_strategy}:
   - Treat as static weight OOM.
   - Prefer set_parallel (increase pp_degree first), mixed_precision (mp_policy bf16, mp_reduce_dtype bf16), enable_cpu_offload (if allowed), reshard_after_forward=True/int.
-  - Do NOT prioritize batch_size or pp_microbatches.
+  - Avoid batch_size or pp_microbatches unless you justify why.
 - If stage == train_steps:
   - Treat as activation OOM.
   - Prefer set_parallel (tp_degree up, sp_enabled=true, cp_degree up for long seq), increase pp_microbatches (if pp_degree>1), or batch_size down.
@@ -2509,6 +2759,7 @@ If you do so, briefly explain why.
 - If shard_plan_compat is low, do not change shard_plan.
 - You MUST choose exactly ONE experiment from DoE in the prompt.
 - If DoE lacks a viable mixed-parallel option, you may supply a full Fsdp2Strategy in plan.strategy (still must obey allowed_actions).
+If ScaleBacktrack shows explicit capability errors (context_parallel, no MoE experts, graph capture, Replicate.dim), avoid repeating those knobs unless you explain why.
 Evidence cues (non-binding):
 - reshard_after_forward=False reduces backward all-gathers but increases memory.
 - merged grouping can improve overlap and reduce collective jitter.
@@ -2546,6 +2797,7 @@ def build_judge_prompt(
     payload = {
         "SemanticState": semantic_state,
         "OOMSensors": _oom_sensors(semantic_state, current_strategy),
+        "ScaleBacktrack": semantic_state.get("scale_backtrack", []),
         "UpperBoundGap": semantic_state.get("upper_bound_gap", {}),
         "CurrentStrategy": current_strategy.to_dict(),
         "ActionCost": semantic_state.get("action_cost", {}),
@@ -2588,6 +2840,8 @@ def build_coder_prompt(
         json.dumps(semantic_state, ensure_ascii=False, indent=2),
         "OOMSensors (trusted):",
         json.dumps(oom_sensors, ensure_ascii=False, indent=2),
+        "ScaleBacktrack (trusted):",
+        json.dumps(semantic_state.get("scale_backtrack", []), ensure_ascii=False, indent=2),
         "UpperBoundGap (trusted):",
         json.dumps(semantic_state.get("upper_bound_gap", {}), ensure_ascii=False, indent=2),
         "CausalSummary (trusted):",
@@ -2622,7 +2876,7 @@ def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[
     if "innermost" in err_tail.lower() and "tp" in err_tail.lower():
         return "Mesh topology invalid: TP must be innermost. Use canonical order PP->DP->EP->CP->TP."
     if metrics.get("oom"):
-        stage = str(metrics.get("oom_stage") or "")
+        stage = _normalize_oom_stage(str(metrics.get("oom_stage") or ""))
         if stage == "load_model":
             return (
                 "CUDA OOM during load_model: weights/materialization only (no activations). "
@@ -2650,6 +2904,46 @@ def _derive_failure_feedback(metrics: Dict, *, allow_offload: bool) -> Optional[
             return "CUDA OOM: enable CPU offload (global or layerwise) and avoid reshard_after_forward=False."
         return "CUDA OOM: try set_parallel, lower batch size, or reshard_after_forward=True; avoid reshard_after_forward=False."
     return None
+
+
+_MEGATRON_LARGE_MODEL_PARAMS = 30_000_000_000
+
+
+def _prefer_megatron_fsdp(
+    args: argparse.Namespace,
+    *,
+    model_params: Optional[int],
+) -> tuple[bool, Optional[str]]:
+    if not (bool(getattr(args, "allow_tp", False)) and bool(getattr(args, "allow_pp", False))):
+        return False, None
+    if bool(getattr(args, "prefer_megatron_fsdp", False)):
+        return True, "manual"
+    if model_params is not None:
+        try:
+            if int(model_params) >= _MEGATRON_LARGE_MODEL_PARAMS and str(args.objective) == "throughput":
+                return True, "model_size"
+        except Exception:
+            return False, None
+    return False, None
+
+
+def _apply_megatron_preference(
+    semantic_state: Dict[str, object],
+    *,
+    args: argparse.Namespace,
+    model_params_hint: Optional[int],
+) -> None:
+    physical = semantic_state.get("physical_budget") or {}
+    total_params = physical.get("total_params")
+    model_params = None
+    if isinstance(total_params, (int, float)) and total_params > 0:
+        model_params = int(total_params)
+    elif model_params_hint is not None:
+        model_params = int(model_params_hint)
+    prefer, reason = _prefer_megatron_fsdp(args, model_params=model_params)
+    semantic_state["prefer_megatron_fsdp"] = prefer
+    if prefer and reason:
+        semantic_state["prefer_megatron_reason"] = reason
 
 
 def _infer_params_from_model_name(model_name: str) -> Optional[int]:
@@ -2721,6 +3015,14 @@ def _run_trial_subprocess(
         "--profile",
         profile,
     ]
+    if args.seq_len_min is not None:
+        cmd.extend(["--seq-len-min", str(args.seq_len_min)])
+    if args.seq_len_max is not None:
+        cmd.extend(["--seq-len-max", str(args.seq_len_max)])
+    if args.dynamic_batch_tokens is not None:
+        cmd.extend(["--dynamic-batch-tokens", str(args.dynamic_batch_tokens)])
+    if bool(getattr(args, "dynamic_pad_to_max", False)):
+        cmd.append("--dynamic-pad-to-max")
     if getattr(args, "seed", None) is not None:
         cmd.extend(["--seed", str(args.seed)])
 
@@ -2901,6 +3203,9 @@ def main() -> None:
         args.allow_ep = True
         args.allow_cp = True
         args.allow_sp = True
+    if bool(getattr(args, "prefer_megatron_fsdp", False)):
+        args.allow_tp = True
+        args.allow_pp = True
     if args.allow_mesh and not args.allow_2d_single_node:
         args.allow_2d_single_node = True
     rag_cards = _load_rag_cards()
@@ -2918,6 +3223,11 @@ def main() -> None:
     comm_ratio_baseline: Optional[float] = None
     comm_ratio_source: Optional[str] = None
     num_layers_hint = _infer_num_hidden_layers(args.model_name)
+    model_params_hint = _infer_params_from_model_name(args.model_name)
+    prefer_megatron, prefer_megatron_reason = _prefer_megatron_fsdp(
+        args,
+        model_params=model_params_hint,
+    )
     history: List[Dict] = []
     seen_hashes = set()
     hash_to_strategy = {}
@@ -2933,13 +3243,28 @@ def main() -> None:
         layer_overrides=[],
         grouping=GroupingConfig(mode="block", merge_factor=1),
     )
-    print("[controller] default baseline strategy (auto reshard):")
+    baseline_name = "baseline_default"
+    if prefer_megatron:
+        megatron = _build_megatron_baseline(
+            args,
+            base_layout=gl,
+            num_layers_hint=num_layers_hint,
+            hardware=hardware,
+        )
+        if megatron:
+            baseline = megatron
+            baseline_name = "baseline_megatron_fsdp"
+            print(f"[controller] megatron-fsdp baseline (reason={prefer_megatron_reason}):")
+        else:
+            print("[controller] megatron-fsdp baseline unavailable; using default baseline.")
+    if baseline_name == "baseline_default":
+        print("[controller] default baseline strategy (auto reshard):")
     print(json.dumps(baseline.to_dict(), ensure_ascii=False, indent=2))
 
     trial_id = 0
     baseline_hash = _strategy_hash(baseline)
     baseline_metrics = _run_trial_subprocess(args, baseline, trial_id=trial_id, profile="light")
-    baseline_metrics["config_name"] = "baseline_default"
+    baseline_metrics["config_name"] = baseline_name
     baseline_metrics["strategy_hash"] = baseline_hash
     if not baseline_metrics.get("oom") and baseline_metrics.get("comm_ratio") is not None:
         comm_ratio_baseline = baseline_metrics.get("comm_ratio")
@@ -3080,6 +3405,7 @@ def main() -> None:
             "min_mem_at_perf": _anchor_view(_min_mem_at_perf(history, baseline_tp)),
         }
         semantic_state["last_oom"] = _last_oom_info(history)
+        semantic_state["scale_backtrack"] = _scale_backtrack(history, hash_to_strategy, limit=args.max_history)
         semantic_state["hardware"] = getattr(hardware, "__dict__", {})
         semantic_state["scale_policy"] = _scale_policy(
             hardware,
@@ -3103,9 +3429,15 @@ def main() -> None:
         semantic_state["bottleneck_triage_secondary"] = triage.get("secondary")
         semantic_state["bottleneck_triage_confidence"] = triage.get("confidence")
         semantic_state["action_mapping"] = _action_mapping_for_triage(triage, semantic_state)
+        seq_len_min = int(args.seq_len_min) if args.seq_len_min is not None else int(args.seq_len)
+        seq_len_max = int(args.seq_len_max) if args.seq_len_max is not None else int(args.seq_len)
         semantic_state["train_hyper"] = {
             "global_batch_size": args.global_batch_size,
-            "seq_len": args.seq_len,
+            "seq_len": seq_len_max,
+            "seq_len_min": seq_len_min,
+            "seq_len_max": seq_len_max,
+            "dynamic_batch_tokens": args.dynamic_batch_tokens,
+            "dynamic_pad_to_max": bool(getattr(args, "dynamic_pad_to_max", False)),
             "num_warmup": args.num_warmup,
             "num_steps": args.num_steps,
             "nproc_per_node": args.nproc,
@@ -3185,6 +3517,7 @@ def main() -> None:
             }
             for t in history[-args.max_history :]
         ]
+        _apply_megatron_preference(semantic_state, args=args, model_params_hint=model_params_hint)
 
         # If uncertainty is high, run one heavy profile for the current best (diagnostic only).
         force_every = int(getattr(args, "force_heavy_every", 0) or 0)
@@ -3226,6 +3559,7 @@ def main() -> None:
                 "min_mem_at_perf": _anchor_view(_min_mem_at_perf(history, baseline_tp)),
             }
             semantic_state["last_oom"] = _last_oom_info(history)
+            semantic_state["scale_backtrack"] = _scale_backtrack(history, hash_to_strategy, limit=args.max_history)
             semantic_state["hardware"] = getattr(hardware, "__dict__", {})
             semantic_state["scale_policy"] = _scale_policy(
                 hardware,
@@ -3249,9 +3583,15 @@ def main() -> None:
             semantic_state["bottleneck_triage_secondary"] = triage.get("secondary")
             semantic_state["bottleneck_triage_confidence"] = triage.get("confidence")
             semantic_state["action_mapping"] = _action_mapping_for_triage(triage, semantic_state)
+            seq_len_min = int(args.seq_len_min) if args.seq_len_min is not None else int(args.seq_len)
+            seq_len_max = int(args.seq_len_max) if args.seq_len_max is not None else int(args.seq_len)
             semantic_state["train_hyper"] = {
                 "global_batch_size": args.global_batch_size,
-                "seq_len": args.seq_len,
+                "seq_len": seq_len_max,
+                "seq_len_min": seq_len_min,
+                "seq_len_max": seq_len_max,
+                "dynamic_batch_tokens": args.dynamic_batch_tokens,
+                "dynamic_pad_to_max": bool(getattr(args, "dynamic_pad_to_max", False)),
                 "num_warmup": args.num_warmup,
                 "num_steps": args.num_steps,
                 "nproc_per_node": args.nproc,
@@ -3331,6 +3671,7 @@ def main() -> None:
                 }
                 for t in history[-args.max_history :]
             ]
+            _apply_megatron_preference(semantic_state, args=args, model_params_hint=model_params_hint)
 
         causal_summary = _build_causal_summary(history, hash_to_strategy, mem_limit_gb=args.mem_limit_gb)
         hypothesis_graph = _build_hypothesis_graph(semantic_state, causal_summary)
@@ -3390,12 +3731,14 @@ def main() -> None:
             allow_parallel=allow_parallel,
             allow_offload=bool(args.allow_offload),
         )
-        if allow_parallel and bool(getattr(args, "force_parallel_doe", False)):
+        prefer_megatron = bool(semantic_state.get("prefer_megatron_fsdp"))
+        if allow_parallel and (bool(getattr(args, "force_parallel_doe", False)) or prefer_megatron):
             doe = _force_parallel_in_doe(
                 doe,
                 candidates,
                 hypothesis_graph,
                 judge_verdict=judge_verdict,
+                prefer_megatron=prefer_megatron,
             )
         doe = doe[:8]
         print(

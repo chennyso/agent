@@ -225,6 +225,9 @@ def _run_steps_pipeline(
             input_ids = input_ids.cuda()
         if target is not None:
             target = target.cuda()
+        attn_mask = None
+        if input_ids is not None and "attention_mask" in batch:
+            attn_mask = batch["attention_mask"].cuda()
         if input_ids is not None and "attention_mask" in batch:
             eff = int(batch["attention_mask"].sum().item())
         elif input_ids is not None:
@@ -237,9 +240,15 @@ def _run_steps_pipeline(
         mb_losses: List[float] = []
         if cp_context_factory is not None:
             with cp_context_factory():
-                schedule.step(input_ids, target=target, losses=mb_losses)
+                if attn_mask is not None:
+                    schedule.step(input_ids, target=target, attention_mask=attn_mask, losses=mb_losses)
+                else:
+                    schedule.step(input_ids, target=target, losses=mb_losses)
         else:
-            schedule.step(input_ids, target=target, losses=mb_losses)
+            if attn_mask is not None:
+                schedule.step(input_ids, target=target, attention_mask=attn_mask, losses=mb_losses)
+            else:
+                schedule.step(input_ids, target=target, losses=mb_losses)
         optimizer.step()
         end_event.record()
         end_event.synchronize()
@@ -420,7 +429,10 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
     ctx = torch.cuda.amp.autocast() if scaler is not None else nullcontext()
     with ctx:
-        out = model(batch["input_ids"].cuda(), labels=batch["labels"].cuda())
+        inputs = {"input_ids": batch["input_ids"].cuda(), "labels": batch["labels"].cuda()}
+        if "attention_mask" in batch:
+            inputs["attention_mask"] = batch["attention_mask"].cuda()
+        out = model(**inputs)
         loss = out.loss
     if scaler is not None:
         scaler.scale(loss).backward()
@@ -852,6 +864,10 @@ def run_trial(
     strategy: Fsdp2Strategy,
     global_batch_size: int,
     seq_len: int,
+    seq_len_min: Optional[int] = None,
+    seq_len_max: Optional[int] = None,
+    dynamic_batch_tokens: Optional[int] = None,
+    dynamic_pad_to_max: bool = False,
     vocab_size: int,
     num_warmup: int,
     num_steps: int,
@@ -871,6 +887,20 @@ def run_trial(
     _set_stage("init")
     if seed is not None:
         set_seeds(int(seed))
+    seq_len_min_val = int(seq_len_min) if seq_len_min is not None else int(seq_len)
+    seq_len_max_val = int(seq_len_max) if seq_len_max is not None else int(seq_len)
+    if seq_len_min_val < 1 or seq_len_max_val < 1:
+        raise ValueError("seq_len_min/seq_len_max must be >= 1")
+    if seq_len_min_val > seq_len_max_val:
+        raise ValueError("seq_len_min must be <= seq_len_max")
+    dynamic_seq_len = seq_len_min_val != seq_len_max_val
+    if dynamic_batch_tokens is not None:
+        dynamic_batch_tokens = int(dynamic_batch_tokens)
+        if dynamic_batch_tokens < 1:
+            raise ValueError("dynamic_batch_tokens must be >= 1")
+    dynamic_pad_to_max = bool(dynamic_pad_to_max)
+    if int(seq_len) != seq_len_max_val:
+        seq_len = int(seq_len_max_val)
     all_runs = []
     world_size_total = dist.get_world_size() if dist.is_initialized() else 1
     parallel_spec = asdict(getattr(strategy, "parallel", None) or {})
@@ -881,6 +911,7 @@ def run_trial(
     sp_enabled = bool(parallel_spec.get("sp_enabled", False))
     mesh_dim_names = parallel_spec.get("mesh_dim_names")
     tp_use_local_output = parallel_spec.get("tp_use_local_output")
+    tp_head_grouping = parallel_spec.get("tp_head_grouping")
     if sp_enabled and tp_degree <= 1:
         raise ValueError("sp_enabled requires tp_degree > 1")
     mesh = None
@@ -954,6 +985,8 @@ def run_trial(
                 tp_mesh,
                 plan_id=plan_id,
                 sp_enabled=sp_enabled,
+                tp_degree=tp_degree,
+                head_grouping=tp_head_grouping,
                 tp_use_local_output=tp_use_local_output,
             )
             parallel_report["tp_plan_id"] = plan_id
@@ -972,6 +1005,8 @@ def run_trial(
         per_rank_batch = int(math.ceil(global_batch_size / max(world, 1)))
         use_pipeline = bool(pp_degree > 1)
         schedule = None
+        if dynamic_seq_len and use_pipeline and not dynamic_pad_to_max:
+            raise ValueError("dynamic seq_len with pipeline requires dynamic_pad_to_max=True")
         pp_rank = 0
         num_stages = 1
         if use_pipeline:
@@ -1037,12 +1072,18 @@ def run_trial(
             optimizer = build_optimizer(model, lr=lr)
         required_batches = num_warmup + num_steps + 1
         required_len = per_rank_batch * required_batches
+        min_batch_size = pp_microbatches if use_pipeline and dynamic_batch_tokens is not None else None
         _set_stage("build_dataloader")
         dataloader = build_synthetic_loader(
             train_hyper={"global_batch_size": global_batch_size},
             vocab_size=vocab_size,
             seq_len=seq_len,
+            seq_len_min=seq_len_min_val,
+            seq_len_max=seq_len_max_val,
             batch_size=per_rank_batch,
+            dynamic_batch_tokens=dynamic_batch_tokens,
+            pad_to_max_seq_len=dynamic_pad_to_max,
+            min_batch_size=min_batch_size,
             length=max(10_000, required_len),
             seed=seed,
         )
@@ -1256,6 +1297,10 @@ def run_trial(
             "effective_global_batch_size": int(per_rank_batch * dp_world_size),
             "per_rank_batch_size": int(per_rank_batch),
             "seq_len": int(seq_len),
+            "seq_len_min": int(seq_len_min_val),
+            "seq_len_max": int(seq_len_max_val),
+            "dynamic_batch_tokens": int(dynamic_batch_tokens) if dynamic_batch_tokens is not None else None,
+            "dynamic_pad_to_max": bool(dynamic_pad_to_max),
             "vocab_size": int(vocab_size),
             "grad_accum": 1,
             "trace_dir": trace_dir,

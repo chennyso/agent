@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-name", type=str, default="/public/home/ssjxscy/.cache/modelscope/hub/models/Qwen/Qwen2.5-14B", help="HF Causal LM name or local path.")
     p.add_argument("--global-batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--seq-len-min", type=int, default=None)
+    p.add_argument("--seq-len-max", type=int, default=None)
+    p.add_argument("--dynamic-batch-tokens", type=int, default=None)
+    p.add_argument("--dynamic-pad-to-max", action="store_true")
     p.add_argument("--vocab-size", type=int, default=151936)  # Qwen vocab size
     p.add_argument("--num-warmup", type=int, default=5)
     p.add_argument("--num-steps", type=int, default=30)
@@ -100,6 +104,10 @@ def main() -> None:
             strategy=strategy,
             global_batch_size=args.global_batch_size,
             seq_len=args.seq_len,
+            seq_len_min=args.seq_len_min,
+            seq_len_max=args.seq_len_max,
+            dynamic_batch_tokens=args.dynamic_batch_tokens,
+            dynamic_pad_to_max=bool(args.dynamic_pad_to_max),
             vocab_size=args.vocab_size,
             num_warmup=args.num_warmup,
             num_steps=args.num_steps,

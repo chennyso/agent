@@ -63,6 +63,7 @@ class ParallelSpec:
     cp_degree: int = 1
     sp_enabled: bool = False
     tp_plan: str = "auto"
+    tp_head_grouping: Optional[Dict[str, int]] = None
     pp_microbatches: int = 1
     pp_schedule: str = "1f1b"
     pp_stages: Optional[List[List[int]]] = None
@@ -126,6 +127,7 @@ class Fsdp2Strategy:
             cp_degree=parallel_payload.get("cp_degree", 1),
             sp_enabled=parallel_payload.get("sp_enabled", False),
             tp_plan=parallel_payload.get("tp_plan", "auto"),
+            tp_head_grouping=parallel_payload.get("tp_head_grouping"),
             pp_microbatches=parallel_payload.get("pp_microbatches", 1),
             pp_schedule=parallel_payload.get("pp_schedule", "1f1b"),
             pp_stages=parallel_payload.get("pp_stages"),
@@ -277,6 +279,27 @@ def _validate_parallel(parallel: ParallelSpec) -> ParallelSpec:
     p.sp_enabled = bool(p.sp_enabled)
     p.tp_plan = str(p.tp_plan or "auto")
     p.pp_schedule = str(p.pp_schedule or "1f1b")
+    if p.tp_head_grouping is not None:
+        if not isinstance(p.tp_head_grouping, dict):
+            raise ValueError("parallel.tp_head_grouping must be a dict")
+        raw = dict(p.tp_head_grouping)
+        num_heads = raw.get("num_attention_heads", raw.get("num_heads"))
+        num_kv_heads = raw.get("num_key_value_heads", raw.get("num_kv_heads"))
+        if num_heads is None or num_kv_heads is None:
+            raise ValueError("parallel.tp_head_grouping requires num_attention_heads and num_key_value_heads")
+        try:
+            num_heads = int(num_heads)
+            num_kv_heads = int(num_kv_heads)
+        except Exception as exc:
+            raise ValueError("parallel.tp_head_grouping values must be integers") from exc
+        if num_heads < 1 or num_kv_heads < 1:
+            raise ValueError("parallel.tp_head_grouping values must be >= 1")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("parallel.tp_head_grouping requires num_attention_heads % num_key_value_heads == 0")
+        p.tp_head_grouping = {
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+        }
     if p.mesh_dim_names is not None:
         if not isinstance(p.mesh_dim_names, (list, tuple)) or not p.mesh_dim_names:
             raise ValueError("parallel.mesh_dim_names must be a non-empty list")

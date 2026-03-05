@@ -26,6 +26,7 @@ def fsdp2_to_dsl(
         "cp_degree": int(getattr(parallel, "cp_degree", 1) or 1),
         "sp_enabled": bool(getattr(parallel, "sp_enabled", False)),
         "tp_plan": getattr(parallel, "tp_plan", "auto"),
+        "tp_head_grouping": getattr(parallel, "tp_head_grouping", None),
         "pp_microbatches": int(getattr(parallel, "pp_microbatches", 1) or 1),
         "pp_schedule": getattr(parallel, "pp_schedule", "1f1b"),
         "pp_stages": getattr(parallel, "pp_stages", None),
@@ -50,6 +51,7 @@ def fsdp2_to_dsl(
                 "tp": {
                     "enabled": parallel_cfg["tp_degree"] > 1,
                     "plan": parallel_cfg["tp_plan"],
+                    "head_grouping": parallel_cfg["tp_head_grouping"],
                     "sequence_parallel": parallel_cfg["sp_enabled"],
                     "use_local_output": parallel_cfg["tp_use_local_output"],
                 },
