@@ -5,6 +5,7 @@ import atexit
 import json
 import math
 import os
+import pwd
 import random
 import time
 from dataclasses import dataclass
@@ -359,7 +360,20 @@ def main() -> None:
 
     model_cfg = cfg.get("model") or {}
     model_path_raw = str(model_cfg.get("path") or "")
-    model_path = os.path.expandvars(os.path.expanduser(model_path_raw))
+
+    def _expand_user_vars(path: str) -> str:
+        out = os.path.expandvars(str(path))
+        out = os.path.expanduser(out)
+        if out.startswith("~"):
+            try:
+                home = pwd.getpwuid(os.getuid()).pw_dir
+            except Exception:
+                home = os.environ.get("HOME", "")
+            if home:
+                out = out.replace("~", home, 1)
+        return out
+
+    model_path = _expand_user_vars(model_path_raw)
     # Prefer local paths (ModelScope cache, etc.). Only treat as HF repo id if it is not path-like.
     # This avoids HFValidationError when users pass "~/.cache/...".
     is_path_like = False
@@ -370,6 +384,11 @@ def main() -> None:
             is_path_like = True
     if is_path_like:
         model_path_for_load = model_path
+        if model_path_for_load.startswith("~"):
+            raise RuntimeError(
+                f"failed to expand '~' in model.path; raw={model_path_raw!r} expanded={model_path_for_load!r}. "
+                "Set $HOME or use an absolute path."
+            )
         if model_path_for_load and not Path(model_path_for_load).exists():
             raise FileNotFoundError(
                 f"model.path looks like a local path but does not exist: raw={model_path_raw!r} expanded={model_path_for_load!r}"
@@ -538,9 +557,12 @@ def main() -> None:
     if pp_microbatches > per_rank_batch:
         raise ValueError("pp.microbatches cannot exceed per-rank batch size (global_batch_size/dp)")
 
+    # Important: pipeline() uses torch.export with FakeTensor. Example inputs and parameters must be on the same device.
+    # We trace on CPU, then move each built stage to CUDA.
     device = torch.device("cuda", local_rank)
-    dummy_input = torch.zeros((per_rank_batch, seq_len), device=device, dtype=torch.long)
-    pipe = pipeline(model, mb_args=(dummy_input,), split_spec=split_spec)
+    dummy_input = torch.zeros((per_rank_batch, seq_len), device="cpu", dtype=torch.long)
+    dummy_attn = torch.ones((per_rank_batch, seq_len), device="cpu", dtype=torch.long)
+    pipe = pipeline(model, mb_args=(dummy_input,), mb_kwargs={"attention_mask": dummy_attn}, split_spec=split_spec)
 
     pp_rank = dist.get_rank(pp_group)
 
@@ -554,6 +576,7 @@ def main() -> None:
     fsdp_reports: List[Dict[str, Any]] = []
     for st in local_stages:
         submod = getattr(st, "submod", st)
+        submod.to(device)
         if tp_degree > 1 and tp_mesh is not None:
             tp_reports.append(_apply_tp_qwen_like(submod, tp_mesh, tp_degree))
         if fsdp_enabled and dp_mesh is not None and dp_degree > 1:
