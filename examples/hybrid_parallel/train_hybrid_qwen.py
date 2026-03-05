@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -342,11 +344,27 @@ def main() -> None:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cuda_alloc_conf)
 
     rank, world_size, local_rank = _setup_dist()
+
+    def _cleanup_dist() -> None:
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup_dist)
+
     seed = int(((cfg.get("train") or {}).get("seed") or 42))
     _seed_all(seed + rank)
 
     model_cfg = cfg.get("model") or {}
-    model_path = str(model_cfg.get("path"))
+    model_path_raw = str(model_cfg.get("path") or "")
+    model_path = os.path.expandvars(os.path.expanduser(model_path_raw))
+    # If user passed a local path with "~", expand it; otherwise allow HF repo ids.
+    if model_path and Path(model_path).exists():
+        model_path_for_load = model_path
+    else:
+        model_path_for_load = model_path_raw
     dtype = _infer_dtype(model_cfg.get("dtype") or "bf16")
     seq_len = int(model_cfg.get("seq_len") or 1024)
 
@@ -431,6 +449,10 @@ def main() -> None:
             f"(pp_idx={pp_idx} dp_idx={dp_idx} tp_idx={tp_idx})",
             flush=True,
         )
+        if model_path_for_load != model_path_raw:
+            print(f"[model] expanded path: {model_path_raw} -> {model_path_for_load}", flush=True)
+        else:
+            print(f"[model] path_or_repo_id: {model_path_for_load}", flush=True)
 
     runtime_cfg = cfg.get("runtime") or {}
     peak_tflops_per_gpu = runtime_cfg.get("peak_tflops_per_gpu")
@@ -456,7 +478,7 @@ def main() -> None:
                 )
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+        model_path_for_load,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         device_map="cpu",
