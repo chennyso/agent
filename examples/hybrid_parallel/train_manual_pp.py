@@ -745,6 +745,27 @@ def main() -> None:
         num_virtual = pp_degree * vpp
 
         per_dp_batch = int(math.ceil(global_batch_size / float(dp_degree)))
+        min_microbatches = 1
+        if schedule_name in {"1f1b", "interleaved1f1b"}:
+            min_microbatches = int(num_virtual)
+        if microbatches < min_microbatches:
+            if per_dp_batch >= min_microbatches:
+                if rank == 0:
+                    print(
+                        f"[warn] microbatches={microbatches} too small for schedule={schedule_name}; "
+                        f"auto-bumping to {min_microbatches}",
+                        flush=True,
+                    )
+                microbatches = int(min_microbatches)
+            else:
+                if rank == 0 and schedule_name != "gpipe":
+                    print(
+                        f"[warn] microbatches={microbatches} and per_dp_batch={per_dp_batch} cannot satisfy "
+                        f"schedule={schedule_name}; falling back to gpipe",
+                        flush=True,
+                    )
+                schedule_name = "gpipe"
+                min_microbatches = 1
         if microbatches > per_dp_batch:
             raise ValueError("pp.microbatches must be <= ceil(global_batch_size/dp_degree)")
 

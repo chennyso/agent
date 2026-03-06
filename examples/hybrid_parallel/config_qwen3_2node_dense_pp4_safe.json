@@ -19,7 +19,7 @@
     "pp": {
       "degree": 4,
       "vpp": 1,
-      "microbatches": 2,
+      "microbatches": 4,
       "schedule": "1f1b",
       "stages": [
         [0, 9],
@@ -69,4 +69,3 @@
     "with_stack": false
   }
 }
-
