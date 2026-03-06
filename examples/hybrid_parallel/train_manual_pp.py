@@ -753,7 +753,7 @@ def main() -> None:
         vocab_size = int(getattr(hf_cfg, "vocab_size", 32000))
         model_params = int(sum(int(p.numel()) for p in full_model.parameters()))
 
-        tp_group = dist.new_group(ranks=tp_group_ranks) if tp_degree > 1 else None
+        tp_group = tp_mesh.get_group() if tp_mesh is not None else None
 
         for stage_id in local_stage_ids:
             ls, le = virtual_slices[int(stage_id)]
