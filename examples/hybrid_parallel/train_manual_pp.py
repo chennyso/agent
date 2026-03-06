@@ -7,6 +7,7 @@ import math
 import os
 import random
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -231,7 +232,7 @@ def _seed_all(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _setup_dist() -> Tuple[int, int, int]:
+def _setup_dist(timeout_seconds: int = 3600) -> Tuple[int, int, int]:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -240,6 +241,7 @@ def _setup_dist() -> Tuple[int, int, int]:
         backend="nccl",
         init_method="env://",
         device_id=torch.device("cuda", local_rank),
+        timeout=timedelta(seconds=int(timeout_seconds)),
     )
     return rank, world_size, local_rank
 
@@ -615,8 +617,10 @@ def main() -> None:
     cuda_alloc_conf = ((cfg.get("runtime") or {}).get("cuda_alloc_conf") or "").strip()
     if cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cuda_alloc_conf)
+    dist_timeout_seconds = int(((cfg.get("runtime") or {}).get("dist_timeout_seconds") or 3600))
+    debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
 
-    rank, world_size, local_rank = _setup_dist()
+    rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
         train_cfg = cfg.get("train") or {}
         seed = int(train_cfg.get("seed") or 42)
@@ -709,6 +713,7 @@ def main() -> None:
         if rank == 0:
             print(f"[init] world={world_size} pp={pp_degree} dp={dp_degree} tp={tp_degree} vpp={vpp}", flush=True)
             print(f"[model] {model_dir}", flush=True)
+            print(f"[init] dist_timeout_seconds={dist_timeout_seconds}", flush=True)
 
         from transformers import AutoConfig, AutoModelForCausalLM  # type: ignore
 
@@ -759,6 +764,12 @@ def main() -> None:
             ls, le = virtual_slices[int(stage_id)]
             is_first = int(stage_id) == 0
             is_last = int(stage_id) == (num_virtual - 1)
+            stage_t0 = time.time()
+            if debug_init_logs:
+                print(
+                    f"[init][rank {rank}] build stage_id={stage_id} layers=[{ls},{le}] first={is_first} last={is_last}",
+                    flush=True,
+                )
             embed = VocabParallelEmbedding(vocab_size=vocab_size, hidden_size=hidden_size, tp_rank=tp_idx, tp_world=tp_degree, tp_group=tp_group) if is_first else None
             norm = getattr(full_model.model, "norm", None) if is_last else None
             lm_head = VocabParallelLMHead(vocab_size=vocab_size, hidden_size=hidden_size, tp_rank=tp_idx, tp_world=tp_degree, tp_group=tp_group) if is_last else None
@@ -780,15 +791,24 @@ def main() -> None:
                 seq_len=seq_len,
                 recompute=stage_recompute,
             )
+            if debug_init_logs:
+                print(f"[init][rank {rank}] load weights stage_id={stage_id}", flush=True)
             _materialize_and_load_stage(stage_mod, model_dir=model_dir, dtype=dtype)
             stage_mod.to(device)
 
             if tp_degree > 1 and tp_mesh is not None:
+                if debug_init_logs:
+                    print(f"[init][rank {rank}] apply tp stage_id={stage_id}", flush=True)
                 _apply_tp_sp(stage_mod, tp_mesh, tp_degree, sp_enabled=sp_enabled)
             if fsdp_enabled and dp_mesh is not None and dp_degree > 1:
                 stage_reshard = bool(reshard_after_forward)
                 if isinstance(reshard_per_stage, list) and len(reshard_per_stage) == num_virtual:
                     stage_reshard = bool(reshard_per_stage[int(stage_id)])
+                if debug_init_logs:
+                    print(
+                        f"[init][rank {rank}] apply fsdp2 stage_id={stage_id} reshard_after_forward={stage_reshard}",
+                        flush=True,
+                    )
                 _apply_fsdp2(stage_mod, dp_mesh, param_dtype=fsdp_param_dtype, reduce_dtype=fsdp_reduce_dtype, reshard_after_forward=stage_reshard)
 
             mb = max(1, int(math.ceil(per_dp_batch / float(microbatches))))
@@ -808,6 +828,11 @@ def main() -> None:
                 output_args=out_args,
                 group=pp_group,
             )
+            if debug_init_logs:
+                print(
+                    f"[init][rank {rank}] stage ready stage_id={stage_id} elapsed={time.time() - stage_t0:.1f}s",
+                    flush=True,
+                )
             stages.append(stage)
             stage_modules.append(stage_mod)
 
@@ -878,7 +903,11 @@ def main() -> None:
             end_ev.synchronize()
             return float(start_ev.elapsed_time(end_ev)), mb_losses
 
+        if debug_init_logs:
+            print(f"[init][rank {rank}] entering pre-train barrier", flush=True)
         dist.barrier()
+        if debug_init_logs:
+            print(f"[init][rank {rank}] passed pre-train barrier", flush=True)
         if is_log_rank:
             print(f"[stats] model_params={model_params:,}", flush=True)
 

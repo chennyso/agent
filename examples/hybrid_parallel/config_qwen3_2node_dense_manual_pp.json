@@ -18,8 +18,8 @@
   "parallel": {
     "pp": {
       "degree": 2,
-      "vpp": 2,
-      "microbatches": 4,
+      "vpp": 1,
+      "microbatches": 2,
       "schedule": "1f1b",
       "stages": "auto",
       "auto_mem_gb": [24, 32],
@@ -37,15 +37,17 @@
       "param_dtype": "bf16",
       "reduce_dtype": "bf16",
       "reshard_after_forward": true,
-      "reshard_after_forward_per_stage": [true, false, true, false]
+      "reshard_after_forward_per_stage": [true, false]
     },
     "recompute": {
       "policy": "full",
-      "per_stage": ["full", "none", "full", "none"]
+      "per_stage": ["full", "none"]
     }
   },
   "runtime": {
-    "cuda_alloc_conf": "expandable_segments:True"
+    "cuda_alloc_conf": "expandable_segments:True",
+    "dist_timeout_seconds": 3600,
+    "debug_init_logs": true
   },
   "mfu": {
     "peak_tflops_total": 0.0,
