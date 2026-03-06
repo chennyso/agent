@@ -7,6 +7,7 @@ import math
 import os
 import pwd
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -340,6 +341,21 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = _load_cfg(args.config)
+    frontend = str(
+        cfg.get("pipeline_frontend")
+        or ((cfg.get("pipeline") or {}).get("frontend"))
+        or "manual"
+    ).lower()
+    manual_entry = Path(__file__).with_name("train_manual_pp.py")
+    if frontend != "export" and os.environ.get("AGENT_DISABLE_MANUAL_PP_REDIRECT", "0") != "1":
+        if not manual_entry.exists():
+            raise FileNotFoundError(f"manual pipeline entry missing: {manual_entry}")
+        print(
+            f"[redirect] pipeline_frontend={frontend}; using manual pipeline runner: {manual_entry.name}",
+            flush=True,
+        )
+        os.execv(sys.executable, [sys.executable, str(manual_entry), "--config", args.config])
+
     cuda_alloc_conf = ((cfg.get("runtime") or {}).get("cuda_alloc_conf") or "").strip()
     if cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cuda_alloc_conf)

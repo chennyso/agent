@@ -688,15 +688,21 @@ def main() -> None:
         def _r(pp: int, dp: int, tp: int) -> int:
             return int(pp) * int(ranks_per_stage) + int(dp) * int(tp_degree) + int(tp)
 
-        pp_group_ranks = [_r(p, dp_idx, tp_idx) for p in range(pp_degree)]
-        pp_group = dist.new_group(ranks=pp_group_ranks)
+        root_mesh_tensor = torch.tensor(
+            [[[_r(pp, dp, tp) for tp in range(tp_degree)] for dp in range(dp_degree)] for pp in range(pp_degree)],
+            dtype=torch.int,
+        )
+        root_mesh = DeviceMesh("cuda", root_mesh_tensor, mesh_dim_names=("pp", "dp", "tp"))
+
+        pp_mesh = root_mesh["pp"]
+        pp_group = pp_mesh.get_group()
 
         stage_base = pp_rank * ranks_per_stage
         tp_group_ranks = [stage_base + dp_idx * tp_degree + t for t in range(tp_degree)]
         dp_group_ranks = [stage_base + d * tp_degree + tp_idx for d in range(dp_degree)]
 
-        tp_mesh = DeviceMesh("cuda", tp_group_ranks, mesh_dim_names=("tp",)) if tp_degree > 1 else None
-        dp_mesh = DeviceMesh("cuda", dp_group_ranks, mesh_dim_names=("dp",)) if dp_degree > 1 else None
+        tp_mesh = root_mesh["tp"] if tp_degree > 1 else None
+        dp_mesh = root_mesh["dp"] if dp_degree > 1 else None
 
         is_log_rank = bool(pp_rank == (pp_degree - 1) and dp_idx == 0 and tp_idx == 0)
 
