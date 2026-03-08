@@ -868,16 +868,16 @@ def main() -> None:
         if vpp > 1:
             if ScheduleInterleaved1F1B is None:
                 raise RuntimeError("interleaved schedule unavailable; set vpp=1")
-            sched = ScheduleInterleaved1F1B(stages, microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec,) if chunk_spec else None)
+            sched = ScheduleInterleaved1F1B(stages, microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
         else:
             if schedule_name == "gpipe":
                 if ScheduleGPipe is None:
                     raise RuntimeError("gpipe unavailable")
-                sched = ScheduleGPipe(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec,) if chunk_spec else None)
+                sched = ScheduleGPipe(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
             else:
                 if Schedule1F1B is None:
                     raise RuntimeError("1f1b unavailable")
-                sched = Schedule1F1B(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec,) if chunk_spec else None)
+                sched = Schedule1F1B(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
 
         params: List[torch.nn.Parameter] = []
         seen: set[int] = set()
@@ -895,6 +895,7 @@ def main() -> None:
         profile_warmup = int(profile_cfg.get("warmup", 1))
         profile_active = int(profile_cfg.get("active", 3))
         profile_repeat = int(profile_cfg.get("repeat", 1))
+        debug_train_logs = bool((cfg.get("runtime") or {}).get("debug_train_logs", True))
 
         eff_global_bsz = int(dp_degree) * int(per_dp_batch)
         flops_per_param_per_token = float(mfu_cfg.get("flops_per_param_per_token", 6.0))
@@ -914,9 +915,17 @@ def main() -> None:
                         dist.broadcast(lbl, src=tp_group_ranks[0], group=tp_group)
                     ids = ids.to(device, non_blocking=True)
                     lbl = lbl.to(device, non_blocking=True)
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)} lbl={tuple(lbl.shape)}", flush=True)
                     sched.step(ids, lbl, losses=mb_losses, return_outputs=False)
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] after sched.step first-stage", flush=True)
                 else:
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] before sched.step non-first-stage", flush=True)
                     sched.step(losses=mb_losses, return_outputs=False)
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] after sched.step non-first-stage", flush=True)
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, float(grad_clip))
             optim.step()
