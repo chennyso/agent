@@ -16,11 +16,12 @@ This folder contains **2-node (16 GPU)** training baselines for HF `AutoModelFor
 
 ## Quick start (manual PP)
 
-1) Edit `examples/hybrid_parallel/config_qwen3_2node_dense_manual_pp.json`
+1) Recommended safe config: `examples/hybrid_parallel/config_qwen3_2node_dense_pp4_gpipe_safe.json`
 
 - Set `model.path` to your local Qwen3-32B directory.
-- For heterogenous VRAM (24GB + 32GB), keep `parallel.pp.stages="auto"` and set `parallel.pp.auto_mem_gb=[24,32]`.
-  - You can also set `parallel.pp.stages=[[0, X], [X+1, 63]]` manually to force a split.
+- This preset uses `pp=4`, `tp=2`, `vpp=1`, `schedule=gpipe` and a conservative manual split:
+  - `[0, 9]`, `[10, 21]`, `[22, 41]`, `[42, 63]`
+- Use `config_qwen3_2node_dense_manual_pp.json` only if you want the older `pp=2` auto-split path.
 
 2) Launch
 
@@ -31,7 +32,7 @@ export MASTER_ADDR=192.168.10.241
 export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=ens8f0
 export GLOO_SOCKET_IFNAME=ens8f0
-bash examples/hybrid_parallel/launch_manual_node0.sh examples/hybrid_parallel/config_qwen3_2node_dense_manual_pp.json
+bash examples/hybrid_parallel/launch_manual_node0.sh examples/hybrid_parallel/config_qwen3_2node_dense_pp4_gpipe_safe.json
 ```
 
 Node1 (g5 / 5090D / 32GB, NIC example `ens9f0`):
@@ -41,12 +42,17 @@ export MASTER_ADDR=192.168.10.241
 export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=ens9f0
 export GLOO_SOCKET_IFNAME=ens9f0
-bash examples/hybrid_parallel/launch_manual_node1.sh examples/hybrid_parallel/config_qwen3_2node_dense_manual_pp.json
+bash examples/hybrid_parallel/launch_manual_node1.sh examples/hybrid_parallel/config_qwen3_2node_dense_pp4_gpipe_safe.json
 ```
 
 ## Notes
 
 - `pp.microbatches` must be `<= ceil(global_batch_size / dp_degree)` where `dp_degree = world_size / (pp_degree * tp_degree)`.
+- `Schedule1F1B` requires `microbatches >= num_stages`; the `pp4_gpipe_safe` preset avoids that constraint by using `GPipe`.
+- If a known preset JSON is missing on a remote node, `train_manual_pp.py` now falls back to a built-in copy of:
+  - `config_qwen3_2node_dense_pp4_gpipe_safe.json`
+  - `config_qwen3_2node_dense_pp4_safe.json`
+  - `config_qwen3_2node_dense_manual_pp.json`
 - `train_manual_pp.py` uses **synthetic token data** (random IDs). Replace `_make_synth_batch()` with your real dataloader.
 - Per-stage different `tp.degree` is not supported (uniform mesh). Use:
   - `pp.stages` (layer split) to fit heterogenous VRAM

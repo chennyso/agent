@@ -10,7 +10,7 @@ set -euo pipefail
 #   export GLOO_SOCKET_IFNAME=<nic>
 #   bash examples/hybrid_parallel/launch_manual_node1.sh /path/to/config.json
 
-CONFIG_PATH="${1:-examples/hybrid_parallel/config_qwen3_2node_dense_manual_pp.json}"
+CONFIG_PATH="${1:-examples/hybrid_parallel/config_qwen3_2node_dense_pp4_gpipe_safe.json}"
 
 export NODE_RANK=1
 export NNODES=2
@@ -23,4 +23,3 @@ torchrun \
   --rdzv_backend=c10d \
   --rdzv_endpoint="${MASTER_ADDR:?}:${MASTER_PORT:?}" \
   examples/hybrid_parallel/train_manual_pp.py --config "${CONFIG_PATH}"
-

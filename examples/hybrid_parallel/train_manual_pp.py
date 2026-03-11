@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import inspect
 import json
 import math
@@ -247,8 +248,181 @@ def _setup_dist(timeout_seconds: int = 3600) -> Tuple[int, int, int]:
 
 
 def _load_cfg(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.loads(f.read())
+    builtin_cfgs: Dict[str, Dict[str, Any]] = {
+        "config_qwen3_2node_dense_pp4_gpipe_safe.json": {
+            "model": {"path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B", "dtype": "bf16", "seq_len": 512},
+            "train": {
+                "seed": 42,
+                "steps": 20,
+                "warmup_steps": 2,
+                "global_batch_size": 8,
+                "grad_accum_steps": 1,
+                "lr": 0.0001,
+                "weight_decay": 0.1,
+                "grad_clip": 1.0,
+                "log_every": 1,
+            },
+            "parallel": {
+                "pp": {
+                    "degree": 4,
+                    "vpp": 1,
+                    "microbatches": 4,
+                    "schedule": "gpipe",
+                    "stages": [[0, 9], [10, 21], [22, 41], [42, 63]],
+                },
+                "tp": {"enabled": True, "degree": 2},
+                "sp": {"enabled": False},
+                "fsdp2": {
+                    "enabled": True,
+                    "param_dtype": "bf16",
+                    "reduce_dtype": "bf16",
+                    "reshard_after_forward": True,
+                    "reshard_after_forward_per_stage": [True, True, True, True],
+                },
+                "recompute": {"policy": "full", "per_stage": ["full", "full", "full", "full"]},
+            },
+            "runtime": {
+                "cuda_alloc_conf": "expandable_segments:True",
+                "dist_timeout_seconds": 3600,
+                "debug_init_logs": True,
+                "debug_train_logs": True,
+            },
+            "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
+            "profile": {
+                "enabled": False,
+                "rank": 0,
+                "trace_dir": "tb_traces",
+                "wait": 1,
+                "warmup": 1,
+                "active": 3,
+                "repeat": 1,
+                "record_shapes": True,
+                "profile_memory": True,
+                "with_stack": False,
+            },
+        },
+        "config_qwen3_2node_dense_pp4_safe.json": {
+            "model": {"path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B", "dtype": "bf16", "seq_len": 512},
+            "train": {
+                "seed": 42,
+                "steps": 50,
+                "warmup_steps": 5,
+                "global_batch_size": 8,
+                "grad_accum_steps": 1,
+                "lr": 0.0001,
+                "weight_decay": 0.1,
+                "grad_clip": 1.0,
+                "log_every": 1,
+            },
+            "parallel": {
+                "pp": {
+                    "degree": 4,
+                    "vpp": 1,
+                    "microbatches": 4,
+                    "schedule": "1f1b",
+                    "stages": [[0, 9], [10, 21], [22, 41], [42, 63]],
+                },
+                "tp": {"enabled": True, "degree": 2},
+                "sp": {"enabled": False},
+                "fsdp2": {
+                    "enabled": True,
+                    "param_dtype": "bf16",
+                    "reduce_dtype": "bf16",
+                    "reshard_after_forward": True,
+                    "reshard_after_forward_per_stage": [True, True, True, True],
+                },
+                "recompute": {"policy": "full", "per_stage": ["full", "full", "full", "full"]},
+            },
+            "runtime": {
+                "cuda_alloc_conf": "expandable_segments:True",
+                "dist_timeout_seconds": 3600,
+                "debug_init_logs": True,
+                "debug_train_logs": True,
+            },
+            "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
+            "profile": {
+                "enabled": False,
+                "rank": 0,
+                "trace_dir": "tb_traces",
+                "wait": 1,
+                "warmup": 1,
+                "active": 3,
+                "repeat": 1,
+                "record_shapes": True,
+                "profile_memory": True,
+                "with_stack": False,
+            },
+        },
+        "config_qwen3_2node_dense_manual_pp.json": {
+            "model": {"path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B", "dtype": "bf16", "seq_len": 512},
+            "train": {
+                "seed": 42,
+                "steps": 50,
+                "warmup_steps": 5,
+                "global_batch_size": 16,
+                "grad_accum_steps": 1,
+                "lr": 0.0001,
+                "weight_decay": 0.1,
+                "grad_clip": 1.0,
+                "log_every": 1,
+            },
+            "parallel": {
+                "pp": {
+                    "degree": 2,
+                    "vpp": 1,
+                    "microbatches": 2,
+                    "schedule": "1f1b",
+                    "stages": "auto",
+                    "auto_mem_gb": [24, 32],
+                    "auto_bias_stage0": -0.1,
+                },
+                "tp": {"enabled": True, "degree": 2},
+                "sp": {"enabled": False},
+                "fsdp2": {
+                    "enabled": True,
+                    "param_dtype": "bf16",
+                    "reduce_dtype": "bf16",
+                    "reshard_after_forward": True,
+                    "reshard_after_forward_per_stage": [True, False],
+                },
+                "recompute": {"policy": "full", "per_stage": ["full", "none"]},
+            },
+            "runtime": {
+                "cuda_alloc_conf": "expandable_segments:True",
+                "dist_timeout_seconds": 3600,
+                "debug_init_logs": True,
+            },
+            "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
+            "profile": {
+                "enabled": False,
+                "rank": 0,
+                "trace_dir": "tb_traces",
+                "wait": 1,
+                "warmup": 1,
+                "active": 3,
+                "repeat": 1,
+                "record_shapes": True,
+                "profile_memory": True,
+                "with_stack": False,
+            },
+        },
+    }
+
+    candidate = Path(path)
+    candidates = [candidate]
+    sibling = Path(__file__).resolve().parent / candidate.name
+    if sibling != candidate:
+        candidates.append(sibling)
+    for cfg_path in candidates:
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return json.loads(f.read())
+
+    builtin = builtin_cfgs.get(candidate.name)
+    if builtin is not None:
+        print(f"[config] missing file {path}; using built-in preset {candidate.name}", flush=True)
+        return copy.deepcopy(builtin)
+    raise FileNotFoundError(f"config file not found: {path}")
 
 
 def _extract_transformer_layers(hf_model: nn.Module) -> nn.ModuleList:
