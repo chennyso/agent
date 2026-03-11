@@ -592,15 +592,11 @@ class DenseCausalLMStage(nn.Module):
         bsz, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
         if seqlen != int(self.seq_len):
             raise RuntimeError(f"seq_len mismatch: got {seqlen}, expected {self.seq_len}")
-        attention_mask = torch.ones((bsz, seqlen), device=hidden_states.device, dtype=torch.long)
+        attention_mask = torch.ones((bsz, seqlen), device=hidden_states.device, dtype=torch.bool)
         position_ids = torch.arange(seqlen, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
         position_embeddings = None
         if self.model.rotary_emb is not None:
-            position_embeddings = _call_with_supported_kwargs(
-                self.model.rotary_emb,
-                hidden_states,
-                position_ids=position_ids,
-            )
+            position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
 
         for layer in self.model.layers:
             if self.recompute in {"full", "checkpoint"}:
@@ -620,6 +616,7 @@ class DenseCausalLMStage(nn.Module):
         if self.lm_head is None:
             raise RuntimeError("last stage missing lm_head")
 
+        labels = labels.long()
         shift_hidden = hidden_states[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
         if hasattr(self.lm_head, "loss"):
@@ -1032,7 +1029,7 @@ def main() -> None:
 
             mb = max(1, int(math.ceil(per_dp_batch / float(microbatches))))
             dummy_ids = torch.zeros((mb, seq_len), device=device, dtype=torch.long)
-            dummy_lbl = torch.zeros((mb, seq_len), device=device, dtype=torch.long)
+            dummy_lbl = torch.zeros((mb, seq_len), device=device, dtype=dtype)
             dummy_hs = torch.zeros((mb, seq_len, hidden_size), device=device, dtype=dtype)
             if is_last:
                 out_args = torch.zeros((), device=device)
@@ -1116,10 +1113,10 @@ def main() -> None:
                                 seed=seed + step * 1000 + ga + dp_idx * 9973,
                             )
                             ids = ids_cpu.to(device, non_blocking=True)
-                            lbl = lbl_cpu.to(device, non_blocking=True)
+                            lbl = lbl_cpu.to(device, dtype=dtype, non_blocking=True)
                         else:
                             ids = torch.empty((per_dp_batch, seq_len), device=device, dtype=torch.long)
-                            lbl = torch.empty((per_dp_batch, seq_len), device=device, dtype=torch.long)
+                            lbl = torch.empty((per_dp_batch, seq_len), device=device, dtype=dtype)
                         if debug_train_logs and step == 0 and ga == 0:
                             print(
                                 f"[train-debug][rank {rank}] before tp broadcast first-stage src={tp_group_ranks[0]} tp_idx={tp_idx}",
@@ -1135,7 +1132,7 @@ def main() -> None:
                             seed=seed + step * 1000 + ga + dp_idx * 9973,
                         )
                         ids = ids_cpu.to(device, non_blocking=True)
-                        lbl = lbl_cpu.to(device, non_blocking=True)
+                        lbl = lbl_cpu.to(device, dtype=dtype, non_blocking=True)
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)} lbl={tuple(lbl.shape)}", flush=True)
                     sched.step(ids, lbl, losses=mb_losses, return_outputs=False)
