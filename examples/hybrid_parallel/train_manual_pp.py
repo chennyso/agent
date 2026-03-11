@@ -1155,24 +1155,34 @@ def main() -> None:
                 batch_seed = seed + step * 1000 + ga + dp_idx * 9973
                 ids = None
                 target = None
-                if dist.get_rank(pp_group) == 0:
+                pp_local_rank = dist.get_rank(pp_group)
+                if pp_local_rank == 0:
                     ids_cpu, _ = _make_synth_batch(vocab_size, seq_len, per_dp_batch, seed=batch_seed)
                     ids = ids_cpu.to(device, non_blocking=True)
-                if dist.get_rank(pp_group) == (pp_degree - 1):
+                if pp_local_rank == (pp_degree - 1):
                     _, target_cpu = _make_synth_batch(vocab_size, seq_len, per_dp_batch, seed=batch_seed)
                     target = target_cpu.to(device, non_blocking=True)
-                if dist.get_rank(pp_group) == 0:
+                if pp_local_rank == 0:
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)}", flush=True)
-                    sched.step(ids, target=target, losses=mb_losses, return_outputs=False)
+                    sched.step(ids, losses=mb_losses, return_outputs=False)
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] after sched.step first-stage", flush=True)
-                else:
+                elif pp_local_rank == (pp_degree - 1):
                     if debug_train_logs and step == 0 and ga == 0:
-                        print(f"[train-debug][rank {rank}] before sched.step non-first-stage", flush=True)
+                        print(
+                            f"[train-debug][rank {rank}] before sched.step last-stage target={tuple(target.shape)}",
+                            flush=True,
+                        )
                     sched.step(target=target, losses=mb_losses, return_outputs=False)
                     if debug_train_logs and step == 0 and ga == 0:
-                        print(f"[train-debug][rank {rank}] after sched.step non-first-stage", flush=True)
+                        print(f"[train-debug][rank {rank}] after sched.step last-stage", flush=True)
+                else:
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] before sched.step middle-stage", flush=True)
+                    sched.step(losses=mb_losses, return_outputs=False)
+                    if debug_train_logs and step == 0 and ga == 0:
+                        print(f"[train-debug][rank {rank}] after sched.step middle-stage", flush=True)
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, float(grad_clip))
             optim.step()
