@@ -1083,12 +1083,35 @@ def main() -> None:
             mb_losses: List[float] = []
             for ga in range(max(1, grad_accum_steps)):
                 if dist.get_rank(pp_group) == 0:
-                    ids, lbl = _make_synth_batch(vocab_size, seq_len, per_dp_batch, seed=seed + step * 1000 + ga + dp_idx * 9973)
                     if tp_degree > 1 and tp_group is not None:
+                        if tp_idx == 0:
+                            ids_cpu, lbl_cpu = _make_synth_batch(
+                                vocab_size,
+                                seq_len,
+                                per_dp_batch,
+                                seed=seed + step * 1000 + ga + dp_idx * 9973,
+                            )
+                            ids = ids_cpu.to(device, non_blocking=True)
+                            lbl = lbl_cpu.to(device, non_blocking=True)
+                        else:
+                            ids = torch.empty((per_dp_batch, seq_len), device=device, dtype=torch.long)
+                            lbl = torch.empty((per_dp_batch, seq_len), device=device, dtype=torch.long)
+                        if debug_train_logs and step == 0 and ga == 0:
+                            print(
+                                f"[train-debug][rank {rank}] before tp broadcast first-stage src={tp_group_ranks[0]} tp_idx={tp_idx}",
+                                flush=True,
+                            )
                         dist.broadcast(ids, src=tp_group_ranks[0], group=tp_group)
                         dist.broadcast(lbl, src=tp_group_ranks[0], group=tp_group)
-                    ids = ids.to(device, non_blocking=True)
-                    lbl = lbl.to(device, non_blocking=True)
+                    else:
+                        ids_cpu, lbl_cpu = _make_synth_batch(
+                            vocab_size,
+                            seq_len,
+                            per_dp_batch,
+                            seed=seed + step * 1000 + ga + dp_idx * 9973,
+                        )
+                        ids = ids_cpu.to(device, non_blocking=True)
+                        lbl = lbl_cpu.to(device, non_blocking=True)
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)} lbl={tuple(lbl.shape)}", flush=True)
                     sched.step(ids, lbl, losses=mb_losses, return_outputs=False)
