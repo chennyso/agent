@@ -286,6 +286,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "dist_timeout_seconds": 3600,
                 "debug_init_logs": True,
                 "debug_train_logs": True,
+                "debug_module_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -338,6 +339,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "dist_timeout_seconds": 3600,
                 "debug_init_logs": True,
                 "debug_train_logs": True,
+                "debug_module_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -391,6 +393,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "cuda_alloc_conf": "expandable_segments:True",
                 "dist_timeout_seconds": 3600,
                 "debug_init_logs": True,
+                "debug_module_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -549,6 +552,9 @@ class DenseCausalLMStage(nn.Module):
         is_last: bool,
         seq_len: int,
         recompute: str,
+        debug_module_logs: bool,
+        debug_rank: int,
+        stage_id: int,
     ) -> None:
         super().__init__()
         self.model = backbone
@@ -558,6 +564,22 @@ class DenseCausalLMStage(nn.Module):
         self.is_last = bool(is_last)
         self.seq_len = int(seq_len)
         self.recompute = str(recompute or "none").lower()
+        self.debug_module_logs = bool(debug_module_logs)
+        self.debug_rank = int(debug_rank)
+        self.stage_id = int(stage_id)
+        self._forward_debug_calls = 0
+        self._loss_debug_calls = 0
+
+    def _debug_enabled(self) -> bool:
+        return bool(self.debug_module_logs and self._forward_debug_calls == 0)
+
+    def _log(self, msg: str) -> None:
+        print(f"[module-debug][rank {self.debug_rank}][stage {self.stage_id}] {msg}", flush=True)
+
+    @staticmethod
+    def _describe_tensor(t: torch.Tensor) -> str:
+        shape = tuple(int(x) for x in t.shape)
+        return f"type={type(t).__name__} shape={shape} dtype={t.dtype} device={t.device}"
 
     def _run_layer(
         self,
@@ -581,13 +603,20 @@ class DenseCausalLMStage(nn.Module):
         return out
 
     def forward(self, *args):  # PipelineStage passes positional only
+        debug_this_call = self._debug_enabled()
         if self.is_first:
             input_ids = args[0]
             if self.model.embed_tokens is None:
                 raise RuntimeError("stage0 missing embed_tokens")
+            if debug_this_call:
+                self._log(f"before embed_tokens {self._describe_tensor(input_ids)}")
             hidden_states = self.model.embed_tokens(input_ids)
+            if debug_this_call:
+                self._log(f"after embed_tokens {self._describe_tensor(hidden_states)}")
         else:
             hidden_states = args[0]
+            if debug_this_call:
+                self._log(f"recv hidden_states {self._describe_tensor(hidden_states)}")
 
         bsz, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
         if seqlen != int(self.seq_len):
@@ -596,9 +625,23 @@ class DenseCausalLMStage(nn.Module):
         position_ids = torch.arange(seqlen, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
         position_embeddings = None
         if self.model.rotary_emb is not None:
+            if debug_this_call:
+                self._log("before rotary_emb")
             position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+            if debug_this_call:
+                if isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) >= 2:
+                    self._log(
+                        "after rotary_emb "
+                        f"cos={self._describe_tensor(position_embeddings[0])} "
+                        f"sin={self._describe_tensor(position_embeddings[1])}"
+                    )
+                else:
+                    self._log(f"after rotary_emb type={type(position_embeddings).__name__}")
 
-        for layer in self.model.layers:
+        for layer_idx, layer in enumerate(self.model.layers):
+            if debug_this_call:
+                global_layer_idx = self.global_layer_start + int(layer_idx)
+                self._log(f"before layer local={layer_idx} global={global_layer_idx}")
             if self.recompute in {"full", "checkpoint"}:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     lambda hs: self._run_layer(layer, hs, attention_mask, position_ids, position_embeddings),
@@ -607,31 +650,58 @@ class DenseCausalLMStage(nn.Module):
                 )
             else:
                 hidden_states = self._run_layer(layer, hidden_states, attention_mask, position_ids, position_embeddings)
+            if debug_this_call:
+                self._log(f"after layer local={layer_idx} global={global_layer_idx} {self._describe_tensor(hidden_states)}")
 
         if not self.is_last:
+            if debug_this_call:
+                self._log(f"forward return hidden_states {self._describe_tensor(hidden_states)}")
+                self._forward_debug_calls += 1
             return hidden_states
 
         if self.model.norm is not None:
+            if debug_this_call:
+                self._log("before final norm")
             hidden_states = self.model.norm(hidden_states)
+            if debug_this_call:
+                self._log(f"after final norm {self._describe_tensor(hidden_states)}")
+        if debug_this_call:
+            self._log(f"forward return last-stage hidden_states {self._describe_tensor(hidden_states)}")
+            self._forward_debug_calls += 1
         return hidden_states
 
     def compute_loss(self, hidden_states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.lm_head is None:
             raise RuntimeError("last stage missing lm_head")
+        debug_this_call = bool(self.debug_module_logs and self._loss_debug_calls == 0)
+        if debug_this_call:
+            self._log(
+                "before compute_loss "
+                f"hidden_states={self._describe_tensor(hidden_states)} "
+                f"labels={self._describe_tensor(labels)}"
+            )
 
         labels = labels.long()
         shift_hidden = hidden_states[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
         if hasattr(self.lm_head, "loss"):
-            return self.lm_head.loss(shift_hidden, shift_labels, ignore_index=-100)  # type: ignore[call-arg]
+            out = self.lm_head.loss(shift_hidden, shift_labels, ignore_index=-100)  # type: ignore[call-arg]
+            if debug_this_call:
+                self._log(f"after compute_loss loss_shape={tuple(out.shape) if out.dim() else ()} dtype={out.dtype}")
+                self._loss_debug_calls += 1
+            return out
 
         logits = self.lm_head(hidden_states)
         shift_logits = logits[:, :-1, :].contiguous()
-        return F.cross_entropy(
+        out = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
         )
+        if debug_this_call:
+            self._log(f"after compute_loss loss_shape={tuple(out.shape) if out.dim() else ()} dtype={out.dtype}")
+            self._loss_debug_calls += 1
+        return out
 
 
 def _resolve_index(model_dir: str) -> Tuple[Optional[Dict[str, str]], List[str]]:
@@ -793,14 +863,8 @@ def _apply_tp_sp(module: nn.Module, tp_mesh: DeviceMesh, tp_degree: int, *, sp_e
 
 def _apply_fsdp2(module: DenseCausalLMStage, dp_mesh: DeviceMesh, *, param_dtype: torch.dtype, reduce_dtype: torch.dtype, reshard_after_forward: bool) -> None:
     mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    if module.model.embed_tokens is not None:
-        fully_shard(module.model.embed_tokens, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
     for layer in module.model.layers:
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
-    if module.model.norm is not None:
-        fully_shard(module.model.norm, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
-    if module.lm_head is not None:
-        fully_shard(module.lm_head, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
 
 
 def _make_synth_batch(vocab_size: int, seq_len: int, batch_size: int, *, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -821,6 +885,7 @@ def main() -> None:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cuda_alloc_conf)
     dist_timeout_seconds = int(((cfg.get("runtime") or {}).get("dist_timeout_seconds") or 3600))
     debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
+    debug_module_logs = bool((cfg.get("runtime") or {}).get("debug_module_logs", True))
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
@@ -1040,6 +1105,9 @@ def main() -> None:
                 is_last=is_last,
                 seq_len=seq_len,
                 recompute=stage_recompute,
+                debug_module_logs=debug_module_logs,
+                debug_rank=rank,
+                stage_id=int(stage_id),
             )
             if debug_init_logs:
                 print(f"[init][rank {rank}] load weights stage_id={stage_id}", flush=True)
