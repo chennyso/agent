@@ -52,7 +52,8 @@
     "dist_timeout_seconds": 3600,
     "debug_init_logs": true,
     "debug_train_logs": true,
-    "debug_module_logs": true
+    "debug_module_logs": true,
+    "debug_p2p_logs": true
   },
   "mfu": {
     "peak_tflops_total": 0.0,

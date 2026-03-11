@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import types
 
 try:  # pragma: no cover
     import torch.profiler as torch_profiler
@@ -287,6 +288,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_init_logs": True,
                 "debug_train_logs": True,
                 "debug_module_logs": True,
+                "debug_p2p_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -340,6 +342,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_init_logs": True,
                 "debug_train_logs": True,
                 "debug_module_logs": True,
+                "debug_p2p_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -394,6 +397,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "dist_timeout_seconds": 3600,
                 "debug_init_logs": True,
                 "debug_module_logs": True,
+                "debug_p2p_logs": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -867,6 +871,57 @@ def _apply_fsdp2(module: DenseCausalLMStage, dp_mesh: DeviceMesh, *, param_dtype
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
 
 
+def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None:
+    if not enabled:
+        return
+    if getattr(stage, "_agent_runtime_debug_enabled", False):
+        return
+    stage._agent_runtime_debug_enabled = True
+    stage._agent_runtime_debug_seen = set()
+
+    def _should_log(key: str) -> bool:
+        seen = stage._agent_runtime_debug_seen
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    def _log(msg: str) -> None:
+        print(f"[p2p-debug][rank {rank}][stage {stage.stage_index}] {msg}", flush=True)
+
+    orig_get_fwd_recv_ops = stage.get_fwd_recv_ops
+    orig_get_fwd_send_ops = stage.get_fwd_send_ops
+    orig_forward_one_chunk = stage.forward_one_chunk
+
+    def get_fwd_recv_ops_wrapper(self, chunk_id: int):
+        ops = orig_get_fwd_recv_ops(chunk_id)
+        if _should_log(f"recv_ops_{chunk_id}"):
+            _log(f"get_fwd_recv_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        return ops
+
+    def get_fwd_send_ops_wrapper(self, chunk_id: int):
+        ops = orig_get_fwd_send_ops(chunk_id)
+        if _should_log(f"send_ops_{chunk_id}"):
+            _log(f"get_fwd_send_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        return ops
+
+    def forward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
+        if _should_log(f"forward_enter_{chunk_id}"):
+            _log(f"forward_one_chunk enter chunk={chunk_id}")
+        out = orig_forward_one_chunk(chunk_id, *args, **kwargs)
+        if _should_log(f"forward_exit_{chunk_id}"):
+            if torch.is_tensor(out):
+                desc = f"shape={tuple(int(x) for x in out.shape)} dtype={out.dtype} device={out.device}"
+            else:
+                desc = f"type={type(out).__name__}"
+            _log(f"forward_one_chunk exit chunk={chunk_id} out={desc}")
+        return out
+
+    stage.get_fwd_recv_ops = types.MethodType(get_fwd_recv_ops_wrapper, stage)
+    stage.get_fwd_send_ops = types.MethodType(get_fwd_send_ops_wrapper, stage)
+    stage.forward_one_chunk = types.MethodType(forward_one_chunk_wrapper, stage)
+
+
 def _make_synth_batch(vocab_size: int, seq_len: int, batch_size: int, *, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cpu")
     g.manual_seed(int(seed))
@@ -886,6 +941,7 @@ def main() -> None:
     dist_timeout_seconds = int(((cfg.get("runtime") or {}).get("dist_timeout_seconds") or 3600))
     debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
     debug_module_logs = bool((cfg.get("runtime") or {}).get("debug_module_logs", True))
+    debug_p2p_logs = bool((cfg.get("runtime") or {}).get("debug_p2p_logs", True))
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
@@ -1142,6 +1198,7 @@ def main() -> None:
                 output_args=out_args,
                 group=pp_group,
             )
+            _enable_stage_runtime_debug(stage, rank=rank, enabled=debug_p2p_logs)
             if debug_init_logs:
                 print(
                     f"[init][rank {rank}] stage ready stage_id={stage_id} elapsed={time.time() - stage_t0:.1f}s",
