@@ -793,9 +793,14 @@ def _apply_tp_sp(module: nn.Module, tp_mesh: DeviceMesh, tp_degree: int, *, sp_e
 
 def _apply_fsdp2(module: DenseCausalLMStage, dp_mesh: DeviceMesh, *, param_dtype: torch.dtype, reduce_dtype: torch.dtype, reshard_after_forward: bool) -> None:
     mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    if module.model.embed_tokens is not None:
+        fully_shard(module.model.embed_tokens, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
     for layer in module.model.layers:
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
-    fully_shard(module, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
+    if module.model.norm is not None:
+        fully_shard(module.model.norm, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
+    if module.lm_head is not None:
+        fully_shard(module.lm_head, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
 
 
 def _make_synth_batch(vocab_size: int, seq_len: int, batch_size: int, *, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
