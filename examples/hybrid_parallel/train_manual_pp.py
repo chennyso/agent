@@ -273,7 +273,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "tp": {"enabled": True, "degree": 2},
                 "sp": {"enabled": False},
                 "fsdp2": {
-                    "enabled": True,
+                    "enabled": False,
                     "param_dtype": "bf16",
                     "reduce_dtype": "bf16",
                     "reshard_after_forward": True,
@@ -880,6 +880,32 @@ def main() -> None:
         if ranks_per_stage % tp_degree != 0:
             raise ValueError("ranks_per_stage must be divisible by tp_degree")
         dp_degree = ranks_per_stage // tp_degree
+
+        if fsdp_enabled and dp_degree > 1 and pp_degree > 1:
+            if reshard_after_forward or (
+                isinstance(reshard_per_stage, list) and any(bool(x) for x in reshard_per_stage)
+            ):
+                if rank == 0:
+                    print(
+                        "[warn] forcing fsdp2 reshard_after_forward=False for PP+TP+FSDP2; "
+                        "this matches PyTorch composability tests and avoids first-step all_gather deadlocks",
+                        flush=True,
+                    )
+                reshard_after_forward = False
+                if isinstance(reshard_per_stage, list):
+                    reshard_per_stage = [False for _ in reshard_per_stage]
+            if recompute != "none" or (
+                isinstance(recompute_per_stage, list) and any(str(x).lower() not in {"none", "off", "false"} for x in recompute_per_stage)
+            ):
+                if rank == 0:
+                    print(
+                        "[warn] forcing recompute=none for PP+TP+FSDP2; "
+                        "activation checkpointing inside FSDP2-wrapped pipeline stages is not aligned with the official composability path",
+                        flush=True,
+                    )
+                recompute = "none"
+                if isinstance(recompute_per_stage, list):
+                    recompute_per_stage = ["none" for _ in recompute_per_stage]
 
         pp_rank = rank // ranks_per_stage
         local_in_stage = rank % ranks_per_stage

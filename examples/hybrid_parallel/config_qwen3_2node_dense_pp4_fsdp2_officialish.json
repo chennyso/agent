@@ -36,15 +36,15 @@
       "enabled": false
     },
     "fsdp2": {
-      "enabled": false,
+      "enabled": true,
       "param_dtype": "bf16",
       "reduce_dtype": "bf16",
-      "reshard_after_forward": true,
-      "reshard_after_forward_per_stage": [true, true, true, true]
+      "reshard_after_forward": false,
+      "reshard_after_forward_per_stage": [false, false, false, false]
     },
     "recompute": {
-      "policy": "full",
-      "per_stage": ["full", "full", "full", "full"]
+      "policy": "none",
+      "per_stage": ["none", "none", "none", "none"]
     }
   },
   "runtime": {

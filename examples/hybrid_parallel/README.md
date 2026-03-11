@@ -21,6 +21,12 @@ This folder contains **2-node (16 GPU)** training baselines for HF `AutoModelFor
 - Set `model.path` to your local Qwen3-32B directory.
 - This preset uses `pp=4`, `tp=2`, `vpp=1`, `schedule=gpipe` and a conservative manual split:
   - `[0, 9]`, `[10, 21]`, `[22, 41]`, `[42, 63]`
+- The default `pp4_gpipe_safe` preset keeps `FSDP2` disabled on purpose.
+  - Current stable path is `PP + TP (+ recompute)`.
+  - `FSDP2 + TP + manual PP` remains experimental and may deadlock on Qwen3 in this setup.
+- For the closest match to PyTorch's official composability pattern, use:
+  - `examples/hybrid_parallel/config_qwen3_2node_dense_pp4_fsdp2_officialish.json`
+  - It enforces `reshard_after_forward=false` and `recompute=none`.
 - Use `config_qwen3_2node_dense_manual_pp.json` only if you want the older `pp=2` auto-split path.
 
 2) Launch
