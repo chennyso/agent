@@ -615,10 +615,11 @@ class DenseCausalLMStage(nn.Module):
             if debug_this_call:
                 self._log(f"before embed_tokens {self._describe_tensor(input_ids)}")
             hidden_states = self.model.embed_tokens(input_ids)
+            hidden_states = hidden_states.contiguous()
             if debug_this_call:
                 self._log(f"after embed_tokens {self._describe_tensor(hidden_states)}")
         else:
-            hidden_states = args[0]
+            hidden_states = args[0].contiguous()
             if debug_this_call:
                 self._log(f"recv hidden_states {self._describe_tensor(hidden_states)}")
 
@@ -658,6 +659,7 @@ class DenseCausalLMStage(nn.Module):
                 self._log(f"after layer local={layer_idx} global={global_layer_idx} {self._describe_tensor(hidden_states)}")
 
         if not self.is_last:
+            hidden_states = hidden_states.contiguous()
             if debug_this_call:
                 self._log(f"forward return hidden_states {self._describe_tensor(hidden_states)}")
                 self._forward_debug_calls += 1
@@ -669,6 +671,7 @@ class DenseCausalLMStage(nn.Module):
             hidden_states = self.model.norm(hidden_states)
             if debug_this_call:
                 self._log(f"after final norm {self._describe_tensor(hidden_states)}")
+        hidden_states = hidden_states.contiguous()
         if debug_this_call:
             self._log(f"forward return last-stage hidden_states {self._describe_tensor(hidden_states)}")
             self._forward_debug_calls += 1
@@ -989,6 +992,7 @@ def main() -> None:
         sp_enabled = bool(sp_cfg.get("enabled", False))
 
         fsdp_enabled = bool(fsdp_cfg.get("enabled", True))
+        fsdp_enabled_per_stage = fsdp_cfg.get("enabled_per_stage")
         fsdp_param_dtype = _infer_dtype(fsdp_cfg.get("param_dtype") or "bf16")
         fsdp_reduce_dtype = _infer_dtype(fsdp_cfg.get("reduce_dtype") or "bf16")
         reshard_after_forward = bool(fsdp_cfg.get("reshard_after_forward", True))
@@ -1007,7 +1011,11 @@ def main() -> None:
             raise ValueError("ranks_per_stage must be divisible by tp_degree")
         dp_degree = ranks_per_stage // tp_degree
 
-        if fsdp_enabled and dp_degree > 1 and pp_degree > 1:
+        any_fsdp_enabled = bool(fsdp_enabled)
+        if isinstance(fsdp_enabled_per_stage, list):
+            any_fsdp_enabled = any(bool(x) for x in fsdp_enabled_per_stage)
+
+        if any_fsdp_enabled and dp_degree > 1 and pp_degree > 1:
             if reshard_after_forward or (
                 isinstance(reshard_per_stage, list) and any(bool(x) for x in reshard_per_stage)
             ):
@@ -1174,7 +1182,11 @@ def main() -> None:
                 if debug_init_logs:
                     print(f"[init][rank {rank}] apply tp stage_id={stage_id}", flush=True)
                 _apply_tp_sp(stage_mod, tp_mesh, tp_degree, sp_enabled=sp_enabled)
-            if fsdp_enabled and dp_mesh is not None and dp_degree > 1:
+            stage_fsdp_enabled = bool(fsdp_enabled)
+            if isinstance(fsdp_enabled_per_stage, list) and len(fsdp_enabled_per_stage) == num_virtual:
+                stage_fsdp_enabled = bool(fsdp_enabled_per_stage[int(stage_id)])
+
+            if stage_fsdp_enabled and dp_mesh is not None and dp_degree > 1:
                 stage_reshard = bool(reshard_after_forward)
                 if isinstance(reshard_per_stage, list) and len(reshard_per_stage) == num_virtual:
                     stage_reshard = bool(reshard_per_stage[int(stage_id)])
