@@ -523,11 +523,19 @@ def _call_with_supported_kwargs(fn, /, *args, **kwargs):
 
 
 class _StageBackbone(nn.Module):
-    def __init__(self, *, embed_tokens: Optional[nn.Module], layers: nn.ModuleList, norm: Optional[nn.Module]):
+    def __init__(
+        self,
+        *,
+        embed_tokens: Optional[nn.Module],
+        layers: nn.ModuleList,
+        norm: Optional[nn.Module],
+        rotary_emb: Optional[nn.Module],
+    ):
         super().__init__()
         self.embed_tokens = embed_tokens
         self.layers = layers
         self.norm = norm
+        self.rotary_emb = rotary_emb
 
 
 class DenseCausalLMStage(nn.Module):
@@ -551,12 +559,20 @@ class DenseCausalLMStage(nn.Module):
         self.seq_len = int(seq_len)
         self.recompute = str(recompute or "none").lower()
 
-    def _run_layer(self, layer: nn.Module, hidden_states: torch.Tensor, attention_mask: torch.Tensor, position_ids: torch.Tensor):
+    def _run_layer(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: Any,
+    ):
         out = _call_with_supported_kwargs(
             layer,
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            position_embeddings=position_embeddings,
             use_cache=False,
             output_attentions=False,
         )
@@ -578,16 +594,23 @@ class DenseCausalLMStage(nn.Module):
             raise RuntimeError(f"seq_len mismatch: got {seqlen}, expected {self.seq_len}")
         attention_mask = torch.ones((bsz, seqlen), device=hidden_states.device, dtype=torch.long)
         position_ids = torch.arange(seqlen, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+        position_embeddings = None
+        if self.model.rotary_emb is not None:
+            position_embeddings = _call_with_supported_kwargs(
+                self.model.rotary_emb,
+                hidden_states,
+                position_ids=position_ids,
+            )
 
         for layer in self.model.layers:
             if self.recompute in {"full", "checkpoint"}:
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    lambda hs: self._run_layer(layer, hs, attention_mask, position_ids),
+                    lambda hs: self._run_layer(layer, hs, attention_mask, position_ids, position_embeddings),
                     hidden_states,
                     use_reentrant=False,
                 )
             else:
-                hidden_states = self._run_layer(layer, hidden_states, attention_mask, position_ids)
+                hidden_states = self._run_layer(layer, hidden_states, attention_mask, position_ids, position_embeddings)
 
         if not self.is_last:
             return hidden_states, labels
@@ -976,6 +999,7 @@ def main() -> None:
                 embed_tokens=embed,
                 layers=nn.ModuleList([layers_full[i] for i in range(int(ls), int(le) + 1)]),
                 norm=norm,
+                rotary_emb=getattr(full_model.model, "rotary_emb", None),
             )
             stage_mod = DenseCausalLMStage(
                 backbone=backbone,
