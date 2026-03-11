@@ -582,12 +582,12 @@ class DenseCausalLMStage(nn.Module):
 
     def forward(self, *args):  # PipelineStage passes positional only
         if self.is_first:
-            input_ids, labels = args
+            input_ids = args[0]
             if self.model.embed_tokens is None:
                 raise RuntimeError("stage0 missing embed_tokens")
             hidden_states = self.model.embed_tokens(input_ids)
         else:
-            hidden_states, labels = args
+            hidden_states = args[0]
 
         bsz, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
         if seqlen != int(self.seq_len):
@@ -609,10 +609,13 @@ class DenseCausalLMStage(nn.Module):
                 hidden_states = self._run_layer(layer, hidden_states, attention_mask, position_ids, position_embeddings)
 
         if not self.is_last:
-            return hidden_states, labels
+            return hidden_states
 
         if self.model.norm is not None:
             hidden_states = self.model.norm(hidden_states)
+        return hidden_states
+
+    def compute_loss(self, hidden_states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.lm_head is None:
             raise RuntimeError("last stage missing lm_head")
 
@@ -1029,18 +1032,14 @@ def main() -> None:
 
             mb = max(1, int(math.ceil(per_dp_batch / float(microbatches))))
             dummy_ids = torch.zeros((mb, seq_len), device=device, dtype=torch.long)
-            dummy_lbl = torch.zeros((mb, seq_len), device=device, dtype=dtype)
             dummy_hs = torch.zeros((mb, seq_len, hidden_size), device=device, dtype=dtype)
-            if is_last:
-                out_args = torch.zeros((), device=device)
-            else:
-                out_args = (torch.zeros((mb, seq_len, hidden_size), device=device, dtype=dtype), dummy_lbl)
+            out_args = torch.zeros((mb, seq_len, hidden_size), device=device, dtype=dtype)
             stage = PipelineStage(
                 stage_mod,
                 int(stage_id),
                 int(num_virtual),
                 device,
-                input_args=(dummy_ids, dummy_lbl) if is_first else (dummy_hs, dummy_lbl),
+                input_args=(dummy_ids,) if is_first else (dummy_hs,),
                 output_args=out_args,
                 group=pp_group,
             )
@@ -1055,24 +1054,48 @@ def main() -> None:
         chunk_spec = TensorChunkSpec(0) if microbatches > 1 else None
         loss_scale = 1.0 / float(max(1, grad_accum_steps))
 
-        def loss_fn(out: Any, _target: Any = None) -> torch.Tensor:
+        local_last_stage = next((m for m in stage_modules if m.is_last), None)
+
+        def loss_fn(out: Any, target: Any = None) -> torch.Tensor:
+            if local_last_stage is None:
+                raise RuntimeError("loss_fn called on rank without last stage")
             if not torch.is_tensor(out):
-                raise RuntimeError("loss_fn expected tensor")
-            return out * float(loss_scale)
+                raise RuntimeError("loss_fn expected tensor hidden states")
+            if target is None or not torch.is_tensor(target):
+                raise RuntimeError("loss_fn expected target tensor")
+            return local_last_stage.compute_loss(out, target) * float(loss_scale)
 
         if vpp > 1:
             if ScheduleInterleaved1F1B is None:
                 raise RuntimeError("interleaved schedule unavailable; set vpp=1")
-            sched = ScheduleInterleaved1F1B(stages, microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
+            sched = ScheduleInterleaved1F1B(
+                stages,
+                microbatches,
+                loss_fn=loss_fn,
+                args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+            )
         else:
             if schedule_name == "gpipe":
                 if ScheduleGPipe is None:
                     raise RuntimeError("gpipe unavailable")
-                sched = ScheduleGPipe(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
+                sched = ScheduleGPipe(
+                    stages[0],
+                    microbatches,
+                    loss_fn=loss_fn,
+                    args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                    kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+                )
             else:
                 if Schedule1F1B is None:
                     raise RuntimeError("1f1b unavailable")
-                sched = Schedule1F1B(stages[0], microbatches, loss_fn=loss_fn, args_chunk_spec=(chunk_spec, chunk_spec) if chunk_spec else None)
+                sched = Schedule1F1B(
+                    stages[0],
+                    microbatches,
+                    loss_fn=loss_fn,
+                    args_chunk_spec=(chunk_spec,) if chunk_spec else None,
+                    kwargs_chunk_spec={"target": chunk_spec} if chunk_spec else None,
+                )
 
         params: List[torch.nn.Parameter] = []
         seen: set[int] = set()
@@ -1103,45 +1126,25 @@ def main() -> None:
             optim.zero_grad(set_to_none=True)
             mb_losses: List[float] = []
             for ga in range(max(1, grad_accum_steps)):
+                batch_seed = seed + step * 1000 + ga + dp_idx * 9973
+                ids = None
+                target = None
                 if dist.get_rank(pp_group) == 0:
-                    if tp_degree > 1 and tp_group is not None:
-                        if tp_idx == 0:
-                            ids_cpu, lbl_cpu = _make_synth_batch(
-                                vocab_size,
-                                seq_len,
-                                per_dp_batch,
-                                seed=seed + step * 1000 + ga + dp_idx * 9973,
-                            )
-                            ids = ids_cpu.to(device, non_blocking=True)
-                            lbl = lbl_cpu.to(device, dtype=dtype, non_blocking=True)
-                        else:
-                            ids = torch.empty((per_dp_batch, seq_len), device=device, dtype=torch.long)
-                            lbl = torch.empty((per_dp_batch, seq_len), device=device, dtype=dtype)
-                        if debug_train_logs and step == 0 and ga == 0:
-                            print(
-                                f"[train-debug][rank {rank}] before tp broadcast first-stage src={tp_group_ranks[0]} tp_idx={tp_idx}",
-                                flush=True,
-                            )
-                        dist.broadcast(ids, src=tp_group_ranks[0], group=tp_group)
-                        dist.broadcast(lbl, src=tp_group_ranks[0], group=tp_group)
-                    else:
-                        ids_cpu, lbl_cpu = _make_synth_batch(
-                            vocab_size,
-                            seq_len,
-                            per_dp_batch,
-                            seed=seed + step * 1000 + ga + dp_idx * 9973,
-                        )
-                        ids = ids_cpu.to(device, non_blocking=True)
-                        lbl = lbl_cpu.to(device, dtype=dtype, non_blocking=True)
+                    ids_cpu, _ = _make_synth_batch(vocab_size, seq_len, per_dp_batch, seed=batch_seed)
+                    ids = ids_cpu.to(device, non_blocking=True)
+                if dist.get_rank(pp_group) == (pp_degree - 1):
+                    _, target_cpu = _make_synth_batch(vocab_size, seq_len, per_dp_batch, seed=batch_seed)
+                    target = target_cpu.to(device, non_blocking=True)
+                if dist.get_rank(pp_group) == 0:
                     if debug_train_logs and step == 0 and ga == 0:
-                        print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)} lbl={tuple(lbl.shape)}", flush=True)
-                    sched.step(ids, lbl, losses=mb_losses, return_outputs=False)
+                        print(f"[train-debug][rank {rank}] before sched.step first-stage ids={tuple(ids.shape)}", flush=True)
+                    sched.step(ids, target=target, losses=mb_losses, return_outputs=False)
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] after sched.step first-stage", flush=True)
                 else:
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] before sched.step non-first-stage", flush=True)
-                    sched.step(losses=mb_losses, return_outputs=False)
+                    sched.step(target=target, losses=mb_losses, return_outputs=False)
                     if debug_train_logs and step == 0 and ga == 0:
                         print(f"[train-debug][rank {rank}] after sched.step non-first-stage", flush=True)
             if grad_clip and grad_clip > 0:
