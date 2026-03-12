@@ -797,6 +797,9 @@ class DenseCausalLMStage(nn.Module):
         self._forward_debug_calls = 0
         self._loss_debug_calls = 0
         self._backward_hook_labels_seen: set[str] = set()
+        self._backward_module_hook_labels_seen: set[str] = set()
+        if self.debug_module_logs:
+            self._register_module_backward_hooks()
 
     def _debug_enabled(self) -> bool:
         return bool(self.debug_module_logs and self._forward_debug_calls == 0)
@@ -847,6 +850,37 @@ class DenseCausalLMStage(nn.Module):
             return grad
 
         tensor.register_hook(_hook)
+
+    def _attach_backward_module_hook(self, module: Optional[nn.Module], label: str) -> None:
+        if module is None:
+            return
+        key = str(label)
+        if key in self._backward_module_hook_labels_seen:
+            return
+        self._backward_module_hook_labels_seen.add(key)
+
+        def _hook(_module, grad_input, grad_output):
+            parts = []
+            if grad_input:
+                first_in = next((g for g in grad_input if isinstance(g, torch.Tensor)), None)
+                if first_in is not None:
+                    parts.append(f"grad_input={self._describe_tensor(first_in)}")
+            if grad_output:
+                first_out = next((g for g in grad_output if isinstance(g, torch.Tensor)), None)
+                if first_out is not None:
+                    parts.append(f"grad_output={self._describe_tensor(first_out)}")
+            suffix = " ".join(parts)
+            self._log(f"backward module {label}" + (f" {suffix}" if suffix else ""))
+
+        module.register_full_backward_hook(_hook)
+
+    def _register_module_backward_hooks(self) -> None:
+        self._attach_backward_module_hook(self.model.embed_tokens, "embed_tokens")
+        for layer_idx, layer in enumerate(self.model.layers):
+            global_layer_idx = self.global_layer_start + int(layer_idx)
+            self._attach_backward_module_hook(layer, f"layer local={layer_idx} global={global_layer_idx}")
+        self._attach_backward_module_hook(self.model.norm, "final norm")
+        self._attach_backward_module_hook(self.lm_head, "lm_head")
 
     def forward(self, *args):  # PipelineStage passes positional only
         debug_this_call = self._debug_enabled()
