@@ -53,6 +53,7 @@
     "debug_init_logs": true,
     "debug_train_logs": true,
     "debug_module_logs": true,
+    "debug_tp_loss_logs": true,
     "debug_p2p_logs": true,
     "serialize_pp_p2p": true,
     "pp_p2p_mode": "subgroup_group_peer"

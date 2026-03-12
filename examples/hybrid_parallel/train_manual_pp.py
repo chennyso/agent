@@ -23,6 +23,28 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     torch_profiler = None
 
+_DEBUG_TP_LOSS = False
+
+
+def _tp_loss_log(msg: str, *, group: Optional[dist.ProcessGroup] = None) -> None:
+    if not _DEBUG_TP_LOSS:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    group_rank = None
+    group_ranks = None
+    if group is not None and dist.is_available() and dist.is_initialized():
+        try:
+            group_rank = dist.get_rank(group)
+            if hasattr(dist, "get_process_group_ranks"):
+                group_ranks = dist.get_process_group_ranks(group)
+        except Exception:
+            group_rank = None
+            group_ranks = None
+    print(
+        f"[tp-loss][rank {rank}] {msg} group_rank={group_rank} group_ranks={group_ranks}",
+        flush=True,
+    )
+
 
 class _AllReduceSum(torch.autograd.Function):
     @staticmethod
@@ -60,7 +82,12 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         logits = vocab_parallel_logits.float()
         logits_max = torch.max(logits, dim=-1)[0]
         if group is not None and dist.get_world_size(group) > 1:
+            _tp_loss_log(
+                f"xent all_reduce logits_max start shape={tuple(logits_max.shape)} dtype={logits_max.dtype}",
+                group=group,
+            )
             dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
+            _tp_loss_log("xent all_reduce logits_max done", group=group)
         logits -= logits_max.unsqueeze(dim=-1)
 
         target_mask = (target < int(vocab_start_index)) | (target >= int(vocab_end_index)) | (target == int(ignore_index))
@@ -80,8 +107,18 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         sum_exp_logits = exp_logits.sum(dim=-1)
 
         if group is not None and dist.get_world_size(group) > 1:
+            _tp_loss_log(
+                f"xent all_reduce predicted_logits start shape={tuple(predicted_logits.shape)} dtype={predicted_logits.dtype}",
+                group=group,
+            )
             dist.all_reduce(predicted_logits, op=dist.ReduceOp.SUM, group=group)
+            _tp_loss_log("xent all_reduce predicted_logits done", group=group)
+            _tp_loss_log(
+                f"xent all_reduce sum_exp_logits start shape={tuple(sum_exp_logits.shape)} dtype={sum_exp_logits.dtype}",
+                group=group,
+            )
             dist.all_reduce(sum_exp_logits, op=dist.ReduceOp.SUM, group=group)
+            _tp_loss_log("xent all_reduce sum_exp_logits done", group=group)
 
         loss = torch.log(sum_exp_logits) - predicted_logits
         exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
@@ -177,7 +214,15 @@ class VocabParallelLMHead(nn.Module):
         return F.linear(hidden_states, self.weight)
 
     def loss(self, hidden_states: torch.Tensor, labels: torch.Tensor, *, ignore_index: int = -100) -> torch.Tensor:
+        _tp_loss_log(
+            f"lm_head.loss enter hidden={tuple(hidden_states.shape)} labels={tuple(labels.shape)}",
+            group=self.tp_group,
+        )
         logits = self(hidden_states)
+        _tp_loss_log(
+            f"lm_head.loss logits shape={tuple(logits.shape)} dtype={logits.dtype}",
+            group=self.tp_group,
+        )
         loss = _vocab_parallel_cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
@@ -188,6 +233,7 @@ class VocabParallelLMHead(nn.Module):
         )
         valid = (labels != int(ignore_index)).view(-1)
         denom = valid.sum().clamp(min=1).to(dtype=loss.dtype)
+        _tp_loss_log("lm_head.loss exit", group=self.tp_group)
         return (loss.view(-1) * valid.to(dtype=loss.dtype)).sum() / denom
 
 from torch.distributed.device_mesh import DeviceMesh
@@ -448,6 +494,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_init_logs": True,
                 "debug_train_logs": True,
                 "debug_module_logs": True,
+                "debug_tp_loss_logs": True,
                 "debug_p2p_logs": True,
                 "serialize_pp_p2p": True,
                 "pp_p2p_mode": "subgroup_group_peer",
@@ -504,6 +551,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_init_logs": True,
                 "debug_train_logs": True,
                 "debug_module_logs": True,
+                "debug_tp_loss_logs": True,
                 "debug_p2p_logs": True,
                 "serialize_pp_p2p": True,
                 "pp_p2p_mode": "subgroup_group_peer",
@@ -1200,6 +1248,8 @@ def main() -> None:
     ap.add_argument("--config", type=str, required=True)
     args = ap.parse_args()
 
+    global _DEBUG_TP_LOSS
+
     cfg = _load_cfg(args.config)
     cuda_alloc_conf = ((cfg.get("runtime") or {}).get("cuda_alloc_conf") or "").strip()
     if cuda_alloc_conf:
@@ -1208,6 +1258,7 @@ def main() -> None:
     debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
     debug_module_logs = bool((cfg.get("runtime") or {}).get("debug_module_logs", True))
     debug_p2p_logs = bool((cfg.get("runtime") or {}).get("debug_p2p_logs", True))
+    _DEBUG_TP_LOSS = bool((cfg.get("runtime") or {}).get("debug_tp_loss_logs", True))
     runtime_cfg = cfg.get("runtime") or {}
     if "pp_p2p_mode" in runtime_cfg:
         pp_p2p_mode = str(runtime_cfg.get("pp_p2p_mode") or "subgroup_group_peer").strip()
