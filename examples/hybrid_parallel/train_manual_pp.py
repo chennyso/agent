@@ -228,6 +228,17 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
     This reduces overlap between PP p2p traffic and subsequent TP/FSDP collectives.
     """
 
+    def _ensure_stage_runtime_infra(self) -> None:
+        stage = self._stage
+        needs_fwd_init = any(chunk_id not in stage.args_recv_info for chunk_id in range(self._n_microbatches))
+        if needs_fwd_init:
+            stage._prepare_forward_infra(self._n_microbatches)
+
+        if self._has_backward:
+            needs_bwd_init = any(chunk_id not in stage.grad_recv_info for chunk_id in range(self._n_microbatches))
+            if needs_bwd_init:
+                stage._prepare_backward_infra(self._n_microbatches)
+
     def _step_microbatches(  # type: ignore[override]
         self,
         arg_mbs: Optional[List] = None,
@@ -241,10 +252,11 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
             raise RuntimeError("torch.distributed.pipelining.schedules unavailable")
 
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
+        self._ensure_stage_runtime_infra()
 
         for i in range(self._n_microbatches):
             with pipe_schedules.record_function(f"Forward {i}"):
-                ops = self._stage.get_fwd_recv_ops(i)
+                ops = [] if self._stage.is_first else self._stage.get_fwd_recv_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="fwd_recv")
                 for work in works.values():
                     work.wait()
@@ -264,7 +276,7 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
 
         for i in range(self._n_microbatches):
             with pipe_schedules.record_function(f"Backward {i}"):
-                ops = self._stage.get_bwd_recv_ops(i)
+                ops = [] if self._stage.is_last else self._stage.get_bwd_recv_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="bwd_recv")
                 for work in works.values():
                     work.wait()
