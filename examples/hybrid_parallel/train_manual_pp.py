@@ -170,6 +170,7 @@ class VocabParallelEmbedding(nn.Module):
         tp_rank: int,
         tp_world: int,
         tp_group: Optional[dist.ProcessGroup],
+        dtype: torch.dtype,
     ) -> None:
         super().__init__()
         start, end, part = _vocab_partition(int(vocab_size), int(tp_rank), int(tp_world))
@@ -178,7 +179,7 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab_end_index = int(end)
         self.partition_vocab_size = int(part)
         self.tp_group = tp_group
-        self.weight = nn.Parameter(torch.empty((self.partition_vocab_size, int(hidden_size)), device="meta"))
+        self.weight = nn.Parameter(torch.empty((self.partition_vocab_size, int(hidden_size)), device="meta", dtype=dtype))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         mask = (input_ids >= int(self.vocab_start_index)) & (input_ids < int(self.vocab_end_index))
@@ -200,6 +201,7 @@ class VocabParallelLMHead(nn.Module):
         tp_rank: int,
         tp_world: int,
         tp_group: Optional[dist.ProcessGroup],
+        dtype: torch.dtype,
     ) -> None:
         super().__init__()
         start, end, part = _vocab_partition(int(vocab_size), int(tp_rank), int(tp_world))
@@ -208,7 +210,7 @@ class VocabParallelLMHead(nn.Module):
         self.vocab_end_index = int(end)
         self.partition_vocab_size = int(part)
         self.tp_group = tp_group
-        self.weight = nn.Parameter(torch.empty((self.partition_vocab_size, int(hidden_size)), device="meta"))
+        self.weight = nn.Parameter(torch.empty((self.partition_vocab_size, int(hidden_size)), device="meta", dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _tp_loss_log(
@@ -1479,9 +1481,23 @@ def main() -> None:
                     f"[init][rank {rank}] build stage_id={stage_id} layers=[{ls},{le}] first={is_first} last={is_last}",
                     flush=True,
                 )
-            embed = VocabParallelEmbedding(vocab_size=vocab_size, hidden_size=hidden_size, tp_rank=tp_idx, tp_world=tp_degree, tp_group=tp_group) if is_first else None
+            embed = VocabParallelEmbedding(
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                tp_rank=tp_idx,
+                tp_world=tp_degree,
+                tp_group=tp_group,
+                dtype=dtype,
+            ) if is_first else None
             norm = getattr(full_model.model, "norm", None) if is_last else None
-            lm_head = VocabParallelLMHead(vocab_size=vocab_size, hidden_size=hidden_size, tp_rank=tp_idx, tp_world=tp_degree, tp_group=tp_group) if is_last else None
+            lm_head = VocabParallelLMHead(
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                tp_rank=tp_idx,
+                tp_world=tp_degree,
+                tp_group=tp_group,
+                dtype=dtype,
+            ) if is_last else None
 
             stage_recompute = recompute
             if isinstance(recompute_per_stage, list) and len(recompute_per_stage) == num_virtual:
