@@ -212,6 +212,74 @@ except Exception:  # pragma: no cover
     TensorChunkSpec = None
 
 try:  # pragma: no cover
+    import torch.distributed.pipelining.schedules as pipe_schedules
+except Exception:  # pragma: no cover
+    pipe_schedules = None  # type: ignore[assignment]
+
+
+class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):  # type: ignore[misc]
+    """
+    A safer GPipe schedule for mixed PP+TP(+FSDP2) runs.
+
+    Difference from upstream ScheduleGPipe:
+    - waits forward sends after each microbatch instead of delaying all waits
+    - waits backward sends after each microbatch instead of delaying all waits
+
+    This reduces overlap between PP p2p traffic and subsequent TP/FSDP collectives.
+    """
+
+    def _step_microbatches(  # type: ignore[override]
+        self,
+        arg_mbs: Optional[List] = None,
+        kwarg_mbs: Optional[List] = None,
+        target_mbs: Optional[List] = None,
+        losses: Optional[List] = None,
+    ):
+        if pipe_schedules is None:
+            raise RuntimeError("torch.distributed.pipelining.schedules unavailable")
+
+        arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
+
+        for i in range(self._n_microbatches):
+            with pipe_schedules.record_function(f"Forward {i}"):
+                ops = self._stage.get_fwd_recv_ops(i)
+                works = pipe_schedules._sorted_batch_p2p(ops, desc="fwd_recv")
+                for work in works.values():
+                    work.wait()
+
+                output = self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
+
+                ops = self._stage.get_fwd_send_ops(i)
+                works = pipe_schedules._sorted_batch_p2p(ops, desc="fwd_send")
+                for work in works.values():
+                    work.wait()
+
+            pipe_schedules.logger.debug(f"[{self._stage.stage_index}] Forwarded microbatch {i}")  # noqa: G004
+            self._maybe_compute_loss(self._stage, output, target_mbs, i)
+
+        if not self._has_backward:
+            return
+
+        for i in range(self._n_microbatches):
+            with pipe_schedules.record_function(f"Backward {i}"):
+                ops = self._stage.get_bwd_recv_ops(i)
+                works = pipe_schedules._sorted_batch_p2p(ops, desc="bwd_recv")
+                for work in works.values():
+                    work.wait()
+
+                loss = self._maybe_get_loss(self._stage, i)
+                self._stage.backward_one_chunk(i, loss=loss)
+
+                ops = self._stage.get_bwd_send_ops(i)
+                works = pipe_schedules._sorted_batch_p2p(ops, desc="bwd_send")
+                for work in works.values():
+                    work.wait()
+
+            pipe_schedules.logger.debug(f"[{self._stage.stage_index}] Backwarded microbatch {i}")  # noqa: G004
+
+        self._update_losses(self._stage, losses)
+
+try:  # pragma: no cover
     from safetensors import safe_open  # type: ignore
 except Exception:  # pragma: no cover
     safe_open = None
@@ -289,6 +357,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_train_logs": True,
                 "debug_module_logs": True,
                 "debug_p2p_logs": True,
+                "serialize_pp_p2p": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -343,6 +412,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_train_logs": True,
                 "debug_module_logs": True,
                 "debug_p2p_logs": True,
+                "serialize_pp_p2p": True,
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -981,6 +1051,7 @@ def main() -> None:
         vpp = int(pp_cfg.get("vpp") or 1)
         microbatches = int(pp_cfg.get("microbatches") or 4)
         schedule_name = str(pp_cfg.get("schedule") or "1f1b").lower()
+        serialize_pp_p2p = bool((cfg.get("runtime") or {}).get("serialize_pp_p2p", False))
         pp_stages = pp_cfg.get("stages")
         pp_auto_mem_gb = pp_cfg.get("auto_mem_gb")
         pp_auto_bias0 = float(pp_cfg.get("auto_bias_stage0", -0.08) or -0.08)
@@ -1247,7 +1318,10 @@ def main() -> None:
             if schedule_name == "gpipe":
                 if ScheduleGPipe is None:
                     raise RuntimeError("gpipe unavailable")
-                sched = ScheduleGPipe(
+                gpipe_cls = SafeScheduleGPipe if serialize_pp_p2p else ScheduleGPipe
+                if rank == 0 and serialize_pp_p2p:
+                    print("[warn] using SafeScheduleGPipe with per-microbatch P2P waits", flush=True)
+                sched = gpipe_cls(
                     stages[0],
                     microbatches,
                     loss_fn=loss_fn,
