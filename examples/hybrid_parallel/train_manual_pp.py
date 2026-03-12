@@ -796,6 +796,7 @@ class DenseCausalLMStage(nn.Module):
         self.stage_id = int(stage_id)
         self._forward_debug_calls = 0
         self._loss_debug_calls = 0
+        self._backward_hook_labels_seen: set[str] = set()
 
     def _debug_enabled(self) -> bool:
         return bool(self.debug_module_logs and self._forward_debug_calls == 0)
@@ -829,6 +830,24 @@ class DenseCausalLMStage(nn.Module):
             return out[0]
         return out
 
+    def _attach_backward_tensor_hook(self, tensor: torch.Tensor, label: str, *, enabled: bool) -> None:
+        if not enabled:
+            return
+        if not isinstance(tensor, torch.Tensor):
+            return
+        if not tensor.requires_grad:
+            return
+        key = str(label)
+        if key in self._backward_hook_labels_seen:
+            return
+        self._backward_hook_labels_seen.add(key)
+
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            self._log(f"backward grad {label} {self._describe_tensor(grad)}")
+            return grad
+
+        tensor.register_hook(_hook)
+
     def forward(self, *args):  # PipelineStage passes positional only
         debug_this_call = self._debug_enabled()
         if self.is_first:
@@ -841,10 +860,12 @@ class DenseCausalLMStage(nn.Module):
             hidden_states = hidden_states.contiguous()
             if debug_this_call:
                 self._log(f"after embed_tokens {self._describe_tensor(hidden_states)}")
+            self._attach_backward_tensor_hook(hidden_states, "after embed_tokens", enabled=debug_this_call)
         else:
             hidden_states = args[0].contiguous()
             if debug_this_call:
                 self._log(f"recv hidden_states {self._describe_tensor(hidden_states)}")
+            self._attach_backward_tensor_hook(hidden_states, "recv hidden_states", enabled=debug_this_call)
 
         bsz, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
         if seqlen != int(self.seq_len):
@@ -880,6 +901,11 @@ class DenseCausalLMStage(nn.Module):
                 hidden_states = self._run_layer(layer, hidden_states, attention_mask, position_ids, position_embeddings)
             if debug_this_call:
                 self._log(f"after layer local={layer_idx} global={global_layer_idx} {self._describe_tensor(hidden_states)}")
+            self._attach_backward_tensor_hook(
+                hidden_states,
+                f"after layer local={layer_idx} global={global_layer_idx}",
+                enabled=debug_this_call,
+            )
 
         if not self.is_last:
             hidden_states = hidden_states.contiguous()
@@ -894,6 +920,7 @@ class DenseCausalLMStage(nn.Module):
             hidden_states = self.model.norm(hidden_states)
             if debug_this_call:
                 self._log(f"after final norm {self._describe_tensor(hidden_states)}")
+            self._attach_backward_tensor_hook(hidden_states, "after final norm", enabled=debug_this_call)
         hidden_states = hidden_states.contiguous()
         if debug_this_call:
             self._log(f"forward return last-stage hidden_states {self._describe_tensor(hidden_states)}")
@@ -916,6 +943,7 @@ class DenseCausalLMStage(nn.Module):
         shift_labels = labels[:, 1:].contiguous()
         if hasattr(self.lm_head, "loss"):
             out = self.lm_head.loss(shift_hidden, shift_labels, ignore_index=-100)  # type: ignore[call-arg]
+            self._attach_backward_tensor_hook(out, "loss output", enabled=debug_this_call)
             if debug_this_call:
                 self._log(f"after compute_loss loss_shape={tuple(out.shape) if out.dim() else ()} dtype={out.dtype}")
                 self._loss_debug_calls += 1
@@ -928,6 +956,7 @@ class DenseCausalLMStage(nn.Module):
             shift_labels.view(-1),
             ignore_index=-100,
         )
+        self._attach_backward_tensor_hook(out, "loss output", enabled=debug_this_call)
         if debug_this_call:
             self._log(f"after compute_loss loss_shape={tuple(out.shape) if out.dim() else ()} dtype={out.dtype}")
             self._loss_debug_calls += 1
