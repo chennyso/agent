@@ -1153,6 +1153,7 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
     orig_get_bwd_recv_ops = getattr(stage, "get_bwd_recv_ops", None)
     orig_get_bwd_send_ops = getattr(stage, "get_bwd_send_ops", None)
     orig_forward_one_chunk = stage.forward_one_chunk
+    orig_backward_one_chunk = getattr(stage, "backward_one_chunk", None)
 
     def _rewrite_ops(ops: List[Any]) -> List[Any]:
         if p2p_mode == "original":
@@ -1219,12 +1220,20 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
     def get_bwd_recv_ops_wrapper(self, chunk_id: int):
         if orig_get_bwd_recv_ops is None:
             return []
-        return _rewrite_ops(orig_get_bwd_recv_ops(chunk_id))
+        ops = _rewrite_ops(orig_get_bwd_recv_ops(chunk_id))
+        if _should_log(f"bwd_recv_ops_{chunk_id}"):
+            _log(f"get_bwd_recv_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        _log_ops("BWD_RECV", chunk_id, ops)
+        return ops
 
     def get_bwd_send_ops_wrapper(self, chunk_id: int):
         if orig_get_bwd_send_ops is None:
             return []
-        return _rewrite_ops(orig_get_bwd_send_ops(chunk_id))
+        ops = _rewrite_ops(orig_get_bwd_send_ops(chunk_id))
+        if _should_log(f"bwd_send_ops_{chunk_id}"):
+            _log(f"get_bwd_send_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        _log_ops("BWD_SEND", chunk_id, ops)
+        return ops
 
     def forward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
         if _should_log(f"forward_enter_{chunk_id}"):
@@ -1238,6 +1247,14 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
             _log(f"forward_one_chunk exit chunk={chunk_id} out={desc}")
         return out
 
+    def backward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
+        if _should_log(f"backward_enter_{chunk_id}"):
+            _log(f"backward_one_chunk enter chunk={chunk_id}")
+        out = orig_backward_one_chunk(chunk_id, *args, **kwargs)
+        if _should_log(f"backward_exit_{chunk_id}"):
+            _log(f"backward_one_chunk exit chunk={chunk_id}")
+        return out
+
     stage.get_fwd_recv_ops = types.MethodType(get_fwd_recv_ops_wrapper, stage)
     stage.get_fwd_send_ops = types.MethodType(get_fwd_send_ops_wrapper, stage)
     if orig_get_bwd_recv_ops is not None:
@@ -1245,6 +1262,8 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
     if orig_get_bwd_send_ops is not None:
         stage.get_bwd_send_ops = types.MethodType(get_bwd_send_ops_wrapper, stage)
     stage.forward_one_chunk = types.MethodType(forward_one_chunk_wrapper, stage)
+    if orig_backward_one_chunk is not None:
+        stage.backward_one_chunk = types.MethodType(backward_one_chunk_wrapper, stage)
 
 
 def _make_synth_batch(vocab_size: int, seq_len: int, batch_size: int, *, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
