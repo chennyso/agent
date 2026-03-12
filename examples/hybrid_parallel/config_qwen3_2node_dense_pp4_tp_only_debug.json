@@ -1,0 +1,79 @@
+{
+  "model": {
+    "path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B",
+    "dtype": "bf16",
+    "seq_len": 512
+  },
+  "train": {
+    "seed": 42,
+    "steps": 20,
+    "warmup_steps": 2,
+    "global_batch_size": 8,
+    "grad_accum_steps": 1,
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "log_every": 1
+  },
+  "parallel": {
+    "pp": {
+      "degree": 4,
+      "vpp": 1,
+      "microbatches": 4,
+      "schedule": "gpipe",
+      "stages": [
+        [0, 9],
+        [10, 21],
+        [22, 41],
+        [42, 63]
+      ]
+    },
+    "tp": {
+      "enabled": true,
+      "degree": 2
+    },
+    "sp": {
+      "enabled": false
+    },
+    "fsdp2": {
+      "enabled": false,
+      "param_dtype": "bf16",
+      "reduce_dtype": "bf16",
+      "reshard_after_forward": false,
+      "reshard_after_forward_per_stage": [false, false, false, false]
+    },
+    "recompute": {
+      "policy": "none",
+      "per_stage": ["none", "none", "none", "none"]
+    }
+  },
+  "runtime": {
+    "cuda_alloc_conf": "expandable_segments:True",
+    "dist_timeout_seconds": 3600,
+    "debug_init_logs": true,
+    "debug_train_logs": true,
+    "debug_module_logs": true,
+    "debug_module_forward_limit": 4,
+    "debug_module_loss_limit": 4,
+    "debug_tp_loss_logs": true,
+    "debug_p2p_logs": true,
+    "serialize_pp_p2p": true,
+    "pp_p2p_mode": "subgroup_group_peer"
+  },
+  "mfu": {
+    "peak_tflops_total": 0.0,
+    "flops_per_param_per_token": 6.0
+  },
+  "profile": {
+    "enabled": false,
+    "rank": 0,
+    "trace_dir": "tb_traces",
+    "wait": 1,
+    "warmup": 1,
+    "active": 3,
+    "repeat": 1,
+    "record_shapes": true,
+    "profile_memory": true,
+    "with_stack": false
+  }
+}
