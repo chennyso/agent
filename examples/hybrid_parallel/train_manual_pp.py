@@ -288,15 +288,39 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
             with pipe_schedules.record_function(f"Forward {i}"):
                 ops = [] if self._stage.is_first else self._stage.get_fwd_recv_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="fwd_recv")
-                for work in works.values():
+                for work_idx, work in works.items():
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"fwd_recv chunk={i} wait_start idx={work_idx}",
+                            flush=True,
+                        )
                     work.wait()
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"fwd_recv chunk={i} wait_done idx={work_idx}",
+                            flush=True,
+                        )
 
                 output = self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
 
                 ops = self._stage.get_fwd_send_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="fwd_send")
-                for work in works.values():
+                for work_idx, work in works.items():
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"fwd_send chunk={i} wait_start idx={work_idx}",
+                            flush=True,
+                        )
                     work.wait()
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"fwd_send chunk={i} wait_done idx={work_idx}",
+                            flush=True,
+                        )
 
             pipe_schedules.logger.debug(f"[{self._stage.stage_index}] Forwarded microbatch {i}")  # noqa: G004
             self._maybe_compute_loss(self._stage, output, target_mbs, i)
@@ -308,16 +332,40 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
             with pipe_schedules.record_function(f"Backward {i}"):
                 ops = [] if self._stage.is_last else self._stage.get_bwd_recv_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="bwd_recv")
-                for work in works.values():
+                for work_idx, work in works.items():
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"bwd_recv chunk={i} wait_start idx={work_idx}",
+                            flush=True,
+                        )
                     work.wait()
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"bwd_recv chunk={i} wait_done idx={work_idx}",
+                            flush=True,
+                        )
 
                 loss = self._maybe_get_loss(self._stage, i)
                 self._stage.backward_one_chunk(i, loss=loss)
 
                 ops = self._stage.get_bwd_send_ops(i)
                 works = pipe_schedules._sorted_batch_p2p(ops, desc="bwd_send")
-                for work in works.values():
+                for work_idx, work in works.items():
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"bwd_send chunk={i} wait_start idx={work_idx}",
+                            flush=True,
+                        )
                     work.wait()
+                    if getattr(self._stage, "_agent_runtime_debug_enabled", False):
+                        print(
+                            f"[p2p-wait][rank {dist.get_rank()}][stage {self._stage.stage_index}] "
+                            f"bwd_send chunk={i} wait_done idx={work_idx}",
+                            flush=True,
+                        )
 
             pipe_schedules.logger.debug(f"[{self._stage.stage_index}] Backwarded microbatch {i}")  # noqa: G004
 
@@ -1006,6 +1054,24 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None
     def _log(msg: str) -> None:
         print(f"[p2p-debug][rank {rank}][stage {stage.stage_index}] {msg}", flush=True)
 
+    def _tensor_meta(t: Any) -> str:
+        if not isinstance(t, torch.Tensor):
+            return f"type={type(t).__name__}"
+        shape = tuple(int(x) for x in t.shape)
+        return f"shape={shape} dtype={t.dtype} device={t.device}"
+
+    def _log_ops(kind: str, chunk_id: int, ops: List[Any]) -> None:
+        if not _should_log(f"{kind}_detail_{chunk_id}"):
+            return
+        for op_idx, op in enumerate(ops):
+            peer = getattr(op, "peer", None)
+            tensor = getattr(op, "tensor", None)
+            group = getattr(op, "group", None)
+            group_id = None if group is None else id(group)
+            _log(
+                f"{kind}[{op_idx}] chunk={chunk_id} peer={peer} tensor={_tensor_meta(tensor)} group_id={group_id}"
+            )
+
     orig_get_fwd_recv_ops = stage.get_fwd_recv_ops
     orig_get_fwd_send_ops = stage.get_fwd_send_ops
     orig_forward_one_chunk = stage.forward_one_chunk
@@ -1014,12 +1080,14 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None
         ops = orig_get_fwd_recv_ops(chunk_id)
         if _should_log(f"recv_ops_{chunk_id}"):
             _log(f"get_fwd_recv_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        _log_ops("RECV", chunk_id, ops)
         return ops
 
     def get_fwd_send_ops_wrapper(self, chunk_id: int):
         ops = orig_get_fwd_send_ops(chunk_id)
         if _should_log(f"send_ops_{chunk_id}"):
             _log(f"get_fwd_send_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
+        _log_ops("SEND", chunk_id, ops)
         return ops
 
     def forward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
