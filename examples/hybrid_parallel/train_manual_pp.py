@@ -796,13 +796,15 @@ class DenseCausalLMStage(nn.Module):
         self.stage_id = int(stage_id)
         self._forward_debug_calls = 0
         self._loss_debug_calls = 0
+        self._forward_debug_limit = 2
+        self._loss_debug_limit = 2
         self._backward_hook_labels_seen: set[str] = set()
         self._backward_module_hook_labels_seen: set[str] = set()
         if self.debug_module_logs:
             self._register_module_backward_hooks()
 
     def _debug_enabled(self) -> bool:
-        return bool(self.debug_module_logs and self._forward_debug_calls == 0)
+        return bool(self.debug_module_logs and self._forward_debug_calls < self._forward_debug_limit)
 
     def _log(self, msg: str) -> None:
         print(f"[module-debug][rank {self.debug_rank}][stage {self.stage_id}] {msg}", flush=True)
@@ -964,7 +966,7 @@ class DenseCausalLMStage(nn.Module):
     def compute_loss(self, hidden_states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.lm_head is None:
             raise RuntimeError("last stage missing lm_head")
-        debug_this_call = bool(self.debug_module_logs and self._loss_debug_calls == 0)
+        debug_this_call = bool(self.debug_module_logs and self._loss_debug_calls < self._loss_debug_limit)
         if debug_this_call:
             self._log(
                 "before compute_loss "
