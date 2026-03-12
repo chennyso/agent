@@ -234,12 +234,19 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
         kwarg_mbs: Optional[List] = None,
     ) -> None:
         stage = self._stage
-        prepare_args = tuple(stage.inputs)
+        template_args = getattr(stage, "_agent_input_args_template", None)
+        template_kwargs = getattr(stage, "_agent_input_kwargs_template", None)
+        if template_args is None:
+            raise RuntimeError("stage missing _agent_input_args_template; stage construction is incomplete")
+
+        prepare_args = tuple(template_args)
         prepare_kwargs: Dict[str, Any] = {}
         if stage.is_first and arg_mbs and len(arg_mbs) > 0 and arg_mbs[0]:
             prepare_args = arg_mbs[0]
         if stage.is_first and kwarg_mbs and len(kwarg_mbs) > 0 and kwarg_mbs[0]:
             prepare_kwargs = kwarg_mbs[0]
+        elif isinstance(template_kwargs, dict):
+            prepare_kwargs = dict(template_kwargs)
 
         needs_fwd_init = any(chunk_id not in stage.args_recv_info for chunk_id in range(self._n_microbatches))
         if needs_fwd_init:
@@ -1318,6 +1325,8 @@ def main() -> None:
                 output_args=out_args,
                 group=pp_group,
             )
+            stage._agent_input_args_template = (dummy_ids,) if is_first else (dummy_hs,)
+            stage._agent_input_kwargs_template = {}
             _enable_stage_runtime_debug(stage, rank=rank, enabled=debug_p2p_logs)
             if debug_init_logs:
                 print(
