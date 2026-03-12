@@ -450,6 +450,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_module_logs": True,
                 "debug_p2p_logs": True,
                 "serialize_pp_p2p": True,
+                "pp_p2p_mode": "subgroup_group_peer",
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -505,6 +506,7 @@ def _load_cfg(path: str) -> Dict[str, Any]:
                 "debug_module_logs": True,
                 "debug_p2p_logs": True,
                 "serialize_pp_p2p": True,
+                "pp_p2p_mode": "subgroup_group_peer",
             },
             "mfu": {"peak_tflops_total": 0.0, "flops_per_param_per_token": 6.0},
             "profile": {
@@ -1036,8 +1038,11 @@ def _apply_fsdp2(module: DenseCausalLMStage, dp_mesh: DeviceMesh, *, param_dtype
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
 
 
-def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, use_default_group_for_p2p: bool = False) -> None:
-    if not enabled and not use_default_group_for_p2p:
+def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mode: str = "original") -> None:
+    p2p_mode = str(p2p_mode or "original").lower()
+    if p2p_mode not in {"original", "default_group", "subgroup_group_peer"}:
+        raise ValueError(f"unsupported p2p_mode: {p2p_mode}")
+    if not enabled and p2p_mode == "original":
         return
     if getattr(stage, "_agent_runtime_debug_enabled", False):
         return
@@ -1088,31 +1093,63 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, use_def
     orig_get_bwd_send_ops = getattr(stage, "get_bwd_send_ops", None)
     orig_forward_one_chunk = stage.forward_one_chunk
 
-    def _remap_ops_to_default_group(ops: List[Any]) -> List[Any]:
-        if not use_default_group_for_p2p:
+    def _rewrite_ops(ops: List[Any]) -> List[Any]:
+        if p2p_mode == "original":
             return ops
-        remapped: List[Any] = []
+        supports_group_peer = "group_peer" in inspect.signature(dist.P2POp).parameters
+        rewritten: List[Any] = []
         for op in ops:
-            remapped.append(
+            op_fn = getattr(op, "op")
+            tensor = getattr(op, "tensor")
+            peer_global = int(getattr(op, "peer"))
+            group = getattr(op, "group", None)
+            tag = int(getattr(op, "tag", 0))
+            if p2p_mode == "default_group" or group is None:
+                rewritten.append(
+                    dist.P2POp(
+                        op_fn,
+                        tensor,
+                        peer_global,
+                        group=None,
+                        tag=tag,
+                    )
+                )
+                continue
+
+            if p2p_mode == "subgroup_group_peer" and supports_group_peer:
+                group_ranks = dist.get_process_group_ranks(group)
+                peer_in_group = int(group_ranks.index(peer_global))
+                rewritten.append(
+                    dist.P2POp(
+                        op=op_fn,
+                        tensor=tensor,
+                        group=group,
+                        group_peer=peer_in_group,
+                        tag=tag,
+                    )
+                )
+                continue
+
+            rewritten.append(
                 dist.P2POp(
-                    getattr(op, "op"),
-                    getattr(op, "tensor"),
-                    int(getattr(op, "peer")),
+                    op_fn,
+                    tensor,
+                    peer_global,
                     group=None,
-                    tag=int(getattr(op, "tag", 0)),
+                    tag=tag,
                 )
             )
-        return remapped
+        return rewritten
 
     def get_fwd_recv_ops_wrapper(self, chunk_id: int):
-        ops = _remap_ops_to_default_group(orig_get_fwd_recv_ops(chunk_id))
+        ops = _rewrite_ops(orig_get_fwd_recv_ops(chunk_id))
         if _should_log(f"recv_ops_{chunk_id}"):
             _log(f"get_fwd_recv_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
         _log_ops("RECV", chunk_id, ops)
         return ops
 
     def get_fwd_send_ops_wrapper(self, chunk_id: int):
-        ops = _remap_ops_to_default_group(orig_get_fwd_send_ops(chunk_id))
+        ops = _rewrite_ops(orig_get_fwd_send_ops(chunk_id))
         if _should_log(f"send_ops_{chunk_id}"):
             _log(f"get_fwd_send_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
         _log_ops("SEND", chunk_id, ops)
@@ -1121,12 +1158,12 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, use_def
     def get_bwd_recv_ops_wrapper(self, chunk_id: int):
         if orig_get_bwd_recv_ops is None:
             return []
-        return _remap_ops_to_default_group(orig_get_bwd_recv_ops(chunk_id))
+        return _rewrite_ops(orig_get_bwd_recv_ops(chunk_id))
 
     def get_bwd_send_ops_wrapper(self, chunk_id: int):
         if orig_get_bwd_send_ops is None:
             return []
-        return _remap_ops_to_default_group(orig_get_bwd_send_ops(chunk_id))
+        return _rewrite_ops(orig_get_bwd_send_ops(chunk_id))
 
     def forward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
         if _should_log(f"forward_enter_{chunk_id}"):
@@ -1169,7 +1206,13 @@ def main() -> None:
     debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
     debug_module_logs = bool((cfg.get("runtime") or {}).get("debug_module_logs", True))
     debug_p2p_logs = bool((cfg.get("runtime") or {}).get("debug_p2p_logs", True))
-    pp_use_default_group_for_p2p = bool((cfg.get("runtime") or {}).get("pp_use_default_group_for_p2p", True))
+    runtime_cfg = cfg.get("runtime") or {}
+    if "pp_p2p_mode" in runtime_cfg:
+        pp_p2p_mode = str(runtime_cfg.get("pp_p2p_mode") or "subgroup_group_peer").strip()
+    elif "pp_use_default_group_for_p2p" in runtime_cfg:
+        pp_p2p_mode = "default_group" if bool(runtime_cfg.get("pp_use_default_group_for_p2p")) else "original"
+    else:
+        pp_p2p_mode = "subgroup_group_peer"
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
@@ -1442,7 +1485,7 @@ def main() -> None:
                 stage,
                 rank=rank,
                 enabled=debug_p2p_logs,
-                use_default_group_for_p2p=pp_use_default_group_for_p2p,
+                p2p_mode=pp_p2p_mode,
             )
             if debug_init_logs:
                 print(
