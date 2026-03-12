@@ -228,16 +228,39 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
     This reduces overlap between PP p2p traffic and subsequent TP/FSDP collectives.
     """
 
-    def _ensure_stage_runtime_infra(self) -> None:
+    def _ensure_stage_runtime_infra(
+        self,
+        arg_mbs: Optional[List] = None,
+        kwarg_mbs: Optional[List] = None,
+    ) -> None:
         stage = self._stage
+        prepare_args = tuple(stage.inputs)
+        prepare_kwargs: Dict[str, Any] = {}
+        if stage.is_first and arg_mbs and len(arg_mbs) > 0 and arg_mbs[0]:
+            prepare_args = arg_mbs[0]
+        if stage.is_first and kwarg_mbs and len(kwarg_mbs) > 0 and kwarg_mbs[0]:
+            prepare_kwargs = kwarg_mbs[0]
+
         needs_fwd_init = any(chunk_id not in stage.args_recv_info for chunk_id in range(self._n_microbatches))
         if needs_fwd_init:
-            stage._prepare_forward_infra(self._n_microbatches)
+            fwd_params = list(inspect.signature(stage._prepare_forward_infra).parameters)
+            if len(fwd_params) <= 1:
+                stage._prepare_forward_infra(self._n_microbatches)
+            elif len(fwd_params) == 2:
+                stage._prepare_forward_infra(self._n_microbatches, prepare_args)
+            else:
+                stage._prepare_forward_infra(self._n_microbatches, prepare_args, prepare_kwargs)
 
         if self._has_backward:
             needs_bwd_init = any(chunk_id not in stage.grad_recv_info for chunk_id in range(self._n_microbatches))
             if needs_bwd_init:
-                stage._prepare_backward_infra(self._n_microbatches)
+                bwd_params = list(inspect.signature(stage._prepare_backward_infra).parameters)
+                if len(bwd_params) <= 1:
+                    stage._prepare_backward_infra(self._n_microbatches)
+                elif len(bwd_params) == 2:
+                    stage._prepare_backward_infra(self._n_microbatches, prepare_args)
+                else:
+                    stage._prepare_backward_infra(self._n_microbatches, prepare_args, prepare_kwargs)
 
     def _step_microbatches(  # type: ignore[override]
         self,
@@ -252,7 +275,7 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
             raise RuntimeError("torch.distributed.pipelining.schedules unavailable")
 
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-        self._ensure_stage_runtime_infra()
+        self._ensure_stage_runtime_infra(arg_mbs, kwarg_mbs)
 
         for i in range(self._n_microbatches):
             with pipe_schedules.record_function(f"Forward {i}"):
