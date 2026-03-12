@@ -1036,12 +1036,12 @@ def _apply_fsdp2(module: DenseCausalLMStage, dp_mesh: DeviceMesh, *, param_dtype
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=bool(reshard_after_forward))
 
 
-def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None:
-    if not enabled:
+def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, use_default_group_for_p2p: bool = False) -> None:
+    if not enabled and not use_default_group_for_p2p:
         return
     if getattr(stage, "_agent_runtime_debug_enabled", False):
         return
-    stage._agent_runtime_debug_enabled = True
+    stage._agent_runtime_debug_enabled = bool(enabled)
     stage._agent_runtime_debug_seen = set()
 
     def _should_log(key: str) -> bool:
@@ -1084,21 +1084,49 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None
 
     orig_get_fwd_recv_ops = stage.get_fwd_recv_ops
     orig_get_fwd_send_ops = stage.get_fwd_send_ops
+    orig_get_bwd_recv_ops = getattr(stage, "get_bwd_recv_ops", None)
+    orig_get_bwd_send_ops = getattr(stage, "get_bwd_send_ops", None)
     orig_forward_one_chunk = stage.forward_one_chunk
 
+    def _remap_ops_to_default_group(ops: List[Any]) -> List[Any]:
+        if not use_default_group_for_p2p:
+            return ops
+        remapped: List[Any] = []
+        for op in ops:
+            remapped.append(
+                dist.P2POp(
+                    getattr(op, "op"),
+                    getattr(op, "tensor"),
+                    int(getattr(op, "peer")),
+                    group=None,
+                    tag=int(getattr(op, "tag", 0)),
+                )
+            )
+        return remapped
+
     def get_fwd_recv_ops_wrapper(self, chunk_id: int):
-        ops = orig_get_fwd_recv_ops(chunk_id)
+        ops = _remap_ops_to_default_group(orig_get_fwd_recv_ops(chunk_id))
         if _should_log(f"recv_ops_{chunk_id}"):
             _log(f"get_fwd_recv_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
         _log_ops("RECV", chunk_id, ops)
         return ops
 
     def get_fwd_send_ops_wrapper(self, chunk_id: int):
-        ops = orig_get_fwd_send_ops(chunk_id)
+        ops = _remap_ops_to_default_group(orig_get_fwd_send_ops(chunk_id))
         if _should_log(f"send_ops_{chunk_id}"):
             _log(f"get_fwd_send_ops chunk={chunk_id} num_ops={len(ops)} is_first={self.is_first} is_last={self.is_last}")
         _log_ops("SEND", chunk_id, ops)
         return ops
+
+    def get_bwd_recv_ops_wrapper(self, chunk_id: int):
+        if orig_get_bwd_recv_ops is None:
+            return []
+        return _remap_ops_to_default_group(orig_get_bwd_recv_ops(chunk_id))
+
+    def get_bwd_send_ops_wrapper(self, chunk_id: int):
+        if orig_get_bwd_send_ops is None:
+            return []
+        return _remap_ops_to_default_group(orig_get_bwd_send_ops(chunk_id))
 
     def forward_one_chunk_wrapper(self, chunk_id: int, *args, **kwargs):
         if _should_log(f"forward_enter_{chunk_id}"):
@@ -1114,6 +1142,10 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None
 
     stage.get_fwd_recv_ops = types.MethodType(get_fwd_recv_ops_wrapper, stage)
     stage.get_fwd_send_ops = types.MethodType(get_fwd_send_ops_wrapper, stage)
+    if orig_get_bwd_recv_ops is not None:
+        stage.get_bwd_recv_ops = types.MethodType(get_bwd_recv_ops_wrapper, stage)
+    if orig_get_bwd_send_ops is not None:
+        stage.get_bwd_send_ops = types.MethodType(get_bwd_send_ops_wrapper, stage)
     stage.forward_one_chunk = types.MethodType(forward_one_chunk_wrapper, stage)
 
 
@@ -1137,6 +1169,7 @@ def main() -> None:
     debug_init_logs = bool((cfg.get("runtime") or {}).get("debug_init_logs", True))
     debug_module_logs = bool((cfg.get("runtime") or {}).get("debug_module_logs", True))
     debug_p2p_logs = bool((cfg.get("runtime") or {}).get("debug_p2p_logs", True))
+    pp_use_default_group_for_p2p = bool((cfg.get("runtime") or {}).get("pp_use_default_group_for_p2p", True))
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
@@ -1405,7 +1438,12 @@ def main() -> None:
             )
             stage._agent_input_args_template = (dummy_ids,) if is_first else (dummy_hs,)
             stage._agent_input_kwargs_template = {}
-            _enable_stage_runtime_debug(stage, rank=rank, enabled=debug_p2p_logs)
+            _enable_stage_runtime_debug(
+                stage,
+                rank=rank,
+                enabled=debug_p2p_logs,
+                use_default_group_for_p2p=pp_use_default_group_for_p2p,
+            )
             if debug_init_logs:
                 print(
                     f"[init][rank {rank}] stage ready stage_id={stage_id} elapsed={time.time() - stage_t0:.1f}s",
