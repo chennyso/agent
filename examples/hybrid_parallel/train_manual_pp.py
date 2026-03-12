@@ -211,7 +211,16 @@ class VocabParallelLMHead(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.partition_vocab_size, int(hidden_size)), device="meta"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden_states, self.weight)
+        _tp_loss_log(
+            f"lm_head.forward enter hidden={tuple(hidden_states.shape)} weight={tuple(self.weight.shape)} hidden_dtype={hidden_states.dtype} weight_dtype={self.weight.dtype}",
+            group=self.tp_group,
+        )
+        out = F.linear(hidden_states, self.weight)
+        _tp_loss_log(
+            f"lm_head.forward exit logits={tuple(out.shape)} dtype={out.dtype}",
+            group=self.tp_group,
+        )
+        return out
 
     def loss(self, hidden_states: torch.Tensor, labels: torch.Tensor, *, ignore_index: int = -100) -> torch.Tensor:
         _tp_loss_log(
