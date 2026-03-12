@@ -1068,8 +1068,18 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool) -> None
             tensor = getattr(op, "tensor", None)
             group = getattr(op, "group", None)
             group_id = None if group is None else id(group)
+            group_ranks = None
+            group_rank = None
+            if group is not None and hasattr(dist, "get_process_group_ranks"):
+                try:
+                    group_ranks = dist.get_process_group_ranks(group)
+                    group_rank = dist.get_rank(group)
+                except Exception:
+                    group_ranks = None
+                    group_rank = None
             _log(
-                f"{kind}[{op_idx}] chunk={chunk_id} peer={peer} tensor={_tensor_meta(tensor)} group_id={group_id}"
+                f"{kind}[{op_idx}] chunk={chunk_id} peer={peer} tensor={_tensor_meta(tensor)} "
+                f"group_id={group_id} group_rank={group_rank} group_ranks={group_ranks}"
             )
 
     orig_get_fwd_recv_ops = stage.get_fwd_recv_ops
@@ -1470,6 +1480,7 @@ def main() -> None:
         profile_active = int(profile_cfg.get("active", 3))
         profile_repeat = int(profile_cfg.get("repeat", 1))
         debug_train_logs = bool((cfg.get("runtime") or {}).get("debug_train_logs", True))
+        warmup_pp_group_collective = bool((cfg.get("runtime") or {}).get("warmup_pp_group_collective", True))
 
         eff_global_bsz = int(dp_degree) * int(per_dp_batch)
         flops_per_param_per_token = float(mfu_cfg.get("flops_per_param_per_token", 6.0))
@@ -1525,6 +1536,14 @@ def main() -> None:
         dist.barrier()
         if debug_init_logs:
             print(f"[init][rank {rank}] passed pre-train barrier", flush=True)
+        if warmup_pp_group_collective:
+            if debug_init_logs:
+                print(f"[init][rank {rank}] warming up pp_group collective", flush=True)
+            pp_warm = torch.zeros(1, device=device, dtype=torch.float32)
+            dist.all_reduce(pp_warm, group=pp_group)
+            torch.cuda.synchronize(device)
+            if debug_init_logs:
+                print(f"[init][rank {rank}] warmed up pp_group collective", flush=True)
         if is_log_rank:
             print(f"[stats] model_params={model_params:,}", flush=True)
 

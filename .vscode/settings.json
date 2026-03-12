@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "E:/python/Agent/pytorch"
+    "cmake.sourceDirectory": "E:/python/Agent/pytorch",
+    "chatgpt.openOnStartup": false
 }
