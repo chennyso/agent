@@ -1525,9 +1525,15 @@ def main() -> None:
             if schedule_name == "gpipe":
                 if ScheduleGPipe is None:
                     raise RuntimeError("gpipe unavailable")
-                gpipe_cls = SafeScheduleGPipe if serialize_pp_p2p else ScheduleGPipe
-                if rank == 0 and serialize_pp_p2p:
+                use_safe_gpipe = bool(serialize_pp_p2p and pp_p2p_mode != "subgroup_group_peer")
+                gpipe_cls = SafeScheduleGPipe if use_safe_gpipe else ScheduleGPipe
+                if rank == 0 and use_safe_gpipe:
                     print("[warn] using SafeScheduleGPipe with per-microbatch P2P waits", flush=True)
+                if rank == 0 and serialize_pp_p2p and pp_p2p_mode == "subgroup_group_peer":
+                    print(
+                        "[warn] disabling SafeScheduleGPipe for subgroup_group_peer mode; using upstream ScheduleGPipe",
+                        flush=True,
+                    )
                 sched = gpipe_cls(
                     stages[0],
                     microbatches,
