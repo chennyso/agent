@@ -273,6 +273,11 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     pipe_schedules = None  # type: ignore[assignment]
 
+try:  # pragma: no cover
+    import torch.distributed.pipelining.stage as pipe_stage_module
+except Exception:  # pragma: no cover
+    pipe_stage_module = None  # type: ignore[assignment]
+
 
 class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):  # type: ignore[misc]
     """
@@ -1190,6 +1195,36 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
             return f"type={type(t).__name__}"
         shape = tuple(int(x) for x in t.shape)
         return f"shape={shape} dtype={t.dtype} device={t.device}"
+
+    def _map_meta(val: Any) -> str:
+        if torch.is_tensor(val):
+            return _tensor_meta(val)
+        if isinstance(val, (tuple, list)):
+            return "[" + ", ".join(_map_meta(x) for x in val) + "]"
+        if isinstance(val, dict):
+            return "{" + ", ".join(f"{k}: {_map_meta(v)}" for k, v in val.items()) + "}"
+        return f"type={type(val).__name__}"
+
+    if pipe_stage_module is not None and not getattr(pipe_stage_module, "_agent_stage_backward_debug_wrapped", False):
+        orig_stage_backward = pipe_stage_module.stage_backward
+
+        def _stage_backward_debug(stage_output, output_grads, input_values, outputs_with_grads_idxs=None):
+            print(
+                f"[p2p-debug][rank {rank}][stage {stage.stage_index}] "
+                f"stage_backward enter stage_output={_map_meta(stage_output)} "
+                f"output_grads={_map_meta(output_grads)} input_values={_map_meta(input_values)}",
+                flush=True,
+            )
+            out = orig_stage_backward(stage_output, output_grads, input_values, outputs_with_grads_idxs)
+            print(
+                f"[p2p-debug][rank {rank}][stage {stage.stage_index}] "
+                f"stage_backward exit grad_inputs={_map_meta(out)}",
+                flush=True,
+            )
+            return out
+
+        pipe_stage_module.stage_backward = _stage_backward_debug
+        pipe_stage_module._agent_stage_backward_debug_wrapped = True
 
     def _log_ops(kind: str, chunk_id: int, ops: List[Any]) -> None:
         if not _should_log(f"{kind}_detail_{chunk_id}"):
