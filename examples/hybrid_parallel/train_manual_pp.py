@@ -234,6 +234,8 @@ class SafeScheduleGPipe(ScheduleGPipe if ScheduleGPipe is not None else object):
         kwarg_mbs: Optional[List] = None,
         target_mbs: Optional[List] = None,
         losses: Optional[List] = None,
+        *extra_args,
+        **extra_kwargs,
     ):
         if pipe_schedules is None:
             raise RuntimeError("torch.distributed.pipelining.schedules unavailable")
