@@ -37,7 +37,7 @@
     },
     "fsdp2": {
       "enabled": true,
-      "enabled_per_stage": [true, false, false, true],
+      "enabled_per_stage": [true, false, false, false],
       "param_dtype": "bf16",
       "reduce_dtype": "bf16",
       "reshard_after_forward": false,
