@@ -1070,6 +1070,7 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
             return
         for op_idx, op in enumerate(ops):
             peer = getattr(op, "peer", None)
+            group_peer = getattr(op, "group_peer", None)
             tensor = getattr(op, "tensor", None)
             group = getattr(op, "group", None)
             group_id = None if group is None else id(group)
@@ -1083,7 +1084,8 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
                     group_ranks = None
                     group_rank = None
             _log(
-                f"{kind}[{op_idx}] chunk={chunk_id} peer={peer} tensor={_tensor_meta(tensor)} "
+                f"{kind}[{op_idx}] chunk={chunk_id} peer={peer} group_peer={group_peer} "
+                f"tensor={_tensor_meta(tensor)} "
                 f"group_id={group_id} group_rank={group_rank} group_ranks={group_ranks}"
             )
 
