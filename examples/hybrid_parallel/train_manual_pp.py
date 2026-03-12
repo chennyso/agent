@@ -782,6 +782,8 @@ class DenseCausalLMStage(nn.Module):
         debug_module_logs: bool,
         debug_rank: int,
         stage_id: int,
+        forward_debug_limit: int,
+        loss_debug_limit: int,
     ) -> None:
         super().__init__()
         self.model = backbone
@@ -796,8 +798,8 @@ class DenseCausalLMStage(nn.Module):
         self.stage_id = int(stage_id)
         self._forward_debug_calls = 0
         self._loss_debug_calls = 0
-        self._forward_debug_limit = 2
-        self._loss_debug_limit = 2
+        self._forward_debug_limit = max(1, int(forward_debug_limit))
+        self._loss_debug_limit = max(1, int(loss_debug_limit))
         self._backward_hook_labels_seen: set[str] = set()
         self._backward_module_hook_labels_seen: set[str] = set()
         if self.debug_module_logs:
@@ -1217,6 +1219,10 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
     orig_get_fwd_send_ops = stage.get_fwd_send_ops
     orig_get_bwd_recv_ops = getattr(stage, "get_bwd_recv_ops", None)
     orig_get_bwd_send_ops = getattr(stage, "get_bwd_send_ops", None)
+    orig_retrieve_recv_activations = getattr(stage, "_retrieve_recv_activations", None)
+    orig_retrieve_recv_grads = getattr(stage, "_retrieve_recv_grads", None)
+    orig_forward_maybe_with_nosync = getattr(stage, "forward_maybe_with_nosync", None)
+    orig_backward_maybe_with_nosync = getattr(stage, "backward_maybe_with_nosync", None)
     orig_forward_one_chunk = stage.forward_one_chunk
     orig_backward_one_chunk = getattr(stage, "backward_one_chunk", None)
 
@@ -1320,12 +1326,56 @@ def _enable_stage_runtime_debug(stage: Any, *, rank: int, enabled: bool, p2p_mod
             _log(f"backward_one_chunk exit chunk={chunk_id}")
         return out
 
+    def retrieve_recv_activations_wrapper(self, chunk_id: int):
+        if _should_log(f"retrieve_recv_activations_enter_{chunk_id}"):
+            _log(f"_retrieve_recv_activations enter chunk={chunk_id}")
+        out = orig_retrieve_recv_activations(chunk_id)
+        if _should_log(f"retrieve_recv_activations_exit_{chunk_id}"):
+            desc = map_debug_info(out) if "map_debug_info" in globals() else type(out).__name__
+            _log(f"_retrieve_recv_activations exit chunk={chunk_id} out={desc}")
+        return out
+
+    def retrieve_recv_grads_wrapper(self, chunk_id: int):
+        if _should_log(f"retrieve_recv_grads_enter_{chunk_id}"):
+            _log(f"_retrieve_recv_grads enter chunk={chunk_id}")
+        out = orig_retrieve_recv_grads(chunk_id)
+        if _should_log(f"retrieve_recv_grads_exit_{chunk_id}"):
+            desc = map_debug_info(out) if "map_debug_info" in globals() else type(out).__name__
+            _log(f"_retrieve_recv_grads exit chunk={chunk_id} out={desc}")
+        return out
+
+    def forward_maybe_with_nosync_wrapper(self, *args, **kwargs):
+        chunk_id = getattr(self, "fwd_chunk_id", None)
+        if _should_log(f"forward_maybe_with_nosync_enter_{chunk_id}"):
+            _log(f"forward_maybe_with_nosync enter chunk={chunk_id}")
+        out = orig_forward_maybe_with_nosync(*args, **kwargs)
+        if _should_log(f"forward_maybe_with_nosync_exit_{chunk_id}"):
+            _log(f"forward_maybe_with_nosync exit chunk={chunk_id}")
+        return out
+
+    def backward_maybe_with_nosync_wrapper(self, kwargs):
+        chunk_id = getattr(self, "bwd_chunk_id", None)
+        if _should_log(f"backward_maybe_with_nosync_enter_{chunk_id}"):
+            _log(f"backward_maybe_with_nosync enter chunk={chunk_id}")
+        out = orig_backward_maybe_with_nosync(kwargs)
+        if _should_log(f"backward_maybe_with_nosync_exit_{chunk_id}"):
+            _log(f"backward_maybe_with_nosync exit chunk={chunk_id}")
+        return out
+
     stage.get_fwd_recv_ops = types.MethodType(get_fwd_recv_ops_wrapper, stage)
     stage.get_fwd_send_ops = types.MethodType(get_fwd_send_ops_wrapper, stage)
     if orig_get_bwd_recv_ops is not None:
         stage.get_bwd_recv_ops = types.MethodType(get_bwd_recv_ops_wrapper, stage)
     if orig_get_bwd_send_ops is not None:
         stage.get_bwd_send_ops = types.MethodType(get_bwd_send_ops_wrapper, stage)
+    if orig_retrieve_recv_activations is not None:
+        stage._retrieve_recv_activations = types.MethodType(retrieve_recv_activations_wrapper, stage)
+    if orig_retrieve_recv_grads is not None:
+        stage._retrieve_recv_grads = types.MethodType(retrieve_recv_grads_wrapper, stage)
+    if orig_forward_maybe_with_nosync is not None:
+        stage.forward_maybe_with_nosync = types.MethodType(forward_maybe_with_nosync_wrapper, stage)
+    if orig_backward_maybe_with_nosync is not None:
+        stage.backward_maybe_with_nosync = types.MethodType(backward_maybe_with_nosync_wrapper, stage)
     stage.forward_one_chunk = types.MethodType(forward_one_chunk_wrapper, stage)
     if orig_backward_one_chunk is not None:
         stage.backward_one_chunk = types.MethodType(backward_one_chunk_wrapper, stage)
@@ -1355,6 +1405,8 @@ def main() -> None:
     debug_p2p_logs = bool((cfg.get("runtime") or {}).get("debug_p2p_logs", True))
     _DEBUG_TP_LOSS = bool((cfg.get("runtime") or {}).get("debug_tp_loss_logs", True))
     runtime_cfg = cfg.get("runtime") or {}
+    forward_debug_limit = int(runtime_cfg.get("debug_module_forward_limit", 4) or 4)
+    loss_debug_limit = int(runtime_cfg.get("debug_module_loss_limit", 4) or 4)
     if "pp_p2p_mode" in runtime_cfg:
         pp_p2p_mode = str(runtime_cfg.get("pp_p2p_mode") or "subgroup_group_peer").strip()
     elif "pp_use_default_group_for_p2p" in runtime_cfg:
@@ -1603,6 +1655,8 @@ def main() -> None:
                 debug_module_logs=debug_module_logs,
                 debug_rank=rank,
                 stage_id=int(stage_id),
+                forward_debug_limit=forward_debug_limit,
+                loss_debug_limit=loss_debug_limit,
             )
             if debug_init_logs:
                 print(f"[init][rank {rank}] load weights stage_id={stage_id}", flush=True)
