@@ -111,6 +111,36 @@ python examples/hybrid_parallel/export_hybrid_policy.py \
 - `--format torchtitan` prints TorchTitan-style override keys
 - `--format both` prints both views
 
+## TorchTitan execution path
+
+- New TorchTitan experiment module: `torchtitan.experiments.hybrid_policy`
+- New TorchTitan launch scripts:
+  - `examples/hybrid_parallel/launch_torchtitan_hybrid_node0.sh`
+  - `examples/hybrid_parallel/launch_torchtitan_hybrid_node1.sh`
+- New TorchTitan configs:
+  - `hybrid_policy:qwen3_hybrid_demo`
+  - `hybrid_policy:qwen3_32b_g4_g5_pp_only`
+  - `hybrid_policy:qwen3_32b_g4_g5_pp_tp`
+  - `hybrid_policy:qwen3_32b_g4_g5_pp_tp_fsdp2`
+
+Example:
+
+```bash
+export MASTER_ADDR=192.168.10.241
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens8f0
+export GLOO_SOCKET_IFNAME=ens8f0
+bash examples/hybrid_parallel/launch_torchtitan_hybrid_node0.sh qwen3_hybrid_demo
+```
+
+```bash
+export MASTER_ADDR=192.168.10.241
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens9f0
+export GLOO_SOCKET_IFNAME=ens9f0
+bash examples/hybrid_parallel/launch_torchtitan_hybrid_node1.sh qwen3_hybrid_demo
+```
+
 ## Metrics / profiler
 
 - `train_manual_pp.py` prints `tokens/s` and `mem_gb` on the logging rank.
