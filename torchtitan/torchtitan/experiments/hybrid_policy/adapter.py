@@ -82,54 +82,12 @@ def _derive_rank_order(policy: dict[str, Any]) -> list[int] | None:
     explicit = metadata.get("rank_order")
     if explicit is not None:
         return [int(x) for x in explicit]
-    cluster_nodes = metadata.get("cluster_nodes") or []
-    stage_to_node = ((policy.get("pipeline") or {}).get("stage_to_node") or [])
-    cp_degree = int(((policy.get("context_parallel") or {}).get("degree") or 1))
-    ep_degree = int(((policy.get("expert_parallel") or {}).get("degree") or 1))
-    if not cluster_nodes or not stage_to_node:
-        return None
-    if cp_degree > 1 or ep_degree > 1:
-        logger.warning(
-            "rank_order auto-derivation currently assumes CP=EP=1; ignoring cluster_nodes for rank ordering"
+    if metadata.get("cluster_nodes"):
+        logger.info(
+            "cluster_nodes metadata detected, but automatic rank_order derivation is disabled "
+            "for now; using TorchTitan's natural rank order unless metadata.rank_order is set explicitly"
         )
-        return None
-    node_to_ranks: dict[str, list[int]] = {}
-    current_rank = 0
-    for node in cluster_nodes:
-        node_name = str(node.get("name"))
-        gpus = int(node.get("gpus") or 0)
-        node_to_ranks[node_name] = list(range(current_rank, current_rank + gpus))
-        current_rank += gpus
-    if current_rank <= 0:
-        return None
-    total_gpus = sum(int(node.get("gpus") or 0) for node in cluster_nodes)
-    pp_degree = int(((policy.get("pipeline") or {}).get("degree") or len(stage_to_node) or 1))
-    if total_gpus <= 0 or total_gpus % max(1, pp_degree) != 0:
-        logger.warning(
-            "cannot derive rank_order because total cluster gpus is not divisible by pipeline degree"
-        )
-        return None
-    stage_rank_width = total_gpus // max(1, pp_degree)
-    rank_order: list[int] = []
-    node_offsets = {name: 0 for name in node_to_ranks}
-    for stage_node in stage_to_node:
-        ranks = node_to_ranks.get(str(stage_node))
-        if ranks is None:
-            raise ValueError(f"hybrid policy references unknown stage node {stage_node!r}")
-        offset = node_offsets[str(stage_node)]
-        end = offset + stage_rank_width
-        if end > len(ranks):
-            raise ValueError(
-                f"node {stage_node!r} does not have enough ranks for requested TP width {stage_rank_width}"
-            )
-        rank_order.extend(ranks[offset:end])
-        node_offsets[str(stage_node)] = end
-    if sorted(rank_order) != list(range(len(rank_order))):
-        logger.warning(
-            "derived rank_order is not a full world permutation; leaving rank_order unset"
-        )
-        return None
-    return rank_order
+    return None
 
 
 def apply_hybrid_policy(
