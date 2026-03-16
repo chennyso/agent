@@ -59,6 +59,9 @@ def _base_qwen3_32b() -> Trainer.Config:
             local_batch_size=_env_int("HYBRID_LOCAL_BATCH_SIZE", 2),
             seq_len=_env_int("HYBRID_SEQ_LEN", 4096),
             steps=_env_int("HYBRID_STEPS", 3000),
+            dtype="bfloat16",
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="bfloat16",
         ),
         checkpoint=CheckpointManager.Config(
             interval=500,
@@ -180,17 +183,16 @@ def qwen3_hybrid_demo() -> Trainer.Config:
     policy_path = os.environ.get("HYBRID_POLICY_PATH") or str(default_policy)
     cfg = apply_hybrid_policy(cfg, policy_path=policy_path)
 
-    if os.environ.get("HYBRID_LOCAL_BATCH_SIZE") is None:
-        min_local_batch_size = (
-            cfg.parallelism.pipeline_parallel_degree
-            * cfg.parallelism.pipeline_parallel_microbatch_size
+    local_stage_count = len(cfg.parallelism.module_fqns_per_model_part or [])
+    min_local_batch_size = (
+        max(1, local_stage_count) * cfg.parallelism.pipeline_parallel_microbatch_size
+    )
+    if cfg.training.local_batch_size < min_local_batch_size:
+        cfg.training.local_batch_size = min_local_batch_size
+        logger.info(
+            "Raising local_batch_size to "
+            f"{min_local_batch_size} so PP microbatches cover all virtual stages"
         )
-        if cfg.training.local_batch_size < min_local_batch_size:
-            cfg.training.local_batch_size = min_local_batch_size
-            logger.info(
-                "HYBRID_LOCAL_BATCH_SIZE not set; raising local_batch_size to "
-                f"{min_local_batch_size} so PP microbatches >= stages"
-            )
 
     if os.environ.get("HYBRID_SEQ_LEN") is None and cfg.training.seq_len > 2048:
         cfg.training.seq_len = 2048

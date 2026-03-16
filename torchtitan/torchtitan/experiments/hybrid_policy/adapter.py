@@ -27,10 +27,10 @@ def _ensure_int(value: Any, context: str, *, min_value: int = 0) -> int:
     return out
 
 
-def _normalize_stage_ranges(stage_ranges: list[list[int]], degree: int) -> list[list[int]]:
-    if len(stage_ranges) != int(degree):
+def _normalize_stage_ranges(stage_ranges: list[list[int]], expected_len: int) -> list[list[int]]:
+    if len(stage_ranges) != int(expected_len):
         raise ValueError(
-            f"hybrid_policy.pipeline.stage_ranges must have len={degree}; got {len(stage_ranges)}"
+            f"hybrid_policy.pipeline.stage_ranges must have len={expected_len}; got {len(stage_ranges)}"
         )
     out: list[list[int]] = []
     expected_start = 0
@@ -106,9 +106,11 @@ def apply_hybrid_policy(
     recompute = policy.get("recompute") or {}
 
     pp_degree = _ensure_int(pipeline.get("degree", 1), "hybrid_policy.pipeline.degree", min_value=1)
+    vpp = _ensure_int(pipeline.get("vpp", 1), "hybrid_policy.pipeline.vpp", min_value=1)
+    total_stages = pp_degree * vpp
     stage_ranges = pipeline.get("stage_ranges")
     if stage_ranges is not None:
-        stage_ranges = _normalize_stage_ranges(stage_ranges, pp_degree)
+        stage_ranges = _normalize_stage_ranges(stage_ranges, total_stages)
         module_parts = _default_stage_modules(stage_ranges)
     else:
         module_parts = pipeline.get("stage_modules")
@@ -125,7 +127,6 @@ def apply_hybrid_policy(
     cfg.parallelism.module_fqns_per_model_part = module_parts
     cfg.parallelism.pipeline_parallel_stage_to_node = pipeline.get("stage_to_node")
 
-    vpp = _ensure_int(pipeline.get("vpp", 1), "hybrid_policy.pipeline.vpp", min_value=1)
     if vpp > 1:
         cfg.parallelism.pipeline_parallel_vpp_per_rank = [vpp for _ in range(pp_degree)]
         if stage_ranges is not None and len(module_parts or []) == int(pp_degree):
