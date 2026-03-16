@@ -984,7 +984,15 @@ class DenseCausalLMStage(nn.Module):
         labels = labels.long()
         shift_hidden = hidden_states[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
+        if debug_this_call:
+            self._log(
+                "compute_loss shift "
+                f"shift_hidden={self._describe_tensor(shift_hidden)} "
+                f"shift_labels={self._describe_tensor(shift_labels)}"
+            )
         if hasattr(self.lm_head, "loss"):
+            if debug_this_call:
+                self._log("compute_loss entering lm_head.loss")
             out = self.lm_head.loss(shift_hidden, shift_labels, ignore_index=-100)  # type: ignore[call-arg]
             self._attach_backward_tensor_hook(out, "loss output", enabled=debug_this_call)
             if debug_this_call:

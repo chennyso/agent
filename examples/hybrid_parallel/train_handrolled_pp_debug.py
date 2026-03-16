@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+import train_manual_pp as manual_pp
 from train_manual_pp import (
     DenseCausalLMStage,
     VocabParallelEmbedding,
@@ -141,6 +142,7 @@ def main() -> None:
     debug_module_logs = bool(runtime_cfg.get("debug_module_logs", True))
     forward_debug_limit = int(runtime_cfg.get("debug_module_forward_limit", 8) or 8)
     loss_debug_limit = int(runtime_cfg.get("debug_module_loss_limit", 8) or 8)
+    manual_pp._DEBUG_TP_LOSS = bool(runtime_cfg.get("debug_tp_loss_logs", True))
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=timeout_seconds)
     device = torch.device("cuda", local_rank)
