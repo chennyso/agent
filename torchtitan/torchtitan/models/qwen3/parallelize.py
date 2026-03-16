@@ -239,6 +239,18 @@ def apply_parallelism_conditioned_fsdp(
             "module-group FSDP policy currently treats tied embedding/output as a single embhead group"
         )
 
+    def _disable_backward_prefetch(module_root: nn.Module) -> None:
+        updated = 0
+        for submodule in module_root.modules():
+            setter = getattr(submodule, "set_modules_to_backward_prefetch", None)
+            if callable(setter):
+                setter([])
+                updated += 1
+        if updated and parallelism.fsdp_policy_trace:
+            logger.info(
+                f"[fsdp-policy] stage={stage_idx} disabled backward prefetch on {updated} FSDP modules"
+            )
+
     if model.tok_embeddings is not None:
         fully_shard(
             model.tok_embeddings,
@@ -278,6 +290,9 @@ def apply_parallelism_conditioned_fsdp(
         )
 
     fully_shard(model, **fsdp_config)
+
+    if pp_enabled and stage_idx == (num_stages - 1):
+        _disable_backward_prefetch(model)
 
 
 def parallelize_qwen3(
