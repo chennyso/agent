@@ -38,6 +38,11 @@ def _dataset_path() -> str | None:
     return str(value) if value else None
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
+
+
 def _base_qwen3_32b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path=_hf_assets("./assets/hf/Qwen3-32B"),
@@ -50,9 +55,9 @@ def _base_qwen3_32b() -> Trainer.Config:
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=4096,
-            steps=3000,
+            local_batch_size=_env_int("HYBRID_LOCAL_BATCH_SIZE", 2),
+            seq_len=_env_int("HYBRID_SEQ_LEN", 4096),
+            steps=_env_int("HYBRID_STEPS", 3000),
         ),
         checkpoint=CheckpointManager.Config(
             interval=500,
@@ -78,9 +83,9 @@ def _base_qwen3_14b() -> Trainer.Config:
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=2048,
-            steps=20,
+            local_batch_size=_env_int("HYBRID_LOCAL_BATCH_SIZE", 1),
+            seq_len=_env_int("HYBRID_SEQ_LEN", 2048),
+            steps=_env_int("HYBRID_STEPS", 20),
         ),
         checkpoint=CheckpointManager.Config(
             interval=100,
