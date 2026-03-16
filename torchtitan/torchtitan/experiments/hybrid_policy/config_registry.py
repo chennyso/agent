@@ -17,6 +17,7 @@ from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, Tra
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.qwen3 import model_registry
 from torchtitan.trainer import Trainer
+from torchtitan.tools.logging import logger
 
 from .adapter import apply_hybrid_policy
 
@@ -177,4 +178,24 @@ def qwen3_hybrid_demo() -> Trainer.Config:
     cfg = _base_qwen3_32b()
     default_policy = Path(__file__).resolve().parent / "policies" / "qwen3_2node_hetero_demo.json"
     policy_path = os.environ.get("HYBRID_POLICY_PATH") or str(default_policy)
-    return apply_hybrid_policy(cfg, policy_path=policy_path)
+    cfg = apply_hybrid_policy(cfg, policy_path=policy_path)
+
+    if os.environ.get("HYBRID_LOCAL_BATCH_SIZE") is None:
+        min_local_batch_size = (
+            cfg.parallelism.pipeline_parallel_degree
+            * cfg.parallelism.pipeline_parallel_microbatch_size
+        )
+        if cfg.training.local_batch_size < min_local_batch_size:
+            cfg.training.local_batch_size = min_local_batch_size
+            logger.info(
+                "HYBRID_LOCAL_BATCH_SIZE not set; raising local_batch_size to "
+                f"{min_local_batch_size} so PP microbatches >= stages"
+            )
+
+    if os.environ.get("HYBRID_SEQ_LEN") is None and cfg.training.seq_len > 2048:
+        cfg.training.seq_len = 2048
+        logger.info(
+            "HYBRID_SEQ_LEN not set; capping hybrid demo seq_len at 2048 for a safer dual-node bring-up"
+        )
+
+    return cfg

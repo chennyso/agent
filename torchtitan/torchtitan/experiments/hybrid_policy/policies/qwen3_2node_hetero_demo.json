@@ -7,10 +7,10 @@
     "microbatches": 1,
     "schedule": "1F1B",
     "stage_ranges": [
-      [0, 8],
-      [9, 23],
-      [24, 43],
-      [44, 63]
+      [0, 11],
+      [12, 29],
+      [30, 48],
+      [49, 63]
     ],
     "stage_to_node": ["g4", "g4", "g5", "g5"]
   },
@@ -29,19 +29,19 @@
   },
   "fsdp2": {
     "enabled": true,
-    "reshard_after_forward": false,
+    "reshard_after_forward": true,
     "policy_mode": "module_groups",
-    "attention_scope": "auto",
-    "mlp_scope": "auto",
-    "embhead_scope": "keep",
-    "node_local_reshard_size": 2,
+    "attention_scope": "global",
+    "mlp_scope": "global",
+    "embhead_scope": "global",
+    "node_local_reshard_size": 0,
     "policy_trace": true,
-    "enabled_per_stage": [false, true, true, false],
-    "reshard_after_forward_per_stage": [false, false, false, false]
+    "enabled_per_stage": [true, true, true, true],
+    "reshard_after_forward_per_stage": [true, true, true, true]
   },
   "recompute": {
     "policy": "full",
-    "per_stage": ["full", "full", "none", "none"]
+    "per_stage": ["full", "full", "full", "full"]
   },
   "metadata": {
     "pipeline_trace": true,
