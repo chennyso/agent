@@ -3,20 +3,16 @@
   "schema_version": 1,
   "pipeline": {
     "degree": 4,
-    "vpp": 2,
+    "vpp": 1,
     "microbatches": 1,
-    "schedule": "Interleaved1F1B",
+    "schedule": "1F1B",
     "stage_ranges": [
-      [0, 4],
-      [5, 11],
-      [12, 22],
-      [23, 28],
-      [29, 36],
-      [37, 46],
-      [47, 57],
-      [58, 63]
+      [0, 5],
+      [6, 13],
+      [14, 35],
+      [36, 63]
     ],
-    "stage_to_node": ["g4", "g4", "g5", "g5", "g4", "g4", "g5", "g5"]
+    "stage_to_node": ["g4", "g4", "g5", "g5"]
   },
   "tensor_parallel": {
     "enabled": true,
