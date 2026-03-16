@@ -119,6 +119,8 @@ python examples/hybrid_parallel/export_hybrid_policy.py \
   - `examples/hybrid_parallel/launch_torchtitan_hybrid_node1.sh`
 - New TorchTitan configs:
   - `hybrid_policy:qwen3_hybrid_demo`
+  - `hybrid_policy:qwen3_14b_single_g4_fsdp8`
+  - `hybrid_policy:qwen3_14b_single_g4_fsdp8_conditioned`
   - `hybrid_policy:qwen3_32b_g4_g5_pp_only`
   - `hybrid_policy:qwen3_32b_g4_g5_pp_tp`
   - `hybrid_policy:qwen3_32b_g4_g5_pp_tp_fsdp2`
@@ -139,6 +141,32 @@ export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=ens9f0
 export GLOO_SOCKET_IFNAME=ens9f0
 bash examples/hybrid_parallel/launch_torchtitan_hybrid_node1.sh qwen3_hybrid_demo
+```
+
+Single-node 14B validation on `g4`:
+
+```bash
+export NNODES=1
+export NODE_RANK=0
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens8f0
+export GLOO_SOCKET_IFNAME=ens8f0
+bash examples/hybrid_parallel/launch_torchtitan_hybrid_node0.sh qwen3_14b_single_g4_fsdp8_conditioned
+```
+
+Offline TorchTitan packaging on `g4` and sync to `g5`:
+
+```bash
+bash torchtitan/scripts/install_editable_local.sh
+bash torchtitan/scripts/build_offline_wheelhouse.sh
+bash examples/hybrid_parallel/push_torchtitan_bundle_to_g5.sh
+```
+
+Offline install on `g5`:
+
+```bash
+bash torchtitan/scripts/install_offline_from_wheelhouse.sh ~/agent/torchtitan/dist/wheelhouse
 ```
 
 ## Metrics / profiler
