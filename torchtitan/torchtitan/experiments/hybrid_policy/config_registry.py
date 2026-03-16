@@ -44,6 +44,68 @@ def _env_int(name: str, default: int) -> int:
     return int(value) if value is not None else default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return str(value) if value is not None else default
+
+
+def _env_int_list(name: str) -> list[int] | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _node_major_rank_order(node_gpu_counts: list[int]) -> list[int]:
+    order: list[int] = []
+    cursor = 0
+    for count in node_gpu_counts:
+        order.extend(range(cursor, cursor + int(count)))
+        cursor += int(count)
+    return order
+
+
+def _interleaved_rank_order(node_gpu_counts: list[int]) -> list[int]:
+    if len(set(int(count) for count in node_gpu_counts)) != 1:
+        raise ValueError("interleaved rank order currently requires equal GPUs per node")
+    per_node = int(node_gpu_counts[0])
+    offsets = []
+    cursor = 0
+    for count in node_gpu_counts:
+        offsets.append(cursor)
+        cursor += int(count)
+    order: list[int] = []
+    for local_idx in range(per_node):
+        for offset in offsets:
+            order.append(offset + local_idx)
+    return order
+
+
+def _resolve_rank_order(node_gpu_counts: list[int]) -> list[int]:
+    explicit = _env_int_list("HYBRID_RANK_ORDER")
+    if explicit is not None:
+        return explicit
+
+    layout = _env_str("HYBRID_RANK_LAYOUT", "node_major").strip().lower()
+    if layout == "node_major":
+        return _node_major_rank_order(node_gpu_counts)
+    if layout == "interleaved":
+        return _interleaved_rank_order(node_gpu_counts)
+    raise ValueError("HYBRID_RANK_LAYOUT must be one of: node_major, interleaved")
+
+
+def _setdefault_many(values: dict[str, str]) -> None:
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
 def _base_qwen3_32b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path=_hf_assets("./assets/hf/Qwen3-32B"),
@@ -223,25 +285,266 @@ def qwen3_32b_2node_24g_32g_fsdp2() -> Trainer.Config:
 
 def qwen3_32b_2node_24g_32g_tp8_fsdp2() -> Trainer.Config:
     cfg = _base_qwen3_32b()
-    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 1)
-    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
-    cfg.training.steps = _env_int("HYBRID_STEPS", 100)
-    cfg.activation_checkpoint.mode = "full"
+    profile = str(os.environ.get("HYBRID_PROFILE") or "balanced").strip().lower()
+    if profile not in {"stable", "balanced", "throughput"}:
+        raise ValueError(
+            "HYBRID_PROFILE must be one of: stable, balanced, throughput"
+        )
+
+    profile_defaults = {
+        "stable": {
+            "seq_len": 1024,
+            "local_batch_size": 1,
+            "global_batch_size": -1,
+            "ac_mode": "full",
+            "compile": False,
+            "async_tp": False,
+            "fsdp_reshard_after_forward": "always",
+            "fsdp_attention_scope": "global",
+            "fsdp_mlp_scope": "global",
+            "fsdp_embhead_scope": "global",
+            "log_freq": 10,
+        },
+        "balanced": {
+            "seq_len": 1024,
+            "local_batch_size": 1,
+            "global_batch_size": 4,
+            "ac_mode": "selective",
+            "compile": False,
+            "async_tp": False,
+            "fsdp_reshard_after_forward": "always",
+            "fsdp_attention_scope": "keep",
+            "fsdp_mlp_scope": "global",
+            "fsdp_embhead_scope": "global",
+            "log_freq": 20,
+        },
+        "throughput": {
+            "seq_len": 1024,
+            "local_batch_size": 1,
+            "global_batch_size": 4,
+            "ac_mode": "selective",
+            "compile": True,
+            "async_tp": True,
+            "fsdp_reshard_after_forward": "never",
+            "fsdp_attention_scope": "keep",
+            "fsdp_mlp_scope": "keep",
+            "fsdp_embhead_scope": "global",
+            "log_freq": 20,
+        },
+    }[profile]
+
+    scope_profile = _env_str("HYBRID_SCOPE_PROFILE", profile).strip().lower()
+    scope_profile_defaults = {
+        "stable": {
+            "fsdp_reshard_after_forward": "always",
+            "fsdp_attention_scope": "global",
+            "fsdp_mlp_scope": "global",
+            "fsdp_embhead_scope": "global",
+            "fsdp_node_local_reshard_size": 0,
+        },
+        "balanced": {
+            "fsdp_reshard_after_forward": "always",
+            "fsdp_attention_scope": "keep",
+            "fsdp_mlp_scope": "global",
+            "fsdp_embhead_scope": "global",
+            "fsdp_node_local_reshard_size": 0,
+        },
+        "throughput": {
+            "fsdp_reshard_after_forward": "never",
+            "fsdp_attention_scope": "keep",
+            "fsdp_mlp_scope": "keep",
+            "fsdp_embhead_scope": "global",
+            "fsdp_node_local_reshard_size": 0,
+        },
+        "node_local": {
+            "fsdp_reshard_after_forward": "always",
+            "fsdp_attention_scope": "node",
+            "fsdp_mlp_scope": "node",
+            "fsdp_embhead_scope": "global",
+            "fsdp_node_local_reshard_size": 8,
+        },
+    }
+    if scope_profile not in scope_profile_defaults:
+        raise ValueError(
+            "HYBRID_SCOPE_PROFILE must be one of: stable, balanced, throughput, node_local"
+        )
+    scope_defaults = scope_profile_defaults[scope_profile]
+
+    cfg.training.local_batch_size = _env_int(
+        "HYBRID_LOCAL_BATCH_SIZE", profile_defaults["local_batch_size"]
+    )
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", profile_defaults["seq_len"])
+    cfg.training.global_batch_size = _env_int(
+        "HYBRID_GLOBAL_BATCH_SIZE", profile_defaults["global_batch_size"]
+    )
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.activation_checkpoint.mode = str(
+        os.environ.get("HYBRID_AC_MODE") or profile_defaults["ac_mode"]
+    )
+    if cfg.activation_checkpoint.mode == "selective":
+        cfg.activation_checkpoint.selective_ac_option = _env_str(
+            "HYBRID_SELECTIVE_AC_OPTION", "op"
+        )
+        if profile == "throughput":
+            cfg.activation_checkpoint.preserve_rng_state = False
+            cfg.activation_checkpoint.early_stop = True
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", profile_defaults["log_freq"])
+    cfg.debug.pipeline_trace = False
+    cfg.debug.pipeline_trace_collectives = False
+    cfg.compile.enable = _env_bool(
+        "HYBRID_ENABLE_COMPILE", profile_defaults["compile"]
+    )
+    enable_async_tp = _env_bool(
+        "HYBRID_ENABLE_ASYNC_TP", profile_defaults["async_tp"]
+    )
+    if enable_async_tp and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    tp_degree = _env_int("HYBRID_TP_DEGREE", 8)
+    dp_shard_degree = _env_int("HYBRID_DP_SHARD_DEGREE", 2)
     cfg.parallelism = ParallelismConfig(
-        data_parallel_shard_degree=2,
-        tensor_parallel_degree=8,
+        data_parallel_shard_degree=dp_shard_degree,
+        tensor_parallel_degree=tp_degree,
         context_parallel_degree=1,
         expert_parallel_degree=1,
         pipeline_parallel_degree=1,
-        fsdp_reshard_after_forward="always",
+        fsdp_reshard_after_forward=str(
+            os.environ.get("HYBRID_FSDP_RESHARD_AFTER_FORWARD")
+            or scope_defaults["fsdp_reshard_after_forward"]
+        ),
         fsdp_parallelism_conditioned_policy="module_groups",
-        fsdp_attention_scope="global",
-        fsdp_mlp_scope="global",
-        fsdp_embhead_scope="global",
-        fsdp_node_local_reshard_size=0,
-        fsdp_policy_trace=True,
+        fsdp_attention_scope=str(
+            os.environ.get("HYBRID_FSDP_ATTENTION_SCOPE")
+            or scope_defaults["fsdp_attention_scope"]
+        ),
+        fsdp_mlp_scope=str(
+            os.environ.get("HYBRID_FSDP_MLP_SCOPE") or scope_defaults["fsdp_mlp_scope"]
+        ),
+        fsdp_embhead_scope=str(
+            os.environ.get("HYBRID_FSDP_EMBHEAD_SCOPE")
+            or scope_defaults["fsdp_embhead_scope"]
+        ),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE",
+            scope_defaults["fsdp_node_local_reshard_size"],
+        ),
+        fsdp_policy_trace=bool(int(os.environ.get("HYBRID_FSDP_POLICY_TRACE", "0"))),
+        enable_async_tensor_parallel=enable_async_tp,
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+        rank_order=_resolve_rank_order([8, 8]),
     )
     logger.info(
-        "Using dedicated 24GB+32GB / Qwen3-32B FSDP2-first policy: TP=8, DP-shard=2, PP=1"
+        "Using dedicated 24GB+32GB / Qwen3-32B FSDP2 topology-aware policy: "
+        "TP/DP/PP topology-aware, profile="
+        f"{profile}, seq_len={cfg.training.seq_len}, "
+        f"scope_profile={scope_profile}, "
+        f"ac={cfg.activation_checkpoint.mode}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"attn/mlp/embhead="
+        f"{cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"tp={cfg.parallelism.tensor_parallel_degree}, "
+        f"dp_shard={cfg.parallelism.data_parallel_shard_degree}, "
+        f"compile={cfg.compile.enable}, async_tp={cfg.parallelism.enable_async_tensor_parallel}, "
+        f"rank_order={cfg.parallelism.rank_order}"
     )
     return cfg
+
+
+def qwen3_32b_2node_24g_32g_tp8_fsdp2_stable() -> Trainer.Config:
+    os.environ.setdefault("HYBRID_PROFILE", "stable")
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_tp8_fsdp2_balanced() -> Trainer.Config:
+    os.environ.setdefault("HYBRID_PROFILE", "balanced")
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_tp8_fsdp2_throughput() -> Trainer.Config:
+    os.environ.setdefault("HYBRID_PROFILE", "throughput")
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_01_baseline() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "stable",
+            "HYBRID_SCOPE_PROFILE": "stable",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_02_balanced_keep() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "balanced",
+            "HYBRID_SCOPE_PROFILE": "balanced",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_03_throughput_intra() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "throughput",
+            "HYBRID_SCOPE_PROFILE": "throughput",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+            "HYBRID_ENABLE_COMPILE": "1",
+            "HYBRID_ENABLE_ASYNC_TP": "1",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_04_node_local() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "balanced",
+            "HYBRID_SCOPE_PROFILE": "node_local",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE": "8",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_05_interleaved() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "balanced",
+            "HYBRID_SCOPE_PROFILE": "balanced",
+            "HYBRID_RANK_LAYOUT": "interleaved",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_sweep_06_interleaved_node_local() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "balanced",
+            "HYBRID_SCOPE_PROFILE": "node_local",
+            "HYBRID_RANK_LAYOUT": "interleaved",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE": "8",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
