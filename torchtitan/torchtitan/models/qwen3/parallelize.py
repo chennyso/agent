@@ -499,6 +499,12 @@ def apply_non_moe_tp(
             PrepareModuleInput,
         )
 
+    attention_kernel_plan = prepare_module_input(
+        input_layouts=(Shard(1), Shard(1), Shard(1)),
+        desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
+        use_local_output=True,
+    )
+
     # Apply tensor + sequence parallelism to every transformer block
     # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
@@ -522,6 +528,7 @@ def apply_non_moe_tp(
             "attention.wv": colwise_parallel(use_local_output=False),
             "attention.q_norm": SequenceParallel(sequence_dim=2),
             "attention.k_norm": SequenceParallel(sequence_dim=2),
+            "attention.inner_attention": attention_kernel_plan,
             "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
             "ffn_norm": SequenceParallel(),
         }
