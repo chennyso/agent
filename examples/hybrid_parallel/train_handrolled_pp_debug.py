@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 import train_manual_pp as manual_pp
+from hybrid_policy import apply_hybrid_policy_to_config
 from train_manual_pp import (
     DenseCausalLMStage,
     VocabParallelEmbedding,
@@ -137,6 +138,7 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = _load_cfg(args.config)
+    cfg, hybrid_policy_warnings = apply_hybrid_policy_to_config(cfg, config_path=args.config)
     runtime_cfg = cfg.get("runtime") or {}
     cuda_alloc_conf = str(runtime_cfg.get("cuda_alloc_conf") or "").strip()
     if cuda_alloc_conf:
@@ -151,6 +153,9 @@ def main() -> None:
     rank, world_size, local_rank = _setup_dist(timeout_seconds=timeout_seconds)
     device = torch.device("cuda", local_rank)
     try:
+        if rank == 0 and hybrid_policy_warnings:
+            for warning in hybrid_policy_warnings:
+                print(f"[hybrid-policy][warn] {warning}", flush=True)
         train_cfg = cfg.get("train") or {}
         par_cfg = cfg.get("parallel") or {}
         pp_cfg = par_cfg.get("pp") or {}

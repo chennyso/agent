@@ -1,0 +1,108 @@
+{
+  "name": "qwen3_2node_hetero_tail_aware_demo",
+  "schema_version": 1,
+  "pipeline": {
+    "degree": 4,
+    "vpp": 1,
+    "microbatches": 4,
+    "schedule": "gpipe",
+    "stage_ranges": [
+      [0, 8],
+      [9, 23],
+      [24, 43],
+      [44, 63]
+    ],
+    "stage_to_node": ["g4", "g4", "g5", "g5"]
+  },
+  "tensor_parallel": {
+    "enabled": true,
+    "degree": 2,
+    "sequence_parallel": false,
+    "plan": "auto"
+  },
+  "context_parallel": {
+    "enabled": false,
+    "degree": 1
+  },
+  "expert_parallel": {
+    "enabled": false,
+    "degree": 1,
+    "expert_tp_degree": 1
+  },
+  "fsdp2": {
+    "enabled": true,
+    "param_dtype": "bf16",
+    "reduce_dtype": "bf16",
+    "reshard_after_forward": false,
+    "enabled_per_stage": [false, true, true, false],
+    "reshard_after_forward_per_stage": [false, false, false, false]
+  },
+  "recompute": {
+    "policy": "mixed",
+    "per_stage": ["full", "full", "none", "none"]
+  },
+  "stage_policies": [
+    {
+      "stage_id": 0,
+      "node": "g4",
+      "layer_range": [0, 8],
+      "notes": "embedding-heavy first stage kept intentionally small"
+    },
+    {
+      "stage_id": 1,
+      "node": "g4",
+      "layer_range": [9, 23],
+      "fsdp_enabled": true,
+      "recompute": "full"
+    },
+    {
+      "stage_id": 2,
+      "node": "g5",
+      "layer_range": [24, 43],
+      "fsdp_enabled": true,
+      "recompute": "full"
+    },
+    {
+      "stage_id": 3,
+      "node": "g5",
+      "layer_range": [44, 63],
+      "reshard_after_forward": false,
+      "recompute": "none",
+      "notes": "tail stage isolates norm + lm_head"
+    }
+  ],
+  "module_policies": [
+    {
+      "pattern": "tok_embeddings",
+      "stage_ids": [0],
+      "placement_hint": "edge_isolation",
+      "notes": "keep embeddings away from middle-stage TP/FSDP pressure"
+    },
+    {
+      "pattern": "norm|output",
+      "stage_ids": [3],
+      "placement_hint": "tail_isolation",
+      "notes": "keep tail modules together for simpler loss/head handling"
+    }
+  ],
+  "phase_policies": [
+    {
+      "name": "warmup",
+      "condition": "step < warmup_steps",
+      "overrides": {
+        "parallel.recompute.policy": "none"
+      }
+    },
+    {
+      "name": "steady_state",
+      "condition": "step >= warmup_steps",
+      "overrides": {
+        "parallel.recompute.policy": "mixed"
+      }
+    }
+  ],
+  "metadata": {
+    "seq_len": 512,
+    "torchtitan_model_name": "qwen3"
+  }
+}

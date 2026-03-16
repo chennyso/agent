@@ -1,0 +1,114 @@
+{
+  "model": {
+    "path": "~/.cache/modelscope/hub/models/Qwen/Qwen3-32B",
+    "dtype": "bf16",
+    "seq_len": 512
+  },
+  "train": {
+    "seed": 42,
+    "steps": 30,
+    "warmup_steps": 4,
+    "global_batch_size": 8,
+    "grad_accum_steps": 1,
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "log_every": 1
+  },
+  "cluster": {
+    "nodes": [
+      {
+        "name": "g4",
+        "gpus": 8,
+        "mem_gb": 24,
+        "perf": 1.0
+      },
+      {
+        "name": "g5",
+        "gpus": 8,
+        "mem_gb": 32,
+        "perf": 1.28
+      }
+    ]
+  },
+  "planner": {
+    "enabled": true,
+    "search": {
+      "pp_degrees": [2, 4],
+      "tp_degrees": [2, 4],
+      "vpp_values": [1, 2],
+      "microbatch_values": [1, 2, 4, 8],
+      "schedules": ["1f1b", "gpipe", "interleaved1f1b"]
+    },
+    "constraints": {
+      "align_layers_to": 2,
+      "min_layers_per_stage": 1,
+      "prefer_contiguous_nodes": true
+    },
+    "cost_model": {
+      "embed_extra_layers": 1.6,
+      "lm_head_extra_layers": 2.0
+    },
+    "policy": {
+      "fsdp_enabled": true,
+      "recompute_pressure_threshold": 0.82,
+      "reshard_pressure_threshold": 0.93
+    },
+    "selection": {
+      "candidate_index": 0,
+      "top_k": 10,
+      "export_path": "outputs/plans/qwen3_32b_candidates.json",
+      "export_policy_path": "outputs/plans/qwen3_32b_selected_policy.json"
+    }
+  },
+  "parallel": {
+    "pp": {
+      "degree": 2,
+      "vpp": 1,
+      "microbatches": 2,
+      "schedule": "1f1b",
+      "stages": "auto",
+      "auto_mem_gb": [24, 32],
+      "auto_bias_stage0": -0.08
+    },
+    "tp": {
+      "enabled": true,
+      "degree": 2
+    },
+    "sp": {
+      "enabled": false
+    },
+    "fsdp2": {
+      "enabled": true,
+      "param_dtype": "bf16",
+      "reduce_dtype": "bf16",
+      "reshard_after_forward": true
+    },
+    "recompute": {
+      "policy": "full"
+    }
+  },
+  "runtime": {
+    "cuda_alloc_conf": "expandable_segments:True",
+    "dist_timeout_seconds": 3600,
+    "debug_init_logs": true,
+    "debug_module_logs": false,
+    "debug_p2p_logs": false
+  },
+  "mfu": {
+    "peak_tflops_total": 0.0,
+    "flops_per_param_per_token": 6.0
+  },
+  "profile": {
+    "enabled": false,
+    "rank": 0,
+    "trace_dir": "tb_traces",
+    "wait": 1,
+    "warmup": 1,
+    "active": 3,
+    "repeat": 1,
+    "record_shapes": true,
+    "profile_memory": true,
+    "with_stack": false
+  }
+}

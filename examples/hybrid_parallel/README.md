@@ -64,6 +64,53 @@ bash examples/hybrid_parallel/launch_manual_node1.sh examples/hybrid_parallel/co
   - `pp.stages` (layer split) to fit heterogenous VRAM
   - `recompute.per_stage` and `fsdp2.reshard_after_forward_per_stage` to trade memory vs throughput
 
+## Planner mode
+
+- New config: `examples/hybrid_parallel/config_qwen3_2node_dense_planner_search.json`
+- New capability in `train_manual_pp.py`:
+  - `planner.enabled=true` lets the script generate candidate `PP/TP/VPP/microbatch/schedule` combinations
+  - the planner emits a custom `parallel.pp.mesh`, so `stage -> rank/node` is no longer hard-coded
+  - stage cuts are solved with a heterogeneity-aware objective instead of plain equal split
+- Dry-run only the planner without launching training:
+
+```bash
+python examples/hybrid_parallel/train_manual_pp.py \
+  --config examples/hybrid_parallel/config_qwen3_2node_dense_planner_search.json \
+  --plan_only
+```
+
+## Hybrid policy schema
+
+- New schema file: `examples/hybrid_parallel/hybrid_policy.py`
+- New demo policy: `examples/hybrid_parallel/hybrid_policy_qwen3_2node_hetero_demo.json`
+- New demo config: `examples/hybrid_parallel/config_qwen3_2node_dense_hybrid_policy_demo.json`
+
+What it adds:
+
+- one place to describe `PP / VPP / TP / CP / EP / FSDP2 / recompute`
+- `stage_policies` for per-stage memory/runtime decisions
+- `module_policies` for tail/embed/expert special handling
+- `phase_policies` as placeholders for warmup vs steady-state policy changes
+
+Current execution support:
+
+- `train_manual_pp.py` and `train_handrolled_pp_debug.py` now read `hybrid_policy`
+- the policy is merged into the existing manual runner config before launch
+- unsupported manual-runner features (for example per-stage TP, asymmetric VPP, CP/EP runtime) are kept as metadata and emitted as warnings instead of being silently dropped
+
+Export helpers:
+
+```bash
+python examples/hybrid_parallel/export_hybrid_policy.py \
+  --config examples/hybrid_parallel/config_qwen3_2node_dense_hybrid_policy_demo.json \
+  --format both \
+  --total_layers 64
+```
+
+- `--format manual` prints the merged manual-runner config
+- `--format torchtitan` prints TorchTitan-style override keys
+- `--format both` prints both views
+
 ## Metrics / profiler
 
 - `train_manual_pp.py` prints `tokens/s` and `mem_gb` on the logging rank.

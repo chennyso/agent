@@ -18,6 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import types
 
+from parallel_planner import (
+    export_candidates,
+    select_execution_plan,
+    summarize_candidates,
+)
+from hybrid_policy import apply_hybrid_policy_to_config
+
 try:  # pragma: no cover
     import torch.profiler as torch_profiler
 except Exception:  # pragma: no cover
@@ -1434,11 +1441,13 @@ def _make_synth_batch(vocab_size: int, seq_len: int, batch_size: int, *, seed: i
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
+    ap.add_argument("--plan_only", action="store_true")
     args = ap.parse_args()
 
     global _DEBUG_TP_LOSS
 
     cfg = _load_cfg(args.config)
+    cfg, hybrid_policy_warnings = apply_hybrid_policy_to_config(cfg, config_path=args.config)
     cuda_alloc_conf = ((cfg.get("runtime") or {}).get("cuda_alloc_conf") or "").strip()
     if cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cuda_alloc_conf)
@@ -1459,6 +1468,9 @@ def main() -> None:
 
     rank, world_size, local_rank = _setup_dist(timeout_seconds=dist_timeout_seconds)
     try:
+        if rank == 0 and hybrid_policy_warnings:
+            for warning in hybrid_policy_warnings:
+                print(f"[hybrid-policy][warn] {warning}", flush=True)
         train_cfg = cfg.get("train") or {}
         seed = int(train_cfg.get("seed") or 42)
         _seed_all(seed + rank)
@@ -1496,6 +1508,7 @@ def main() -> None:
         pp_stages = pp_cfg.get("stages")
         pp_auto_mem_gb = pp_cfg.get("auto_mem_gb")
         pp_auto_bias0 = float(pp_cfg.get("auto_bias_stage0", -0.08) or -0.08)
+        pp_mesh_cfg = pp_cfg.get("mesh")
 
         tp_enabled = bool(tp_cfg.get("enabled", True))
         tp_degree = int(tp_cfg.get("degree") or 2)
@@ -1515,6 +1528,73 @@ def main() -> None:
 
         if PipelineStage is None or TensorChunkSpec is None:
             raise RuntimeError("torch.distributed.pipelining unavailable")
+
+        from transformers import AutoConfig, AutoModelForCausalLM  # type: ignore
+
+        hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        with torch.device("meta"):
+            full_model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
+        if getattr(full_model.config, "use_cache", None) is not None:
+            full_model.config.use_cache = False
+        if getattr(full_model.config, "return_dict", None) is not None:
+            full_model.config.return_dict = False
+
+        planner_cfg = cfg.get("planner") or {}
+        planner_enabled = bool(planner_cfg.get("enabled", False))
+        if planner_enabled:
+            selected_plan, candidate_plans = select_execution_plan(
+                cfg=cfg,
+                model=full_model,
+                world_size=world_size,
+            )
+            if rank == 0:
+                print("[planner] top candidates:", flush=True)
+                print(summarize_candidates(candidate_plans), flush=True)
+                export_path = str(
+                    ((planner_cfg.get("selection") or {}).get("export_path") or "").strip()
+                )
+                if export_path:
+                    export_candidates(candidates=candidate_plans, path=export_path)
+                    print(f"[planner] exported candidates to {export_path}", flush=True)
+                export_policy_path = str(
+                    ((planner_cfg.get("selection") or {}).get("export_policy_path") or "").strip()
+                )
+                if export_policy_path:
+                    policy_payload = selected_plan.to_hybrid_policy(
+                        metadata={"seq_len": seq_len, "torchtitan_model_name": "qwen3"}
+                    ).to_dict()
+                    export_file = Path(export_policy_path)
+                    export_file.parent.mkdir(parents=True, exist_ok=True)
+                    export_file.write_text(
+                        json.dumps(policy_payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(f"[planner] exported selected hybrid policy to {export_policy_path}", flush=True)
+            if args.plan_only:
+                return
+
+            overrides = selected_plan.to_config_overrides()
+            pp_cfg = {**pp_cfg, **(overrides.get("parallel", {}).get("pp") or {})}
+            tp_cfg = {**tp_cfg, **(overrides.get("parallel", {}).get("tp") or {})}
+            fsdp_cfg = {**fsdp_cfg, **(overrides.get("parallel", {}).get("fsdp2") or {})}
+            recompute_cfg = {
+                **recompute_cfg,
+                **(overrides.get("parallel", {}).get("recompute") or {}),
+            }
+            pp_degree = int(pp_cfg.get("degree") or pp_degree)
+            vpp = int(pp_cfg.get("vpp") or vpp)
+            microbatches = int(pp_cfg.get("microbatches") or microbatches)
+            schedule_name = str(pp_cfg.get("schedule") or schedule_name).lower()
+            pp_stages = pp_cfg.get("stages")
+            pp_mesh_cfg = pp_cfg.get("mesh")
+            tp_enabled = bool(tp_cfg.get("enabled", tp_enabled))
+            tp_degree = int(tp_cfg.get("degree") or tp_degree)
+            if not tp_enabled:
+                tp_degree = 1
+            fsdp_enabled = bool(fsdp_cfg.get("enabled", fsdp_enabled))
+            fsdp_enabled_per_stage = fsdp_cfg.get("enabled_per_stage")
+            reshard_per_stage = fsdp_cfg.get("reshard_after_forward_per_stage")
+            recompute_per_stage = recompute_cfg.get("per_stage")
 
         if world_size % pp_degree != 0:
             raise ValueError("world_size must be divisible by pp_degree")
@@ -1553,26 +1633,34 @@ def main() -> None:
                 if isinstance(recompute_per_stage, list):
                     recompute_per_stage = ["none" for _ in recompute_per_stage]
 
-        pp_rank = rank // ranks_per_stage
-        local_in_stage = rank % ranks_per_stage
-        dp_idx = local_in_stage // tp_degree
-        tp_idx = local_in_stage % tp_degree
+        if isinstance(pp_mesh_cfg, list):
+            root_mesh_tensor = torch.tensor(pp_mesh_cfg, dtype=torch.int)
+        else:
+            def _r(pp: int, dp: int, tp: int) -> int:
+                return int(pp) * int(ranks_per_stage) + int(dp) * int(tp_degree) + int(tp)
 
-        def _r(pp: int, dp: int, tp: int) -> int:
-            return int(pp) * int(ranks_per_stage) + int(dp) * int(tp_degree) + int(tp)
+            root_mesh_tensor = torch.tensor(
+                [[[_r(pp, dp, tp) for tp in range(tp_degree)] for dp in range(dp_degree)] for pp in range(pp_degree)],
+                dtype=torch.int,
+            )
 
-        root_mesh_tensor = torch.tensor(
-            [[[_r(pp, dp, tp) for tp in range(tp_degree)] for dp in range(dp_degree)] for pp in range(pp_degree)],
-            dtype=torch.int,
-        )
+        if list(root_mesh_tensor.shape) != [pp_degree, dp_degree, tp_degree]:
+            raise ValueError(
+                f"parallel.pp.mesh shape {list(root_mesh_tensor.shape)} does not match "
+                f"[pp_degree, dp_degree, tp_degree]={[pp_degree, dp_degree, tp_degree]}"
+            )
+
+        rank_pos = (root_mesh_tensor == int(rank)).nonzero(as_tuple=False)
+        if rank_pos.shape != (1, 3):
+            raise RuntimeError(f"rank {rank} not found exactly once in pp mesh")
+        pp_rank, dp_idx, tp_idx = [int(x) for x in rank_pos[0].tolist()]
+
         root_mesh = DeviceMesh("cuda", root_mesh_tensor, mesh_dim_names=("pp", "dp", "tp"))
-
         pp_mesh = root_mesh["pp"]
         pp_group = pp_mesh.get_group()
 
-        stage_base = pp_rank * ranks_per_stage
-        tp_group_ranks = [stage_base + dp_idx * tp_degree + t for t in range(tp_degree)]
-        dp_group_ranks = [stage_base + d * tp_degree + tp_idx for d in range(dp_degree)]
+        tp_group_ranks = [int(x) for x in root_mesh_tensor[pp_rank, dp_idx, :].tolist()]
+        dp_group_ranks = [int(x) for x in root_mesh_tensor[pp_rank, :, tp_idx].tolist()]
 
         tp_mesh = root_mesh["tp"] if tp_degree > 1 else None
         dp_mesh = root_mesh["dp"] if dp_degree > 1 else None
@@ -1583,16 +1671,9 @@ def main() -> None:
             print(f"[init] world={world_size} pp={pp_degree} dp={dp_degree} tp={tp_degree} vpp={vpp}", flush=True)
             print(f"[model] {model_dir}", flush=True)
             print(f"[init] dist_timeout_seconds={dist_timeout_seconds}", flush=True)
-
-        from transformers import AutoConfig, AutoModelForCausalLM  # type: ignore
-
-        hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        with torch.device("meta"):
-            full_model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
-        if getattr(full_model.config, "use_cache", None) is not None:
-            full_model.config.use_cache = False
-        if getattr(full_model.config, "return_dict", None) is not None:
-            full_model.config.return_dict = False
+            if isinstance(pp_cfg.get("stage_to_node"), list):
+                print(f"[planner] stage_to_node={pp_cfg.get('stage_to_node')}", flush=True)
+            print(f"[mesh] {root_mesh_tensor.tolist()}", flush=True)
 
         if isinstance(pp_stages, str) and pp_stages.strip().lower() == "auto":
             if not isinstance(pp_auto_mem_gb, list) or len(pp_auto_mem_gb) != pp_degree:
@@ -1639,7 +1720,7 @@ def main() -> None:
             raise ValueError("pp.microbatches must be <= ceil(global_batch_size/dp_degree)")
 
         device = torch.device("cuda", local_rank)
-        local_stage_ids = [dist.get_rank(pp_group) + k * pp_degree for k in range(vpp)]
+        local_stage_ids = [int(pp_rank) + k * pp_degree for k in range(vpp)]
         stages: List[Any] = []
         stage_modules: List[DenseCausalLMStage] = []
 
