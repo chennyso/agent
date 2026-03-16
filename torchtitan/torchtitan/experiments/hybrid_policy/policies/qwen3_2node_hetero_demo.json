@@ -1,0 +1,54 @@
+{
+  "name": "qwen3_2node_hetero_tail_aware_demo",
+  "schema_version": 1,
+  "pipeline": {
+    "degree": 4,
+    "vpp": 1,
+    "microbatches": 1,
+    "schedule": "1F1B",
+    "stage_ranges": [
+      [0, 8],
+      [9, 23],
+      [24, 43],
+      [44, 63]
+    ],
+    "stage_to_node": ["g4", "g4", "g5", "g5"]
+  },
+  "tensor_parallel": {
+    "enabled": true,
+    "degree": 2
+  },
+  "context_parallel": {
+    "enabled": false,
+    "degree": 1
+  },
+  "expert_parallel": {
+    "enabled": false,
+    "degree": 1,
+    "expert_tp_degree": 1
+  },
+  "fsdp2": {
+    "enabled": true,
+    "reshard_after_forward": false,
+    "policy_mode": "module_groups",
+    "attention_scope": "auto",
+    "mlp_scope": "auto",
+    "embhead_scope": "keep",
+    "node_local_reshard_size": 2,
+    "policy_trace": true,
+    "enabled_per_stage": [false, true, true, false],
+    "reshard_after_forward_per_stage": [false, false, false, false]
+  },
+  "recompute": {
+    "policy": "full",
+    "per_stage": ["full", "full", "none", "none"]
+  },
+  "metadata": {
+    "pipeline_trace": true,
+    "pipeline_trace_collectives": true,
+    "cluster_nodes": [
+      {"name": "g4", "gpus": 8},
+      {"name": "g5", "gpus": 8}
+    ]
+  }
+}

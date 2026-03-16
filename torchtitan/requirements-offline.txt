@@ -1,0 +1,12 @@
+PySocks
+torchdata>=0.8.0
+datasets>=3.6.0
+tokenizers>=0.15.0
+transformers>=4.42.0
+safetensors
+fsspec
+tyro
+tensorboard
+wandb
+einops
+pillow
