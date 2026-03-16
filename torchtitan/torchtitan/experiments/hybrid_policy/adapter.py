@@ -165,11 +165,18 @@ def apply_hybrid_policy(
             )
     else:
         fsdp_enabled = bool(fsdp2.get("enabled", False))
-    cfg.parallelism.data_parallel_shard_degree = (
-        max(1, cfg.parallelism.data_parallel_shard_degree)
-        if fsdp_enabled
-        else 1
-    )
+    if fsdp_enabled:
+        current_dp_shard = int(cfg.parallelism.data_parallel_shard_degree)
+        if current_dp_shard <= 1:
+            cfg.parallelism.data_parallel_shard_degree = -1
+            logger.info(
+                "hybrid_policy enabled FSDP2 without explicit shard degree; "
+                "using inferred data_parallel_shard_degree from world_size / (pp * tp * cp)"
+            )
+        else:
+            cfg.parallelism.data_parallel_shard_degree = max(1, current_dp_shard)
+    else:
+        cfg.parallelism.data_parallel_shard_degree = 1
 
     reshard_per_stage = fsdp2.get("reshard_after_forward_per_stage")
     if isinstance(reshard_per_stage, list):

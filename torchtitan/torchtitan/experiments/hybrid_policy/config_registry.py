@@ -29,12 +29,24 @@ def _hf_assets(default_path: str) -> str:
     return str(os.environ.get("HYBRID_HF_ASSETS_PATH") or default_path)
 
 
+def _dataset_name(default_name: str) -> str:
+    return str(os.environ.get("HYBRID_DATASET") or default_name)
+
+
+def _dataset_path() -> str | None:
+    value = os.environ.get("HYBRID_DATASET_PATH")
+    return str(value) if value else None
+
+
 def _base_qwen3_32b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path=_hf_assets("./assets/hf/Qwen3-32B"),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("32B"),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset=_dataset_name("c4"),
+            dataset_path=_dataset_path(),
+        ),
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
         training=TrainingConfig(
@@ -59,7 +71,10 @@ def _base_qwen3_14b() -> Trainer.Config:
         hf_assets_path=_hf_assets("./assets/hf/Qwen3-14B"),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("14B"),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset=_dataset_name("c4"),
+            dataset_path=_dataset_path(),
+        ),
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
         training=TrainingConfig(

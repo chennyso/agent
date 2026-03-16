@@ -7,6 +7,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -26,9 +27,70 @@ def _load_c4_dataset(dataset_path: str, split: str):
     return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
 
+def _resolve_local_dataset_files(dataset_path: str) -> tuple[str, list[str]]:
+    path = Path(dataset_path)
+    if path.is_file():
+        suffix = path.suffix.lower()
+        if suffix in {".jsonl", ".json"}:
+            return "json", [str(path)]
+        if suffix == ".parquet":
+            return "parquet", [str(path)]
+        if suffix in {".txt", ".text"}:
+            return "text", [str(path)]
+        raise ValueError(
+            f"Unsupported local dataset file type: {path.suffix}. "
+            "Supported types are .jsonl/.json, .parquet, .txt/.text"
+        )
+
+    if not path.is_dir():
+        raise ValueError(f"Local dataset path does not exist: {dataset_path}")
+
+    candidate_patterns = [
+        ("json", "train*.jsonl"),
+        ("json", "train*.json"),
+        ("parquet", "train*.parquet"),
+        ("text", "train*.txt"),
+        ("text", "train*.text"),
+    ]
+    for dataset_type, pattern in candidate_patterns:
+        matches = sorted(str(p) for p in path.glob(pattern))
+        if matches:
+            return dataset_type, matches
+
+    raise ValueError(
+        f"No supported local training files found under {dataset_path}. "
+        "Expected files like train*.jsonl, train*.json, train*.parquet, or train*.txt"
+    )
+
+
+def _load_local_text_dataset(dataset_path: str):
+    dataset_type, data_files = _resolve_local_dataset_files(dataset_path)
+    logger.info(
+        f"Loading local text dataset from {dataset_path} using {dataset_type} files: {data_files}"
+    )
+    return load_dataset(
+        dataset_type,
+        data_files={"train": data_files},
+        split="train",
+        streaming=True,
+    )
+
+
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
+
+
+def _process_local_text(sample: dict[str, Any]) -> str:
+    for key in ("text", "content", "raw_text", "document", "article"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    raise KeyError(
+        "Unable to find text field in local dataset sample. "
+        f"Available keys: {list(sample.keys())}"
+    )
 
 
 # Add your dataset here - more information at docs/datasets.md
@@ -47,6 +109,11 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    "local_text": DatasetConfig(
+        path=".",
+        loader=_load_local_text_dataset,
+        sample_processor=_process_local_text,
     ),
 }
 
