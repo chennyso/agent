@@ -201,3 +201,21 @@ def qwen3_hybrid_demo() -> Trainer.Config:
         )
 
     return cfg
+
+
+def qwen3_32b_2node_24g_32g_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    policy_path = (
+        Path(__file__).resolve().parent
+        / "policies"
+        / "qwen3_32b_2node_24g_32g_fsdp2.json"
+    )
+    cfg = apply_hybrid_policy(cfg, policy_path=policy_path)
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 2)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 100)
+    logger.info(
+        "Using dedicated 24GB+32GB / Qwen3-32B policy: PP=2, TP=4, FSDP2, "
+        "stage split [0-27] on g4 and [28-63]+head on g5"
+    )
+    return cfg

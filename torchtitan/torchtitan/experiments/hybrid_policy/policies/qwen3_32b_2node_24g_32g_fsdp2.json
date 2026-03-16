@@ -1,5 +1,5 @@
 {
-  "name": "qwen3_2node_hetero_tail_aware_demo",
+  "name": "qwen3_32b_2node_24g_32g_fsdp2",
   "schema_version": 1,
   "pipeline": {
     "degree": 2,
@@ -7,8 +7,8 @@
     "microbatches": 1,
     "schedule": "1F1B",
     "stage_ranges": [
-      [0, 23],
-      [24, 63]
+      [0, 27],
+      [28, 63]
     ],
     "stage_to_node": ["g4", "g5"]
   },
@@ -45,8 +45,8 @@
     "pipeline_trace": true,
     "pipeline_trace_collectives": true,
     "cluster_nodes": [
-      {"name": "g4", "gpus": 8},
-      {"name": "g5", "gpus": 8}
+      {"name": "g4", "gpus": 8, "memory_gb": 24},
+      {"name": "g5", "gpus": 8, "memory_gb": 32}
     ]
   }
 }

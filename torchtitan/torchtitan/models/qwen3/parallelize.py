@@ -291,7 +291,7 @@ def apply_parallelism_conditioned_fsdp(
 
     fully_shard(model, **fsdp_config)
 
-    if pp_enabled and stage_idx == (num_stages - 1):
+    if pp_enabled:
         _disable_backward_prefetch(model)
 
 
