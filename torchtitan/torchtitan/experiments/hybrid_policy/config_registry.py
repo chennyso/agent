@@ -219,3 +219,29 @@ def qwen3_32b_2node_24g_32g_fsdp2() -> Trainer.Config:
         "stage split [0-27] on g4 and [28-63]+head on g5"
     )
     return cfg
+
+
+def qwen3_32b_2node_24g_32g_tp8_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 100)
+    cfg.activation_checkpoint.mode = "full"
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=8,
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        fsdp_reshard_after_forward="always",
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope="global",
+        fsdp_mlp_scope="global",
+        fsdp_embhead_scope="global",
+        fsdp_node_local_reshard_size=0,
+        fsdp_policy_trace=True,
+    )
+    logger.info(
+        "Using dedicated 24GB+32GB / Qwen3-32B FSDP2-first policy: TP=8, DP-shard=2, PP=1"
+    )
+    return cfg
