@@ -60,6 +60,7 @@ def _recv_activation(
     step: int,
     microbatch_idx: int,
     src_rank: int,
+    group: dist.ProcessGroup,
     shape: Tuple[int, ...],
     dtype: torch.dtype,
     device: torch.device,
@@ -67,7 +68,7 @@ def _recv_activation(
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tag = _msg_tag(10, step, microbatch_idx)
     _log(rank, stage_idx, step, microbatch_idx, f"recv_act start src={src_rank} tag={tag} {_tensor_meta(tensor)}")
-    dist.recv(tensor, src=src_rank, tag=tag)
+    dist.recv(tensor, src=src_rank, group=group, tag=tag)
     _log(rank, stage_idx, step, microbatch_idx, f"recv_act done src={src_rank} tag={tag} {_tensor_meta(tensor)}")
     return tensor
 
@@ -79,12 +80,13 @@ def _send_activation(
     step: int,
     microbatch_idx: int,
     dst_rank: int,
+    group: dist.ProcessGroup,
     tensor: torch.Tensor,
 ) -> None:
     tag = _msg_tag(10, step, microbatch_idx)
     send_tensor = tensor.detach().contiguous()
     _log(rank, stage_idx, step, microbatch_idx, f"send_act start dst={dst_rank} tag={tag} {_tensor_meta(send_tensor)}")
-    dist.send(send_tensor, dst=dst_rank, tag=tag)
+    dist.send(send_tensor, dst=dst_rank, group=group, tag=tag)
     _log(rank, stage_idx, step, microbatch_idx, f"send_act done dst={dst_rank} tag={tag}")
 
 
@@ -95,6 +97,7 @@ def _recv_grad(
     step: int,
     microbatch_idx: int,
     src_rank: int,
+    group: dist.ProcessGroup,
     shape: Tuple[int, ...],
     dtype: torch.dtype,
     device: torch.device,
@@ -102,7 +105,7 @@ def _recv_grad(
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tag = _msg_tag(20, step, microbatch_idx)
     _log(rank, stage_idx, step, microbatch_idx, f"recv_grad start src={src_rank} tag={tag} {_tensor_meta(tensor)}")
-    dist.recv(tensor, src=src_rank, tag=tag)
+    dist.recv(tensor, src=src_rank, group=group, tag=tag)
     _log(rank, stage_idx, step, microbatch_idx, f"recv_grad done src={src_rank} tag={tag} {_tensor_meta(tensor)}")
     return tensor
 
@@ -114,12 +117,13 @@ def _send_grad(
     step: int,
     microbatch_idx: int,
     dst_rank: int,
+    group: dist.ProcessGroup,
     tensor: torch.Tensor,
 ) -> None:
     tag = _msg_tag(20, step, microbatch_idx)
     send_tensor = tensor.detach().contiguous()
     _log(rank, stage_idx, step, microbatch_idx, f"send_grad start dst={dst_rank} tag={tag} {_tensor_meta(send_tensor)}")
-    dist.send(send_tensor, dst=dst_rank, tag=tag)
+    dist.send(send_tensor, dst=dst_rank, group=group, tag=tag)
     _log(rank, stage_idx, step, microbatch_idx, f"send_grad done dst={dst_rank} tag={tag}")
 
 
@@ -172,6 +176,16 @@ def main() -> None:
         pp_rank = rank // int(ranks_per_stage)
         dp_idx = rank % int(ranks_per_stage)
         line_ranks = _build_line_ranks(world_size, pp_degree, ranks_per_stage, dp_idx)
+        line_groups: List[dist.ProcessGroup] = []
+        line_group: Optional[dist.ProcessGroup] = None
+        for line_dp_idx in range(dp_degree):
+            ranks = _build_line_ranks(world_size, pp_degree, ranks_per_stage, line_dp_idx)
+            group = dist.new_group(ranks=ranks)
+            line_groups.append(group)
+            if int(line_dp_idx) == int(dp_idx):
+                line_group = group
+        if line_group is None:
+            raise RuntimeError("failed to create line_group")
         prev_rank = line_ranks[pp_rank - 1] if pp_rank > 0 else None
         next_rank = line_ranks[pp_rank + 1] if pp_rank < (pp_degree - 1) else None
 
@@ -281,6 +295,11 @@ def main() -> None:
         dist.barrier()
         if debug_init_logs:
             print(f"[handpp-init][rank {rank}] passed pre-train barrier", flush=True)
+        line_warm = torch.zeros(1, device=device, dtype=torch.float32)
+        dist.all_reduce(line_warm, group=line_group)
+        torch.cuda.synchronize(device)
+        if debug_init_logs:
+            print(f"[handpp-init][rank {rank}] warmed line_group={line_ranks}", flush=True)
 
         for step in range(steps):
             step_start = time.time()
@@ -309,6 +328,7 @@ def main() -> None:
                             step=step,
                             microbatch_idx=microbatch_idx,
                             src_rank=int(prev_rank),
+                            group=line_group,
                             shape=hidden_shape,
                             dtype=dtype,
                             device=device,
@@ -335,6 +355,7 @@ def main() -> None:
                             step=step,
                             microbatch_idx=microbatch_idx,
                             dst_rank=int(next_rank),
+                            group=line_group,
                             tensor=stage_output,
                         )
 
@@ -354,6 +375,7 @@ def main() -> None:
                             step=step,
                             microbatch_idx=microbatch_idx,
                             src_rank=int(next_rank),
+                            group=line_group,
                             shape=tuple(int(x) for x in cached_outputs[microbatch_idx].shape),
                             dtype=cached_outputs[microbatch_idx].dtype,
                             device=device,
@@ -372,6 +394,7 @@ def main() -> None:
                             step=step,
                             microbatch_idx=microbatch_idx,
                             dst_rank=int(prev_rank),
+                            group=line_group,
                             tensor=grad_to_prev,
                         )
 
