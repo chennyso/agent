@@ -8,10 +8,11 @@ TORCHTITAN_DIR="${TORCHTITAN_DIR:-torchtitan}"
 export NODE_RANK="${NODE_RANK:-1}"
 export NNODES="${NNODES:-2}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python}}"
 
 cd "${TORCHTITAN_DIR}"
 
-torchrun \
+exec "${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --node_rank="${NODE_RANK}" \

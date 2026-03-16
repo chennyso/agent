@@ -11,6 +11,7 @@ export NODE_RANK="${NODE_RANK:-1}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens8f0}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python}}"
 
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-./assets/hf/Qwen3-32B}"
 DUMP_FOLDER="${DUMP_FOLDER:-./outputs/qwen3_32b_tt_2node_hetero}"
@@ -24,7 +25,7 @@ if [ -d "${HF_ASSETS_PATH}" ]; then
     )
 fi
 
-torchrun \
+exec "${PYTHON_BIN}" -m torch.distributed.run \
     --nnodes="${NNODES}" \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --node_rank="${NODE_RANK}" \
