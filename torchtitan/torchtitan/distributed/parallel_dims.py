@@ -110,10 +110,9 @@ class ParallelDims:
 
         Note: DeviceMesh currently recreates the process group for each dimension.
         It should share the process group for the same dim group to avoid unnecessary
-        process group creation. We can also use Fake to achieve a similar goal.
-        However, using Fake to avoid redundancy messing up the code. We only use Fake
-        when it is necessary. For now, we just let DeviceMesh create redundant process
-        group and wait for DeviceMesh to fix the issue.
+        process group creation. In practice, using the Fake backend here is currently
+        incompatible with newer ProcessGroup wrappers used by recent PyTorch builds, so
+        we always build real groups for stability.
         """
 
         def unflatten_mesh(
@@ -121,22 +120,11 @@ class ParallelDims:
             dim_names: tuple[str, ...],
             dim_degrees: tuple[int, ...],
         ):
-            """Unflatten the world mesh to create the required mesh dimensions.
-
-            Uses fake backend for dimensions with degree 1 or for 'batch' dimension
-            to avoid unnecessary process group creation.
-            """
-            backend_override = {}
-            for name, degree in zip(dim_names, dim_degrees, strict=True):
-                if not self._mesh_exist(name, degree):
-                    backend_override[name] = "fake"
-
+            """Unflatten the world mesh to create the required mesh dimensions."""
             return world_mesh._unflatten(
                 0,
                 dim_degrees,
                 dim_names,
-                # pyrefly: ignore [bad-argument-type]
-                backend_override=backend_override,
             )
 
         logger.info(
@@ -306,9 +294,6 @@ class ParallelDims:
 
         Returns a dictionary of enabled one-dimensional device meshes, allowing you to
         access their process groups.
-
-        Note:
-            Device meshes created with the Fake backend are still included in the results.
 
         Returns:
             dict[str, DeviceMesh]: A dictionary mapping mesh dimension names to their
