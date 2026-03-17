@@ -523,6 +523,28 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        timing_summary = ""
+        if extra_metrics:
+            step_total = extra_metrics.get("time_metrics/step_total(s)")
+            forward_backward = extra_metrics.get("time_metrics/forward_backward(s)")
+            all_gather = extra_metrics.get("time_metrics/profile_all_gather(ms)")
+            reduce_scatter = extra_metrics.get(
+                "time_metrics/profile_reduce_scatter(ms)"
+            )
+            pipeline_idle = extra_metrics.get("time_metrics/pp_idle_estimate(s)")
+            summary_parts = []
+            if isinstance(step_total, (int, float)):
+                summary_parts.append(f"step_time: {step_total:.3f}s")
+            if isinstance(forward_backward, (int, float)):
+                summary_parts.append(f"fwd_bwd: {forward_backward:.3f}s")
+            if isinstance(all_gather, (int, float)):
+                summary_parts.append(f"ag: {all_gather:.1f}ms")
+            if isinstance(reduce_scatter, (int, float)):
+                summary_parts.append(f"rs: {reduce_scatter:.1f}ms")
+            if isinstance(pipeline_idle, (int, float)):
+                summary_parts.append(f"pp_idle≈ {pipeline_idle:.3f}s")
+            if summary_parts:
+                timing_summary = "  " + "  ".join(summary_parts)
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -531,7 +553,7 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}{timing_summary}{color.reset}"
         )
 
         self.ntokens_since_last_log = 0

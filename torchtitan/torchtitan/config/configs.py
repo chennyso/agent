@@ -496,3 +496,9 @@ class DebugConfig:
 
     pipeline_trace_collectives: bool = False
     """Include pipeline P2P collective planning logs when pipeline_trace is enabled."""
+
+    step_timing_breakdown: bool = False
+    """Enable per-step timing breakdown collection for compute and communication analysis."""
+
+    step_timing_with_profiler: bool = False
+    """Use `torch.profiler` to break profiled steps into collective categories. Higher overhead."""

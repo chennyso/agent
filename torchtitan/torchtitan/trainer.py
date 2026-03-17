@@ -8,6 +8,7 @@ import dataclasses
 import json
 import os
 import time
+from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
@@ -15,6 +16,7 @@ from typing import Annotated, Any, cast
 
 import torch
 import torch.distributed.checkpoint.stateful
+import torch.profiler
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -429,6 +431,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
+        self.step_timing_enabled = config.debug.step_timing_breakdown
+        self.step_timing_with_profiler = (
+            config.debug.step_timing_breakdown
+            and config.debug.step_timing_with_profiler
+        )
+        self.pp_stage_timing = None
+        if self.step_timing_enabled and parallel_dims.pp_enabled:
+            from torchtitan.distributed.pipeline_parallel import (
+                enable_pipeline_stage_timing,
+            )
+
+            if hasattr(self.pp_schedule, "stages"):
+                pp_stages = list(self.pp_schedule.stages)
+            else:
+                stage = getattr(self.pp_schedule, "stage", None)
+                pp_stages = [stage] if stage is not None else []
+            if pp_stages:
+                self.pp_stage_timing = enable_pipeline_stage_timing(
+                    pp_stages,
+                    device=self.device,
+                )
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -684,9 +707,78 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _synchronize_for_timing(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _maybe_start_step_profiler(self):
+        if not self.step_timing_with_profiler or not self.metrics_processor.should_log(
+            self.step
+        ):
+            return None
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        profiler.__enter__()
+        return profiler
+
+    def _stop_step_profiler(self, profiler) -> dict[str, float]:
+        if profiler is None:
+            return {}
+        profiler.__exit__(None, None, None)
+
+        metrics: dict[str, float] = {}
+        categories = {
+            "all_gather": ("all_gather", "allgather", "foreach_all_gather"),
+            "reduce_scatter": ("reduce_scatter", "reduce_scatter_tensor"),
+            "all_reduce": ("all_reduce", "allreduce"),
+            "p2p": ("send", "recv", "isend", "irecv", "batch_isend_irecv"),
+        }
+        totals_us: dict[str, float] = defaultdict(float)
+        total_cuda_us = 0.0
+
+        for event in profiler.key_averages():
+            event_key = str(getattr(event, "key", ""))
+            event_cuda_us = float(
+                getattr(
+                    event,
+                    "self_device_time_total",
+                    getattr(event, "self_cuda_time_total", 0.0),
+                )
+            )
+            total_cuda_us += event_cuda_us
+            lowered = event_key.lower()
+            for category, patterns in categories.items():
+                if any(pattern in lowered for pattern in patterns):
+                    totals_us[category] += event_cuda_us
+                    break
+
+        total_comm_us = sum(totals_us.values())
+        metrics["time_metrics/profile_cuda_total(ms)"] = total_cuda_us / 1000.0
+        metrics["time_metrics/profile_compute(ms)"] = max(
+            total_cuda_us - total_comm_us, 0.0
+        ) / 1000.0
+        for category, value_us in totals_us.items():
+            metrics[f"time_metrics/profile_{category}(ms)"] = value_us / 1000.0
+        return metrics
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        profiler = self._maybe_start_step_profiler()
+        collect_step_timing = self.step_timing_enabled and self.metrics_processor.should_log(
+            self.step
+        )
+        timing_metrics: dict[str, float] = {}
+        if collect_step_timing and self.pp_stage_timing is not None:
+            self.pp_stage_timing.reset()
+        step_start = time.perf_counter()
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
@@ -698,37 +790,94 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        microbatch_collect_start = time.perf_counter()
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
+        if collect_step_timing:
+            timing_metrics["time_metrics/microbatch_collect(s)"] = (
+                time.perf_counter() - microbatch_collect_start
+            )
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            token_sync_start = time.perf_counter()
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
             global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
         else:
             global_valid_tokens = local_valid_tokens.float()
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            timing_metrics["time_metrics/token_sync(s)"] = (
+                time.perf_counter() - token_sync_start
+            )
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
+        transfer_time_s = 0.0
+        forward_backward_time_s = 0.0
         for input_dict, labels in microbatches:
             # Move tensors to GPU
+            if collect_step_timing:
+                self._synchronize_for_timing()
+                transfer_start = time.perf_counter()
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
+            if collect_step_timing:
+                self._synchronize_for_timing()
+                transfer_time_s += time.perf_counter() - transfer_start
 
+            if collect_step_timing:
+                self._synchronize_for_timing()
+                forward_backward_start = time.perf_counter()
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
+            if collect_step_timing:
+                self._synchronize_for_timing()
+                forward_backward_time_s += time.perf_counter() - forward_backward_start
             accumulated_losses.append(loss.detach())
 
+        if collect_step_timing:
+            timing_metrics["time_metrics/cpu_to_device(s)"] = transfer_time_s
+            timing_metrics["time_metrics/forward_backward(s)"] = (
+                forward_backward_time_s
+            )
+            if self.pp_stage_timing is not None:
+                local_stage_busy_s = (
+                    self.pp_stage_timing.forward_chunk_time_s
+                    + self.pp_stage_timing.backward_chunk_time_s
+                )
+                timing_metrics["time_metrics/pp_forward_chunks(s)"] = (
+                    self.pp_stage_timing.forward_chunk_time_s
+                )
+                timing_metrics["time_metrics/pp_backward_chunks(s)"] = (
+                    self.pp_stage_timing.backward_chunk_time_s
+                )
+                timing_metrics["time_metrics/pp_forward_chunks(count)"] = float(
+                    self.pp_stage_timing.forward_chunk_count
+                )
+                timing_metrics["time_metrics/pp_backward_chunks(count)"] = float(
+                    self.pp_stage_timing.backward_chunk_count
+                )
+                timing_metrics["time_metrics/pp_idle_estimate(s)"] = max(
+                    forward_backward_time_s - local_stage_busy_s,
+                    0.0,
+                )
+
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            grad_clip_start = time.perf_counter()
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.config.training.max_norm,
@@ -736,9 +885,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            timing_metrics["time_metrics/grad_clip(s)"] = (
+                time.perf_counter() - grad_clip_start
+            )
         self.checkpointer.maybe_wait_for_staging()
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            optimizer_start = time.perf_counter()
         self.optimizers.step()
         self.lr_schedulers.step()
+        if collect_step_timing:
+            self._synchronize_for_timing()
+            timing_metrics["time_metrics/optimizer(s)"] = (
+                time.perf_counter() - optimizer_start
+            )
+            timing_metrics["time_metrics/step_total(s)"] = (
+                time.perf_counter() - step_start
+            )
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -779,6 +944,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        if collect_step_timing:
+            extra_metrics.update(timing_metrics)
+            extra_metrics.update(self._stop_step_profiler(profiler))
+        else:
+            self._stop_step_profiler(profiler)
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

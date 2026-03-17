@@ -6,7 +6,9 @@
 import copy
 import math
 import os
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -42,7 +44,70 @@ __all__ = [
     "build_pipeline_schedule",
     "generate_llm_fqn_per_model_part",
     "pipeline_module_split",
+    "PipelineStageTimingState",
+    "enable_pipeline_stage_timing",
 ]
+
+
+@dataclass(slots=True)
+class PipelineStageTimingState:
+    forward_chunk_time_s: float = 0.0
+    backward_chunk_time_s: float = 0.0
+    forward_chunk_count: int = 0
+    backward_chunk_count: int = 0
+
+    def reset(self) -> None:
+        self.forward_chunk_time_s = 0.0
+        self.backward_chunk_time_s = 0.0
+        self.forward_chunk_count = 0
+        self.backward_chunk_count = 0
+
+
+def _device_synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def enable_pipeline_stage_timing(
+    stages: list[PipelineStage],
+    *,
+    device: torch.device,
+) -> PipelineStageTimingState:
+    timing_state = PipelineStageTimingState()
+    for stage in stages:
+        original_forward = stage.forward_one_chunk
+        original_backward = stage.backward_one_chunk
+
+        def _wrap_forward(original: Callable, state: PipelineStageTimingState):
+            def wrapped(*args, **kwargs):
+                _device_synchronize(device)
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    _device_synchronize(device)
+                    state.forward_chunk_time_s += time.perf_counter() - start
+                    state.forward_chunk_count += 1
+
+            return wrapped
+
+        def _wrap_backward(original: Callable, state: PipelineStageTimingState):
+            def wrapped(*args, **kwargs):
+                _device_synchronize(device)
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    _device_synchronize(device)
+                    state.backward_chunk_time_s += time.perf_counter() - start
+                    state.backward_chunk_count += 1
+
+            return wrapped
+
+        stage.forward_one_chunk = _wrap_forward(original_forward, timing_state)
+        stage.backward_one_chunk = _wrap_backward(original_backward, timing_state)
+
+    return timing_state
 
 
 def pipeline_llm(
