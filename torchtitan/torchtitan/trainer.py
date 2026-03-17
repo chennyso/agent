@@ -79,8 +79,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         metrics: MetricsProcessor.Config = field(
             default_factory=MetricsProcessor.Config
         )
-        # TODO: remove the optional flag once Flux tokenizer is modeled properly
-        tokenizer: BaseTokenizer.Config | None = field(
+        tokenizer: BaseTokenizer.Config = field(
             default_factory=HuggingFaceTokenizer.Config
         )
         dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
@@ -163,7 +162,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     parallel_dims: ParallelDims
 
     # swappable training components
-    tokenizer: BaseTokenizer | None
+    tokenizer: BaseTokenizer
     dataloader: BaseDataLoader
     model_config: BaseModel.Config
     # TODO: we should make this list[BaseModel / Decoder] but this will affect many components.
@@ -207,15 +206,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
-        if config.parallelism.rank_order:
-            logger.info(
-                f"Using experimental rank_order={config.parallelism.rank_order}"
-            )
-        if config.parallelism.pipeline_parallel_stage_to_node:
-            logger.info(
-                "Pipeline stage_to_node hints="
-                f"{config.parallelism.pipeline_parallel_stage_to_node}"
-            )
 
         # Logging needs to happen after distributed initialized
         config.maybe_log()
@@ -241,11 +231,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         # build tokenizer
-        self.tokenizer = (
-            config.tokenizer.build(tokenizer_path=config.hf_assets_path)
-            if config.tokenizer is not None
-            else None
-        )
+        self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
         # build dataloader
         self.dataloader = config.dataloader.build(
@@ -375,7 +361,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model_config=model_config,
                 parallelize_fn=model_spec.parallelize_fn,
                 loss_fn=self.loss_fn,
-                debug_config=config.debug,
             )
             # when PP is enabled, `model` obj is no longer used after this point,
             # model_parts is used instead
@@ -531,7 +516,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             ep=parallelism_config.expert_parallel_degree,
             etp=parallelism_config.expert_tensor_parallel_degree,
             world_size=world_size,
-            rank_order=parallelism_config.rank_order,
         )
 
     def batch_generator(

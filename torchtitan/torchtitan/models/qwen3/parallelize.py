@@ -149,6 +149,135 @@ def _resolve_qwen3_group_scope(
     return _default_scope_name(base_reshard)
 
 
+def _resolve_qwen3_prefetch_profile(
+    *,
+    direction: str,
+    configured_profile: str,
+    parallel_dims: ParallelDims,
+    stage_idx: int,
+    num_stages: int,
+    stage_to_node: tuple[str, ...],
+    is_last_local_stage: bool,
+) -> str:
+    if configured_profile != "auto":
+        return configured_profile
+
+    if not parallel_dims.pp_enabled or num_stages <= 1:
+        return "none"
+
+    current_stage_node = stage_to_node[stage_idx] if 0 <= stage_idx < len(stage_to_node) else None
+    crosses_prev = (
+        current_stage_node is not None
+        and stage_idx > 0
+        and stage_to_node[stage_idx - 1] != current_stage_node
+    )
+    crosses_next = (
+        current_stage_node is not None
+        and stage_idx + 1 < num_stages
+        and stage_to_node[stage_idx + 1] != current_stage_node
+    )
+    near_cross_node_boundary = crosses_prev or crosses_next
+    has_vpp = num_stages > parallel_dims.pp
+
+    if direction == "forward":
+        if near_cross_node_boundary:
+            return "none"
+        return "block"
+
+    if direction == "backward":
+        if has_vpp or is_last_local_stage or near_cross_node_boundary:
+            return "none"
+        return "block"
+
+    raise ValueError(f"Unsupported prefetch direction {direction!r}")
+
+
+def _set_modules_to_prefetch(
+    module: nn.Module,
+    *,
+    direction: str,
+    targets: list[nn.Module],
+) -> bool:
+    setter = getattr(module, f"set_modules_to_{direction}_prefetch", None)
+    if callable(setter):
+        setter(targets)
+        return True
+    return False
+
+
+def _apply_explicit_prefetch_policy(
+    model: nn.Module,
+    *,
+    forward_profile: str,
+    backward_profile: str,
+    stage_idx: int,
+    trace: bool,
+) -> None:
+    transformer_blocks = list(model.layers.values())
+    if not transformer_blocks:
+        return
+
+    forward_updates = 0
+    if forward_profile == "block":
+        next_transformer_blocks = transformer_blocks[1:] + [None]
+        if model.tok_embeddings is not None:
+            forward_updates += int(
+                _set_modules_to_prefetch(
+                    model.tok_embeddings,
+                    direction="forward",
+                    targets=[transformer_blocks[0]],
+                )
+            )
+        for transformer_block, next_transformer_block in zip(
+            transformer_blocks, next_transformer_blocks
+        ):
+            targets: list[nn.Module] = []
+            if next_transformer_block is not None:
+                targets = [next_transformer_block]
+            elif model.norm is not None and model.output is not None:
+                targets = [model.norm, model.output]
+            forward_updates += int(
+                _set_modules_to_prefetch(
+                    transformer_block,
+                    direction="forward",
+                    targets=targets,
+                )
+            )
+
+    backward_updates = 0
+    if backward_profile == "block":
+        reversed_transformer_blocks = list(reversed(transformer_blocks))
+        prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+        if model.norm is not None and model.output is not None:
+            backward_updates += int(
+                _set_modules_to_prefetch(
+                    model.output,
+                    direction="backward",
+                    targets=[reversed_transformer_blocks[0]],
+                )
+            )
+        for transformer_block, prev_transformer_block in zip(
+            reversed_transformer_blocks, prev_transformer_blocks
+        ):
+            targets = [prev_transformer_block] if prev_transformer_block is not None else []
+            if not targets and model.tok_embeddings is not None:
+                targets = [model.tok_embeddings]
+            backward_updates += int(
+                _set_modules_to_prefetch(
+                    transformer_block,
+                    direction="backward",
+                    targets=targets,
+                )
+            )
+
+    if trace and (forward_updates or backward_updates):
+        logger.info(
+            "[fsdp-policy] "
+            f"stage={stage_idx} explicit_prefetch forward={forward_profile}({forward_updates}) "
+            f"backward={backward_profile}({backward_updates})"
+        )
+
+
 def apply_parallelism_conditioned_fsdp(
     model: nn.Module,
     dp_mesh: DeviceMesh,
@@ -223,6 +352,24 @@ def apply_parallelism_conditioned_fsdp(
         base_reshard=base_reshard,
         node_local_size=parallelism.fsdp_node_local_reshard_size,
     )
+    forward_prefetch_profile = _resolve_qwen3_prefetch_profile(
+        direction="forward",
+        configured_profile=parallelism.fsdp_forward_prefetch,
+        parallel_dims=parallel_dims,
+        stage_idx=stage_idx,
+        num_stages=num_stages,
+        stage_to_node=stage_to_node,
+        is_last_local_stage=is_last_local_stage,
+    )
+    backward_prefetch_profile = _resolve_qwen3_prefetch_profile(
+        direction="backward",
+        configured_profile=parallelism.fsdp_backward_prefetch,
+        parallel_dims=parallel_dims,
+        stage_idx=stage_idx,
+        num_stages=num_stages,
+        stage_to_node=stage_to_node,
+        is_last_local_stage=is_last_local_stage,
+    )
 
     if parallelism.fsdp_policy_trace:
         logger.info(
@@ -231,7 +378,8 @@ def apply_parallelism_conditioned_fsdp(
             f"stage_node={getattr(model, '_tt_stage_node', 'n/a')} "
             f"attention={attention_scope}->{attention_reshard} "
             f"mlp={mlp_scope}->{mlp_reshard} "
-            f"embhead={embhead_scope}->{embhead_reshard}"
+            f"embhead={embhead_scope}->{embhead_reshard} "
+            f"prefetch={forward_prefetch_profile}/{backward_prefetch_profile}"
         )
 
     if getattr(model, "enable_weight_tying", False):
@@ -292,7 +440,16 @@ def apply_parallelism_conditioned_fsdp(
     fully_shard(model, **fsdp_config)
 
     if pp_enabled:
-        _disable_backward_prefetch(model)
+        if backward_prefetch_profile == "none":
+            _disable_backward_prefetch(model)
+        if forward_prefetch_profile != "none" or backward_prefetch_profile != "none":
+            _apply_explicit_prefetch_policy(
+                model,
+                forward_profile=forward_prefetch_profile,
+                backward_profile=backward_prefetch_profile,
+                stage_idx=stage_idx,
+                trace=parallelism.fsdp_policy_trace,
+            )
 
 
 def parallelize_qwen3(

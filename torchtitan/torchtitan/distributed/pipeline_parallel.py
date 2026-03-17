@@ -27,7 +27,6 @@ from torchtitan.components.loss import LossFunction
 from torchtitan.config import (
     ActivationCheckpointConfig,
     CompileConfig,
-    DebugConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -60,7 +59,6 @@ def pipeline_llm(
     model_config: BaseModel.Config,
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
-    debug_config: DebugConfig | None = None,
 ) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
     pp_mesh = parallel_dims.get_mesh("pp")
 
@@ -130,30 +128,8 @@ def pipeline_llm(
         module_names_per_stage = generate_llm_fqn_per_model_part(
             num_virtual_stages, num_layers, input_weight, output_weight
         )
-    stage_to_node = parallelism.pipeline_parallel_stage_to_node
-    if stage_to_node is not None and len(stage_to_node) != len(module_names_per_stage):
-        raise ValueError(
-            f"pipeline_parallel_stage_to_node must have len={len(module_names_per_stage)}; "
-            f"got {len(stage_to_node)}"
-        )
-    vpp_per_rank = parallelism.pipeline_parallel_vpp_per_rank
-    if vpp_per_rank is not None:
-        if len(vpp_per_rank) != int(parallel_dims.pp):
-            raise ValueError(
-                f"pipeline_parallel_vpp_per_rank must have len={parallel_dims.pp}; got {len(vpp_per_rank)}"
-            )
-        if len(set(int(x) for x in vpp_per_rank)) != 1:
-            raise NotImplementedError(
-                "Asymmetric VPP is represented in config, but the current TorchTitan runtime still requires "
-                "a uniform number of local stages per PP rank."
-            )
     for i, stage_ms in enumerate(module_names_per_stage):
         logger.debug(f"Stage {i}: {stage_ms}")
-        if debug_config is not None and debug_config.pipeline_trace:
-            node_info = stage_to_node[i] if stage_to_node is not None else "n/a"
-            logger.info(
-                f"[pp-trace][init] stage={i} node={node_info} modules={module_names_per_stage[i]}"
-            )
 
     stages, model_parts = pipeline_module_split(
         model,
@@ -161,8 +137,6 @@ def pipeline_llm(
         parallelism.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
-        debug_config=debug_config,
-        stage_to_node=stage_to_node,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -396,78 +370,12 @@ def generate_llm_fqn_per_model_part(
     return module_names_per_stage
 
 
-def _enable_pipeline_debug(
-    *,
-    stage: PipelineStage,
-    debug_config: DebugConfig,
-    module_names: list[str],
-    node_name: str | None,
-) -> None:
-    if not debug_config.pipeline_trace:
-        return
-
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-    stage_idx = int(getattr(stage, "stage_index", getattr(stage, "group_rank", -1)))
-    logger.info(
-        f"[pp-trace][stage_init] rank={rank} stage={stage_idx} node={node_name or 'n/a'} modules={module_names}"
-    )
-
-    def _wrap_method(method_name: str):
-        original = getattr(stage, method_name, None)
-        if original is None or getattr(original, "_hybrid_trace_wrapped", False):
-            return
-
-        def wrapped(*args, **kwargs):
-            chunk = kwargs.get("chunk")
-            if chunk is None and args:
-                for value in args:
-                    if isinstance(value, int):
-                        chunk = value
-                        break
-            logger.info(
-                f"[pp-trace][{method_name}] rank={rank} stage={stage_idx} chunk={chunk} enter"
-            )
-            result = original(*args, **kwargs)
-            if debug_config.pipeline_trace_collectives and method_name in {
-                "get_fwd_recv_ops",
-                "get_fwd_send_ops",
-                "get_bwd_recv_ops",
-                "get_bwd_send_ops",
-            }:
-                try:
-                    num_ops = len(result)
-                except Exception:
-                    num_ops = "unknown"
-                logger.info(
-                    f"[pp-trace][{method_name}] rank={rank} stage={stage_idx} chunk={chunk} ops={num_ops}"
-                )
-            logger.info(
-                f"[pp-trace][{method_name}] rank={rank} stage={stage_idx} chunk={chunk} exit"
-            )
-            return result
-
-        wrapped._hybrid_trace_wrapped = True  # type: ignore[attr-defined]
-        setattr(stage, method_name, wrapped)
-
-    for name in (
-        "forward_one_chunk",
-        "backward_one_chunk",
-        "get_fwd_recv_ops",
-        "get_fwd_send_ops",
-        "get_bwd_recv_ops",
-        "get_bwd_send_ops",
-    ):
-        _wrap_method(name)
-
-
 def pipeline_module_split(
     whole_model: nn.Module,
     pp_mesh: DeviceMesh,
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
-    debug_config: DebugConfig | None = None,
-    stage_to_node: list[str] | None = None,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
@@ -505,12 +413,7 @@ def pipeline_module_split(
     pp_degree = pp_mesh.size()
 
     def _build_stage_from_modules(
-        stage_idx: int,
-        module_names: list[str],
-        num_stages: int,
-        *,
-        local_stage_slot: int,
-        local_stage_count: int,
+        stage_idx: int, module_names: list[str], num_stages: int
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
 
@@ -553,17 +456,6 @@ def pipeline_module_split(
                 # Replace with None
                 setattr(model, module_name, None)
 
-        setattr(model, "_tt_stage_idx", stage_idx)
-        setattr(model, "_tt_num_stages", num_stages)
-        setattr(model, "_tt_stage_modules", tuple(module_names))
-        setattr(model, "_tt_pp_rank", pp_rank)
-        setattr(model, "_tt_local_stage_slot", local_stage_slot)
-        setattr(model, "_tt_local_stage_count", local_stage_count)
-        setattr(model, "_tt_is_last_local_stage", local_stage_slot == (local_stage_count - 1))
-        if stage_to_node is not None:
-            setattr(model, "_tt_stage_to_node", tuple(stage_to_node))
-            setattr(model, "_tt_stage_node", stage_to_node[stage_idx])
-
         stage = PipelineStage(
             model,
             stage_idx,
@@ -571,13 +463,6 @@ def pipeline_module_split(
             device,
             group=pp_mesh.get_group("pp"),
         )
-        if debug_config is not None and debug_config.pipeline_trace:
-            _enable_pipeline_debug(
-                stage=stage,
-                debug_config=debug_config,
-                module_names=module_names,
-                node_name=(stage_to_node[stage_idx] if stage_to_node is not None else None),
-            )
         return stage, model
 
     num_stages = len(module_names_per_stage)
@@ -611,16 +496,12 @@ def pipeline_module_split(
         else:
             raise ValueError(f"Unknown style {style}")
 
-    stage_indices = _get_stage_indices()
-    local_stage_count = len(stage_indices)
-    for local_stage_slot, stage_idx in enumerate(stage_indices):
+    for stage_idx in _get_stage_indices():
         module_names = module_names_per_stage[stage_idx]
         stage, model_chunk = _build_stage_from_modules(
             stage_idx,
             module_names,
             num_stages,
-            local_stage_slot=local_stage_slot,
-            local_stage_count=local_stage_count,
         )
         logger.info(
             f"PP rank {pp_rank} is building stage_idx {stage_idx} "

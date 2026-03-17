@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import math
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -24,6 +25,107 @@ from .adapter import apply_hybrid_policy
 
 def _layer_range(start: int, end: int) -> list[str]:
     return [f"layers.{i}" for i in range(start, end)]
+
+
+def _module_parts_from_stage_ranges(stage_ranges: list[tuple[int, int]]) -> list[list[str]]:
+    parts: list[list[str]] = []
+    for idx, (start, end) in enumerate(stage_ranges):
+        stage_modules: list[str] = []
+        if idx == 0:
+            stage_modules.append("tok_embeddings")
+        stage_modules.extend(f"layers.{layer_idx}" for layer_idx in range(start, end + 1))
+        if idx == len(stage_ranges) - 1:
+            stage_modules.extend(["norm", "output"])
+        parts.append(stage_modules)
+    return parts
+
+
+def _allocate_stage_layer_counts(
+    num_layers: int,
+    effective_stage_weights: list[float],
+) -> list[int]:
+    if num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    if not effective_stage_weights or any(weight <= 0 for weight in effective_stage_weights):
+        raise ValueError("effective_stage_weights must be positive")
+
+    total_weight = sum(effective_stage_weights)
+    raw = [num_layers * weight / total_weight for weight in effective_stage_weights]
+    counts = [math.floor(value) for value in raw]
+    remainder = num_layers - sum(counts)
+
+    ranked = sorted(
+        range(len(raw)),
+        key=lambda idx: (raw[idx] - counts[idx], effective_stage_weights[idx]),
+        reverse=True,
+    )
+    for idx in ranked[:remainder]:
+        counts[idx] += 1
+
+    if any(count <= 0 for count in counts):
+        raise ValueError(f"Invalid stage allocation produced non-positive counts: {counts}")
+    return counts
+
+
+def _contiguous_ranges_from_counts(counts: list[int]) -> list[tuple[int, int]]:
+    start = 0
+    ranges: list[tuple[int, int]] = []
+    for count in counts:
+        end = start + count - 1
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def _weighted_stage_ranges(
+    *,
+    num_layers: int,
+    stage_mem_gb: list[int],
+    stage_penalties: list[float] | None = None,
+) -> list[tuple[int, int]]:
+    penalties = stage_penalties or [0.0 for _ in stage_mem_gb]
+    if len(stage_mem_gb) != len(penalties):
+        raise ValueError("stage_mem_gb and stage_penalties must have the same length")
+    effective_weights = [
+        max(1.0, float(mem_gb) - float(penalty))
+        for mem_gb, penalty in zip(stage_mem_gb, penalties, strict=True)
+    ]
+    counts = _allocate_stage_layer_counts(num_layers, effective_weights)
+    return _contiguous_ranges_from_counts(counts)
+
+
+def _joint_stage_ranges(
+    *,
+    num_layers: int,
+    stage_mem_gb: list[int],
+    stage_to_node: list[str],
+    first_stage_penalty: float,
+    last_stage_penalty: float,
+    cross_node_penalty: float,
+    interleaved_penalty: float = 0.0,
+) -> list[tuple[int, int]]:
+    if len(stage_mem_gb) != len(stage_to_node):
+        raise ValueError("stage_mem_gb and stage_to_node must have the same length")
+
+    penalties = [0.0 for _ in stage_mem_gb]
+    if penalties:
+        penalties[0] += float(first_stage_penalty)
+        penalties[-1] += float(last_stage_penalty)
+
+    for idx in range(len(stage_to_node) - 1):
+        if stage_to_node[idx] != stage_to_node[idx + 1]:
+            penalties[idx] += float(cross_node_penalty)
+            penalties[idx + 1] += max(0.5, float(cross_node_penalty) - 0.5)
+
+    if interleaved_penalty > 0:
+        for idx in range(1, len(stage_to_node) - 1):
+            penalties[idx] += float(interleaved_penalty)
+
+    return _weighted_stage_ranges(
+        num_layers=num_layers,
+        stage_mem_gb=stage_mem_gb,
+        stage_penalties=penalties,
+    )
 
 
 def _hf_assets(default_path: str) -> str:
@@ -189,6 +291,97 @@ def qwen3_14b_single_g4_fsdp8_conditioned() -> Trainer.Config:
     return cfg
 
 
+def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_14b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 2048)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 400)
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "selective")
+    if cfg.activation_checkpoint.mode == "selective":
+        cfg.activation_checkpoint.selective_ac_option = _env_str(
+            "HYBRID_SELECTIVE_AC_OPTION", "op"
+        )
+        cfg.activation_checkpoint.preserve_rng_state = False
+        cfg.activation_checkpoint.early_stop = True
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", True)
+
+    stage_to_node = ["g5", "g5", "g5", "g5"]
+    stage_ranges = _joint_stage_ranges(
+        num_layers=40,
+        stage_mem_gb=[32, 32, 32, 32],
+        stage_to_node=stage_to_node,
+        first_stage_penalty=float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 4)),
+        last_stage_penalty=float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 5)),
+        cross_node_penalty=0.0,
+        interleaved_penalty=float(_env_int("HYBRID_PP_INTERLEAVED_PENALTY", 1)),
+    )
+
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=_env_int("HYBRID_DP_SHARD_DEGREE", 2),
+        tensor_parallel_degree=_env_int("HYBRID_TP_DEGREE", 2),
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_vpp_per_rank=[2, 2],
+        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=stage_to_node,
+        rank_order=_resolve_rank_order([8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "auto"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "global"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_node_local_reshard_size=0,
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+        fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "none"),
+        fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "none"),
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", True),
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+    )
+    if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool(
+        "HYBRID_PP_TRACE_COLLECTIVES", False
+    )
+    logger.info(
+        "Using single-node 5090D Qwen3-14B strategy: PP=2, VPP=2, TP=2, FSDP2=2, "
+        f"stage_ranges={stage_ranges}, seq_len={cfg.training.seq_len}, "
+        f"local_batch={cfg.training.local_batch_size}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"scopes={cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"prefetch={cfg.parallelism.fsdp_forward_prefetch}/"
+        f"{cfg.parallelism.fsdp_backward_prefetch}"
+    )
+    return cfg
+
+
+def qwen3_14b_single_5090d_vpp_fsdp2_safe() -> Trainer.Config:
+    cfg = qwen3_14b_single_5090d_vpp_fsdp2()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 2)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 1024)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "full")
+    cfg.parallelism.fsdp_attention_scope = _env_str(
+        "HYBRID_FSDP_ATTENTION_SCOPE", "global"
+    )
+    cfg.parallelism.fsdp_mlp_scope = _env_str("HYBRID_FSDP_MLP_SCOPE", "global")
+    cfg.parallelism.enable_async_tensor_parallel = _env_bool(
+        "HYBRID_ENABLE_ASYNC_TP", False
+    )
+    return cfg
+
+
 def qwen3_32b_g4_g5_pp_only() -> Trainer.Config:
     cfg = _base_qwen3_32b()
     cfg.parallelism = ParallelismConfig(
@@ -319,9 +512,9 @@ def qwen3_32b_2node_24g_32g_tp8_fsdp2() -> Trainer.Config:
             "log_freq": 20,
         },
         "throughput": {
-            "seq_len": 1024,
+            "seq_len": 512,
             "local_batch_size": 1,
-            "global_batch_size": 4,
+            "global_batch_size": -1,
             "ac_mode": "selective",
             "compile": True,
             "async_tp": True,
@@ -378,6 +571,7 @@ def qwen3_32b_2node_24g_32g_tp8_fsdp2() -> Trainer.Config:
         "HYBRID_GLOBAL_BATCH_SIZE", profile_defaults["global_batch_size"]
     )
     cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 200)
     cfg.activation_checkpoint.mode = str(
         os.environ.get("HYBRID_AC_MODE") or profile_defaults["ac_mode"]
     )
@@ -548,3 +742,309 @@ def qwen3_32b_2node_24g_32g_sweep_06_interleaved_node_local() -> Trainer.Config:
         }
     )
     return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_best_effort_hetero() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "throughput",
+            "HYBRID_SCOPE_PROFILE": "throughput",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+            "HYBRID_ENABLE_COMPILE": "1",
+            "HYBRID_ENABLE_ASYNC_TP": "1",
+            "HYBRID_AC_MODE": "none",
+            "HYBRID_FSDP_EMBHEAD_SCOPE": "keep",
+            "HYBRID_GC_FREQ": "200",
+            "HYBRID_LOG_FREQ": "20",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_best_effort_hetero_safe() -> Trainer.Config:
+    _setdefault_many(
+        {
+            "HYBRID_PROFILE": "throughput",
+            "HYBRID_SCOPE_PROFILE": "throughput",
+            "HYBRID_RANK_LAYOUT": "node_major",
+            "HYBRID_TP_DEGREE": "8",
+            "HYBRID_DP_SHARD_DEGREE": "2",
+            "HYBRID_ENABLE_COMPILE": "1",
+            "HYBRID_ENABLE_ASYNC_TP": "1",
+            "HYBRID_AC_MODE": "selective",
+            "HYBRID_FSDP_EMBHEAD_SCOPE": "global",
+            "HYBRID_GC_FREQ": "200",
+            "HYBRID_LOG_FREQ": "20",
+        }
+    )
+    return qwen3_32b_2node_24g_32g_tp8_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_hetero_joint_pp2_vpp2_tp4_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 1024)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 400)
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "selective")
+    if cfg.activation_checkpoint.mode == "selective":
+        cfg.activation_checkpoint.selective_ac_option = _env_str(
+            "HYBRID_SELECTIVE_AC_OPTION", "op"
+        )
+        cfg.activation_checkpoint.preserve_rng_state = False
+        cfg.activation_checkpoint.early_stop = True
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", True)
+
+    stage_to_node = ["g4", "g4", "g5", "g5"]
+    stage_ranges = _joint_stage_ranges(
+        num_layers=64,
+        stage_mem_gb=[24, 24, 32, 32],
+        stage_to_node=stage_to_node,
+        first_stage_penalty=float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 5)),
+        last_stage_penalty=float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 10)),
+        cross_node_penalty=float(_env_int("HYBRID_PP_CROSS_NODE_PENALTY", 2)),
+        interleaved_penalty=float(_env_int("HYBRID_PP_INTERLEAVED_PENALTY", 1)),
+    )
+
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=_env_int("HYBRID_DP_SHARD_DEGREE", 2),
+        tensor_parallel_degree=_env_int("HYBRID_TP_DEGREE", 4),
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_vpp_per_rank=[2, 2],
+        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=stage_to_node,
+        rank_order=_resolve_rank_order([8, 8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "auto"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "auto"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 8
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+        fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "none"),
+        fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "auto"),
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", True),
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+    )
+    if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool(
+        "HYBRID_PP_TRACE_COLLECTIVES", False
+    )
+    logger.info(
+        "Using joint hetero strategy: PP=2, VPP=2, TP=4, FSDP2=2, "
+        f"stage_ranges={stage_ranges}, stage_to_node={stage_to_node}, "
+        f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}, "
+        f"ac={cfg.activation_checkpoint.mode}, compile={cfg.compile.enable}, "
+        f"async_tp={cfg.parallelism.enable_async_tensor_parallel}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"scopes={cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"prefetch={cfg.parallelism.fsdp_forward_prefetch}/"
+        f"{cfg.parallelism.fsdp_backward_prefetch}, "
+        f"node_local_reshard={cfg.parallelism.fsdp_node_local_reshard_size}"
+    )
+    return cfg
+
+
+def qwen3_32b_2node_24g_32g_hetero_joint_pp2_tp4_fsdp2_safe() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 2)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 1024)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 300)
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "selective")
+    if cfg.activation_checkpoint.mode == "selective":
+        cfg.activation_checkpoint.selective_ac_option = _env_str(
+            "HYBRID_SELECTIVE_AC_OPTION", "op"
+        )
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", True)
+
+    stage_to_node = ["g4", "g5"]
+    stage_ranges = _joint_stage_ranges(
+        num_layers=64,
+        stage_mem_gb=[24, 32],
+        stage_to_node=stage_to_node,
+        first_stage_penalty=float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 5)),
+        last_stage_penalty=float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 6)),
+        cross_node_penalty=float(_env_int("HYBRID_PP_CROSS_NODE_PENALTY", 2)),
+    )
+
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=_env_int("HYBRID_DP_SHARD_DEGREE", 2),
+        tensor_parallel_degree=_env_int("HYBRID_TP_DEGREE", 4),
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_schedule="1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=stage_to_node,
+        rank_order=_resolve_rank_order([8, 8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "auto"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "auto"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "auto"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 8
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+        fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "auto"),
+        fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "auto"),
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", True),
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+    )
+    if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool(
+        "HYBRID_PP_TRACE_COLLECTIVES", False
+    )
+    logger.info(
+        "Using safe joint hetero strategy: PP=2, TP=4, FSDP2=2, "
+        f"stage_ranges={stage_ranges}, stage_to_node={stage_to_node}, "
+        f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}, "
+        f"ac={cfg.activation_checkpoint.mode}, compile={cfg.compile.enable}, "
+        f"async_tp={cfg.parallelism.enable_async_tensor_parallel}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"scopes={cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"prefetch={cfg.parallelism.fsdp_forward_prefetch}/"
+        f"{cfg.parallelism.fsdp_backward_prefetch}"
+    )
+    return cfg
+
+
+def qwen3_32b_2node_24g_32g_optimized_hetero() -> Trainer.Config:
+    return qwen3_32b_2node_24g_32g_hetero_joint_pp2_vpp2_tp4_fsdp2()
+
+
+def qwen3_32b_2node_24g_32g_megatron_pp2_tp4_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 2)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 200)
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "selective")
+    if cfg.activation_checkpoint.mode == "selective":
+        cfg.activation_checkpoint.selective_ac_option = _env_str(
+            "HYBRID_SELECTIVE_AC_OPTION", "op"
+        )
+
+    stage_ranges = _weighted_stage_ranges(
+        num_layers=64,
+        stage_mem_gb=[24, 32],
+        stage_penalties=[
+            float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 4)),
+            float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 3)),
+        ],
+    )
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=4,
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_schedule="1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=["g4", "g5"],
+        rank_order=_resolve_rank_order([8, 8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "keep"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "global"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 0
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+    )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool("HYBRID_PP_TRACE_COLLECTIVES", False)
+    logger.info(
+        "Using Megatron-like hetero PP strategy: PP=2, TP=4, FSDP2=2, "
+        f"stage_ranges={stage_ranges}, stage_to_node=[g4,g5]"
+    )
+    return cfg
+
+
+def qwen3_32b_2node_24g_32g_megatron_pp2_vpp2_tp4_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_32b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 200)
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "full")
+
+    stage_ranges = _weighted_stage_ranges(
+        num_layers=64,
+        stage_mem_gb=[24, 24, 32, 32],
+        stage_penalties=[
+            float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 4)),
+            0.0,
+            0.0,
+            float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 3)),
+        ],
+    )
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=4,
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_vpp_per_rank=[2, 2],
+        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=["g4", "g4", "g5", "g5"],
+        rank_order=_resolve_rank_order([8, 8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "global"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "global"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 0
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+    )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool("HYBRID_PP_TRACE_COLLECTIVES", False)
+    logger.info(
+        "Using Megatron-like hetero VPP strategy: PP=2, VPP=2, TP=4, FSDP2=2, "
+        f"virtual_stage_ranges={stage_ranges}"
+    )
+    return cfg

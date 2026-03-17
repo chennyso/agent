@@ -147,6 +147,22 @@ class ParallelismConfig:
     fsdp_policy_trace: bool = False
     """Emit detailed logs when experimental module-group FSDP policies are resolved."""
 
+    fsdp_forward_prefetch: Literal["auto", "none", "block"] = "auto"
+    """
+    Experimental forward prefetch profile for module-group FSDP.
+    - "auto": choose a profile based on PP/VPP topology.
+    - "none": disable explicit forward prefetch and rely on FSDP defaults.
+    - "block": prefetch the next transformer block (or output head for the last block).
+    """
+
+    fsdp_backward_prefetch: Literal["auto", "none", "block"] = "auto"
+    """
+    Experimental backward prefetch profile for module-group FSDP.
+    - "auto": choose a conservative profile based on PP/VPP topology.
+    - "none": disable explicit backward prefetch.
+    - "block": prefetch the previous transformer block during backward.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 

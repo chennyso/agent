@@ -19,9 +19,10 @@ def main() -> None:
 
     import torchtitan
 
+    torchtitan_version = getattr(torchtitan, "__version__", "0.0.0+unknown")
     logger.info(
         "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
-        torchtitan.__version__,
+        torchtitan_version,
     )
 
     config_manager = ConfigManager()
