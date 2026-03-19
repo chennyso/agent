@@ -165,6 +165,46 @@ def _env_int_list(name: str) -> list[int] | None:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def _configure_g5_telemetry(
+    cfg: Trainer.Config,
+    *,
+    default_log_freq: int,
+    profiler_default: bool = True,
+    save_for_all_ranks: bool = True,
+) -> None:
+    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", default_log_freq)
+    cfg.metrics.enable_jsonl = _env_bool("HYBRID_ENABLE_JSONL", True)
+    cfg.metrics.save_jsonl_file = _env_str("HYBRID_JSONL_FILE", "metrics.jsonl")
+    cfg.metrics.save_for_all_ranks = _env_bool(
+        "HYBRID_JSONL_ALL_RANKS", save_for_all_ranks
+    )
+    cfg.debug.step_timing_breakdown = _env_bool("HYBRID_STEP_TIMING", True)
+    cfg.debug.step_timing_with_profiler = cfg.debug.step_timing_breakdown and _env_bool(
+        "HYBRID_STEP_TIMING_WITH_PROFILER", profiler_default
+    )
+
+
+def _warn_underfilled_vpp(
+    cfg: Trainer.Config,
+    *,
+    config_name: str,
+) -> None:
+    module_parts = cfg.parallelism.module_fqns_per_model_part or []
+    if not module_parts or cfg.parallelism.pipeline_parallel_degree <= 1:
+        return
+    total_virtual_stages = len(module_parts)
+    microbatch_size = cfg.parallelism.pipeline_parallel_microbatch_size
+    if microbatch_size <= 0:
+        return
+    n_microbatches = cfg.training.local_batch_size // microbatch_size
+    if n_microbatches < total_virtual_stages:
+        logger.warning(
+            f"{config_name}: n_microbatches={n_microbatches} is smaller than "
+            f"total_virtual_stages={total_virtual_stages}. Treat this config as bring-up only, "
+            "not as a valid PP/VPP performance comparison."
+        )
+
+
 def _node_major_rank_order(node_gpu_counts: list[int]) -> list[int]:
     order: list[int] = []
     cursor = 0
@@ -291,14 +331,13 @@ def qwen3_14b_single_g4_fsdp8_conditioned() -> Trainer.Config:
     return cfg
 
 
-def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
+def qwen3_14b_single_5090d_tp4_fsdp2_throughput() -> Trainer.Config:
     cfg = _base_qwen3_14b()
-    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 2)
     cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
-    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 2048)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 1024)
     cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
-    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 400)
-    cfg.metrics.log_freq = _env_int("HYBRID_LOG_FREQ", 20)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 200)
     cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "selective")
     if cfg.activation_checkpoint.mode == "selective":
         cfg.activation_checkpoint.selective_ac_option = _env_str(
@@ -306,7 +345,60 @@ def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
         )
         cfg.activation_checkpoint.preserve_rng_state = False
         cfg.activation_checkpoint.early_stop = True
-    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", True)
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", False)
+    _configure_g5_telemetry(cfg, default_log_freq=1, profiler_default=True)
+
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=_env_int("HYBRID_DP_SHARD_DEGREE", 2),
+        tensor_parallel_degree=_env_int("HYBRID_TP_DEGREE", 4),
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        rank_order=_resolve_rank_order([8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "never"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "keep"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "keep"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 0
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
+        fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "none"),
+        fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "none"),
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", False),
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+    )
+    if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    logger.info(
+        "Using g5 single-node Qwen3-14B throughput strategy: "
+        "PP=1, TP=4, FSDP2=2, CP=0, EP=0, "
+        f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"scopes={cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"compile={cfg.compile.enable}, async_tp={cfg.parallelism.enable_async_tensor_parallel}. "
+        "CP remains disabled for Qwen3 on this path."
+    )
+    return cfg
+
+
+def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
+    cfg = _base_qwen3_14b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", -1)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 512)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 400)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "full")
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", False)
+    _configure_g5_telemetry(cfg, default_log_freq=1, profiler_default=True)
 
     stage_to_node = ["g5", "g5", "g5", "g5"]
     stage_ranges = _joint_stage_ranges(
@@ -335,14 +427,14 @@ def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
             "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
         ),
         fsdp_parallelism_conditioned_policy="module_groups",
-        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "auto"),
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "global"),
         fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "global"),
         fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
         fsdp_node_local_reshard_size=0,
         fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", False),
         fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "none"),
         fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "none"),
-        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", True),
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", False),
         disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
     )
     if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
@@ -354,7 +446,7 @@ def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
         "HYBRID_PP_TRACE_COLLECTIVES", False
     )
     logger.info(
-        "Using single-node 5090D Qwen3-14B strategy: PP=2, VPP=2, TP=2, FSDP2=2, "
+        "Using g5 single-node Qwen3-14B VPP research strategy: PP=2, VPP=2, TP=2, FSDP2=2, CP=0, EP=0, "
         f"stage_ranges={stage_ranges}, seq_len={cfg.training.seq_len}, "
         f"local_batch={cfg.training.local_batch_size}, "
         f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
@@ -362,8 +454,10 @@ def qwen3_14b_single_5090d_vpp_fsdp2() -> Trainer.Config:
         f"{cfg.parallelism.fsdp_mlp_scope}/"
         f"{cfg.parallelism.fsdp_embhead_scope}, "
         f"prefetch={cfg.parallelism.fsdp_forward_prefetch}/"
-        f"{cfg.parallelism.fsdp_backward_prefetch}"
+        f"{cfg.parallelism.fsdp_backward_prefetch}. "
+        "CP remains disabled for Qwen3 on this path."
     )
+    _warn_underfilled_vpp(cfg, config_name="qwen3_14b_single_5090d_vpp_fsdp2")
     return cfg
 
 
@@ -379,6 +473,11 @@ def qwen3_14b_single_5090d_vpp_fsdp2_safe() -> Trainer.Config:
     cfg.parallelism.enable_async_tensor_parallel = _env_bool(
         "HYBRID_ENABLE_ASYNC_TP", False
     )
+    logger.info(
+        "Adjusted g5 VPP research config to safe bring-up defaults: "
+        f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}"
+    )
+    _warn_underfilled_vpp(cfg, config_name="qwen3_14b_single_5090d_vpp_fsdp2_safe")
     return cfg
 
 

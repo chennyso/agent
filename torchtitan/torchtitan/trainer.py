@@ -56,6 +56,234 @@ from torchtitan.tools.profiling import (
 )
 
 
+@dataclass(slots=True)
+class _SubgraphTimingEntry:
+    stage_idx: int
+    group_name: str
+    forward_time_s: float = 0.0
+    backward_time_s: float = 0.0
+    forward_calls: int = 0
+    backward_calls: int = 0
+    activation_peak_gib: float = 0.0
+    reserved_peak_gib: float = 0.0
+    full_param_gib: float = 0.0
+
+
+class _SubgraphTimingState:
+    def __init__(self, model_parts: list[torch.nn.Module], device: torch.device) -> None:
+        self.device = device
+        self._handles: list[Any] = []
+        self._forward_start: dict[int, float] = {}
+        self._backward_start: dict[int, float] = {}
+        self._entries: dict[tuple[int, str], _SubgraphTimingEntry] = {}
+        self._stage_param_gib: dict[int, float] = defaultdict(float)
+        self._register_model_parts(model_parts)
+
+    def _register_model_parts(self, model_parts: list[torch.nn.Module]) -> None:
+        for local_stage_idx, model_part in enumerate(model_parts):
+            stage_idx = int(getattr(model_part, "_tt_stage_idx", local_stage_idx))
+            if getattr(model_part, "tok_embeddings", None) is not None:
+                self._register_group(model_part.tok_embeddings, stage_idx, "embhead")
+            if getattr(model_part, "norm", None) is not None:
+                self._register_group(model_part.norm, stage_idx, "embhead")
+            if getattr(model_part, "output", None) is not None:
+                self._register_group(model_part.output, stage_idx, "embhead")
+            layers = getattr(model_part, "layers", None)
+            if layers is None:
+                continue
+            for transformer_block in layers.values():
+                if getattr(transformer_block, "attention", None) is not None:
+                    self._register_group(
+                        transformer_block.attention,
+                        stage_idx,
+                        "attention",
+                    )
+                if getattr(transformer_block, "moe_enabled", False):
+                    moe_module = getattr(transformer_block, "moe", None)
+                    if moe_module is not None:
+                        self._register_group(moe_module, stage_idx, "experts")
+                else:
+                    ffn_module = getattr(transformer_block, "feed_forward", None)
+                    if ffn_module is not None:
+                        self._register_group(ffn_module, stage_idx, "ffn")
+
+    def _register_group(
+        self,
+        module: torch.nn.Module,
+        stage_idx: int,
+        group_name: str,
+    ) -> None:
+        entry = self._entries.setdefault(
+            (stage_idx, group_name),
+            _SubgraphTimingEntry(stage_idx=stage_idx, group_name=group_name),
+        )
+        param_gib = (
+            sum(parameter.numel() * parameter.element_size() for parameter in module.parameters())
+            / float(1024**3)
+        )
+        entry.full_param_gib += param_gib
+        self._stage_param_gib[stage_idx] += param_gib
+
+        self._handles.extend(
+            [
+                module.register_forward_pre_hook(
+                    self._make_forward_pre_hook(stage_idx, group_name)
+                ),
+                module.register_forward_hook(
+                    self._make_forward_post_hook(stage_idx, group_name)
+                ),
+                module.register_full_backward_pre_hook(
+                    self._make_backward_pre_hook(stage_idx, group_name)
+                ),
+                module.register_full_backward_hook(
+                    self._make_backward_post_hook(stage_idx, group_name)
+                ),
+            ]
+        )
+
+    def reset(self) -> None:
+        self._forward_start.clear()
+        self._backward_start.clear()
+        for entry in self._entries.values():
+            entry.forward_time_s = 0.0
+            entry.backward_time_s = 0.0
+            entry.forward_calls = 0
+            entry.backward_calls = 0
+            entry.activation_peak_gib = 0.0
+            entry.reserved_peak_gib = 0.0
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def stage_param_gib(self) -> dict[int, float]:
+        return dict(self._stage_param_gib)
+
+    def per_stage_busy_s(self) -> dict[int, float]:
+        stage_busy: dict[int, float] = defaultdict(float)
+        for entry in self._entries.values():
+            stage_busy[entry.stage_idx] += entry.forward_time_s + entry.backward_time_s
+        return dict(stage_busy)
+
+    def stage_reserved_peak_gib(self) -> dict[int, float]:
+        stage_reserved: dict[int, float] = defaultdict(float)
+        for entry in self._entries.values():
+            stage_reserved[entry.stage_idx] = max(
+                stage_reserved[entry.stage_idx], entry.reserved_peak_gib
+            )
+        return dict(stage_reserved)
+
+    def to_metrics(
+        self,
+        *,
+        global_all_gather_ms: float | None,
+        global_reduce_scatter_ms: float | None,
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        stage_weights = self.stage_param_gib()
+        total_param_gib = sum(stage_weights.values())
+        for stage_idx, stage_param_gib in stage_weights.items():
+            if total_param_gib > 0 and global_all_gather_ms is not None:
+                metrics[
+                    f"stage_metrics/stage_{stage_idx}/ag_estimated(ms)"
+                ] = global_all_gather_ms * (stage_param_gib / total_param_gib)
+            if total_param_gib > 0 and global_reduce_scatter_ms is not None:
+                metrics[
+                    f"stage_metrics/stage_{stage_idx}/rs_estimated(ms)"
+                ] = global_reduce_scatter_ms * (stage_param_gib / total_param_gib)
+
+        for (stage_idx, group_name), entry in self._entries.items():
+            prefix = f"subgraph_metrics/stage_{stage_idx}/{group_name}"
+            metrics[f"{prefix}/fwd(ms)"] = entry.forward_time_s * 1000.0
+            metrics[f"{prefix}/bwd(ms)"] = entry.backward_time_s * 1000.0
+            metrics[f"{prefix}/fwd(count)"] = float(entry.forward_calls)
+            metrics[f"{prefix}/bwd(count)"] = float(entry.backward_calls)
+            metrics[f"{prefix}/activation_live(GiB)"] = entry.activation_peak_gib
+            metrics[f"{prefix}/reserved_peak(GiB)"] = entry.reserved_peak_gib
+            metrics[f"{prefix}/full_param_live(GiB)"] = entry.full_param_gib
+            stage_total_gib = stage_weights.get(stage_idx, 0.0)
+            if (
+                stage_total_gib > 0
+                and global_all_gather_ms is not None
+                and entry.full_param_gib > 0
+            ):
+                stage_ag_ms = global_all_gather_ms * (stage_total_gib / total_param_gib)
+                metrics[f"{prefix}/ag_estimated(ms)"] = stage_ag_ms * (
+                    entry.full_param_gib / stage_total_gib
+                )
+        return metrics
+
+    def _synchronize(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _reserved_gib(self) -> float:
+        if self.device.type != "cuda":
+            return 0.0
+        return float(torch.cuda.memory_reserved(self.device)) / float(1024**3)
+
+    def _tensor_bytes(self, value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            return value.numel() * value.element_size()
+        if isinstance(value, dict):
+            return sum(self._tensor_bytes(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(self._tensor_bytes(item) for item in value)
+        return 0
+
+    def _entry(self, stage_idx: int, group_name: str) -> _SubgraphTimingEntry:
+        return self._entries[(stage_idx, group_name)]
+
+    def _make_forward_pre_hook(self, stage_idx: int, group_name: str):
+        def hook(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            self._synchronize()
+            self._forward_start[id(module)] = time.perf_counter()
+
+        return hook
+
+    def _make_forward_post_hook(self, stage_idx: int, group_name: str):
+        def hook(module: torch.nn.Module, args: tuple[Any, ...], output: Any) -> None:
+            start = self._forward_start.pop(id(module), None)
+            if start is None:
+                return
+            self._synchronize()
+            entry = self._entry(stage_idx, group_name)
+            entry.forward_time_s += time.perf_counter() - start
+            entry.forward_calls += 1
+            entry.activation_peak_gib = max(
+                entry.activation_peak_gib,
+                self._tensor_bytes(output) / float(1024**3),
+            )
+            entry.reserved_peak_gib = max(entry.reserved_peak_gib, self._reserved_gib())
+
+        return hook
+
+    def _make_backward_pre_hook(self, stage_idx: int, group_name: str):
+        def hook(module: torch.nn.Module, grad_output: Any) -> None:
+            self._synchronize()
+            self._backward_start[id(module)] = time.perf_counter()
+
+        return hook
+
+    def _make_backward_post_hook(self, stage_idx: int, group_name: str):
+        def hook(
+            module: torch.nn.Module,
+            grad_input: Any,
+            grad_output: Any,
+        ) -> None:
+            start = self._backward_start.pop(id(module), None)
+            if start is None:
+                return
+            self._synchronize()
+            entry = self._entry(stage_idx, group_name)
+            entry.backward_time_s += time.perf_counter() - start
+            entry.backward_calls += 1
+            entry.reserved_peak_gib = max(entry.reserved_peak_gib, self._reserved_gib())
+
+        return hook
+
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -399,6 +627,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             model.train()
 
             self.model_parts = [model]
+            setattr(model, "_tt_stage_idx", 0)
+            setattr(model, "_tt_num_stages", 1)
+            host_label = (
+                os.environ.get("HOSTNAME")
+                or os.environ.get("COMPUTERNAME")
+                or "local"
+            )
+            setattr(model, "_tt_stage_to_node", (host_label,))
+            setattr(model, "_tt_stage_node", host_label)
+            setattr(model, "_tt_is_last_local_stage", True)
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -437,6 +675,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             and config.debug.step_timing_with_profiler
         )
         self.pp_stage_timing = None
+        self.subgraph_timing = None
         if self.step_timing_enabled and parallel_dims.pp_enabled:
             from torchtitan.distributed.pipeline_parallel import (
                 enable_pipeline_stage_timing,
@@ -452,6 +691,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     pp_stages,
                     device=self.device,
                 )
+        if self.step_timing_enabled:
+            self.subgraph_timing = _SubgraphTimingState(self.model_parts, self.device)
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -768,6 +1009,75 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             metrics[f"time_metrics/profile_{category}(ms)"] = value_us / 1000.0
         return metrics
 
+    def _collect_stage_and_subgraph_metrics(
+        self,
+        *,
+        forward_backward_time_s: float,
+        profiler_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        global_ag_ms = profiler_metrics.get("time_metrics/profile_all_gather(ms)")
+        global_rs_ms = profiler_metrics.get("time_metrics/profile_reduce_scatter(ms)")
+
+        if self.pp_stage_timing is not None:
+            for stage_idx, stage_entry in sorted(self.pp_stage_timing.stage_entries.items()):
+                metrics[f"stage_metrics/stage_{stage_idx}/fwd(ms)"] = (
+                    stage_entry.forward_chunk_time_s * 1000.0
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/bwd(ms)"] = (
+                    stage_entry.backward_chunk_time_s * 1000.0
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/busy(ms)"] = (
+                    stage_entry.busy_time_s * 1000.0
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/fwd(count)"] = float(
+                    stage_entry.forward_chunk_count
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/bwd(count)"] = float(
+                    stage_entry.backward_chunk_count
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/idle_estimated(ms)"] = (
+                    max(forward_backward_time_s - stage_entry.busy_time_s, 0.0) * 1000.0
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/peak_reserved(GiB)"] = (
+                    stage_entry.max_reserved_gib
+                )
+                metrics[f"stage_metrics/stage_{stage_idx}/peak_active(GiB)"] = (
+                    stage_entry.max_active_gib
+                )
+
+        if self.subgraph_timing is not None:
+            metrics.update(
+                self.subgraph_timing.to_metrics(
+                    global_all_gather_ms=global_ag_ms,
+                    global_reduce_scatter_ms=global_rs_ms,
+                )
+            )
+            if self.pp_stage_timing is None:
+                stage_reserved = self.subgraph_timing.stage_reserved_peak_gib()
+                for stage_idx, busy_s in self.subgraph_timing.per_stage_busy_s().items():
+                    metrics[f"stage_metrics/stage_{stage_idx}/busy(ms)"] = busy_s * 1000.0
+                    metrics[f"stage_metrics/stage_{stage_idx}/idle_estimated(ms)"] = (
+                        max(forward_backward_time_s - busy_s, 0.0) * 1000.0
+                    )
+                    metrics[f"stage_metrics/stage_{stage_idx}/fwd(ms)"] = sum(
+                        value
+                        for key, value in metrics.items()
+                        if key.startswith(f"subgraph_metrics/stage_{stage_idx}/")
+                        and key.endswith("/fwd(ms)")
+                    )
+                    metrics[f"stage_metrics/stage_{stage_idx}/bwd(ms)"] = sum(
+                        value
+                        for key, value in metrics.items()
+                        if key.startswith(f"subgraph_metrics/stage_{stage_idx}/")
+                        and key.endswith("/bwd(ms)")
+                    )
+                    metrics[f"stage_metrics/stage_{stage_idx}/peak_reserved(GiB)"] = (
+                        stage_reserved.get(stage_idx, 0.0)
+                    )
+
+        return metrics
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -778,6 +1088,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         timing_metrics: dict[str, float] = {}
         if collect_step_timing and self.pp_stage_timing is not None:
             self.pp_stage_timing.reset()
+        if collect_step_timing and self.subgraph_timing is not None:
+            self.subgraph_timing.reset()
         step_start = time.perf_counter()
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
@@ -946,7 +1258,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         }
         if collect_step_timing:
             extra_metrics.update(timing_metrics)
-            extra_metrics.update(self._stop_step_profiler(profiler))
+            profiler_metrics = self._stop_step_profiler(profiler)
+            extra_metrics.update(profiler_metrics)
+            extra_metrics.update(
+                self._collect_stage_and_subgraph_metrics(
+                    forward_backward_time_s=forward_backward_time_s,
+                    profiler_metrics=profiler_metrics,
+                )
+            )
         else:
             self._stop_step_profiler(profiler)
         self.metrics_processor.log(

@@ -50,17 +50,45 @@ __all__ = [
 
 
 @dataclass(slots=True)
+class PipelineStageTimingEntry:
+    stage_index: int
+    forward_chunk_time_s: float = 0.0
+    backward_chunk_time_s: float = 0.0
+    forward_chunk_count: int = 0
+    backward_chunk_count: int = 0
+    max_reserved_gib: float = 0.0
+    max_active_gib: float = 0.0
+
+    @property
+    def busy_time_s(self) -> float:
+        return self.forward_chunk_time_s + self.backward_chunk_time_s
+
+
+@dataclass(slots=True)
 class PipelineStageTimingState:
     forward_chunk_time_s: float = 0.0
     backward_chunk_time_s: float = 0.0
     forward_chunk_count: int = 0
     backward_chunk_count: int = 0
+    stage_entries: dict[int, PipelineStageTimingEntry] = None
 
     def reset(self) -> None:
         self.forward_chunk_time_s = 0.0
         self.backward_chunk_time_s = 0.0
         self.forward_chunk_count = 0
         self.backward_chunk_count = 0
+        self.stage_entries = {}
+
+    def __post_init__(self) -> None:
+        if self.stage_entries is None:
+            self.stage_entries = {}
+
+    def get_stage_entry(self, stage_index: int) -> PipelineStageTimingEntry:
+        stage_entry = self.stage_entries.get(stage_index)
+        if stage_entry is None:
+            stage_entry = PipelineStageTimingEntry(stage_index=stage_index)
+            self.stage_entries[stage_index] = stage_entry
+        return stage_entry
 
 
 def _device_synchronize(device: torch.device) -> None:
@@ -77,8 +105,22 @@ def enable_pipeline_stage_timing(
     for stage in stages:
         original_forward = stage.forward_one_chunk
         original_backward = stage.backward_one_chunk
+        stage_index = int(getattr(stage, "stage_index", len(timing_state.stage_entries)))
 
-        def _wrap_forward(original: Callable, state: PipelineStageTimingState):
+        def _sample_device_memory_gib() -> tuple[float, float]:
+            if device.type != "cuda":
+                return (0.0, 0.0)
+            gib = float(1024**3)
+            return (
+                float(torch.cuda.memory_reserved(device)) / gib,
+                float(torch.cuda.memory_allocated(device)) / gib,
+            )
+
+        def _wrap_forward(
+            original: Callable,
+            state: PipelineStageTimingState,
+            wrapped_stage_index: int,
+        ):
             def wrapped(*args, **kwargs):
                 _device_synchronize(device)
                 start = time.perf_counter()
@@ -86,12 +128,27 @@ def enable_pipeline_stage_timing(
                     return original(*args, **kwargs)
                 finally:
                     _device_synchronize(device)
-                    state.forward_chunk_time_s += time.perf_counter() - start
+                    elapsed = time.perf_counter() - start
+                    reserved_gib, active_gib = _sample_device_memory_gib()
+                    stage_entry = state.get_stage_entry(wrapped_stage_index)
+                    stage_entry.forward_chunk_time_s += elapsed
+                    stage_entry.forward_chunk_count += 1
+                    stage_entry.max_reserved_gib = max(
+                        stage_entry.max_reserved_gib, reserved_gib
+                    )
+                    stage_entry.max_active_gib = max(
+                        stage_entry.max_active_gib, active_gib
+                    )
+                    state.forward_chunk_time_s += elapsed
                     state.forward_chunk_count += 1
 
             return wrapped
 
-        def _wrap_backward(original: Callable, state: PipelineStageTimingState):
+        def _wrap_backward(
+            original: Callable,
+            state: PipelineStageTimingState,
+            wrapped_stage_index: int,
+        ):
             def wrapped(*args, **kwargs):
                 _device_synchronize(device)
                 start = time.perf_counter()
@@ -99,13 +156,28 @@ def enable_pipeline_stage_timing(
                     return original(*args, **kwargs)
                 finally:
                     _device_synchronize(device)
-                    state.backward_chunk_time_s += time.perf_counter() - start
+                    elapsed = time.perf_counter() - start
+                    reserved_gib, active_gib = _sample_device_memory_gib()
+                    stage_entry = state.get_stage_entry(wrapped_stage_index)
+                    stage_entry.backward_chunk_time_s += elapsed
+                    stage_entry.backward_chunk_count += 1
+                    stage_entry.max_reserved_gib = max(
+                        stage_entry.max_reserved_gib, reserved_gib
+                    )
+                    stage_entry.max_active_gib = max(
+                        stage_entry.max_active_gib, active_gib
+                    )
+                    state.backward_chunk_time_s += elapsed
                     state.backward_chunk_count += 1
 
             return wrapped
 
-        stage.forward_one_chunk = _wrap_forward(original_forward, timing_state)
-        stage.backward_one_chunk = _wrap_backward(original_backward, timing_state)
+        stage.forward_one_chunk = _wrap_forward(
+            original_forward, timing_state, stage_index
+        )
+        stage.backward_one_chunk = _wrap_backward(
+            original_backward, timing_state, stage_index
+        )
 
     return timing_state
 
@@ -204,6 +276,27 @@ def pipeline_llm(
         module_names_per_stage,
     )
 
+    stage_to_node = parallelism.pipeline_parallel_stage_to_node or [
+        f"pp_stage_{idx}" for idx in range(num_virtual_stages)
+    ]
+    if len(stage_to_node) != num_virtual_stages:
+        raise ValueError(
+            "pipeline_parallel_stage_to_node must have one label per pipeline stage. "
+            f"Got {len(stage_to_node)} labels for {num_virtual_stages} stages."
+        )
+    local_stage_indices = [
+        int(getattr(stage, "stage_index", local_idx))
+        for local_idx, stage in enumerate(stages)
+    ]
+    last_local_stage_idx = max(local_stage_indices) if local_stage_indices else -1
+    for model_part, stage in zip(model_parts, stages, strict=True):
+        stage_idx = int(getattr(stage, "stage_index", 0))
+        setattr(model_part, "_tt_stage_idx", stage_idx)
+        setattr(model_part, "_tt_num_stages", num_virtual_stages)
+        setattr(model_part, "_tt_stage_to_node", tuple(stage_to_node))
+        setattr(model_part, "_tt_stage_node", stage_to_node[stage_idx])
+        setattr(model_part, "_tt_is_last_local_stage", stage_idx == last_local_stage_idx)
+
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
     # We need to iterate through model_parts to apply SPMD parallelisms, compilation,
     # optimizer, and checkpointing
@@ -288,7 +381,8 @@ def build_pipeline_schedule(
     if n_microbatches < num_total_stages:
         logger.warning(
             f"Number of microbatches ({n_microbatches}) is less than the total number "
-            f"of stages ({num_total_stages}) which may result in a bubble in the pipeline."
+            f"of stages ({num_total_stages}) which may result in a bubble in the pipeline. "
+            "Treat this configuration as bring-up only rather than a valid PP/VPP performance conclusion."
         )
 
     # pyrefly: ignore [bad-instantiation]

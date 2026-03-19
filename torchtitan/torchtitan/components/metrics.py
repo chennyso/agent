@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import os
 import time
 from collections import namedtuple
@@ -127,6 +128,27 @@ class TensorBoardLogger(BaseLogger):
 
     def close(self) -> None:
         self.writer.close()
+
+
+class JsonlLogger(BaseLogger):
+    """Logger implementation that writes one JSON object per line."""
+
+    def __init__(self, log_dir: str, file_name: str = "metrics.jsonl"):
+        os.makedirs(log_dir, exist_ok=True)
+        self.file_path = os.path.join(log_dir, file_name)
+        self._handle = open(self.file_path, "a", encoding="utf-8", buffering=1)
+        logger.info(f"JSONL metrics logging enabled. Logs will be saved at {self.file_path}")
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        payload = {
+            "step": int(step),
+            "timestamp": time.time(),
+            "metrics": metrics,
+        }
+        self._handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def close(self) -> None:
+        self._handle.close()
 
 
 class WandBLogger(BaseLogger):
@@ -300,6 +322,12 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        enable_jsonl: bool = False
+        """Whether to log metrics to a JSONL file for post-processing."""
+
+        save_jsonl_file: str = "metrics.jsonl"
+        """File name for JSONL metrics when enable_jsonl is True."""
+
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims
@@ -383,11 +411,14 @@ class MetricsProcessor(Configurable):
         # Log initial config state
         logger.debug(
             f"Building logger with config: wandb={config.enable_wandb}, "
-            f"tensorboard={config.enable_tensorboard}"
+            f"tensorboard={config.enable_tensorboard}, "
+            f"jsonl={config.enable_jsonl}"
         )
 
         # Check if any logging backend is enabled
-        has_logging_enabled = config.enable_tensorboard or config.enable_wandb
+        has_logging_enabled = (
+            config.enable_tensorboard or config.enable_wandb or config.enable_jsonl
+        )
 
         # Determine if this rank should log
         should_log = has_logging_enabled
@@ -446,6 +477,11 @@ class MetricsProcessor(Configurable):
             logger.debug("Creating TensorBoard logger")
             tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
             logger_container.add_logger(tensorboard_logger)
+
+        if config.enable_jsonl:
+            logger.debug("Creating JSONL logger")
+            jsonl_logger = JsonlLogger(base_log_dir, config.save_jsonl_file)
+            logger_container.add_logger(jsonl_logger)
 
         if logger_container.number_of_loggers == 0:
             logger.debug("No loggers enabled, returning an empty LoggerContainer")
@@ -527,22 +563,46 @@ class MetricsProcessor(Configurable):
         if extra_metrics:
             step_total = extra_metrics.get("time_metrics/step_total(s)")
             forward_backward = extra_metrics.get("time_metrics/forward_backward(s)")
+            compute_total = extra_metrics.get("time_metrics/profile_compute(ms)")
             all_gather = extra_metrics.get("time_metrics/profile_all_gather(ms)")
             reduce_scatter = extra_metrics.get(
                 "time_metrics/profile_reduce_scatter(ms)"
             )
+            all_reduce = extra_metrics.get("time_metrics/profile_all_reduce(ms)")
+            p2p = extra_metrics.get("time_metrics/profile_p2p(ms)")
             pipeline_idle = extra_metrics.get("time_metrics/pp_idle_estimate(s)")
             summary_parts = []
             if isinstance(step_total, (int, float)):
                 summary_parts.append(f"step_time: {step_total:.3f}s")
             if isinstance(forward_backward, (int, float)):
                 summary_parts.append(f"fwd_bwd: {forward_backward:.3f}s")
+            if isinstance(compute_total, (int, float)):
+                summary_parts.append(f"comp: {compute_total:.1f}ms")
             if isinstance(all_gather, (int, float)):
                 summary_parts.append(f"ag: {all_gather:.1f}ms")
             if isinstance(reduce_scatter, (int, float)):
                 summary_parts.append(f"rs: {reduce_scatter:.1f}ms")
+            if isinstance(all_reduce, (int, float)):
+                summary_parts.append(f"ar: {all_reduce:.1f}ms")
+            if isinstance(p2p, (int, float)):
+                summary_parts.append(f"p2p: {p2p:.1f}ms")
             if isinstance(pipeline_idle, (int, float)):
-                summary_parts.append(f"pp_idle≈ {pipeline_idle:.3f}s")
+                summary_parts.append(f"pp_idle~{pipeline_idle:.3f}s")
+            hottest_stage = None
+            hottest_stage_busy_ms = -1.0
+            for key, value in extra_metrics.items():
+                if (
+                    isinstance(value, (int, float))
+                    and key.startswith("stage_metrics/stage_")
+                    and key.endswith("/busy(ms)")
+                    and float(value) > hottest_stage_busy_ms
+                ):
+                    hottest_stage = key.split("/")[1]
+                    hottest_stage_busy_ms = float(value)
+            if hottest_stage is not None:
+                summary_parts.append(
+                    f"hot_stage: {hottest_stage.replace('stage_', 's')}({hottest_stage_busy_ms:.1f}ms)"
+                )
             if summary_parts:
                 timing_summary = "  " + "  ".join(summary_parts)
         logger.info(
