@@ -619,6 +619,8 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         common += ["--recompute-granularity", str(strategy.recompute_granularity)]
         if str(strategy.recompute_granularity) == "selective":
             common += ["--recompute-activations", "--recompute-modules", "core_attn"]
+    if transformer_impl != "transformer_engine":
+        common.append("--no-gradient-accumulation-fusion")
     if args.enable_tp_comm_overlap:
         if not sequence_parallel_active:
             raise ValueError("tp_comm_overlap requires tp_degree > 1 with sequence parallel enabled")

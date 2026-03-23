@@ -267,6 +267,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["trial_context"]["runtime_stack"]["transformer_impl"], "local")
             self.assertIn("--no-rope-fusion", cmd)
             self.assertIn("--no-persist-layer-norm", cmd)
+            self.assertIn("--no-gradient-accumulation-fusion", cmd)
             self.assertNotIn("--sequence-parallel", cmd)
 
     def test_trial_runner_dry_run_sequence_parallel_toggle_disables_sp_flag(self) -> None:

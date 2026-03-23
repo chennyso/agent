@@ -349,6 +349,10 @@ if [[ "$MODEL_TRACK" == "dense" ]]; then
   TRAINING_ARGS+=(--recompute-granularity selective --recompute-activations --recompute-modules core_attn)
 fi
 
+if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]]; then
+  TRAINING_ARGS+=(--no-gradient-accumulation-fusion)
+fi
+
 EXTRA_PARALLEL_ARGS=(
   --tensor-model-parallel-size "$TP_SIZE"
   --pipeline-model-parallel-size "$PP_SIZE"
