@@ -45,16 +45,27 @@ echo "Using CUDA_HOME: ${CUDA_HOME}"
 
 readarray -t TE_SOURCE < <(
   python - <<'PY' "${MEGATRON_ROOT}/pyproject.toml"
+import re
 import sys
-import tomllib
 from pathlib import Path
 
-payload = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-source = payload["tool"]["uv"]["sources"]["transformer-engine"]
-print(source["git"])
-print(source["rev"])
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(
+    r'^transformer-engine\s*=\s*\{\s*git\s*=\s*"([^"]+)"\s*,\s*rev\s*=\s*"([^"]+)"\s*\}',
+    text,
+    flags=re.MULTILINE,
+)
+if not match:
+    raise SystemExit("Could not locate pinned transformer-engine source in pyproject.toml")
+print(match.group(1))
+print(match.group(2))
 PY
 )
+
+if [[ "${#TE_SOURCE[@]}" -lt 2 ]]; then
+  echo "Error: failed to resolve pinned Transformer Engine source from ${MEGATRON_ROOT}/pyproject.toml"
+  exit 1
+fi
 
 TE_GIT="${TE_SOURCE[0]}"
 TE_REV="${TE_SOURCE[1]}"
