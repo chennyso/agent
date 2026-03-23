@@ -383,7 +383,6 @@ LOGGING_ARGS=(
   --tensorboard-log-interval "$TENSORBOARD_LOG_INTERVAL"
   --ckpt-format torch_dist
   --distributed-timeout-minutes 60
-  --save "$CHECKPOINT_PATH"
 )
 if (( LOAD_CHECKPOINT > 0 )); then
   LOGGING_ARGS+=(--load "$CHECKPOINT_PATH")
@@ -392,7 +391,7 @@ if (( EVAL_ITERS > 0 && EVAL_INTERVAL > 0 )); then
   LOGGING_ARGS+=(--eval-iters "$EVAL_ITERS" --eval-interval "$EVAL_INTERVAL")
 fi
 if (( SAVE_INTERVAL > 0 )); then
-  LOGGING_ARGS+=(--save-interval "$SAVE_INTERVAL")
+  LOGGING_ARGS+=(--save "$CHECKPOINT_PATH" --save-interval "$SAVE_INTERVAL")
 fi
 if (( ENABLE_PROFILE > 0 )); then
   LOGGING_ARGS+=(--profile --profile-step-start "$PROFILE_STEP_START" --profile-step-end "$PROFILE_STEP_END")

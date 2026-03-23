@@ -160,7 +160,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["trial_context"]["resolved_paths"]["megatron_entry"], str(megatron_root / "pretrain_gpt.py"))
             self.assertEqual(
                 payload["trial_context"]["resolved_paths"]["torchrun_log_dir"],
-                str(Path("./runs_megatron") / "trial_000" / "torchrun_logs"),
+                str((Path("./runs_megatron").resolve()) / "trial_000" / "torchrun_logs"),
             )
             self.assertIn("launcher_env", payload["launch_plan"])
             self.assertIn("megatron_command", payload["launch_plan"])
@@ -300,7 +300,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["launch_plan"]["observability"]["profile_step_end"], 7)
             self.assertTrue(payload["launch_plan"]["observability"]["enable_pytorch_profiler"])
             self.assertTrue(payload["launch_plan"]["observability"]["enable_memory_history"])
-            self.assertEqual(payload["trial_context"]["resolved_paths"]["torch_profile_path"], str((tmp / "runs" / "trial_000" / "torch_profile")))
+            self.assertEqual(
+                payload["trial_context"]["resolved_paths"]["torch_profile_path"],
+                str((tmp / "runs").resolve() / "trial_000" / "torch_profile"),
+            )
 
     def test_trial_runner_dry_run_nsys_wraps_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -437,7 +440,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(payload["root_cause_source"].endswith("stderr.log"))
             self.assertEqual(
                 payload["trial_context"]["resolved_paths"]["torchrun_log_dir"],
-                str(run_root / "trial_000" / "torchrun_logs"),
+                str(run_root.resolve() / "trial_000" / "torchrun_logs"),
             )
 
     def test_summary_fields_stable_without_cross_node_signal(self) -> None:

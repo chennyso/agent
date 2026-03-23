@@ -70,7 +70,7 @@ def _resolve_launcher_script(root: Optional[str], launcher_script: Optional[str]
 
 
 def _default_run_root(args: argparse.Namespace) -> Path:
-    return Path(args.run_root or "./runs_megatron")
+    return Path(args.run_root or "./runs_megatron").resolve()
 
 
 def _trial_output_dirs(args: argparse.Namespace, trial_id: int) -> Dict[str, str]:
@@ -479,8 +479,6 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         "torch_dist",
         "--distributed-timeout-minutes",
         str(int(args.distributed_timeout_minutes)),
-        "--save",
-        output_dirs["checkpoint_path"],
         "--tensorboard-dir",
         output_dirs["tensorboard_path"],
         "--tensorboard-log-interval",
@@ -505,7 +503,7 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
     if int(args.eval_iters) > 0 and int(args.eval_interval) > 0:
         common += ["--eval-iters", str(int(args.eval_iters)), "--eval-interval", str(int(args.eval_interval))]
     if int(args.save_interval) > 0:
-        common += ["--save-interval", str(int(args.save_interval))]
+        common += ["--save", output_dirs["checkpoint_path"], "--save-interval", str(int(args.save_interval))]
     if observability["enable_log_timers_to_tensorboard"]:
         common.append("--log-timers-to-tensorboard")
     if observability["enable_log_memory_to_tensorboard"]:
