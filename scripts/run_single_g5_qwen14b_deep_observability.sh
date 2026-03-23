@@ -64,6 +64,16 @@ python -m megatron_agent.agent_loop \
   --tokenizer-model "$TOKENIZER_MODEL" \
   --data-path "$DATA_PATH"
 
+echo "Export finished."
+echo "  summary: ${EXPORT_DIR}/summary_megatron.json"
+echo "  baseline program: ${PROGRAM_FILE}"
+
+if [[ ! -f "$PROGRAM_FILE" ]]; then
+  echo "Error: exported baseline program not found: ${PROGRAM_FILE}"
+  exit 1
+fi
+
+set +e
 python -m megatron_agent.trial_runner \
   --program-file "$PROGRAM_FILE" \
   --output "$OUTPUT_JSON" \
@@ -83,6 +93,41 @@ python -m megatron_agent.trial_runner \
   "${PROFILE_RANK_ARGS[@]}" \
   "${WANDB_ARGS[@]}" \
   "${NSYS_ARGS[@]}"
+TRIAL_RC=$?
+set -e
+
+if (( TRIAL_RC != 0 )); then
+  echo "Trial runner failed with exit code ${TRIAL_RC}."
+  if [[ -f "$OUTPUT_JSON" ]]; then
+    echo "Failure summary from ${OUTPUT_JSON}:"
+    python - <<'PY' "$OUTPUT_JSON"
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+print(f"  returncode: {payload.get('returncode')}")
+print(f"  error_msg: {payload.get('error_msg')}")
+trial_context = payload.get("trial_context") or {}
+resolved = trial_context.get("resolved_paths") or {}
+launch_plan = payload.get("launch_plan") or {}
+observability = launch_plan.get("observability") or {}
+print(f"  megatron_entry: {trial_context.get('megatron_entry')}")
+print(f"  trial_dir: {resolved.get('trial_dir')}")
+print(f"  tensorboard: {resolved.get('tensorboard_path')}")
+print(f"  torch_profile: {resolved.get('torch_profile_path')}")
+print(f"  memory_snapshot: {resolved.get('memory_snapshot_path')}")
+print(f"  nsys_output: {resolved.get('nsys_output')}")
+print(f"  stdout_log: {resolved.get('stdout_log')}")
+print(f"  stderr_log: {resolved.get('stderr_log')}")
+print(f"  launch_plan_log: {resolved.get('launch_plan_log')}")
+print(f"  stderr_tail: {payload.get('stderr_tail')}")
+print(f"  stdout_tail: {payload.get('stdout_tail')}")
+print(f"  observability: {observability}")
+PY
+  else
+    echo "No output json was produced."
+  fi
+  exit "$TRIAL_RC"
+fi
 
 echo "Run finished."
 echo "  metrics: ${OUTPUT_JSON}"

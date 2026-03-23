@@ -231,6 +231,15 @@ def _prepare_trial_artifact_dirs(output_dirs: Dict[str, str], observability: Dic
         Path(str(nsys_output)).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
+    trial_dir = Path(output_dirs["trial_dir"])
+    return {
+        "stdout_log": str(trial_dir / "stdout.log"),
+        "stderr_log": str(trial_dir / "stderr.log"),
+        "launch_plan_log": str(trial_dir / "launch_plan.json"),
+    }
+
+
 def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
     return [
         "--num-layers",
@@ -704,6 +713,7 @@ def run_trial(
     cwd = str(Path(args.megatron_root)) if args.megatron_root else None
     resolved_entry = _resolve_megatron_entry(args.megatron_root, args.megatron_entry)
     output_dirs = _trial_output_dirs(args, trial_id)
+    log_paths = _trial_log_paths(output_dirs)
     try:
         observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
         launcher_env_overrides = _launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs)
@@ -736,6 +746,9 @@ def run_trial(
         "memory_snapshot_path": observability["memory_snapshot_path"],
         "nsys_output": observability["nsys_output"],
         "data_cache_path": output_dirs["data_cache_path"],
+        "stdout_log": log_paths["stdout_log"],
+        "stderr_log": log_paths["stderr_log"],
+        "launch_plan_log": log_paths["launch_plan_log"],
     }
     metrics["strategy"] = strategy.to_dict()
     metrics["strategy_hash"] = strategy.semantic_hash()
@@ -771,6 +784,11 @@ def run_trial(
                 "nsys_output": observability["nsys_output"],
             },
         }
+        Path(log_paths["launch_plan_log"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_paths["launch_plan_log"]).write_text(
+            json.dumps(metrics["launch_plan"], indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
         if bool(getattr(args, "dry_run", False)):
             metrics["dry_run"] = True
             metrics["returncode"] = 0
@@ -799,6 +817,8 @@ def run_trial(
 
     stdout_text = proc.stdout or ""
     stderr_text = proc.stderr or ""
+    Path(log_paths["stdout_log"]).write_text(stdout_text, encoding="utf-8")
+    Path(log_paths["stderr_log"]).write_text(stderr_text, encoding="utf-8")
     metrics["returncode"] = proc.returncode
     metrics["stdout_tail"] = stdout_text[-2000:]
     metrics["stderr_tail"] = stderr_text[-2000:]
