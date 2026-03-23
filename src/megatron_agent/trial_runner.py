@@ -81,6 +81,7 @@ def _trial_output_dirs(args: argparse.Namespace, trial_id: int) -> Dict[str, str
         "checkpoint_path": str(trial_dir / "checkpoints"),
         "tensorboard_path": str(trial_dir / "tensorboard"),
         "torch_profile_path": str(trial_dir / "torch_profile"),
+        "torchrun_log_dir": str(trial_dir / "torchrun_logs"),
         "chakra_path": str(trial_dir / "chakra"),
         "nsys_path": str(trial_dir / "nsys"),
         "data_cache_path": str(trial_dir / "cache"),
@@ -219,7 +220,16 @@ def _build_nsys_command(observability: Dict[str, Any]) -> Optional[List[str]]:
 
 
 def _prepare_trial_artifact_dirs(output_dirs: Dict[str, str], observability: Dict[str, Any]) -> None:
-    for key in ("trial_dir", "checkpoint_path", "tensorboard_path", "data_cache_path", "torch_profile_path", "chakra_path", "nsys_path"):
+    for key in (
+        "trial_dir",
+        "checkpoint_path",
+        "tensorboard_path",
+        "data_cache_path",
+        "torch_profile_path",
+        "torchrun_log_dir",
+        "chakra_path",
+        "nsys_path",
+    ):
         path = output_dirs.get(key)
         if path:
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -238,6 +248,89 @@ def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
         "stderr_log": str(trial_dir / "stderr.log"),
         "launch_plan_log": str(trial_dir / "launch_plan.json"),
     }
+
+
+def _runtime_env_defaults() -> Dict[str, str]:
+    return {
+        "CUDA_DEVICE_MAX_CONNECTIONS": str(os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1")),
+        "TORCH_NCCL_AVOID_RECORD_STREAMS": str(os.environ.get("TORCH_NCCL_AVOID_RECORD_STREAMS", "1")),
+        "PYTORCH_CUDA_ALLOC_CONF": str(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")),
+        "NCCL_DEBUG": str(os.environ.get("NCCL_DEBUG", "WARN")),
+        "PYTHONFAULTHANDLER": str(os.environ.get("PYTHONFAULTHANDLER", "1")),
+        "TORCH_SHOW_CPP_STACKTRACES": str(os.environ.get("TORCH_SHOW_CPP_STACKTRACES", "1")),
+    }
+
+
+def _safe_read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _extract_error_excerpt_from_text(text: str, radius: int = 1200) -> Optional[str]:
+    if not text or not text.strip():
+        return None
+    markers = [
+        "Traceback (most recent call last):",
+        "AssertionError",
+        "RuntimeError",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "FileNotFoundError",
+        "PermissionError",
+        "CUDA out of memory",
+        "NCCL error",
+        "NCCL WARN",
+        "NCCL timeout",
+        "Segmentation fault",
+        "Signal 11",
+        "Signal 15",
+    ]
+    for marker in markers:
+        index = text.rfind(marker)
+        if index >= 0:
+            start = max(index - radius, 0)
+            end = min(index + radius, len(text))
+            return text[start:end].strip()
+    return None
+
+
+def _collect_torchrun_log_files(torchrun_log_dir: str) -> List[str]:
+    root = Path(torchrun_log_dir)
+    if not root.exists():
+        return []
+    files: List[str] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            files.append(str(path))
+    return files
+
+
+def _extract_failure_details(stdout_text: str, stderr_text: str, torchrun_log_dir: str) -> Dict[str, Any]:
+    torchrun_log_files = _collect_torchrun_log_files(torchrun_log_dir)
+    for file_path in torchrun_log_files:
+        excerpt = _extract_error_excerpt_from_text(_safe_read_text(Path(file_path)))
+        if excerpt:
+            return {
+                "root_cause_source": file_path,
+                "root_cause_excerpt": excerpt[-4000:],
+                "torchrun_log_files": torchrun_log_files,
+            }
+    for source_name, text in (("stderr", stderr_text), ("stdout", stdout_text)):
+        excerpt = _extract_error_excerpt_from_text(text)
+        if excerpt:
+            return {
+                "root_cause_source": source_name,
+                "root_cause_excerpt": excerpt[-4000:],
+                "torchrun_log_files": torchrun_log_files,
+            }
+    return {"torchrun_log_files": torchrun_log_files}
 
 
 def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
@@ -495,6 +588,7 @@ def _build_megatron_cmd(
     entry = _resolve_megatron_entry(args.megatron_root, args.megatron_entry)
     if not entry.exists():
         raise FileNotFoundError(f"Megatron entry not found: {entry}")
+    output_dirs = _trial_output_dirs(args, trial_id)
 
     cmd: List[str] = [
         sys.executable,
@@ -502,6 +596,10 @@ def _build_megatron_cmd(
         "torch.distributed.run",
         "--nproc_per_node",
         str(args.nproc),
+        "--log-dir",
+        output_dirs["torchrun_log_dir"],
+        "--redirects",
+        "3",
     ]
     if int(args.nnodes) > 1:
         cmd += [
@@ -568,6 +666,7 @@ def _build_launcher_env(
 ) -> Dict[str, str]:
     output_dirs = _trial_output_dirs(args, trial_id)
     env = os.environ.copy()
+    env.update(_runtime_env_defaults())
     env.update(_launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs))
     return env
 
@@ -634,11 +733,14 @@ def _launcher_env_overrides(
     return env
 
 
-def _parse_error(stderr: str) -> str:
-    if "CUDA out of memory" in stderr:
+def _parse_error(stderr: str, root_cause_excerpt: Optional[str] = None) -> str:
+    combined = "\n".join(part for part in (root_cause_excerpt or "", stderr or "") if part)
+    if "CUDA out of memory" in combined:
         return "CUDA OOM"
-    if "NCCL" in stderr and ("Watchdog" in stderr or "timed out" in stderr):
+    if "NCCL" in combined and ("Watchdog" in combined or "timed out" in combined):
         return "NCCL timeout"
+    if root_cause_excerpt:
+        return f"Runtime Error: {root_cause_excerpt[-1200:]}"
     tail = stderr[-200:] if stderr else ""
     return f"Runtime Error: {tail}"
 
@@ -742,6 +844,7 @@ def run_trial(
         "checkpoint_path": output_dirs["checkpoint_path"],
         "tensorboard_path": output_dirs["tensorboard_path"],
         "torch_profile_path": observability["torch_profile_path"],
+        "torchrun_log_dir": output_dirs["torchrun_log_dir"],
         "chakra_path": observability["chakra_path"] if bool(observability["profile_collect_chakra"]) else None,
         "memory_snapshot_path": observability["memory_snapshot_path"],
         "nsys_output": observability["nsys_output"],
@@ -808,7 +911,13 @@ def run_trial(
             )
         else:
             cmd = list(executed_command)
-            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                env=_build_launcher_env(args, program, compiled, trial_id),
+            )
     except Exception as exc:
         metrics["returncode"] = 1
         metrics["error_msg"] = str(exc)
@@ -824,7 +933,9 @@ def run_trial(
     metrics["stderr_tail"] = stderr_text[-2000:]
 
     if proc.returncode != 0:
-        metrics["error_msg"] = _parse_error(stderr_text)
+        failure_details = _extract_failure_details(stdout_text, stderr_text, output_dirs["torchrun_log_dir"])
+        metrics.update(failure_details)
+        metrics["error_msg"] = _parse_error(stderr_text, metrics.get("root_cause_excerpt"))
         metrics["oom"] = "CUDA OOM" in metrics["error_msg"]
         return metrics
 

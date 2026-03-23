@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -157,9 +158,15 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertEqual(payload["trial_context"]["runner_mode"], "direct_entry")
             self.assertEqual(payload["trial_context"]["resolved_paths"]["megatron_entry"], str(megatron_root / "pretrain_gpt.py"))
+            self.assertEqual(
+                payload["trial_context"]["resolved_paths"]["torchrun_log_dir"],
+                str(Path("./runs_megatron") / "trial_000" / "torchrun_logs"),
+            )
             self.assertIn("launcher_env", payload["launch_plan"])
             self.assertIn("megatron_command", payload["launch_plan"])
             self.assertGreater(len(payload["launch_plan"]["megatron_command"]), 0)
+            self.assertIn("--log-dir", payload["launch_plan"]["megatron_command"])
+            self.assertIn("--redirects", payload["launch_plan"]["megatron_command"])
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "1")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "0")
 
@@ -373,6 +380,65 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["returncode"], 1)
             self.assertIn("tp_comm_overlap requires tp_degree > 1 with sequence parallel enabled", payload["error_msg"])
+
+    def test_trial_runner_failure_extracts_root_cause_from_torchrun_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            megatron_root = tmp / "Megatron-LM"
+            megatron_root.mkdir()
+            (megatron_root / "pretrain_gpt.py").write_text("print('stub')\n", encoding="utf-8")
+
+            program_path = tmp / "baseline.json"
+            output_path = tmp / "failure.json"
+            run_root = tmp / "runs"
+            program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
+
+            def _fake_run(cmd, capture_output, text, cwd, env=None):
+                torchrun_dir = run_root / "trial_000" / "torchrun_logs" / "test_run_id" / "attempt_0" / "0"
+                torchrun_dir.mkdir(parents=True, exist_ok=True)
+                (torchrun_dir / "stderr.log").write_text(
+                    "Traceback (most recent call last):\n"
+                    "  File \"pretrain_gpt.py\", line 1, in <module>\n"
+                    "    raise ValueError('boom')\n"
+                    "ValueError: boom\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stdout="elastic wrapper stdout\n",
+                    stderr="elastic wrapper stderr\n",
+                )
+
+            with mock.patch("megatron_agent.trial_runner.subprocess.run", side_effect=_fake_run):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--run-root",
+                        str(run_root),
+                    ],
+                ):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        trial_runner.main()
+
+            self.assertEqual(exc_info.exception.code, 1)
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertIn("ValueError: boom", payload["root_cause_excerpt"])
+            self.assertTrue(payload["root_cause_source"].endswith("stderr.log"))
+            self.assertEqual(
+                payload["trial_context"]["resolved_paths"]["torchrun_log_dir"],
+                str(run_root / "trial_000" / "torchrun_logs"),
+            )
 
     def test_summary_fields_stable_without_cross_node_signal(self) -> None:
         baseline = default_dense_program("single_g5")
