@@ -17,6 +17,7 @@ PROGRAM_FILE="${PROGRAM_FILE:-${PROGRAMS_DIR}/00_baseline.json}"
 
 RUN_TARGET="${RUN_TARGET:-single_g5}"
 MODEL_TRACK="${MODEL_TRACK:-dense}"
+TRANSFORMER_IMPL="${TRANSFORMER_IMPL:-transformer_engine}"
 TRAIN_ITERS="${TRAIN_ITERS:-20}"
 CANDIDATE_LIMIT="${CANDIDATE_LIMIT:-4}"
 OBSERVABILITY_PRESET="${OBSERVABILITY_PRESET:-deep}"
@@ -82,6 +83,7 @@ python -m megatron_agent.trial_runner \
   --launcher-script "" \
   --run-target "$RUN_TARGET" \
   --model-track "$MODEL_TRACK" \
+  --transformer-impl "$TRANSFORMER_IMPL" \
   --nproc 8 \
   --nnodes 1 \
   --train-iters "$TRAIN_ITERS" \

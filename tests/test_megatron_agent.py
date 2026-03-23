@@ -20,6 +20,16 @@ from megatron_agent.programs import classify_program_family  # noqa: E402
 
 
 class TestMegatronAgentProgramFlow(unittest.TestCase):
+    def _mock_runtime_stack(self) -> mock._patch:
+        return mock.patch(
+            "megatron_agent.trial_runner._validate_runtime_stack",
+            return_value={
+                "transformer_impl": "transformer_engine",
+                "transformer_engine_version": "test-te",
+                "apex_path": "/tmp/apex/__init__.py",
+            },
+        )
+
     def test_single_node_dense_default_exports_family_outside_candidate(self) -> None:
         baseline = default_dense_program("single_g5")
         rewrite = agent_loop._rewrite_space(baseline, {})
@@ -137,23 +147,24 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             output_path = tmp / "dry_run.json"
             program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--dry-run",
-                ],
-            ):
-                trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--dry-run",
+                    ],
+                ):
+                    trial_runner.main()
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertTrue(payload["dry_run"])
@@ -166,10 +177,13 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("launcher_env", payload["launch_plan"])
             self.assertIn("megatron_command", payload["launch_plan"])
             self.assertGreater(len(payload["launch_plan"]["megatron_command"]), 0)
-            self.assertIn("--no-rope-fusion", payload["launch_plan"]["megatron_command"])
-            self.assertIn("--no-persist-layer-norm", payload["launch_plan"]["megatron_command"])
+            self.assertEqual(payload["launch_plan"]["launcher_env"]["TRANSFORMER_IMPL"], "transformer_engine")
+            self.assertEqual(payload["trial_context"]["runtime_stack"]["transformer_engine_version"], "test-te")
+            self.assertNotIn("--no-rope-fusion", payload["launch_plan"]["megatron_command"])
+            self.assertNotIn("--no-persist-layer-norm", payload["launch_plan"]["megatron_command"])
             self.assertIn("--log-dir", payload["launch_plan"]["megatron_command"])
             self.assertIn("--redirects", payload["launch_plan"]["megatron_command"])
+            self.assertIn("transformer_engine", payload["launch_plan"]["megatron_command"])
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "1")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "0")
 
@@ -211,6 +225,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["program"]["cluster"]["target"], "single_g4")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["RUN_TARGET"], "single_g4")
+            self.assertEqual(payload["launch_plan"]["launcher_env"]["TRANSFORMER_IMPL"], "local")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "0")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "1")
 
@@ -228,23 +243,24 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             output_path = tmp / "sp_toggle_off_dry_run.json"
             program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--dry-run",
-                ],
-            ):
-                trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--dry-run",
+                    ],
+                ):
+                    trial_runner.main()
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["launch_plan"]["launcher_env"]["ENABLE_SP"], "0")
@@ -261,35 +277,36 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             output_path = tmp / "deep_observability.json"
             program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--run-root",
-                    str(tmp / "runs"),
-                    "--dry-run",
-                    "--observability-preset",
-                    "deep",
-                    "--profile-step-start",
-                    "3",
-                    "--profile-step-end",
-                    "7",
-                    "--wandb-project",
-                    "megatron-tests",
-                    "--wandb-exp-name",
-                    "single-g5-qwen14b-deep",
-                ],
-            ):
-                trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--run-root",
+                        str(tmp / "runs"),
+                        "--dry-run",
+                        "--observability-preset",
+                        "deep",
+                        "--profile-step-start",
+                        "3",
+                        "--profile-step-end",
+                        "7",
+                        "--wandb-project",
+                        "megatron-tests",
+                        "--wandb-exp-name",
+                        "single-g5-qwen14b-deep",
+                    ],
+                ):
+                    trial_runner.main()
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             cmd = payload["launch_plan"]["megatron_command"]
@@ -319,28 +336,29 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             output_path = tmp / "nsys_dry_run.json"
             program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--run-root",
-                    str(tmp / "runs"),
-                    "--dry-run",
-                    "--enable-nsys",
-                    "--nsys-output",
-                    "custom_nsys/profile",
-                ],
-            ):
-                trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--run-root",
+                        str(tmp / "runs"),
+                        "--dry-run",
+                        "--enable-nsys",
+                        "--nsys-output",
+                        "custom_nsys/profile",
+                    ],
+                ):
+                    trial_runner.main()
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             executed = payload["launch_plan"]["executed_command"]
@@ -361,25 +379,26 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             output_path = tmp / "tp_overlap_invalid_dry_run.json"
             program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--enable-tp-comm-overlap",
-                    "--dry-run",
-                ],
-            ):
-                with self.assertRaises(SystemExit) as exc_info:
-                    trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--enable-tp-comm-overlap",
+                        "--dry-run",
+                    ],
+                ):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        trial_runner.main()
 
             self.assertEqual(exc_info.exception.code, 1)
 
@@ -416,30 +435,31 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     stderr="elastic wrapper stderr\n",
                 )
 
-            with mock.patch("megatron_agent.trial_runner.subprocess.run", side_effect=_fake_run):
-                with mock.patch(
-                    "megatron_agent.trial_runner._validate_cuda_toolchain",
-                    return_value={"CUDA_HOME": "/usr/local/cuda", "CUDA_PATH": "/usr/local/cuda", "CUDACXX": "/usr/local/cuda/bin/nvcc"},
-                ):
-                    with mock.patch.object(
-                        sys,
-                        "argv",
-                        [
-                            "trial_runner.py",
-                            "--program-file",
-                            str(program_path),
-                            "--output",
-                            str(output_path),
-                            "--megatron-root",
-                            str(megatron_root),
-                            "--launcher-script",
-                            "",
-                            "--run-root",
-                            str(run_root),
-                        ],
+            with self._mock_runtime_stack():
+                with mock.patch("megatron_agent.trial_runner.subprocess.run", side_effect=_fake_run):
+                    with mock.patch(
+                        "megatron_agent.trial_runner._validate_cuda_toolchain",
+                        return_value={"CUDA_HOME": "/usr/local/cuda", "CUDA_PATH": "/usr/local/cuda", "CUDACXX": "/usr/local/cuda/bin/nvcc"},
                     ):
-                        with self.assertRaises(SystemExit) as exc_info:
-                            trial_runner.main()
+                        with mock.patch.object(
+                            sys,
+                            "argv",
+                            [
+                                "trial_runner.py",
+                                "--program-file",
+                                str(program_path),
+                                "--output",
+                                str(output_path),
+                                "--megatron-root",
+                                str(megatron_root),
+                                "--launcher-script",
+                                "",
+                                "--run-root",
+                                str(run_root),
+                            ],
+                        ):
+                            with self.assertRaises(SystemExit) as exc_info:
+                                trial_runner.main()
 
             self.assertEqual(exc_info.exception.code, 1)
             payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -464,6 +484,44 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(env["CUDA_HOME"], str(cuda_home))
             self.assertEqual(env["CUDA_PATH"], str(cuda_home))
             self.assertEqual(env["CUDACXX"], str(bin_dir / "nvcc"))
+
+    def test_single_g5_dense_dry_run_requires_perf_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            megatron_root = tmp / "Megatron-LM"
+            megatron_root.mkdir()
+            (megatron_root / "pretrain_gpt.py").write_text("print('stub')\n", encoding="utf-8")
+
+            program_path = tmp / "baseline.json"
+            output_path = tmp / "missing_perf_stack.json"
+            program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
+
+            with mock.patch(
+                "megatron_agent.trial_runner._validate_runtime_stack",
+                side_effect=RuntimeError("single_g5 dense high-performance path requires Apex with apex.optimizers.FusedAdam available in the active environment."),
+            ):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--dry-run",
+                    ],
+                ):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        trial_runner.main()
+
+            self.assertEqual(exc_info.exception.code, 1)
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertIn("single_g5 dense high-performance path requires Apex", payload["error_msg"])
 
     def test_prepare_trial_artifact_dirs_clears_stale_trial_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -20,6 +20,22 @@ export MEGATRON_ROOT=/public/home/ssjxscy/agent/Megatron-LM
 export LAUNCHER_SCRIPT=examples/qwen/train_qwen3_14b_rtx_8gpu.sh
 ```
 
+For the `single_g5` Qwen3-14B high-performance path, the shared environment must provide both Transformer Engine and Apex. Install them on `g4` into the shared env, then verify them again on `g5`:
+
+```bash
+bash ./scripts/install_g5_perf_stack_on_g4.sh
+```
+
+Expected validation commands after install:
+
+```bash
+source /public/home/ssjxscy/envs/torchdist_ok/bin/activate
+python -c "import transformer_engine; print(transformer_engine.__version__)"
+python -c "import apex; print(apex.__file__)"
+python -c "from transformer_engine.pytorch.optimizers import FusedAdam"
+python -c "from apex.optimizers import FusedAdam"
+```
+
 ## 1. Export Programs Without Running Trials
 
 Use `--export-only` to synthesize baseline and candidate programs, write program JSON files, and emit a manifest in `summary_megatron.json`.

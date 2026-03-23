@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shlex
@@ -325,6 +326,48 @@ def _validate_cuda_toolchain() -> Dict[str, str]:
     return runtime_env
 
 
+def _resolve_transformer_impl(args: argparse.Namespace, program: MegatronProgram) -> str:
+    raw = str(getattr(args, "transformer_impl", "auto") or "auto").strip().lower()
+    if raw and raw != "auto":
+        return raw
+    if str(program.cluster.target) == "single_g5" and str(program.model.track) == "dense":
+        return "transformer_engine"
+    return "local"
+
+
+def _validate_runtime_stack(args: argparse.Namespace, program: MegatronProgram) -> Dict[str, str]:
+    transformer_impl = _resolve_transformer_impl(args, program)
+    if transformer_impl != "transformer_engine":
+        return {"transformer_impl": transformer_impl}
+
+    try:
+        transformer_engine = importlib.import_module("transformer_engine")
+        te_optim = importlib.import_module("transformer_engine.pytorch.optimizers")
+        getattr(te_optim, "FusedAdam")
+    except Exception as exc:
+        raise RuntimeError(
+            "transformer_engine path requires Transformer Engine with "
+            "transformer_engine.pytorch.optimizers.FusedAdam available in the active environment."
+        ) from exc
+
+    details = {
+        "transformer_impl": transformer_impl,
+        "transformer_engine_version": str(getattr(transformer_engine, "__version__", "unknown")),
+    }
+    if str(program.cluster.target) == "single_g5" and str(program.model.track) == "dense":
+        try:
+            apex = importlib.import_module("apex")
+            apex_optim = importlib.import_module("apex.optimizers")
+            getattr(apex_optim, "FusedAdam")
+        except Exception as exc:
+            raise RuntimeError(
+                "single_g5 dense high-performance path requires Apex with "
+                "apex.optimizers.FusedAdam available in the active environment."
+            ) from exc
+        details["apex_path"] = str(getattr(apex, "__file__", ""))
+    return details
+
+
 def _safe_read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -398,7 +441,8 @@ def _extract_failure_details(stdout_text: str, stderr_text: str, torchrun_log_di
 
 
 def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
-    return [
+    transformer_impl = _resolve_transformer_impl(args, program)
+    shape_args = [
         "--num-layers",
         str(int(program.model.num_layers)),
         "--hidden-size",
@@ -418,8 +462,6 @@ def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strate
         str(int(args.max_position_embeddings or strategy.seq_len)),
         "--position-embedding-type",
         "rope",
-        "--no-rope-fusion",
-        "--no-persist-layer-norm",
         "--rotary-percent",
         "1.0",
         "--rotary-base",
@@ -444,10 +486,14 @@ def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strate
         "--vocab-size",
         str(int(args.vocab_size)),
     ]
+    if transformer_impl != "transformer_engine":
+        shape_args += ["--no-rope-fusion", "--no-persist-layer-norm"]
+    return shape_args
 
 
 def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
-    return [
+    transformer_impl = _resolve_transformer_impl(args, program)
+    shape_args = [
         "--num-layers",
         str(int(program.model.num_layers)),
         "--hidden-size",
@@ -466,8 +512,6 @@ def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy
         str(int(args.moe_max_position_embeddings or strategy.seq_len)),
         "--position-embedding-type",
         "rope",
-        "--no-rope-fusion",
-        "--no-persist-layer-norm",
         "--rotary-percent",
         "1.0",
         "--normalization",
@@ -499,15 +543,19 @@ def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy
         "--expert-tensor-parallel-size",
         str(int(program.parallel.expert_tp_degree)),
     ]
+    if transformer_impl != "transformer_engine":
+        shape_args += ["--no-rope-fusion", "--no-persist-layer-norm"]
+    return shape_args
 
 
 def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy, trial_id: int) -> List[str]:
     output_dirs = _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
+    transformer_impl = _resolve_transformer_impl(args, program)
     common = [
         "--use-mcore-models",
         "--transformer-impl",
-        str(args.transformer_impl),
+        transformer_impl,
         "--attention-backend",
         str(args.attention_backend),
         "--micro-batch-size",
@@ -746,6 +794,7 @@ def _launcher_env_overrides(
 ) -> Dict[str, str]:
     output_dirs = output_dirs or _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
+    transformer_impl = _resolve_transformer_impl(args, program)
     env = dict(compiled.launcher_env)
     env.update(
         {
@@ -762,7 +811,7 @@ def _launcher_env_overrides(
             "CHECKPOINT_PATH": output_dirs["checkpoint_path"],
             "TENSORBOARD_LOGS_PATH": output_dirs["tensorboard_path"],
             "DATA_CACHE_PATH": output_dirs["data_cache_path"],
-            "TRANSFORMER_IMPL": str(args.transformer_impl),
+            "TRANSFORMER_IMPL": transformer_impl,
             "ATTENTION_BACKEND": str(args.attention_backend),
             "ENABLE_TP_COMM_OVERLAP": "1" if bool(args.enable_tp_comm_overlap) else "0",
             "ENABLE_PROFILE": "1" if bool(observability["profile_enabled"]) else "0",
@@ -883,6 +932,7 @@ def run_trial(
     output_dirs = _trial_output_dirs(args, trial_id)
     log_paths = _trial_log_paths(output_dirs)
     try:
+        runtime_stack = _validate_runtime_stack(args, program)
         observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
         launcher_env_overrides = _launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs)
     except Exception as exc:
@@ -902,6 +952,7 @@ def run_trial(
         "enable_memory_history": bool(observability["enable_memory_history"]),
         "enable_nsys": bool(observability["enable_nsys"]),
     }
+    metrics["trial_context"]["runtime_stack"] = runtime_stack
     metrics["trial_context"]["resolved_paths"] = {
         "megatron_root": str(args.megatron_root),
         "megatron_entry": str(resolved_entry),
@@ -1064,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-tp-comm-overlap", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     add_observability_args(parser)
-    parser.add_argument("--transformer-impl", type=str, default="local")
+    parser.add_argument("--transformer-impl", type=str, default="auto")
     parser.add_argument("--attention-backend", type=str, default="auto")
     parser.add_argument("--train-iters", type=int, default=10)
     parser.add_argument("--eval-iters", type=int, default=0)

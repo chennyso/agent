@@ -72,7 +72,7 @@ ENABLE_NSYS=${ENABLE_NSYS:-0}
 NSYS_OUTPUT=${NSYS_OUTPUT:-}
 NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx}
 
-TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-local}
+TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-transformer_engine}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-auto}
 ENABLE_TP_COMM_OVERLAP=${ENABLE_TP_COMM_OVERLAP:-0}
 ENABLE_SP=${ENABLE_SP:-1}
@@ -140,6 +140,20 @@ require_path() {
     echo "Error: ${label} not found at ${path}"
     exit 1
   fi
+}
+
+require_perf_stack() {
+  python - <<'PY'
+import importlib
+
+transformer_engine = importlib.import_module("transformer_engine")
+importlib.import_module("transformer_engine.pytorch.optimizers").FusedAdam
+apex = importlib.import_module("apex")
+importlib.import_module("apex.optimizers").FusedAdam
+
+print(f"Transformer Engine: {getattr(transformer_engine, '__version__', 'unknown')}")
+print(f"Apex: {getattr(apex, '__file__', '')}")
+PY
 }
 
 append_if_enabled() {
@@ -244,6 +258,10 @@ if (( USE_MOCK_DATA == 0 )); then
   require_path "${DATA_PATH}.idx" "indexed dataset idx"
 fi
 
+if [[ "$RUN_TARGET" == "single_g5" ]] && [[ "$MODEL_TRACK" == "dense" ]] && [[ "$TRANSFORMER_IMPL" == "transformer_engine" ]]; then
+  require_perf_stack
+fi
+
 DISTRIBUTED_ARGS=(
   --nproc_per_node "$GPUS_PER_NODE"
   --nnodes "$NUM_NODES"
@@ -260,8 +278,6 @@ COMMON_MODEL_ARGS=(
   --seq-length "$SEQ_LENGTH"
   --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
   --position-embedding-type rope
-  --no-rope-fusion
-  --no-persist-layer-norm
   --rotary-percent 1.0
   --normalization RMSNorm
   --norm-epsilon 1e-6
@@ -270,6 +286,10 @@ COMMON_MODEL_ARGS=(
   --hidden-dropout 0.0
   --make-vocab-size-divisible-by 128
 )
+
+if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]]; then
+  COMMON_MODEL_ARGS+=(--no-rope-fusion --no-persist-layer-norm)
+fi
 
 if [[ "$MODEL_TRACK" == "dense" ]]; then
   MODEL_ARGS=(
