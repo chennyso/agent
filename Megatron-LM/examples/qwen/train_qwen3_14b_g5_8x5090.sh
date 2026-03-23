@@ -261,6 +261,7 @@ COMMON_MODEL_ARGS=(
   --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
   --position-embedding-type rope
   --no-rope-fusion
+  --no-persist-layer-norm
   --rotary-percent 1.0
   --normalization RMSNorm
   --norm-epsilon 1e-6

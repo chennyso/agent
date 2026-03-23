@@ -167,6 +167,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("megatron_command", payload["launch_plan"])
             self.assertGreater(len(payload["launch_plan"]["megatron_command"]), 0)
             self.assertIn("--no-rope-fusion", payload["launch_plan"]["megatron_command"])
+            self.assertIn("--no-persist-layer-norm", payload["launch_plan"]["megatron_command"])
             self.assertIn("--log-dir", payload["launch_plan"]["megatron_command"])
             self.assertIn("--redirects", payload["launch_plan"]["megatron_command"])
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "1")
