@@ -35,13 +35,18 @@ fi
 export CUDA_HOME
 export CUDA_PATH="${CUDA_HOME}"
 export CUDACXX="${CUDA_HOME}/bin/nvcc"
-export PATH="${CUDA_HOME}/bin:${PATH}"
+export PATH="${ENV_PREFIX}/bin:${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS
 
 echo "Using shared env: ${ENV_PREFIX}"
 echo "Using Megatron root: ${MEGATRON_ROOT}"
 echo "Using CUDA_HOME: ${CUDA_HOME}"
+
+uv pip install --upgrade "cmake>=3.21,<4" ninja "setuptools>=70.1" wheel
+hash -r
+cmake --version
+ninja --version
 
 readarray -t TE_SOURCE < <(
   python - <<'PY' "${MEGATRON_ROOT}/pyproject.toml"
