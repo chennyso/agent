@@ -229,6 +229,46 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "0")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "1")
 
+    def test_trial_runner_dry_run_single_g5_local_disables_sp_and_enables_local_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            megatron_root = tmp / "Megatron-LM"
+            megatron_root.mkdir()
+            (megatron_root / "pretrain_gpt.py").write_text("print('stub')\n", encoding="utf-8")
+
+            program_path = tmp / "single_g5_local.json"
+            output_path = tmp / "single_g5_local_dry_run.json"
+            program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "trial_runner.py",
+                    "--program-file",
+                    str(program_path),
+                    "--output",
+                    str(output_path),
+                    "--megatron-root",
+                    str(megatron_root),
+                    "--launcher-script",
+                    "",
+                    "--transformer-impl",
+                    "local",
+                    "--dry-run",
+                ],
+            ):
+                trial_runner.main()
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            cmd = payload["launch_plan"]["megatron_command"]
+            self.assertEqual(payload["launch_plan"]["launcher_env"]["TRANSFORMER_IMPL"], "local")
+            self.assertEqual(payload["launch_plan"]["launcher_env"]["ENABLE_SP"], "0")
+            self.assertEqual(payload["trial_context"]["runtime_stack"]["transformer_impl"], "local")
+            self.assertIn("--no-rope-fusion", cmd)
+            self.assertIn("--no-persist-layer-norm", cmd)
+            self.assertNotIn("--sequence-parallel", cmd)
+
     def test_trial_runner_dry_run_sequence_parallel_toggle_disables_sp_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

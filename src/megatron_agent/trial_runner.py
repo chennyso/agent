@@ -335,6 +335,14 @@ def _resolve_transformer_impl(args: argparse.Namespace, program: MegatronProgram
     return "local"
 
 
+def _sequence_parallel_requested(strategy: MegatronStrategy) -> bool:
+    return bool(strategy.parallel.sp_enabled) and int(strategy.parallel.tp_degree) > 1
+
+
+def _sequence_parallel_active(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> bool:
+    return _sequence_parallel_requested(strategy) and _resolve_transformer_impl(args, program) == "transformer_engine"
+
+
 def _validate_runtime_stack(args: argparse.Namespace, program: MegatronProgram) -> Dict[str, str]:
     transformer_impl = _resolve_transformer_impl(args, program)
     if transformer_impl != "transformer_engine":
@@ -552,6 +560,7 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
     output_dirs = _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
     transformer_impl = _resolve_transformer_impl(args, program)
+    sequence_parallel_active = _sequence_parallel_active(args, program, strategy)
     common = [
         "--use-mcore-models",
         "--transformer-impl",
@@ -611,10 +620,10 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         if str(strategy.recompute_granularity) == "selective":
             common += ["--recompute-activations", "--recompute-modules", "core_attn"]
     if args.enable_tp_comm_overlap:
-        if not (bool(strategy.parallel.sp_enabled) and int(strategy.parallel.tp_degree) > 1):
+        if not sequence_parallel_active:
             raise ValueError("tp_comm_overlap requires tp_degree > 1 with sequence parallel enabled")
         common.append("--tp-comm-overlap")
-    if strategy.parallel.sp_enabled and int(strategy.parallel.tp_degree) > 1:
+    if sequence_parallel_active:
         common.append("--sequence-parallel")
     if int(args.eval_iters) > 0 and int(args.eval_interval) > 0:
         common += ["--eval-iters", str(int(args.eval_iters)), "--eval-interval", str(int(args.eval_interval))]
@@ -795,6 +804,7 @@ def _launcher_env_overrides(
     output_dirs = output_dirs or _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
     transformer_impl = _resolve_transformer_impl(args, program)
+    sequence_parallel_active = _sequence_parallel_active(args, program, compiled.strategy)
     env = dict(compiled.launcher_env)
     env.update(
         {
@@ -812,6 +822,7 @@ def _launcher_env_overrides(
             "TENSORBOARD_LOGS_PATH": output_dirs["tensorboard_path"],
             "DATA_CACHE_PATH": output_dirs["data_cache_path"],
             "TRANSFORMER_IMPL": transformer_impl,
+            "ENABLE_SP": "1" if sequence_parallel_active else "0",
             "ATTENTION_BACKEND": str(args.attention_backend),
             "ENABLE_TP_COMM_OVERLAP": "1" if bool(args.enable_tp_comm_overlap) else "0",
             "ENABLE_PROFILE": "1" if bool(observability["profile_enabled"]) else "0",

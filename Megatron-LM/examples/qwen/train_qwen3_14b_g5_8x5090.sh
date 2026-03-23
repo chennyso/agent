@@ -72,10 +72,10 @@ ENABLE_NSYS=${ENABLE_NSYS:-0}
 NSYS_OUTPUT=${NSYS_OUTPUT:-}
 NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx}
 
-TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-transformer_engine}
+TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-local}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-auto}
 ENABLE_TP_COMM_OVERLAP=${ENABLE_TP_COMM_OVERLAP:-0}
-ENABLE_SP=${ENABLE_SP:-1}
+ENABLE_SP=${ENABLE_SP:-}
 LOAD_CHECKPOINT=${LOAD_CHECKPOINT:-0}
 USE_BF16=${USE_BF16:-1}
 USE_FP16=${USE_FP16:-0}
@@ -140,20 +140,6 @@ require_path() {
     echo "Error: ${label} not found at ${path}"
     exit 1
   fi
-}
-
-require_perf_stack() {
-  python - <<'PY'
-import importlib
-
-transformer_engine = importlib.import_module("transformer_engine")
-importlib.import_module("transformer_engine.pytorch.optimizers").FusedAdam
-apex = importlib.import_module("apex")
-importlib.import_module("apex.optimizers").FusedAdam
-
-print(f"Transformer Engine: {getattr(transformer_engine, '__version__', 'unknown')}")
-print(f"Apex: {getattr(apex, '__file__', '')}")
-PY
 }
 
 append_if_enabled() {
@@ -258,8 +244,17 @@ if (( USE_MOCK_DATA == 0 )); then
   require_path "${DATA_PATH}.idx" "indexed dataset idx"
 fi
 
-if [[ "$RUN_TARGET" == "single_g5" ]] && [[ "$MODEL_TRACK" == "dense" ]] && [[ "$TRANSFORMER_IMPL" == "transformer_engine" ]]; then
-  require_perf_stack
+if [[ -z "${ENABLE_SP}" ]]; then
+  if [[ "$TRANSFORMER_IMPL" == "transformer_engine" ]]; then
+    ENABLE_SP=1
+  else
+    ENABLE_SP=0
+  fi
+fi
+
+if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]] && [[ "$ENABLE_SP" == "1" ]]; then
+  echo "Invalid preset: sequence parallel requires transformer_engine in the current runtime path"
+  exit 1
 fi
 
 DISTRIBUTED_ARGS=(
