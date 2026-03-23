@@ -464,6 +464,30 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(env["CUDA_PATH"], str(cuda_home))
             self.assertEqual(env["CUDACXX"], str(bin_dir / "nvcc"))
 
+    def test_prepare_trial_artifact_dirs_clears_stale_trial_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial_dir = Path(tmpdir) / "trial_000"
+            stale_file = trial_dir / "torchrun_logs" / "old" / "stderr.log"
+            stale_file.parent.mkdir(parents=True, exist_ok=True)
+            stale_file.write_text("stale", encoding="utf-8")
+
+            output_dirs = {
+                "trial_dir": str(trial_dir),
+                "checkpoint_path": str(trial_dir / "checkpoints"),
+                "tensorboard_path": str(trial_dir / "tensorboard"),
+                "torch_profile_path": str(trial_dir / "torch_profile"),
+                "torchrun_log_dir": str(trial_dir / "torchrun_logs"),
+                "chakra_path": str(trial_dir / "chakra"),
+                "nsys_path": str(trial_dir / "nsys"),
+                "data_cache_path": str(trial_dir / "cache"),
+            }
+            observability = {"memory_snapshot_path": None, "nsys_output": None}
+
+            trial_runner._prepare_trial_artifact_dirs(output_dirs, observability)
+
+            self.assertFalse(stale_file.exists())
+            self.assertTrue((trial_dir / "torchrun_logs").exists())
+
     def test_summary_fields_stable_without_cross_node_signal(self) -> None:
         baseline = default_dense_program("single_g5")
         candidate = agent_loop._build_single_node_pipeline_candidate(baseline)

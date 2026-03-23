@@ -221,6 +221,9 @@ def _build_nsys_command(observability: Dict[str, Any]) -> Optional[List[str]]:
 
 
 def _prepare_trial_artifact_dirs(output_dirs: Dict[str, str], observability: Dict[str, Any]) -> None:
+    trial_dir = Path(output_dirs["trial_dir"])
+    if trial_dir.exists():
+        shutil.rmtree(trial_dir)
     for key in (
         "trial_dir",
         "checkpoint_path",
