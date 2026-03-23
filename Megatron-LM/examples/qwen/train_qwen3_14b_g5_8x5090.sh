@@ -260,6 +260,7 @@ COMMON_MODEL_ARGS=(
   --seq-length "$SEQ_LENGTH"
   --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
   --position-embedding-type rope
+  --no-rope-fusion
   --rotary-percent 1.0
   --normalization RMSNorm
   --norm-epsilon 1e-6

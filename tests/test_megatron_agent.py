@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -165,6 +166,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("launcher_env", payload["launch_plan"])
             self.assertIn("megatron_command", payload["launch_plan"])
             self.assertGreater(len(payload["launch_plan"]["megatron_command"]), 0)
+            self.assertIn("--no-rope-fusion", payload["launch_plan"]["megatron_command"])
             self.assertIn("--log-dir", payload["launch_plan"]["megatron_command"])
             self.assertIn("--redirects", payload["launch_plan"]["megatron_command"])
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "1")
@@ -414,25 +416,29 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 )
 
             with mock.patch("megatron_agent.trial_runner.subprocess.run", side_effect=_fake_run):
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        "trial_runner.py",
-                        "--program-file",
-                        str(program_path),
-                        "--output",
-                        str(output_path),
-                        "--megatron-root",
-                        str(megatron_root),
-                        "--launcher-script",
-                        "",
-                        "--run-root",
-                        str(run_root),
-                    ],
+                with mock.patch(
+                    "megatron_agent.trial_runner._validate_cuda_toolchain",
+                    return_value={"CUDA_HOME": "/usr/local/cuda", "CUDA_PATH": "/usr/local/cuda", "CUDACXX": "/usr/local/cuda/bin/nvcc"},
                 ):
-                    with self.assertRaises(SystemExit) as exc_info:
-                        trial_runner.main()
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "trial_runner.py",
+                            "--program-file",
+                            str(program_path),
+                            "--output",
+                            str(output_path),
+                            "--megatron-root",
+                            str(megatron_root),
+                            "--launcher-script",
+                            "",
+                            "--run-root",
+                            str(run_root),
+                        ],
+                    ):
+                        with self.assertRaises(SystemExit) as exc_info:
+                            trial_runner.main()
 
             self.assertEqual(exc_info.exception.code, 1)
             payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -442,6 +448,21 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 payload["trial_context"]["resolved_paths"]["torchrun_log_dir"],
                 str(run_root.resolve() / "trial_000" / "torchrun_logs"),
             )
+
+    def test_runtime_env_defaults_discovers_cuda_home_from_nvcc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cuda_home = Path(tmpdir) / "cuda"
+            bin_dir = cuda_home / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            (bin_dir / "nvcc").write_text("", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch("megatron_agent.trial_runner.shutil.which", return_value=str(bin_dir / "nvcc")):
+                    env = trial_runner._runtime_env_defaults()
+
+            self.assertEqual(env["CUDA_HOME"], str(cuda_home))
+            self.assertEqual(env["CUDA_PATH"], str(cuda_home))
+            self.assertEqual(env["CUDACXX"], str(bin_dir / "nvcc"))
 
     def test_summary_fields_stable_without_cross_node_signal(self) -> None:
         baseline = default_dense_program("single_g5")

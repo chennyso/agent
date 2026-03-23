@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -251,7 +252,7 @@ def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
 
 
 def _runtime_env_defaults() -> Dict[str, str]:
-    return {
+    env = {
         "CUDA_DEVICE_MAX_CONNECTIONS": str(os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1")),
         "TORCH_NCCL_AVOID_RECORD_STREAMS": str(os.environ.get("TORCH_NCCL_AVOID_RECORD_STREAMS", "1")),
         "PYTORCH_CUDA_ALLOC_CONF": str(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")),
@@ -259,6 +260,66 @@ def _runtime_env_defaults() -> Dict[str, str]:
         "PYTHONFAULTHANDLER": str(os.environ.get("PYTHONFAULTHANDLER", "1")),
         "TORCH_SHOW_CPP_STACKTRACES": str(os.environ.get("TORCH_SHOW_CPP_STACKTRACES", "1")),
     }
+    cuda_home = _discover_cuda_home()
+    if cuda_home:
+        env.setdefault("CUDA_HOME", cuda_home)
+        env.setdefault("CUDA_PATH", cuda_home)
+        env.setdefault("CUDACXX", str(Path(cuda_home) / "bin" / "nvcc"))
+    return env
+
+
+def _discover_cuda_home() -> Optional[str]:
+    candidates: List[Path] = []
+    for key in ("CUDA_HOME", "CUDA_PATH"):
+        raw = os.environ.get(key)
+        if raw:
+            candidates.append(Path(raw))
+
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        candidates.append(Path(nvcc).resolve().parent.parent)
+
+    for raw in (
+        "/usr/local/cuda",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12.6",
+        "/usr/local/cuda-12.4",
+        "/usr/local/cuda-12.3",
+        "/usr/local/cuda-12.2",
+        "/usr/local/cuda-12.1",
+        "/usr/local/cuda-12.0",
+        "/usr/local/cuda-11.8",
+        "/opt/cuda",
+    ):
+        candidates.append(Path(raw))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            normalized = str(candidate.resolve())
+        except OSError:
+            normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        nvcc_path = candidate / "bin" / "nvcc"
+        if nvcc_path.exists():
+            return str(candidate)
+    return None
+
+
+def _validate_cuda_toolchain() -> Dict[str, str]:
+    runtime_env = _runtime_env_defaults()
+    cuda_home = runtime_env.get("CUDA_HOME")
+    cudacxx = runtime_env.get("CUDACXX")
+    if not cuda_home or not cudacxx:
+        raise RuntimeError(
+            "CUDA toolchain not resolved for Megatron fused kernel compilation. "
+            "Set CUDA_HOME/CUDA_PATH/CUDACXX so that nvcc is available."
+        )
+    if not Path(cudacxx).exists():
+        raise RuntimeError(f"CUDACXX path does not exist: {cudacxx}")
+    return runtime_env
 
 
 def _safe_read_text(path: Path) -> str:
@@ -354,6 +415,7 @@ def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strate
         str(int(args.max_position_embeddings or strategy.seq_len)),
         "--position-embedding-type",
         "rope",
+        "--no-rope-fusion",
         "--rotary-percent",
         "1.0",
         "--rotary-base",
@@ -400,6 +462,7 @@ def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy
         str(int(args.moe_max_position_embeddings or strategy.seq_len)),
         "--position-embedding-type",
         "rope",
+        "--no-rope-fusion",
         "--rotary-percent",
         "1.0",
         "--normalization",
@@ -664,7 +727,7 @@ def _build_launcher_env(
 ) -> Dict[str, str]:
     output_dirs = _trial_output_dirs(args, trial_id)
     env = os.environ.copy()
-    env.update(_runtime_env_defaults())
+    env.update(_validate_cuda_toolchain())
     env.update(_launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs))
     return env
 
