@@ -75,6 +75,19 @@ fi
 TE_GIT="${TE_SOURCE[0]}"
 TE_REV="${TE_SOURCE[1]}"
 
+clear_te_build_cache() {
+  local uv_cache_root="${HOME}/.cache/uv/git-v0/checkouts"
+  if [[ ! -d "${uv_cache_root}" ]]; then
+    return
+  fi
+  find "${uv_cache_root}" -type d -path "*/${TE_REV}/build" -print0 2>/dev/null | while IFS= read -r -d '' build_dir; do
+    echo "Removing stale Transformer Engine build cache: ${build_dir}"
+    rm -rf "${build_dir}"
+  done
+}
+
+clear_te_build_cache
+
 cd "${MEGATRON_ROOT}"
 uv pip install --group build
 uv pip install --no-build-isolation "git+${TE_GIT}@${TE_REV}"
