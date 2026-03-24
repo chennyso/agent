@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from megatron_agent.config import (
     MegatronProgram,
     MegatronStrategy,
+    default_backend_caps,
     default_dense_program,
     default_moe_smoke_program,
     validate_strategy,
@@ -335,12 +336,18 @@ def _resolve_transformer_impl(args: argparse.Namespace, program: MegatronProgram
     return "local"
 
 
+def _resolve_backend_caps(args: argparse.Namespace, program: MegatronProgram) -> Dict[str, Any]:
+    transformer_impl = _resolve_transformer_impl(args, program)
+    return default_backend_caps(transformer_impl).to_dict()
+
+
 def _sequence_parallel_requested(strategy: MegatronStrategy) -> bool:
     return bool(strategy.parallel.sp_enabled) and int(strategy.parallel.tp_degree) > 1
 
 
 def _sequence_parallel_active(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> bool:
-    return _sequence_parallel_requested(strategy) and _resolve_transformer_impl(args, program) == "transformer_engine"
+    backend_caps = _resolve_backend_caps(args, program)
+    return _sequence_parallel_requested(strategy) and bool(backend_caps["supports_sequence_parallel"])
 
 
 def _validate_runtime_stack(args: argparse.Namespace, program: MegatronProgram) -> Dict[str, str]:
@@ -374,8 +381,6 @@ def _validate_runtime_stack(args: argparse.Namespace, program: MegatronProgram) 
             ) from exc
         details["apex_path"] = str(getattr(apex, "__file__", ""))
     return details
-
-
 def _safe_read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -449,7 +454,8 @@ def _extract_failure_details(stdout_text: str, stderr_text: str, torchrun_log_di
 
 
 def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
-    transformer_impl = _resolve_transformer_impl(args, program)
+    backend_caps = _resolve_backend_caps(args, program)
+    transformer_impl = backend_caps["transformer_impl"]
     shape_args = [
         "--num-layers",
         str(int(program.model.num_layers)),
@@ -500,7 +506,8 @@ def _dense_shape_args(args: argparse.Namespace, program: MegatronProgram, strate
 
 
 def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy) -> List[str]:
-    transformer_impl = _resolve_transformer_impl(args, program)
+    backend_caps = _resolve_backend_caps(args, program)
+    transformer_impl = backend_caps["transformer_impl"]
     shape_args = [
         "--num-layers",
         str(int(program.model.num_layers)),
@@ -559,7 +566,8 @@ def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy
 def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy, trial_id: int) -> List[str]:
     output_dirs = _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
-    transformer_impl = _resolve_transformer_impl(args, program)
+    backend_caps = _resolve_backend_caps(args, program)
+    transformer_impl = backend_caps["transformer_impl"]
     sequence_parallel_active = _sequence_parallel_active(args, program, strategy)
     common = [
         "--use-mcore-models",
@@ -619,16 +627,23 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         common += ["--recompute-granularity", str(strategy.recompute_granularity)]
         if str(strategy.recompute_granularity) == "selective":
             common += ["--recompute-activations", "--recompute-modules", "core_attn"]
-    if transformer_impl != "transformer_engine":
+    if not backend_caps["supports_sequence_parallel"]:
         common.append("--no-gradient-accumulation-fusion")
     if args.enable_tp_comm_overlap:
-        if not sequence_parallel_active:
+        if not sequence_parallel_active or not backend_caps["supports_tp_comm_overlap"]:
             raise ValueError("tp_comm_overlap requires tp_degree > 1 with sequence parallel enabled")
         common.append("--tp-comm-overlap")
     if sequence_parallel_active:
         common.append("--sequence-parallel")
-    if int(args.eval_iters) > 0 and int(args.eval_interval) > 0:
-        common += ["--eval-iters", str(int(args.eval_iters)), "--eval-interval", str(int(args.eval_interval))]
+    eval_iters = int(args.eval_iters)
+    eval_interval = int(args.eval_interval)
+    if eval_iters > 0:
+        common += ["--eval-iters", str(eval_iters), "--eval-interval", str(max(eval_interval, 1))]
+    else:
+        # Megatron's current defaults are eval_iters=100 and eval_interval=None.
+        # If we omit both flags when eval is disabled, dataset sizing can fail
+        # before training starts. Pass an explicit no-eval pair instead.
+        common += ["--eval-iters", "0", "--eval-interval", "1"]
     if int(args.save_interval) > 0:
         common += ["--save", output_dirs["checkpoint_path"], "--save-interval", str(int(args.save_interval))]
     if observability["enable_log_timers_to_tensorboard"]:
@@ -929,6 +944,9 @@ def run_trial(
             "nnodes": int(args.nnodes),
             "runner_mode": None,
             "launcher_script": None,
+            "compile_notes": list(compiled.compile_notes),
+            "resolved_profile": dict(compiled.to_dict().get("resolved_profile") or {}),
+            "resolved_backend_caps": _resolve_backend_caps(args, program),
         },
     }
     if not compiled.legality.is_valid:
@@ -946,6 +964,7 @@ def run_trial(
     log_paths = _trial_log_paths(output_dirs)
     try:
         runtime_stack = _validate_runtime_stack(args, program)
+        resolved_backend_caps = _resolve_backend_caps(args, program)
         observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
         launcher_env_overrides = _launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs)
     except Exception as exc:
@@ -966,6 +985,7 @@ def run_trial(
         "enable_nsys": bool(observability["enable_nsys"]),
     }
     metrics["trial_context"]["runtime_stack"] = runtime_stack
+    metrics["trial_context"]["resolved_backend_caps"] = resolved_backend_caps
     metrics["trial_context"]["resolved_paths"] = {
         "megatron_root": str(args.megatron_root),
         "megatron_entry": str(resolved_entry),
@@ -1000,6 +1020,9 @@ def run_trial(
             "launcher_command": launcher_command,
             "executed_command": executed_command if not launcher_script else launcher_command,
             "launcher_env": launcher_env_overrides,
+            "compile_notes": list(compiled.compile_notes),
+            "resolved_profile": dict(compiled.to_dict().get("resolved_profile") or {}),
+            "resolved_backend_caps": resolved_backend_caps,
             "observability": {
                 "preset": observability["preset"],
                 "profile_enabled": bool(observability["profile_enabled"]),

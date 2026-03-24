@@ -191,6 +191,117 @@ class ClusterSpec:
 
 
 @dataclass
+class MachineProfile:
+    name: str = "consumer_single_node_g5"
+    device_class: str = "consumer_gpu"
+    device_memory_gb: Optional[int] = None
+    interconnect_class: str = "single_node_pcie"
+    communication_sensitivity: str = "medium"
+    prefer_small_tp: bool = True
+    prefer_pp_for_scaling: bool = True
+    supports_te_path: bool = False
+    notes: Optional[str] = None
+
+    def normalized(self) -> "MachineProfile":
+        norm = copy.deepcopy(self)
+        norm.name = str(norm.name or "consumer_single_node_g5")
+        norm.device_class = str(norm.device_class or "consumer_gpu")
+        if norm.device_memory_gb is not None:
+            norm.device_memory_gb = max(int(norm.device_memory_gb), 1)
+        norm.interconnect_class = str(norm.interconnect_class or "single_node_pcie")
+        norm.communication_sensitivity = str(norm.communication_sensitivity or "medium").lower()
+        norm.prefer_small_tp = bool(norm.prefer_small_tp)
+        norm.prefer_pp_for_scaling = bool(norm.prefer_pp_for_scaling)
+        norm.supports_te_path = bool(norm.supports_te_path)
+        if norm.notes is not None:
+            norm.notes = str(norm.notes).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "name": norm.name,
+            "device_class": norm.device_class,
+            "device_memory_gb": norm.device_memory_gb,
+            "interconnect_class": norm.interconnect_class,
+            "communication_sensitivity": norm.communication_sensitivity,
+            "prefer_small_tp": bool(norm.prefer_small_tp),
+            "prefer_pp_for_scaling": bool(norm.prefer_pp_for_scaling),
+            "supports_te_path": bool(norm.supports_te_path),
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MachineProfile":
+        return cls(
+            name=str(payload.get("name", "consumer_single_node_g5")),
+            device_class=str(payload.get("device_class", "consumer_gpu")),
+            device_memory_gb=payload.get("device_memory_gb"),
+            interconnect_class=str(payload.get("interconnect_class", "single_node_pcie")),
+            communication_sensitivity=str(payload.get("communication_sensitivity", "medium")),
+            prefer_small_tp=bool(payload.get("prefer_small_tp", True)),
+            prefer_pp_for_scaling=bool(payload.get("prefer_pp_for_scaling", True)),
+            supports_te_path=bool(payload.get("supports_te_path", False)),
+            notes=payload.get("notes"),
+        )
+
+
+@dataclass
+class BackendCaps:
+    transformer_impl: str = "local"
+    supports_sequence_parallel: bool = False
+    supports_tp_comm_overlap: bool = False
+    supports_rope_fusion: bool = False
+    supports_persist_layer_norm: bool = False
+    supports_dual_plane: bool = False
+    supports_moe: bool = True
+    supports_observability_deep: bool = True
+    notes: Optional[str] = None
+
+    def normalized(self) -> "BackendCaps":
+        norm = copy.deepcopy(self)
+        norm.transformer_impl = str(norm.transformer_impl or "local").strip().lower() or "local"
+        norm.supports_sequence_parallel = bool(norm.supports_sequence_parallel)
+        norm.supports_tp_comm_overlap = bool(norm.supports_tp_comm_overlap)
+        norm.supports_rope_fusion = bool(norm.supports_rope_fusion)
+        norm.supports_persist_layer_norm = bool(norm.supports_persist_layer_norm)
+        norm.supports_dual_plane = bool(norm.supports_dual_plane)
+        norm.supports_moe = bool(norm.supports_moe)
+        norm.supports_observability_deep = bool(norm.supports_observability_deep)
+        if norm.notes is not None:
+            norm.notes = str(norm.notes).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "transformer_impl": norm.transformer_impl,
+            "supports_sequence_parallel": bool(norm.supports_sequence_parallel),
+            "supports_tp_comm_overlap": bool(norm.supports_tp_comm_overlap),
+            "supports_rope_fusion": bool(norm.supports_rope_fusion),
+            "supports_persist_layer_norm": bool(norm.supports_persist_layer_norm),
+            "supports_dual_plane": bool(norm.supports_dual_plane),
+            "supports_moe": bool(norm.supports_moe),
+            "supports_observability_deep": bool(norm.supports_observability_deep),
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "BackendCaps":
+        return cls(
+            transformer_impl=str(payload.get("transformer_impl", "local")),
+            supports_sequence_parallel=bool(payload.get("supports_sequence_parallel", False)),
+            supports_tp_comm_overlap=bool(payload.get("supports_tp_comm_overlap", False)),
+            supports_rope_fusion=bool(payload.get("supports_rope_fusion", False)),
+            supports_persist_layer_norm=bool(payload.get("supports_persist_layer_norm", False)),
+            supports_dual_plane=bool(payload.get("supports_dual_plane", False)),
+            supports_moe=bool(payload.get("supports_moe", True)),
+            supports_observability_deep=bool(payload.get("supports_observability_deep", True)),
+            notes=payload.get("notes"),
+        )
+
+
+@dataclass
 class ModelSpec:
     track: str = "dense"
     model_name: str = "qwen3_14b"
@@ -600,6 +711,8 @@ class MegatronProgram:
     schedule: ScheduleSpec = field(default_factory=ScheduleSpec)
     constraints: ConstraintSpec = field(default_factory=ConstraintSpec)
     search_space: SearchSpaceSpec = field(default_factory=SearchSpaceSpec)
+    machine_profile: Optional[MachineProfile] = None
+    backend_caps: Optional[BackendCaps] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     schema_version: int = 1
 
@@ -614,6 +727,8 @@ class MegatronProgram:
         norm.schedule = norm.schedule.normalized()
         norm.constraints = norm.constraints.normalized()
         norm.search_space = norm.search_space.normalized()
+        norm.machine_profile = norm.machine_profile.normalized() if norm.machine_profile is not None else None
+        norm.backend_caps = norm.backend_caps.normalized() if norm.backend_caps is not None else None
         norm.metadata = copy.deepcopy(norm.metadata or {})
         return norm
 
@@ -630,6 +745,8 @@ class MegatronProgram:
             "schedule": norm.schedule.to_dict(),
             "constraints": norm.constraints.to_dict(),
             "search_space": norm.search_space.to_dict(),
+            "machine_profile": norm.machine_profile.to_dict() if norm.machine_profile is not None else None,
+            "backend_caps": norm.backend_caps.to_dict() if norm.backend_caps is not None else None,
             "metadata": copy.deepcopy(norm.metadata),
         }
 
@@ -654,6 +771,12 @@ class MegatronProgram:
             schedule=ScheduleSpec.from_dict(payload.get("schedule") or {}),
             constraints=ConstraintSpec.from_dict(payload.get("constraints") or {}),
             search_space=SearchSpaceSpec.from_dict(payload.get("search_space") or {}),
+            machine_profile=MachineProfile.from_dict(payload.get("machine_profile") or {})
+            if payload.get("machine_profile") is not None
+            else None,
+            backend_caps=BackendCaps.from_dict(payload.get("backend_caps") or {})
+            if payload.get("backend_caps") is not None
+            else None,
             metadata=copy.deepcopy(payload.get("metadata") or {}),
             schema_version=int(payload.get("schema_version", 1) or 1),
         )
@@ -668,6 +791,71 @@ def default_cluster_spec(target: str) -> ClusterSpec:
     if str(target) == "single_g4":
         return ClusterSpec(target="single_g4", nodes=["g4"], gpus_per_node=8)
     return ClusterSpec(target="single_g5", nodes=["g5"], gpus_per_node=8)
+
+
+def default_machine_profile(target: str) -> MachineProfile:
+    if str(target) == "single_g4":
+        return MachineProfile(
+            name="consumer_single_node_4090d",
+            device_class="consumer_gpu",
+            device_memory_gb=24,
+            interconnect_class="single_node_pcie",
+            communication_sensitivity="high",
+            prefer_small_tp=True,
+            prefer_pp_for_scaling=True,
+            supports_te_path=False,
+            notes="4090D-like single-node profile with stronger communication and memory caution",
+        )
+    if str(target) == "dual_g4_g5":
+        return MachineProfile(
+            name="heterogeneous_dual_4090d_5090d",
+            device_class="heterogeneous_consumer_gpu",
+            device_memory_gb=24,
+            interconnect_class="cross_node_heterogeneous",
+            communication_sensitivity="very_high",
+            prefer_small_tp=True,
+            prefer_pp_for_scaling=True,
+            supports_te_path=False,
+            notes="heterogeneous dual-node profile with asymmetric devices and cross-node communication penalty",
+        )
+    return MachineProfile(
+        name="consumer_single_node_5090d",
+        device_class="consumer_gpu",
+        device_memory_gb=32,
+        interconnect_class="single_node_pcie",
+        communication_sensitivity="medium",
+        prefer_small_tp=True,
+        prefer_pp_for_scaling=True,
+        supports_te_path=True,
+        notes="5090D-like single-node profile with conservative TP bias and PP-preferred scaling",
+    )
+
+
+def default_backend_caps(transformer_impl: str = "local") -> BackendCaps:
+    impl = str(transformer_impl or "local").strip().lower() or "local"
+    if impl == "transformer_engine":
+        return BackendCaps(
+            transformer_impl="transformer_engine",
+            supports_sequence_parallel=True,
+            supports_tp_comm_overlap=True,
+            supports_rope_fusion=True,
+            supports_persist_layer_norm=True,
+            supports_dual_plane=True,
+            supports_moe=True,
+            supports_observability_deep=True,
+            notes="Transformer Engine backend caps for the fast path",
+        )
+    return BackendCaps(
+        transformer_impl="local",
+        supports_sequence_parallel=False,
+        supports_tp_comm_overlap=False,
+        supports_rope_fusion=False,
+        supports_persist_layer_norm=False,
+        supports_dual_plane=False,
+        supports_moe=True,
+        supports_observability_deep=True,
+        notes="Local backend caps keep compatibility guards enabled",
+    )
 
 
 def default_dense_program(target: str = "single_g5") -> MegatronProgram:
@@ -706,6 +894,9 @@ def default_dense_program(target: str = "single_g5") -> MegatronProgram:
         ),
         schedule=ScheduleSpec(),
         constraints=ConstraintSpec(required_node_local_axes=["tp"]),
+        search_space=SearchSpaceSpec(),
+        machine_profile=default_machine_profile(target),
+        backend_caps=default_backend_caps("local"),
         metadata={"program_kind": "baseline_dense"},
     )
 
@@ -753,5 +944,8 @@ def default_moe_smoke_program(target: str = "single_g5") -> MegatronProgram:
         ),
         schedule=ScheduleSpec(),
         constraints=ConstraintSpec(required_node_local_axes=["tp", "ep"]),
+        search_space=SearchSpaceSpec(),
+        machine_profile=default_machine_profile(target),
+        backend_caps=default_backend_caps("local"),
         metadata={"program_kind": "baseline_moe_smoke"},
     )

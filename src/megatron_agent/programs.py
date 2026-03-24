@@ -5,15 +5,19 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from megatron_agent.config import (
+    BackendCaps,
     ClusterSpec,
     ConstraintSpec,
     LayoutSpec,
+    MachineProfile,
     MegatronParallelSpec,
     MegatronProgram,
     MegatronStrategy,
     ModelSpec,
     PartitionSpec,
     ScheduleSpec,
+    default_backend_caps,
+    default_machine_profile,
     validate_strategy,
 )
 
@@ -40,6 +44,7 @@ class ProgramLegalityReport:
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     rejected_constraints: List[str] = field(default_factory=list)
+    advisories: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,6 +52,7 @@ class ProgramLegalityReport:
             "errors": list(self.errors),
             "warnings": list(self.warnings),
             "rejected_constraints": list(self.rejected_constraints),
+            "advisories": list(self.advisories),
         }
 
 
@@ -57,6 +63,8 @@ class CompiledProgram:
     extra_args: List[str] = field(default_factory=list)
     family: FamilyClassification = field(default_factory=FamilyClassification)
     legality: ProgramLegalityReport = field(default_factory=lambda: ProgramLegalityReport(is_valid=True))
+    compile_notes: List[str] = field(default_factory=list)
+    resolved_profile: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,11 +73,48 @@ class CompiledProgram:
             "extra_args": list(self.extra_args),
             "family": self.family.to_dict(),
             "legality": self.legality.to_dict(),
+            "compile_notes": list(self.compile_notes),
+            "resolved_profile": {
+                "machine_profile": self.resolved_profile.get("machine_profile").to_dict()
+                if self.resolved_profile.get("machine_profile") is not None
+                else None,
+                "backend_caps": self.resolved_profile.get("backend_caps").to_dict()
+                if self.resolved_profile.get("backend_caps") is not None
+                else None,
+            },
         }
 
 
-def _copy_program(program: MegatronProgram) -> MegatronProgram:
-    return MegatronProgram.from_dict(program.to_dict())
+
+
+def _resolved_profile_context(program: MegatronProgram) -> Dict[str, Any]:
+    machine_profile = (program.machine_profile or default_machine_profile(str(program.cluster.target))).normalized()
+    backend_caps = (program.backend_caps or default_backend_caps("local")).normalized()
+    return {
+        "machine_profile": machine_profile,
+        "backend_caps": backend_caps,
+    }
+
+
+def _profile_compile_notes(program: MegatronProgram, backend_caps: BackendCaps, machine_profile: MachineProfile) -> List[str]:
+    notes: List[str] = []
+    if machine_profile.communication_sensitivity in {"high", "very_high"}:
+        notes.append(
+            "TP bound tightened because machine profile is communication-sensitive consumer PCIe-class hardware"
+        )
+    if program.model.track == "dense" and machine_profile.prefer_pp_for_scaling and str(program.cluster.target) in {"single_g4", "single_g5"}:
+        notes.append("PP split remains preferred because the single-node consumer profile favors PP over larger TP")
+    if int(program.parallel.tp_degree) > 1 and not backend_caps.supports_sequence_parallel:
+        notes.append(
+            f"SP candidate suppressed because backend caps do not support sequence parallel on {backend_caps.transformer_impl} path"
+        )
+    if program.model.track == "moe" and not backend_caps.supports_dual_plane:
+        notes.append(
+            f"dual-plane retained only when backend caps allow it; {backend_caps.transformer_impl} path stays conservative"
+        )
+    elif program.model.track == "moe" and backend_caps.supports_dual_plane:
+        notes.append("dual-plane remains available because MoE profile and backend caps both allow it")
+    return notes
 
 
 def classify_program_family(program: MegatronProgram) -> FamilyClassification:
@@ -152,6 +197,12 @@ def check_program(program: MegatronProgram, target: Optional[str] = None) -> Pro
     errors: List[str] = []
     warnings: List[str] = []
     rejected: List[str] = []
+    profile_context = _resolved_profile_context(norm)
+    advisories = _profile_compile_notes(
+        norm,
+        backend_caps=profile_context["backend_caps"],
+        machine_profile=profile_context["machine_profile"],
+    )
 
     if norm.constraints.requires_runtime_pg_rebuild:
         rejected.append("runtime_pg_rebuild_not_supported_v1")
@@ -222,6 +273,7 @@ def check_program(program: MegatronProgram, target: Optional[str] = None) -> Pro
         errors=errors,
         warnings=warnings,
         rejected_constraints=rejected,
+        advisories=advisories,
     )
 
 
@@ -245,12 +297,16 @@ def program_to_strategy(program: MegatronProgram) -> MegatronStrategy:
 
 
 def compile_program(program: MegatronProgram, target: Optional[str] = None) -> CompiledProgram:
-    norm = _copy_program(program).normalized()
+    norm = copy.deepcopy(program).normalized()
     if target:
         norm.cluster.target = str(target)
     family = classify_program_family(norm)
     legality = check_program(norm)
     strategy = program_to_strategy(norm)
+    profile_context = _resolved_profile_context(norm)
+    machine_profile = profile_context["machine_profile"]
+    backend_caps = profile_context["backend_caps"]
+    compile_notes = _profile_compile_notes(norm, backend_caps=backend_caps, machine_profile=machine_profile)
 
     env: Dict[str, str] = {
         "RUN_TARGET": str(norm.cluster.target),
@@ -276,6 +332,10 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         "ALLOW_ASYMMETRIC_VPP": "1" if norm.search_space.allow_asymmetric_vpp else "0",
         "ALLOW_DUAL_PLANE": "1" if norm.search_space.allow_dual_plane else "0",
         "ALLOW_STAGE_AWARE_SCHEDULE": "1" if norm.search_space.allow_stage_aware_schedule else "0",
+        "MACHINE_PROFILE_NAME": str(machine_profile.name),
+        "MACHINE_COMM_SENSITIVITY": str(machine_profile.communication_sensitivity),
+        "BACKEND_CAPS_IMPL": str(backend_caps.transformer_impl),
+        "BACKEND_SUPPORTS_SEQUENCE_PARALLEL": "1" if backend_caps.supports_sequence_parallel else "0",
     }
 
     if norm.layout.pipeline_layout:
@@ -322,4 +382,6 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         extra_args=extra_args,
         family=family,
         legality=legality,
+        compile_notes=compile_notes,
+        resolved_profile=profile_context,
     )

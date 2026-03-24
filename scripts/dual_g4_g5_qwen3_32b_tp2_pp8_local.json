@@ -1,0 +1,92 @@
+{
+  "cluster": {
+    "target": "dual_g4_g5",
+    "nodes": ["g4", "g5"],
+    "gpus_per_node": 8
+  },
+  "model": {
+    "track": "dense",
+    "model_name": "Qwen3-32B",
+    "num_layers": 64
+  },
+  "parallel": {
+    "tp_degree": 2,
+    "pp_degree": 8,
+    "vpp_degree": 1,
+    "ep_degree": 1,
+    "cp_degree": 1,
+    "expert_tp_degree": 1,
+    "sp_enabled": false
+  },
+  "partition": {
+    "stages": [
+      { "decoder_layers": 8, "special_tokens": ["E"] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": [] },
+      { "decoder_layers": 8, "special_tokens": ["L"] }
+    ]
+  },
+  "layout": {
+    "stage_to_node": ["g4", "g4", "g4", "g4", "g5", "g5", "g5", "g5"],
+    "vpp_degree": 1,
+    "pipeline_layout": null
+  },
+  "plane_map": {
+    "attention": {
+      "tp_degree": 2,
+      "cp_degree": 1,
+      "ep_degree": 1,
+      "expert_tp_degree": 1
+    },
+    "moe": null,
+    "enabled": false
+  },
+  "schedule": {
+    "microbatch_group_size_per_vp_stage": null,
+    "skeleton": "fixed_1f1b",
+    "dispatch_order": "default"
+  },
+  "constraints": {
+    "required_node_local_axes": ["tp"],
+    "requires_runtime_pg_rebuild": false,
+    "requested_heterogeneous_apipe": false
+  },
+  "search_space": {},
+  "machine_profile": {
+    "name": "heterogeneous_dual_4090d_5090d",
+    "device_class": "heterogeneous_consumer_gpu",
+    "device_memory_gb": 24,
+    "interconnect_class": "cross_node_heterogeneous",
+    "communication_sensitivity": "very_high",
+    "prefer_small_tp": true,
+    "prefer_pp_for_scaling": true,
+    "supports_te_path": false,
+    "notes": "heterogeneous dual-node profile with asymmetric devices and cross-node communication penalty"
+  },
+  "backend_caps": {
+    "transformer_impl": "local",
+    "supports_sequence_parallel": false,
+    "supports_tp_comm_overlap": false,
+    "supports_rope_fusion": false,
+    "supports_persist_layer_norm": false,
+    "supports_dual_plane": false,
+    "supports_moe": true,
+    "supports_observability_deep": true,
+    "notes": "Local backend caps keep compatibility guards enabled"
+  },
+  "metadata": {
+    "program_kind": "manual_dual_g4_g5_qwen3_32b_tp2_pp8_local",
+    "micro_batch_size": 1,
+    "global_batch_size": 8,
+    "seq_len": 1024,
+    "use_bf16": true,
+    "use_fp16": false,
+    "recompute_granularity": "selective",
+    "extra_args": []
+  },
+  "schema_version": 1
+}

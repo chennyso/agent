@@ -408,8 +408,14 @@ LOGGING_ARGS=(
 if (( LOAD_CHECKPOINT > 0 )); then
   LOGGING_ARGS+=(--load "$CHECKPOINT_PATH")
 fi
-if (( EVAL_ITERS > 0 && EVAL_INTERVAL > 0 )); then
-  LOGGING_ARGS+=(--eval-iters "$EVAL_ITERS" --eval-interval "$EVAL_INTERVAL")
+if (( EVAL_ITERS > 0 )); then
+  SAFE_EVAL_INTERVAL=$EVAL_INTERVAL
+  if (( SAFE_EVAL_INTERVAL <= 0 )); then
+    SAFE_EVAL_INTERVAL=1
+  fi
+  LOGGING_ARGS+=(--eval-iters "$EVAL_ITERS" --eval-interval "$SAFE_EVAL_INTERVAL")
+else
+  LOGGING_ARGS+=(--eval-iters 0 --eval-interval 1)
 fi
 if (( SAVE_INTERVAL > 0 )); then
   LOGGING_ARGS+=(--save "$CHECKPOINT_PATH" --save-interval "$SAVE_INTERVAL")

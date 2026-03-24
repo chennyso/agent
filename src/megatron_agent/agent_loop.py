@@ -6,10 +6,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from megatron_agent.config import (
+    BackendCaps,
     ConstraintRuleSpec,
+    MachineProfile,
     MegatronProgram,
     SearchSpaceSpec,
+    default_backend_caps,
     default_dense_program,
+    default_machine_profile,
     default_moe_smoke_program,
 )
 from megatron_agent.programs import check_program, classify_program_family, compile_program
@@ -260,6 +264,33 @@ def _build_summary_payload(
     return summary
 
 
+
+
+def _profile_context(program: MegatronProgram) -> Tuple[MachineProfile, BackendCaps]:
+    machine_profile = (program.machine_profile or default_machine_profile(str(program.cluster.target))).normalized()
+    backend_caps = (program.backend_caps or default_backend_caps("local")).normalized()
+    return machine_profile, backend_caps
+
+
+def _profile_prefers_small_tp(profile: MachineProfile) -> bool:
+    return bool(profile.prefer_small_tp or profile.communication_sensitivity in {"high", "very_high"})
+
+
+def _profile_max_tp(program: MegatronProgram, profile: MachineProfile) -> int:
+    cluster_limit = max(int(program.cluster.gpus_per_node), 1)
+    baseline_tp = max(int(program.parallel.tp_degree), 1)
+    if _profile_prefers_small_tp(profile):
+        return max(1, min(cluster_limit, baseline_tp))
+    return cluster_limit
+
+
+def _profile_max_pp(program: MegatronProgram, profile: MachineProfile) -> int:
+    base = max(int(program.parallel.pp_degree), 1)
+    if bool(profile.prefer_pp_for_scaling):
+        return min(int(program.cluster.world_size), max(base, 2))
+    return min(int(program.cluster.world_size), base)
+
+
 def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
     program = default_moe_smoke_program(args.run_target) if args.model_track == "moe" else default_dense_program(args.run_target)
     program.parallel.tp_degree = int(args.tp or program.parallel.tp_degree)
@@ -292,6 +323,9 @@ def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
             program.layout.stage_to_node = ["g4"] * midpoint + ["g5"] * (int(program.parallel.pp_degree) - midpoint)
         else:
             program.layout.stage_to_node = [str(program.cluster.nodes[-1])] * int(program.parallel.pp_degree)
+    requested_impl = str(getattr(args, "transformer_impl", "auto") or "auto").strip().lower()
+    program.machine_profile = default_machine_profile(args.run_target)
+    program.backend_caps = default_backend_caps("local" if requested_impl == "auto" else requested_impl)
     program.metadata.update(
         {
             "micro_batch_size": int(args.micro_batch_size),
@@ -312,19 +346,29 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
     stage_spread = float(runtime_summary.get("stage_spread_ratio") or 0.0)
     cross_node_exposed = float(runtime_summary.get("cross_node_exposed_ratio") or runtime_summary.get("exposed_comm_ratio") or 0.0)
     is_dual = program.cluster.target == "dual_g4_g5"
+    machine_profile, backend_caps = _profile_context(program)
 
     rules: List[ConstraintRuleSpec] = []
     required_local_axes = ["tp"] if is_dual else []
     if program.model.track == "moe":
         required_local_axes.append("ep")
 
-    allow_nonuniform = bool(is_dual or stage_spread >= 0.08 or int(program.parallel.pp_degree) > 1)
+    allow_nonuniform = bool(
+        is_dual
+        or int(program.parallel.pp_degree) > 1
+        or stage_spread >= 0.08
+        or machine_profile.communication_sensitivity in {"high", "very_high"}
+    )
     if allow_nonuniform:
         rules.append(
             ConstraintRuleSpec(
                 name="relax_uniform_pp",
-                rationale="stage spread or topology asymmetry indicates uniform stage prior is too restrictive",
-                params={"stage_spread_ratio": stage_spread, "target": program.cluster.target},
+                rationale="profile or runtime asymmetry indicates uniform stage prior is too restrictive",
+                params={
+                    "stage_spread_ratio": stage_spread,
+                    "target": program.cluster.target,
+                    "communication_sensitivity": machine_profile.communication_sensitivity,
+                },
             )
         )
 
@@ -334,26 +378,42 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         and int(program.parallel.pp_degree) == 1
         and int(program.parallel.tp_degree) >= 2
         and int(program.model.num_layers) >= 4
+        and bool(machine_profile.prefer_pp_for_scaling)
     )
     if allow_single_node_pp_split:
         rules.append(
             ConstraintRuleSpec(
                 name="allow_single_node_pp_split",
-                rationale="single-node dense baseline can be relaxed from tp-only into a 2-stage pp family-outside candidate",
-                params={"tp_degree": int(program.parallel.tp_degree), "num_layers": int(program.model.num_layers)},
+                rationale="single-node consumer dense profile prefers PP scaling over larger TP",
+                params={
+                    "tp_degree": int(program.parallel.tp_degree),
+                    "num_layers": int(program.model.num_layers),
+                    "profile": machine_profile.name,
+                },
             )
         )
 
-    allow_sequence_parallel_toggle = bool(int(program.parallel.tp_degree) > 1)
+    allow_sequence_parallel_toggle = bool(
+        int(program.parallel.tp_degree) > 1 and backend_caps.supports_sequence_parallel
+    )
     if allow_sequence_parallel_toggle:
         rules.append(
             ConstraintRuleSpec(
                 name="allow_sequence_parallel_toggle",
-                rationale="Megatron sequence parallel is a TP-coupled optimization and can be toggled only when tp_degree > 1",
+                rationale="sequence parallel toggles are allowed only when backend capabilities support the intended path",
                 params={
                     "tp_degree": int(program.parallel.tp_degree),
                     "baseline_sp_enabled": bool(program.parallel.sp_enabled),
+                    "transformer_impl": backend_caps.transformer_impl,
                 },
+            )
+        )
+    elif int(program.parallel.tp_degree) > 1:
+        rules.append(
+            ConstraintRuleSpec(
+                name="suppress_sequence_parallel_toggle",
+                rationale="sequence parallel toggle suppressed because backend capabilities do not support it",
+                params={"transformer_impl": backend_caps.transformer_impl},
             )
         )
 
@@ -364,28 +424,68 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         rules.append(
             ConstraintRuleSpec(
                 name="allow_asymmetric_vpp",
-                rationale="model layers can be re-grouped into a vpp-aware schedule family",
+                rationale="model layers can be regrouped into a VPP-aware schedule family",
                 params={"num_layers": int(program.model.num_layers), "pp_degree": int(program.parallel.pp_degree)},
             )
         )
 
-    allow_dual_plane = bool(program.model.track == "moe")
+    allow_dual_plane = bool(program.model.track == "moe" and backend_caps.supports_dual_plane)
     if allow_dual_plane:
         rules.append(
             ConstraintRuleSpec(
                 name="decouple_attention_and_moe_planes",
-                rationale="MoE track benefits from separating attention TP/CP and expert EP/ETP decisions",
-                params={"model_track": program.model.track},
+                rationale="dual-plane candidate retained only for MoE profiles with backend support",
+                params={"model_track": program.model.track, "transformer_impl": backend_caps.transformer_impl},
+            )
+        )
+    elif program.model.track == "moe":
+        rules.append(
+            ConstraintRuleSpec(
+                name="suppress_dual_plane",
+                rationale="dual-plane candidate suppressed because backend capabilities do not advertise support",
+                params={"transformer_impl": backend_caps.transformer_impl},
             )
         )
 
-    allow_stage_aware = bool(int(program.parallel.pp_degree) > 1 and (is_dual or bubble_ratio >= 0.03))
+    allow_stage_aware = bool(
+        int(program.parallel.pp_degree) > 1
+        and (
+            is_dual
+            or bubble_ratio >= 0.03
+            or stage_spread >= 0.08
+            or machine_profile.communication_sensitivity in {"high", "very_high"}
+        )
+    )
     if allow_stage_aware:
         rules.append(
             ConstraintRuleSpec(
                 name="allow_stage_aware_schedule",
-                rationale="bubble or dual-node boundary suggests fixed 1F1B skeleton may be suboptimal",
-                params={"bubble_ratio": bubble_ratio},
+                rationale="bubble, stage spread, or communication-sensitive profile suggests grouped stage-aware scheduling",
+                params={
+                    "bubble_ratio": bubble_ratio,
+                    "stage_spread_ratio": stage_spread,
+                    "communication_sensitivity": machine_profile.communication_sensitivity,
+                },
+            )
+        )
+
+    max_tp_size = _profile_max_tp(program, machine_profile)
+    if max_tp_size < int(program.cluster.gpus_per_node):
+        rules.append(
+            ConstraintRuleSpec(
+                name="tighten_tp_bound",
+                rationale="TP bound tightened for communication-sensitive consumer profile",
+                params={"max_tp_size": max_tp_size, "profile": machine_profile.name},
+            )
+        )
+
+    max_pp_size = _profile_max_pp(program, machine_profile)
+    if max_pp_size > int(program.parallel.pp_degree):
+        rules.append(
+            ConstraintRuleSpec(
+                name="expand_pp_bound",
+                rationale="PP bound opened because the machine profile prefers PP for scaling",
+                params={"max_pp_size": max_pp_size, "profile": machine_profile.name},
             )
         )
 
@@ -393,7 +493,7 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         rules.append(
             ConstraintRuleSpec(
                 name="localize_high_frequency_axes",
-                rationale="runtime logs show exposed communication on slow boundaries",
+                rationale="runtime logs show exposed communication on slower boundaries",
                 params={"cross_node_exposed_ratio": cross_node_exposed},
             )
         )
@@ -407,17 +507,19 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         allow_stage_aware_schedule=allow_stage_aware,
         allow_subgraph_submeshes=False,
         allow_heterogeneous_apipe=False,
-        max_tp_size=int(program.cluster.gpus_per_node) if is_dual else int(program.parallel.tp_degree),
-        max_pp_size=min(int(program.cluster.world_size), max(int(program.parallel.pp_degree), 2)),
+        max_tp_size=max_tp_size,
+        max_pp_size=max_pp_size,
         max_ep_size=int(program.cluster.gpus_per_node) if is_dual else None,
         max_cp_size=int(program.cluster.gpus_per_node) if is_dual else None,
         max_vpp_size=2 if allow_asymmetric_vpp else 1,
         required_node_local_axes=required_local_axes,
-        preferred_node_for_module={"embedding": "g4", "loss": "g5"} if is_dual else {"embedding": str(program.cluster.nodes[-1]), "loss": str(program.cluster.nodes[-1])},
+        preferred_node_for_module={"embedding": "g4", "loss": "g5"}
+        if is_dual
+        else {"embedding": str(program.cluster.nodes[-1]), "loss": str(program.cluster.nodes[-1])},
         forbidden_axes_by_node={"g5": ["tp"]} if is_dual and cross_node_exposed >= 0.05 else {},
         allowed_schedule_skeletons=["fixed_1f1b", "stage_aware_grouped"] if allow_stage_aware else ["fixed_1f1b"],
         rewrite_rules=rules,
-        notes="space rewrite derived from topology + runtime summary",
+        notes="space rewrite derived from explicit profile/capability priors plus runtime summary",
     )
     return search_space.normalized()
 
@@ -530,6 +632,7 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
     program_kind = str(program.metadata.get("program_kind") or "")
     is_single_node_pp_split = program_kind == "candidate_single_node_pp_split"
     is_sequence_parallel_toggle = program_kind == "candidate_sequence_parallel_toggle"
+    is_dual_plane_candidate = program_kind == "candidate_dual_plane"
     if search_space.max_tp_size is not None and int(program.parallel.tp_degree) > int(search_space.max_tp_size):
         return False, f"tp_degree={program.parallel.tp_degree} exceeds search-space max_tp_size={search_space.max_tp_size}"
     if search_space.max_pp_size is not None and int(program.parallel.pp_degree) > int(search_space.max_pp_size):
@@ -540,7 +643,7 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
         return False, f"cp_degree={program.parallel.cp_degree} exceeds search-space max_cp_size={search_space.max_cp_size}"
     if search_space.max_vpp_size is not None and int(program.parallel.vpp_degree) > int(search_space.max_vpp_size):
         return False, f"vpp_degree={program.parallel.vpp_degree} exceeds search-space max_vpp_size={search_space.max_vpp_size}"
-    if not search_space.allow_dual_plane and program.plane_map.enabled:
+    if is_dual_plane_candidate and not search_space.allow_dual_plane:
         return False, "dual-plane mapping is not allowed in the current search space"
     if not search_space.allow_stage_aware_schedule and program.schedule.skeleton != "fixed_1f1b":
         return False, "stage-aware schedule is not allowed in the current search space"
@@ -640,7 +743,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--megatron-entry", type=str, default="pretrain_gpt.py")
     parser.add_argument("--megatron-args", type=str, default=None)
     parser.add_argument("--megatron-args-file", type=str, default=None)
-    parser.add_argument("--transformer-impl", type=str, default="local")
+    parser.add_argument("--transformer-impl", type=str, default="auto")
     parser.add_argument("--attention-backend", type=str, default="auto")
     parser.add_argument("--tokenizer-model", type=str, default=DEFAULT_TOKENIZER_MODEL)
     parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)

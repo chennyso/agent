@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from megatron_agent import agent_loop, trial_runner  # noqa: E402
-from megatron_agent.config import default_dense_program, default_moe_smoke_program  # noqa: E402
+from megatron_agent.config import default_backend_caps, default_dense_program, default_moe_smoke_program  # noqa: E402
 from megatron_agent.programs import classify_program_family  # noqa: E402
 
 
@@ -35,16 +35,28 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         rewrite = agent_loop._rewrite_space(baseline, {})
         candidates, rejected = agent_loop._synthesize_programs(baseline, rewrite, candidate_limit=8)
 
+        self.assertEqual(baseline.machine_profile.name, "consumer_single_node_5090d")
+        self.assertEqual(baseline.backend_caps.transformer_impl, "local")
         self.assertTrue(rewrite.allow_single_node_pp_split)
-        self.assertTrue(rewrite.allow_sequence_parallel_toggle)
+        self.assertFalse(rewrite.allow_sequence_parallel_toggle)
         self.assertEqual(rejected, [])
         candidate_kinds = [candidate.metadata.get("program_kind") for candidate in candidates]
         self.assertIn("candidate_single_node_pp_split", candidate_kinds)
-        self.assertIn("candidate_sequence_parallel_toggle", candidate_kinds)
+        self.assertNotIn("candidate_sequence_parallel_toggle", candidate_kinds)
 
         target = next(candidate for candidate in candidates if candidate.metadata.get("program_kind") == "candidate_single_node_pp_split")
         family = classify_program_family(target).to_dict()
         self.assertTrue(family["is_family_outside"])
+
+    def test_sequence_parallel_toggle_requires_backend_caps_support(self) -> None:
+        baseline = default_dense_program("single_g5")
+        baseline.backend_caps = default_backend_caps("transformer_engine")
+
+        rewrite = agent_loop._rewrite_space(baseline, {})
+        candidates, rejected = agent_loop._synthesize_programs(baseline, rewrite, candidate_limit=8)
+
+        self.assertTrue(rewrite.allow_sequence_parallel_toggle)
+        self.assertEqual(rejected, [])
         sp_toggle = next(candidate for candidate in candidates if candidate.metadata.get("program_kind") == "candidate_sequence_parallel_toggle")
         self.assertEqual(sp_toggle.parallel.tp_degree, baseline.parallel.tp_degree)
         self.assertFalse(sp_toggle.parallel.sp_enabled)
@@ -56,12 +68,13 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
         self.assertFalse(rewrite.allow_single_node_pp_split)
         self.assertTrue(rewrite.allow_nonuniform_partition)
-        self.assertTrue(rewrite.allow_sequence_parallel_toggle)
+        self.assertFalse(rewrite.allow_sequence_parallel_toggle)
         self.assertEqual(rejected, [])
         self.assertEqual(baseline.layout.stage_to_node, ["g4", "g4"])
+        self.assertEqual(baseline.machine_profile.name, "consumer_single_node_4090d")
         candidate_kinds = [candidate.metadata.get("program_kind") for candidate in candidates]
         self.assertIn("candidate_nonuniform_partition", candidate_kinds)
-        self.assertIn("candidate_sequence_parallel_toggle", candidate_kinds)
+        self.assertNotIn("candidate_sequence_parallel_toggle", candidate_kinds)
 
     def test_dual_target_candidate_synthesis_still_produces_expected_families(self) -> None:
         dense_baseline = default_dense_program("dual_g4_g5")
@@ -75,9 +88,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "candidate_nonuniform_partition",
                 "candidate_stage_aware_schedule",
                 "candidate_topology_layout",
-                "candidate_sequence_parallel_toggle",
             }.issubset(dense_kinds)
         )
+        self.assertNotIn("candidate_sequence_parallel_toggle", dense_kinds)
 
         moe_baseline = default_moe_smoke_program("dual_g4_g5")
         moe_runtime = {"bubble_ratio": 0.06, "stage_spread_ratio": 0.10, "cross_node_exposed_ratio": 0.09}
@@ -86,15 +99,28 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         moe_kinds = {candidate.metadata.get("program_kind") for candidate in moe_candidates}
 
         self.assertFalse(moe_rewrite.allow_sequence_parallel_toggle)
+        self.assertFalse(moe_rewrite.allow_dual_plane)
         self.assertTrue(
             {
                 "candidate_nonuniform_partition",
                 "candidate_stage_aware_schedule",
-                "candidate_dual_plane",
                 "candidate_topology_layout",
             }.issubset(moe_kinds)
         )
+        self.assertNotIn("candidate_dual_plane", moe_kinds)
         self.assertNotIn("candidate_sequence_parallel_toggle", moe_kinds)
+
+    def test_dual_plane_requires_backend_caps_support(self) -> None:
+        moe_baseline = default_moe_smoke_program("dual_g4_g5")
+        moe_baseline.backend_caps = default_backend_caps("transformer_engine")
+        moe_runtime = {"bubble_ratio": 0.06, "stage_spread_ratio": 0.10, "cross_node_exposed_ratio": 0.09}
+
+        moe_rewrite = agent_loop._rewrite_space(moe_baseline, moe_runtime)
+        moe_candidates, _ = agent_loop._synthesize_programs(moe_baseline, moe_rewrite, candidate_limit=8)
+        moe_kinds = {candidate.metadata.get("program_kind") for candidate in moe_candidates}
+
+        self.assertTrue(moe_rewrite.allow_dual_plane)
+        self.assertIn("candidate_dual_plane", moe_kinds)
 
     def test_export_only_writes_programs_and_summary_without_running_trials(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,17 +150,17 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(summary["mode"], "program_synthesis_export_only")
             self.assertEqual(summary["tested_trials"], [])
-            self.assertEqual(summary["candidate_generation_count"], 2)
+            self.assertEqual(summary["candidate_generation_count"], 1)
             self.assertEqual(summary["candidate_execution_count"], 0)
             self.assertEqual(summary["compile_success_rate"], 1.0)
-            self.assertEqual(summary["family_outside_ratio"], 0.5)
+            self.assertEqual(summary["family_outside_ratio"], 1.0)
             self.assertIn("candidate_manifest", summary)
             self.assertEqual(summary["recommended_execution_order"][0], "baseline")
 
             exported_files = sorted(path.name for path in programs_dir.glob("*.json"))
             self.assertIn("00_baseline.json", exported_files)
             self.assertIn("01_candidate_single_node_pp_split.json", exported_files)
-            self.assertIn("02_candidate_sequence_parallel_toggle.json", exported_files)
+            self.assertNotIn("02_candidate_sequence_parallel_toggle.json", exported_files)
 
     def test_trial_runner_dry_run_emits_launch_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,6 +212,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("transformer_engine", payload["launch_plan"]["megatron_command"])
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "1")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "0")
+            self.assertEqual(payload["trial_context"]["resolved_backend_caps"]["transformer_impl"], "transformer_engine")
+            self.assertEqual(payload["launch_plan"]["resolved_backend_caps"]["transformer_impl"], "transformer_engine")
+            self.assertEqual(payload["trial_context"]["resolved_profile"]["machine_profile"]["name"], "consumer_single_node_5090d")
+            self.assertIn("PP split remains preferred", " ".join(payload["launch_plan"]["compile_notes"]))
 
     def test_trial_runner_dry_run_respects_single_g4_and_fp16(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -228,6 +258,8 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["launch_plan"]["launcher_env"]["TRANSFORMER_IMPL"], "local")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_BF16"], "0")
             self.assertEqual(payload["launch_plan"]["launcher_env"]["USE_FP16"], "1")
+            self.assertEqual(payload["trial_context"]["resolved_backend_caps"]["transformer_impl"], "local")
+            self.assertEqual(payload["trial_context"]["resolved_profile"]["machine_profile"]["name"], "consumer_single_node_4090d")
 
     def test_trial_runner_dry_run_single_g5_local_disables_sp_and_enables_local_guards(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -268,7 +300,13 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("--no-rope-fusion", cmd)
             self.assertIn("--no-persist-layer-norm", cmd)
             self.assertIn("--no-gradient-accumulation-fusion", cmd)
+            self.assertIn("--eval-iters", cmd)
+            self.assertIn("--eval-interval", cmd)
+            self.assertEqual(cmd[cmd.index("--eval-iters") + 1], "0")
+            self.assertEqual(cmd[cmd.index("--eval-interval") + 1], "1")
             self.assertNotIn("--sequence-parallel", cmd)
+            self.assertEqual(payload["launch_plan"]["resolved_backend_caps"]["transformer_impl"], "local")
+            self.assertIn("SP candidate suppressed", " ".join(payload["launch_plan"]["compile_notes"]))
 
     def test_trial_runner_dry_run_sequence_parallel_toggle_disables_sp_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
