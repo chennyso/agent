@@ -14,7 +14,31 @@ from torch.utils import cpp_extension
 os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 
+def _should_skip_build(args) -> tuple[bool, str]:
+    if os.environ.get("MEGATRON_SKIP_LEGACY_FUSED_KERNELS", "0") == "1":
+        return True, "MEGATRON_SKIP_LEGACY_FUSED_KERNELS=1"
+
+    cuda_home = cpp_extension.CUDA_HOME
+    if not cuda_home:
+        return True, "torch cpp_extension CUDA_HOME is not set"
+
+    nvcc_path = os.path.join(cuda_home, "bin", "nvcc")
+    if not os.path.exists(nvcc_path):
+        return True, f"nvcc not found at {nvcc_path}"
+
+    return False, ""
+
+
 def load(args):
+    should_skip, reason = _should_skip_build(args)
+    if should_skip:
+        if getattr(args, "rank", 0) == 0:
+            print(
+                f"> skipping legacy fused kernel compilation: {reason}",
+                flush=True,
+            )
+        return
+
     # Check if cuda 11 is installed for compute capability 8.0
     cc_flag = []
     _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(

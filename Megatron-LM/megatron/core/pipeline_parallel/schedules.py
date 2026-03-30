@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -845,6 +846,17 @@ def get_pp_rank_microbatches(
 
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
+    template = str(os.environ.get("SCHEDULE_TEMPLATE", "fixed_1f1b") or "fixed_1f1b").strip()
+    if template == "pp4_middle_relief" and num_model_chunks > 1:
+        if num_model_chunks == 2:
+            model_chunk_order = [1, 0]
+        else:
+            middle = num_model_chunks // 2
+            left = list(range(middle - 1, -1, -1))
+            right = list(range(middle, num_model_chunks))
+            model_chunk_order = right + left
+    else:
+        model_chunk_order = list(range(num_model_chunks))
     schedule_table = []
     for min_microbatch_id_in_group in range(
         0, num_microbatches, microbatch_group_size_per_vp_stage
@@ -854,7 +866,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
             schedule_table.extend(
                 [
                     (microbatch_id, model_chunk_id)
-                    for model_chunk_id in range(num_model_chunks)
+                    for model_chunk_id in model_chunk_order
                     for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
                 ]
             )
@@ -863,7 +875,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
             schedule_table.extend(
                 [
                     (microbatch_id, model_chunk_id)
-                    for model_chunk_id in range(num_model_chunks)
+                    for model_chunk_id in model_chunk_order
                     for microbatch_id in range(
                         min_microbatch_id_in_group,
                         min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,

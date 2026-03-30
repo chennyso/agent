@@ -21,6 +21,12 @@ from megatron_agent.config import (
 )
 from megatron_agent.metrics_parser import parse_megatron_logs
 from megatron_agent.programs import CompiledProgram, compile_program
+from megatron_agent.trace_reducer import (
+    build_agent_observation,
+    build_trial_artifact,
+    classify_bottleneck,
+    reduce_trial_trace,
+)
 
 DEFAULT_MEGATRON_ROOT = "/public/home/ssjxscy/agent/Megatron-LM"
 DEFAULT_LAUNCHER_SCRIPT = "examples/qwen/train_qwen3_14b_rtx_8gpu.sh"
@@ -254,6 +260,40 @@ def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
         "stderr_log": str(trial_dir / "stderr.log"),
         "launch_plan_log": str(trial_dir / "launch_plan.json"),
     }
+
+
+def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, Any]) -> Dict[str, str]:
+    artifact_dir = Path(output_dirs["trial_dir"]) / "analysis"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = dict(metrics.get("trial_artifact") or {})
+    context_record = dict(metrics.get("context_record") or {})
+    visualization = dict(artifact.get("visualization_artifacts") or {})
+    perfetto_trace = dict(visualization.get("perfetto_trace") or {})
+    search_space_blueprint = dict(artifact.get("search_space_blueprint") or {})
+    bottleneck_breakdown = list(artifact.get("bottleneck_breakdown") or [])
+
+    outputs = {
+        "trial_artifact_json": str(artifact_dir / "trial_artifact.json"),
+        "context_record_json": str(artifact_dir / "context_record.json"),
+        "perfetto_trace_json": str(artifact_dir / "perfetto_trace.json"),
+        "search_space_blueprint_json": str(artifact_dir / "search_space_blueprint.json"),
+        "bottleneck_breakdown_json": str(artifact_dir / "bottleneck_breakdown.json"),
+    }
+    Path(outputs["trial_artifact_json"]).write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
+    Path(outputs["context_record_json"]).write_text(json.dumps(context_record, indent=2, ensure_ascii=False), encoding="utf-8")
+    if perfetto_trace:
+        Path(outputs["perfetto_trace_json"]).write_text(json.dumps(perfetto_trace, indent=2, ensure_ascii=False), encoding="utf-8")
+    if search_space_blueprint:
+        Path(outputs["search_space_blueprint_json"]).write_text(
+            json.dumps(search_space_blueprint, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if bottleneck_breakdown:
+        Path(outputs["bottleneck_breakdown_json"]).write_text(
+            json.dumps(bottleneck_breakdown, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    return outputs
 
 
 def _runtime_env_defaults() -> Dict[str, str]:
@@ -891,6 +931,9 @@ def _parse_error(stderr: str, root_cause_excerpt: Optional[str] = None) -> str:
 def _program_from_strategy(strategy: MegatronStrategy, target: str, model_track: str) -> MegatronProgram:
     base = default_moe_smoke_program(target) if model_track == "moe" else default_dense_program(target)
     base.parallel = strategy.parallel.normalized()
+    base.batch_plan.micro_batch_size = int(strategy.micro_batch_size)
+    base.batch_plan.global_batch_size = int(strategy.global_batch_size)
+    base.batch_plan.target_tokens_per_step = int(strategy.global_batch_size) * int(strategy.seq_len)
     base.metadata.update(
         {
             "micro_batch_size": int(strategy.micro_batch_size),
@@ -1099,6 +1142,17 @@ def run_trial(
         seq_len=int(strategy.seq_len),
     )
     metrics.update(parsed)
+    metrics["trace_summary"] = reduce_trial_trace(program, metrics=metrics)
+    observation = build_agent_observation(program, trace_summary=metrics["trace_summary"])
+    metrics["context_record"] = observation.to_dict()
+    metrics["failure_modes"] = list(observation.failure_modes or [])
+    metrics["bottleneck_signature"] = classify_bottleneck(program, metrics["trace_summary"])
+    metrics["trial_artifact"] = build_trial_artifact(
+        program,
+        observation,
+        bottleneck_signature=metrics["bottleneck_signature"],
+    )
+    metrics["analysis_artifact_paths"] = _write_analysis_artifacts(output_dirs, metrics)
     metrics["oom"] = False
     return metrics
 
@@ -1110,6 +1164,9 @@ def _load_program_or_strategy(path: Path, default_model_track: str, default_targ
     strategy = MegatronStrategy.from_dict(payload)
     base = default_moe_smoke_program(default_target) if default_model_track == "moe" else default_dense_program(default_target)
     base.parallel = strategy.parallel.normalized()
+    base.batch_plan.micro_batch_size = int(strategy.micro_batch_size)
+    base.batch_plan.global_batch_size = int(strategy.global_batch_size)
+    base.batch_plan.target_tokens_per_step = int(strategy.global_batch_size) * int(strategy.seq_len)
     base.metadata.update(
         {
             "micro_batch_size": int(strategy.micro_batch_size),
@@ -1135,7 +1192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--megatron-args", type=str, default=None)
     parser.add_argument("--megatron-args-file", type=str, default=None)
     parser.add_argument("--model-track", type=str, choices=["dense", "moe"], default="dense")
-    parser.add_argument("--run-target", type=str, choices=["single_g4", "single_g5", "dual_g4_g5"], default="single_g5")
+    parser.add_argument("--run-target", type=str, choices=["single_g4", "single_g5", "dual_g4_g5", "dual_g5_g5"], default="single_g5")
     parser.add_argument("--nproc", type=int, default=8)
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
@@ -1189,7 +1246,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.run_target == "dual_g4_g5" and int(args.nnodes) < 2:
+    if args.run_target in {"dual_g4_g5", "dual_g5_g5"} and int(args.nnodes) < 2:
         args.nnodes = 2
     if not args.program_file and not args.strategy_file:
         raise ValueError("either --program-file or --strategy-file is required")

@@ -1,0 +1,12 @@
+ [2026-03-24 09:22:22.430606] iteration       20/      20 | consumed samples:          320 | elapsed time per iteration (ms): 4673.3 | throughput per GPU (TFLOP/s/GPU): 37.3 | MFU (%): 17.8 | learning rate: 1.000000E-05 | global batch size:    16 | lm loss: 1.292848E+01 | loss scale: 1.0 | grad norm: 0.000 | number of skipped iterations:   0 | number of nan iterations:   0 |
+INFO:megatron.core.timers:(min, max) time across ranks (ms):
+    forward-backward ...............................: (3407.16, 3407.22)
+    embedding-grads-all-reduce .....................: (0.02, 0.02)
+    all-grads-sync .................................: (4.73, 4.83)
+    optimizer-copy-to-main-grad ....................: (0.22, 0.36)
+    optimizer-inner-step ...........................: (743.64, 1246.45)
+    optimizer-copy-main-to-model-params ............: (7.49, 7.78)
+    optimizer ......................................: (1255.43, 1255.72)
+    batch-generator ................................: (13.89, 18.60)
+    forward-compute ................................: (1567.33, 1567.82)
+    backward-compute ...............................: (1794.55, 1811.55)

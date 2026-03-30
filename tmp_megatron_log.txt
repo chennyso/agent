@@ -1,0 +1,24 @@
+ [2026-03-24 08:42:45.847349] iteration       11/      20 | consumed samples:          176 | elapsed time per iteration (ms): 4105.4 | throughput per GPU (TFLOP/s/GPU): 42.5 | learning rate: 6.890576E-05 | global batch size:    16 | lm loss: 1.294418E+01 | loss scale: 1.0 | grad norm: 0.000 | number of skipped iterations:   0 | number of nan iterations:   0 |
+INFO:megatron.core.timers:(min, max) time across ranks (ms):
+    forward-backward ...............................: (3199.99, 3200.04)
+    embedding-grads-all-reduce .....................: (0.02, 0.02)
+    all-grads-sync .................................: (4.76, 4.95)
+    optimizer-copy-to-main-grad ....................: (0.26, 0.37)
+    optimizer-inner-step ...........................: (752.50, 887.67)
+    optimizer-copy-main-to-model-params ............: (7.50, 8.54)
+    optimizer ......................................: (896.56, 897.62)
+    batch-generator ................................: (15.39, 17.20)
+    forward-compute ................................: (1360.18, 1360.84)
+    backward-compute ...............................: (1810.42, 1811.47)
+ [2026-03-24 08:42:49.932632] iteration       12/      20 | consumed samples:          192 | elapsed time per iteration (ms): 4085.2 | throughput per GPU (TFLOP/s/GPU): 42.7 | learning rate: 5.970378E-05 | global batch size:    16 | lm loss: 1.293694E+01 | loss scale: 1.0 | grad norm: 0.000 | number of skipped iterations:   0 | number of nan iterations:   0 |
+INFO:megatron.core.timers:(min, max) time across ranks (ms):
+    forward-backward ...............................: (3158.16, 3158.21)
+    embedding-grads-all-reduce .....................: (0.02, 0.02)
+    all-grads-sync .................................: (4.77, 4.93)
+    optimizer-copy-to-main-grad ....................: (0.23, 0.33)
+    optimizer-inner-step ...........................: (747.43, 910.31)
+    optimizer-copy-main-to-model-params ............: (7.48, 7.55)
+    optimizer ......................................: (919.14, 919.22)
+    batch-generator ................................: (14.57, 15.48)
+    forward-compute ................................: (1341.42, 1341.90)
+    backward-compute ...............................: (1788.34, 1788.93)

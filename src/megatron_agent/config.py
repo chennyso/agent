@@ -10,6 +10,12 @@ _SEMANTIC_HASH_SALT = "megatron_strategy_v2"
 _PROGRAM_HASH_SALT = "megatron_program_v1"
 _DEFAULT_DENSE_MODULE_FAMILIES = ["embedding", "decoder", "loss"]
 _DEFAULT_MOE_MODULE_FAMILIES = ["embedding", "decoder", "experts", "loss"]
+_DEFAULT_VARIABLE_TIERS = {
+    "apipe": "global_low_freq",
+    "placement": "global_low_freq",
+    "local_parallel": "local_mid_freq",
+    "pipe": "runtime_high_freq",
+}
 
 
 def _stable_hash(payload: Dict[str, Any], salt: str) -> str:
@@ -503,6 +509,7 @@ class PlaneMapSpec:
 class ScheduleSpec:
     microbatch_group_size_per_vp_stage: Optional[int] = None
     skeleton: str = "fixed_1f1b"
+    template: str = "fixed_1f1b"
     dispatch_order: str = "default"
 
     def normalized(self) -> "ScheduleSpec":
@@ -510,6 +517,7 @@ class ScheduleSpec:
         if norm.microbatch_group_size_per_vp_stage is not None:
             norm.microbatch_group_size_per_vp_stage = max(int(norm.microbatch_group_size_per_vp_stage), 1)
         norm.skeleton = str(norm.skeleton or "fixed_1f1b")
+        norm.template = str(norm.template or norm.skeleton or "fixed_1f1b")
         norm.dispatch_order = str(norm.dispatch_order or "default")
         return norm
 
@@ -517,6 +525,7 @@ class ScheduleSpec:
         return {
             "microbatch_group_size_per_vp_stage": self.microbatch_group_size_per_vp_stage,
             "skeleton": self.skeleton,
+            "template": self.template,
             "dispatch_order": self.dispatch_order,
         }
 
@@ -525,13 +534,359 @@ class ScheduleSpec:
         return cls(
             microbatch_group_size_per_vp_stage=payload.get("microbatch_group_size_per_vp_stage"),
             skeleton=str(payload.get("skeleton", "fixed_1f1b")),
+            template=str(payload.get("template", payload.get("skeleton", "fixed_1f1b"))),
             dispatch_order=str(payload.get("dispatch_order", "default")),
+        )
+
+
+@dataclass
+class BatchPlanSpec:
+    micro_batch_size: int = 1
+    global_batch_size: int = 16
+    grad_accum_steps: Optional[int] = None
+    target_tokens_per_step: Optional[int] = None
+
+    def normalized(self) -> "BatchPlanSpec":
+        norm = copy.deepcopy(self)
+        norm.micro_batch_size = max(int(norm.micro_batch_size), 1)
+        norm.global_batch_size = max(int(norm.global_batch_size), 1)
+        if norm.grad_accum_steps is not None:
+            norm.grad_accum_steps = max(int(norm.grad_accum_steps), 1)
+        if norm.target_tokens_per_step is not None:
+            norm.target_tokens_per_step = max(int(norm.target_tokens_per_step), 1)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "micro_batch_size": int(norm.micro_batch_size),
+            "global_batch_size": int(norm.global_batch_size),
+            "grad_accum_steps": norm.grad_accum_steps,
+            "target_tokens_per_step": norm.target_tokens_per_step,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "BatchPlanSpec":
+        return cls(
+            micro_batch_size=int(payload.get("micro_batch_size", 1) or 1),
+            global_batch_size=int(payload.get("global_batch_size", 16) or 1),
+            grad_accum_steps=payload.get("grad_accum_steps"),
+            target_tokens_per_step=payload.get("target_tokens_per_step"),
+        )
+
+
+@dataclass
+class LengthBucketPolicy:
+    name: str
+    min_seq_len: int = 1
+    max_seq_len: Optional[int] = None
+    preferred_program_kind: Optional[str] = None
+    cp_cap: Optional[int] = None
+    micro_batch_cap: Optional[int] = None
+    schedule_templates: List[str] = field(default_factory=list)
+    notes: Optional[str] = None
+
+    def normalized(self) -> "LengthBucketPolicy":
+        norm = copy.deepcopy(self)
+        norm.name = str(norm.name or "default")
+        norm.min_seq_len = max(int(norm.min_seq_len), 1)
+        if norm.max_seq_len is not None:
+            norm.max_seq_len = max(int(norm.max_seq_len), norm.min_seq_len)
+        if norm.cp_cap is not None:
+            norm.cp_cap = max(int(norm.cp_cap), 1)
+        if norm.micro_batch_cap is not None:
+            norm.micro_batch_cap = max(int(norm.micro_batch_cap), 1)
+        norm.schedule_templates = [str(item) for item in (norm.schedule_templates or [])]
+        if norm.preferred_program_kind is not None:
+            norm.preferred_program_kind = str(norm.preferred_program_kind).strip() or None
+        if norm.notes is not None:
+            norm.notes = str(norm.notes).strip() or None
+        return norm
+
+    def matches(self, seq_len: int) -> bool:
+        norm = self.normalized()
+        current = max(int(seq_len), 1)
+        if current < norm.min_seq_len:
+            return False
+        if norm.max_seq_len is not None and current > norm.max_seq_len:
+            return False
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "name": norm.name,
+            "min_seq_len": int(norm.min_seq_len),
+            "max_seq_len": norm.max_seq_len,
+            "preferred_program_kind": norm.preferred_program_kind,
+            "cp_cap": norm.cp_cap,
+            "micro_batch_cap": norm.micro_batch_cap,
+            "schedule_templates": list(norm.schedule_templates),
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "LengthBucketPolicy":
+        return cls(
+            name=str(payload.get("name", "default")),
+            min_seq_len=int(payload.get("min_seq_len", 1) or 1),
+            max_seq_len=payload.get("max_seq_len"),
+            preferred_program_kind=payload.get("preferred_program_kind"),
+            cp_cap=payload.get("cp_cap"),
+            micro_batch_cap=payload.get("micro_batch_cap"),
+            schedule_templates=[str(item) for item in (payload.get("schedule_templates") or [])],
+            notes=payload.get("notes"),
+        )
+
+
+@dataclass
+class SubgraphSpec:
+    name: str
+    stage_index: int
+    decoder_start: int = 0
+    decoder_end: int = 0
+    module_family: str = "decoder"
+    special_tokens: List[str] = field(default_factory=list)
+    attention_heavy: bool = False
+    loss_heavy: bool = False
+
+    def normalized(self) -> "SubgraphSpec":
+        norm = copy.deepcopy(self)
+        norm.name = str(norm.name or "subgraph")
+        norm.stage_index = max(int(norm.stage_index), 0)
+        norm.decoder_start = max(int(norm.decoder_start), 0)
+        norm.decoder_end = max(int(norm.decoder_end), norm.decoder_start)
+        norm.module_family = str(norm.module_family or "decoder")
+        norm.special_tokens = [str(token) for token in (norm.special_tokens or []) if str(token).strip()]
+        norm.attention_heavy = bool(norm.attention_heavy)
+        norm.loss_heavy = bool(norm.loss_heavy)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "name": norm.name,
+            "stage_index": int(norm.stage_index),
+            "decoder_start": int(norm.decoder_start),
+            "decoder_end": int(norm.decoder_end),
+            "module_family": norm.module_family,
+            "special_tokens": list(norm.special_tokens),
+            "attention_heavy": bool(norm.attention_heavy),
+            "loss_heavy": bool(norm.loss_heavy),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "SubgraphSpec":
+        return cls(
+            name=str(payload.get("name", "subgraph")),
+            stage_index=int(payload.get("stage_index", 0) or 0),
+            decoder_start=int(payload.get("decoder_start", 0) or 0),
+            decoder_end=int(payload.get("decoder_end", 0) or 0),
+            module_family=str(payload.get("module_family", "decoder")),
+            special_tokens=[str(token) for token in (payload.get("special_tokens") or [])],
+            attention_heavy=bool(payload.get("attention_heavy", False)),
+            loss_heavy=bool(payload.get("loss_heavy", False)),
+        )
+
+
+@dataclass
+class PlacementEntrySpec:
+    subgraph: str
+    nodes: List[str] = field(default_factory=list)
+    device_group_size: int = 1
+    device_type: Optional[str] = None
+    topology_domain: Optional[str] = None
+
+    def normalized(self) -> "PlacementEntrySpec":
+        norm = copy.deepcopy(self)
+        norm.subgraph = str(norm.subgraph or "subgraph")
+        norm.nodes = [str(node) for node in (norm.nodes or [])]
+        norm.device_group_size = max(int(norm.device_group_size), 1)
+        if norm.device_type is not None:
+            norm.device_type = str(norm.device_type).strip() or None
+        if norm.topology_domain is not None:
+            norm.topology_domain = str(norm.topology_domain).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "subgraph": norm.subgraph,
+            "nodes": list(norm.nodes),
+            "device_group_size": int(norm.device_group_size),
+            "device_type": norm.device_type,
+            "topology_domain": norm.topology_domain,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "PlacementEntrySpec":
+        return cls(
+            subgraph=str(payload.get("subgraph", "subgraph")),
+            nodes=[str(node) for node in (payload.get("nodes") or [])],
+            device_group_size=int(payload.get("device_group_size", 1) or 1),
+            device_type=payload.get("device_type"),
+            topology_domain=payload.get("topology_domain"),
+        )
+
+
+@dataclass
+class LocalParallelSpec:
+    subgraph: str
+    vpp_degree: int = 1
+    cp_degree: int = 1
+    fsdp_scope: str = "none"
+    shard_strategy: str = "none"
+    reshard_policy: str = "default"
+    shard_group_size: Optional[int] = None
+    replicate_group_size: Optional[int] = None
+    offload_policy: str = "none"
+    reduce_dtype: Optional[str] = None
+    device_group_size: Optional[int] = None
+    device_group_type: Optional[str] = None
+
+    def normalized(self) -> "LocalParallelSpec":
+        norm = copy.deepcopy(self)
+        norm.subgraph = str(norm.subgraph or "subgraph")
+        norm.vpp_degree = max(int(norm.vpp_degree), 1)
+        norm.cp_degree = max(int(norm.cp_degree), 1)
+        norm.fsdp_scope = str(norm.fsdp_scope or "none").strip().lower() or "none"
+        norm.shard_strategy = str(norm.shard_strategy or "none").strip().lower() or "none"
+        norm.reshard_policy = str(norm.reshard_policy or "default").strip().lower() or "default"
+        if norm.shard_group_size is not None:
+            norm.shard_group_size = max(int(norm.shard_group_size), 1)
+        if norm.replicate_group_size is not None:
+            norm.replicate_group_size = max(int(norm.replicate_group_size), 1)
+        norm.offload_policy = str(norm.offload_policy or "none").strip().lower() or "none"
+        if norm.reduce_dtype is not None:
+            norm.reduce_dtype = str(norm.reduce_dtype).strip().lower() or None
+        if norm.device_group_size is not None:
+            norm.device_group_size = max(int(norm.device_group_size), 1)
+        if norm.device_group_type is not None:
+            norm.device_group_type = str(norm.device_group_type).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "subgraph": norm.subgraph,
+            "vpp_degree": int(norm.vpp_degree),
+            "cp_degree": int(norm.cp_degree),
+            "fsdp_scope": norm.fsdp_scope,
+            "shard_strategy": norm.shard_strategy,
+            "reshard_policy": norm.reshard_policy,
+            "shard_group_size": norm.shard_group_size,
+            "replicate_group_size": norm.replicate_group_size,
+            "offload_policy": norm.offload_policy,
+            "reduce_dtype": norm.reduce_dtype,
+            "device_group_size": norm.device_group_size,
+            "device_group_type": norm.device_group_type,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "LocalParallelSpec":
+        return cls(
+            subgraph=str(payload.get("subgraph", "subgraph")),
+            vpp_degree=int(payload.get("vpp_degree", 1) or 1),
+            cp_degree=int(payload.get("cp_degree", 1) or 1),
+            fsdp_scope=str(payload.get("fsdp_scope", "none")),
+            shard_strategy=str(payload.get("shard_strategy", "none")),
+            reshard_policy=str(payload.get("reshard_policy", "default")),
+            shard_group_size=payload.get("shard_group_size"),
+            replicate_group_size=payload.get("replicate_group_size"),
+            offload_policy=str(payload.get("offload_policy", "none")),
+            reduce_dtype=payload.get("reduce_dtype"),
+            device_group_size=payload.get("device_group_size"),
+            device_group_type=payload.get("device_group_type"),
+        )
+
+
+@dataclass
+class PipeRuntimeSpec:
+    template: str = "fixed_1f1b"
+    microbatch_order: str = "default"
+    steady_state_group_size: Optional[int] = None
+    warmup_policy: str = "default"
+    cooldown_policy: str = "default"
+
+    def normalized(self) -> "PipeRuntimeSpec":
+        norm = copy.deepcopy(self)
+        norm.template = str(norm.template or "fixed_1f1b")
+        norm.microbatch_order = str(norm.microbatch_order or "default")
+        if norm.steady_state_group_size is not None:
+            norm.steady_state_group_size = max(int(norm.steady_state_group_size), 1)
+        norm.warmup_policy = str(norm.warmup_policy or "default")
+        norm.cooldown_policy = str(norm.cooldown_policy or "default")
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "template": norm.template,
+            "microbatch_order": norm.microbatch_order,
+            "steady_state_group_size": norm.steady_state_group_size,
+            "warmup_policy": norm.warmup_policy,
+            "cooldown_policy": norm.cooldown_policy,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "PipeRuntimeSpec":
+        return cls(
+            template=str(payload.get("template", "fixed_1f1b")),
+            microbatch_order=str(payload.get("microbatch_order", "default")),
+            steady_state_group_size=payload.get("steady_state_group_size"),
+            warmup_policy=str(payload.get("warmup_policy", "default")),
+            cooldown_policy=str(payload.get("cooldown_policy", "default")),
+        )
+
+
+@dataclass
+class StrategyIRSpec:
+    apipe: List[SubgraphSpec] = field(default_factory=list)
+    placement: List[PlacementEntrySpec] = field(default_factory=list)
+    local_parallel: List[LocalParallelSpec] = field(default_factory=list)
+    pipe: PipeRuntimeSpec = field(default_factory=PipeRuntimeSpec)
+    variable_tiers: Dict[str, str] = field(default_factory=lambda: copy.deepcopy(_DEFAULT_VARIABLE_TIERS))
+
+    def normalized(self) -> "StrategyIRSpec":
+        norm = copy.deepcopy(self)
+        norm.apipe = [item.normalized() for item in (norm.apipe or [])]
+        norm.placement = [item.normalized() for item in (norm.placement or [])]
+        norm.local_parallel = [item.normalized() for item in (norm.local_parallel or [])]
+        norm.pipe = norm.pipe.normalized()
+        tiers = copy.deepcopy(_DEFAULT_VARIABLE_TIERS)
+        for key, value in (norm.variable_tiers or {}).items():
+            tiers[str(key)] = str(value or tiers.get(str(key), "global_low_freq"))
+        norm.variable_tiers = tiers
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "apipe": [item.to_dict() for item in norm.apipe],
+            "placement": [item.to_dict() for item in norm.placement],
+            "local_parallel": [item.to_dict() for item in norm.local_parallel],
+            "pipe": norm.pipe.to_dict(),
+            "variable_tiers": copy.deepcopy(norm.variable_tiers),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "StrategyIRSpec":
+        return cls(
+            apipe=[SubgraphSpec.from_dict(item) for item in (payload.get("apipe") or [])],
+            placement=[PlacementEntrySpec.from_dict(item) for item in (payload.get("placement") or [])],
+            local_parallel=[LocalParallelSpec.from_dict(item) for item in (payload.get("local_parallel") or [])],
+            pipe=PipeRuntimeSpec.from_dict(payload.get("pipe") or {}),
+            variable_tiers={
+                str(key): str(value)
+                for key, value in (payload.get("variable_tiers") or {}).items()
+            },
         )
 
 
 @dataclass
 class ConstraintSpec:
     required_node_local_axes: List[str] = field(default_factory=list)
+    memory_budget_gb: Optional[float] = None
     requires_runtime_pg_rebuild: bool = False
     requested_heterogeneous_apipe: bool = False
     notes: Optional[str] = None
@@ -539,6 +894,8 @@ class ConstraintSpec:
     def normalized(self) -> "ConstraintSpec":
         norm = copy.deepcopy(self)
         norm.required_node_local_axes = [str(axis) for axis in (norm.required_node_local_axes or [])]
+        if norm.memory_budget_gb is not None:
+            norm.memory_budget_gb = max(float(norm.memory_budget_gb), 1.0)
         norm.requires_runtime_pg_rebuild = bool(norm.requires_runtime_pg_rebuild)
         norm.requested_heterogeneous_apipe = bool(norm.requested_heterogeneous_apipe)
         return norm
@@ -546,6 +903,7 @@ class ConstraintSpec:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "required_node_local_axes": list(self.required_node_local_axes),
+            "memory_budget_gb": self.memory_budget_gb,
             "requires_runtime_pg_rebuild": bool(self.requires_runtime_pg_rebuild),
             "requested_heterogeneous_apipe": bool(self.requested_heterogeneous_apipe),
             "notes": self.notes,
@@ -555,6 +913,7 @@ class ConstraintSpec:
     def from_dict(cls, payload: Dict[str, Any]) -> "ConstraintSpec":
         return cls(
             required_node_local_axes=[str(axis) for axis in (payload.get("required_node_local_axes") or [])],
+            memory_budget_gb=payload.get("memory_budget_gb"),
             requires_runtime_pg_rebuild=bool(payload.get("requires_runtime_pg_rebuild", False)),
             requested_heterogeneous_apipe=bool(payload.get("requested_heterogeneous_apipe", False)),
             notes=payload.get("notes"),
@@ -602,6 +961,8 @@ class SearchSpaceSpec:
     allow_asymmetric_vpp: bool = False
     allow_dual_plane: bool = False
     allow_stage_aware_schedule: bool = False
+    allow_hybrid_shard: bool = False
+    allow_torchtitan_schedule_sandbox: bool = False
     allow_subgraph_submeshes: bool = False
     allow_heterogeneous_apipe: bool = False
     max_tp_size: Optional[int] = None
@@ -609,10 +970,16 @@ class SearchSpaceSpec:
     max_ep_size: Optional[int] = None
     max_cp_size: Optional[int] = None
     max_vpp_size: Optional[int] = None
+    max_shard_group_size: Optional[int] = None
+    max_replicate_group_size: Optional[int] = None
+    max_micro_batch_size: Optional[int] = None
+    max_estimated_memory_pressure: Optional[float] = None
+    prefer_memory_relief: bool = False
     required_node_local_axes: List[str] = field(default_factory=list)
     preferred_node_for_module: Dict[str, str] = field(default_factory=dict)
     forbidden_axes_by_node: Dict[str, List[str]] = field(default_factory=dict)
     allowed_schedule_skeletons: List[str] = field(default_factory=lambda: ["fixed_1f1b"])
+    allowed_schedule_templates: List[str] = field(default_factory=lambda: ["fixed_1f1b"])
     rewrite_rules: List[ConstraintRuleSpec] = field(default_factory=list)
     notes: Optional[str] = None
 
@@ -624,6 +991,8 @@ class SearchSpaceSpec:
         norm.allow_asymmetric_vpp = bool(norm.allow_asymmetric_vpp)
         norm.allow_dual_plane = bool(norm.allow_dual_plane)
         norm.allow_stage_aware_schedule = bool(norm.allow_stage_aware_schedule)
+        norm.allow_hybrid_shard = bool(norm.allow_hybrid_shard)
+        norm.allow_torchtitan_schedule_sandbox = bool(norm.allow_torchtitan_schedule_sandbox)
         norm.allow_subgraph_submeshes = bool(norm.allow_subgraph_submeshes)
         norm.allow_heterogeneous_apipe = bool(norm.allow_heterogeneous_apipe)
         if norm.max_tp_size is not None:
@@ -636,6 +1005,15 @@ class SearchSpaceSpec:
             norm.max_cp_size = max(int(norm.max_cp_size), 1)
         if norm.max_vpp_size is not None:
             norm.max_vpp_size = max(int(norm.max_vpp_size), 1)
+        if norm.max_shard_group_size is not None:
+            norm.max_shard_group_size = max(int(norm.max_shard_group_size), 1)
+        if norm.max_replicate_group_size is not None:
+            norm.max_replicate_group_size = max(int(norm.max_replicate_group_size), 1)
+        if norm.max_micro_batch_size is not None:
+            norm.max_micro_batch_size = max(int(norm.max_micro_batch_size), 1)
+        if norm.max_estimated_memory_pressure is not None:
+            norm.max_estimated_memory_pressure = max(float(norm.max_estimated_memory_pressure), 0.1)
+        norm.prefer_memory_relief = bool(norm.prefer_memory_relief)
         norm.required_node_local_axes = [str(axis) for axis in (norm.required_node_local_axes or [])]
         norm.preferred_node_for_module = {str(key): str(value) for key, value in (norm.preferred_node_for_module or {}).items()}
         norm.forbidden_axes_by_node = {
@@ -643,6 +1021,7 @@ class SearchSpaceSpec:
             for node, axes in (norm.forbidden_axes_by_node or {}).items()
         }
         norm.allowed_schedule_skeletons = [str(item) for item in (norm.allowed_schedule_skeletons or ["fixed_1f1b"])]
+        norm.allowed_schedule_templates = [str(item) for item in (norm.allowed_schedule_templates or ["fixed_1f1b"])]
         norm.rewrite_rules = [rule.normalized() for rule in (norm.rewrite_rules or [])]
         return norm
 
@@ -655,6 +1034,8 @@ class SearchSpaceSpec:
             "allow_asymmetric_vpp": bool(norm.allow_asymmetric_vpp),
             "allow_dual_plane": bool(norm.allow_dual_plane),
             "allow_stage_aware_schedule": bool(norm.allow_stage_aware_schedule),
+            "allow_hybrid_shard": bool(norm.allow_hybrid_shard),
+            "allow_torchtitan_schedule_sandbox": bool(norm.allow_torchtitan_schedule_sandbox),
             "allow_subgraph_submeshes": bool(norm.allow_subgraph_submeshes),
             "allow_heterogeneous_apipe": bool(norm.allow_heterogeneous_apipe),
             "max_tp_size": norm.max_tp_size,
@@ -662,10 +1043,16 @@ class SearchSpaceSpec:
             "max_ep_size": norm.max_ep_size,
             "max_cp_size": norm.max_cp_size,
             "max_vpp_size": norm.max_vpp_size,
+            "max_shard_group_size": norm.max_shard_group_size,
+            "max_replicate_group_size": norm.max_replicate_group_size,
+            "max_micro_batch_size": norm.max_micro_batch_size,
+            "max_estimated_memory_pressure": norm.max_estimated_memory_pressure,
+            "prefer_memory_relief": bool(norm.prefer_memory_relief),
             "required_node_local_axes": list(norm.required_node_local_axes),
             "preferred_node_for_module": copy.deepcopy(norm.preferred_node_for_module),
             "forbidden_axes_by_node": copy.deepcopy(norm.forbidden_axes_by_node),
             "allowed_schedule_skeletons": list(norm.allowed_schedule_skeletons),
+            "allowed_schedule_templates": list(norm.allowed_schedule_templates),
             "rewrite_rules": [rule.to_dict() for rule in norm.rewrite_rules],
             "notes": norm.notes,
         }
@@ -679,6 +1066,8 @@ class SearchSpaceSpec:
             allow_asymmetric_vpp=bool(payload.get("allow_asymmetric_vpp", False)),
             allow_dual_plane=bool(payload.get("allow_dual_plane", False)),
             allow_stage_aware_schedule=bool(payload.get("allow_stage_aware_schedule", False)),
+            allow_hybrid_shard=bool(payload.get("allow_hybrid_shard", False)),
+            allow_torchtitan_schedule_sandbox=bool(payload.get("allow_torchtitan_schedule_sandbox", False)),
             allow_subgraph_submeshes=bool(payload.get("allow_subgraph_submeshes", False)),
             allow_heterogeneous_apipe=bool(payload.get("allow_heterogeneous_apipe", False)),
             max_tp_size=payload.get("max_tp_size"),
@@ -686,6 +1075,11 @@ class SearchSpaceSpec:
             max_ep_size=payload.get("max_ep_size"),
             max_cp_size=payload.get("max_cp_size"),
             max_vpp_size=payload.get("max_vpp_size"),
+            max_shard_group_size=payload.get("max_shard_group_size"),
+            max_replicate_group_size=payload.get("max_replicate_group_size"),
+            max_micro_batch_size=payload.get("max_micro_batch_size"),
+            max_estimated_memory_pressure=payload.get("max_estimated_memory_pressure"),
+            prefer_memory_relief=bool(payload.get("prefer_memory_relief", False)),
             required_node_local_axes=[str(axis) for axis in (payload.get("required_node_local_axes") or [])],
             preferred_node_for_module={
                 str(key): str(value) for key, value in (payload.get("preferred_node_for_module") or {}).items()
@@ -695,6 +1089,7 @@ class SearchSpaceSpec:
                 for node, axes in (payload.get("forbidden_axes_by_node") or {}).items()
             },
             allowed_schedule_skeletons=[str(item) for item in (payload.get("allowed_schedule_skeletons") or ["fixed_1f1b"])],
+            allowed_schedule_templates=[str(item) for item in (payload.get("allowed_schedule_templates") or ["fixed_1f1b"])],
             rewrite_rules=[ConstraintRuleSpec.from_dict(rule) for rule in (payload.get("rewrite_rules") or [])],
             notes=payload.get("notes"),
         )
@@ -709,8 +1104,11 @@ class MegatronProgram:
     layout: LayoutSpec = field(default_factory=LayoutSpec)
     plane_map: PlaneMapSpec = field(default_factory=PlaneMapSpec)
     schedule: ScheduleSpec = field(default_factory=ScheduleSpec)
+    batch_plan: BatchPlanSpec = field(default_factory=BatchPlanSpec)
+    strategy_ir: StrategyIRSpec = field(default_factory=StrategyIRSpec)
     constraints: ConstraintSpec = field(default_factory=ConstraintSpec)
     search_space: SearchSpaceSpec = field(default_factory=SearchSpaceSpec)
+    length_bucket_policies: List[LengthBucketPolicy] = field(default_factory=list)
     machine_profile: Optional[MachineProfile] = None
     backend_caps: Optional[BackendCaps] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -725,11 +1123,22 @@ class MegatronProgram:
         norm.layout = norm.layout.normalized()
         norm.plane_map = norm.plane_map.normalized()
         norm.schedule = norm.schedule.normalized()
+        norm.batch_plan = norm.batch_plan.normalized()
+        norm.strategy_ir = norm.strategy_ir.normalized()
         norm.constraints = norm.constraints.normalized()
         norm.search_space = norm.search_space.normalized()
+        norm.length_bucket_policies = [item.normalized() for item in (norm.length_bucket_policies or [])]
         norm.machine_profile = norm.machine_profile.normalized() if norm.machine_profile is not None else None
         norm.backend_caps = norm.backend_caps.normalized() if norm.backend_caps is not None else None
         norm.metadata = copy.deepcopy(norm.metadata or {})
+        norm.metadata["micro_batch_size"] = int(norm.batch_plan.micro_batch_size)
+        norm.metadata["global_batch_size"] = int(norm.batch_plan.global_batch_size)
+        if norm.batch_plan.grad_accum_steps is not None:
+            norm.metadata["grad_accum_steps"] = int(norm.batch_plan.grad_accum_steps)
+        if norm.batch_plan.target_tokens_per_step is not None:
+            norm.metadata["target_tokens_per_step"] = int(norm.batch_plan.target_tokens_per_step)
+        if not norm.strategy_ir.apipe or not norm.strategy_ir.placement or not norm.strategy_ir.local_parallel:
+            norm.strategy_ir = _derive_strategy_ir(norm)
         return norm
 
     def to_dict(self) -> Dict[str, Any]:
@@ -743,8 +1152,11 @@ class MegatronProgram:
             "layout": norm.layout.to_dict(),
             "plane_map": norm.plane_map.to_dict(),
             "schedule": norm.schedule.to_dict(),
+            "batch_plan": norm.batch_plan.to_dict(),
+            "strategy_ir": norm.strategy_ir.to_dict(),
             "constraints": norm.constraints.to_dict(),
             "search_space": norm.search_space.to_dict(),
+            "length_bucket_policies": [item.to_dict() for item in norm.length_bucket_policies],
             "machine_profile": norm.machine_profile.to_dict() if norm.machine_profile is not None else None,
             "backend_caps": norm.backend_caps.to_dict() if norm.backend_caps is not None else None,
             "metadata": copy.deepcopy(norm.metadata),
@@ -769,8 +1181,21 @@ class MegatronProgram:
             layout=LayoutSpec.from_dict(payload.get("layout") or {}),
             plane_map=PlaneMapSpec.from_dict(payload.get("plane_map") or {}),
             schedule=ScheduleSpec.from_dict(payload.get("schedule") or {}),
+            batch_plan=BatchPlanSpec.from_dict(
+                payload.get("batch_plan")
+                or {
+                    "micro_batch_size": (payload.get("metadata") or {}).get("micro_batch_size", 1),
+                    "global_batch_size": (payload.get("metadata") or {}).get("global_batch_size", 16),
+                    "grad_accum_steps": (payload.get("metadata") or {}).get("grad_accum_steps"),
+                    "target_tokens_per_step": (payload.get("metadata") or {}).get("target_tokens_per_step"),
+                }
+            ),
+            strategy_ir=StrategyIRSpec.from_dict(payload.get("strategy_ir") or {}),
             constraints=ConstraintSpec.from_dict(payload.get("constraints") or {}),
             search_space=SearchSpaceSpec.from_dict(payload.get("search_space") or {}),
+            length_bucket_policies=[
+                LengthBucketPolicy.from_dict(item) for item in (payload.get("length_bucket_policies") or [])
+            ],
             machine_profile=MachineProfile.from_dict(payload.get("machine_profile") or {})
             if payload.get("machine_profile") is not None
             else None,
@@ -785,7 +1210,446 @@ class MegatronProgram:
         return _stable_hash(self.to_dict(), _PROGRAM_HASH_SALT)
 
 
+@dataclass
+class ProgramTemplate:
+    name: str
+    run_target: str
+    model_track: str
+    length_bucket: str = "default"
+    bottleneck_tags: List[str] = field(default_factory=list)
+    selection_score: Optional[float] = None
+    program: MegatronProgram = field(default_factory=MegatronProgram)
+
+    def normalized(self) -> "ProgramTemplate":
+        norm = copy.deepcopy(self)
+        norm.name = str(norm.name or "template")
+        norm.run_target = str(norm.run_target or norm.program.cluster.target or "single_g5")
+        norm.model_track = str(norm.model_track or norm.program.model.track or "dense")
+        norm.length_bucket = str(norm.length_bucket or "default")
+        norm.bottleneck_tags = [str(item) for item in (norm.bottleneck_tags or [])]
+        norm.program = norm.program.normalized()
+        if norm.selection_score is not None:
+            norm.selection_score = float(norm.selection_score)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "name": norm.name,
+            "run_target": norm.run_target,
+            "model_track": norm.model_track,
+            "length_bucket": norm.length_bucket,
+            "bottleneck_tags": list(norm.bottleneck_tags),
+            "selection_score": norm.selection_score,
+            "program": norm.program.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ProgramTemplate":
+        return cls(
+            name=str(payload.get("name", "template")),
+            run_target=str(payload.get("run_target", "single_g5")),
+            model_track=str(payload.get("model_track", "dense")),
+            length_bucket=str(payload.get("length_bucket", "default")),
+            bottleneck_tags=[str(item) for item in (payload.get("bottleneck_tags") or [])],
+            selection_score=payload.get("selection_score"),
+            program=MegatronProgram.from_dict(payload.get("program") or {}),
+        )
+
+
+@dataclass
+class ProgramBank:
+    templates: List[ProgramTemplate] = field(default_factory=list)
+
+    def normalized(self) -> "ProgramBank":
+        norm = copy.deepcopy(self)
+        norm.templates = [item.normalized() for item in (norm.templates or [])]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {"templates": [item.to_dict() for item in norm.templates]}
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ProgramBank":
+        return cls(templates=[ProgramTemplate.from_dict(item) for item in (payload.get("templates") or [])])
+
+
+PipePlan = PipeRuntimeSpec
+LocalParallelPolicy = LocalParallelSpec
+
+
+@dataclass
+class AgentObservation:
+    hardware_context: Dict[str, Any] = field(default_factory=dict)
+    backend_context: Dict[str, Any] = field(default_factory=dict)
+    model_context: Dict[str, Any] = field(default_factory=dict)
+    workload_context: Dict[str, Any] = field(default_factory=dict)
+    runtime_evidence: Dict[str, Any] = field(default_factory=dict)
+    evidence_record: Dict[str, Any] = field(default_factory=dict)
+    failure_modes: List[Dict[str, Any]] = field(default_factory=list)
+    derived_bottlenecks: List[Dict[str, Any]] = field(default_factory=list)
+    optimization_hints: List[Dict[str, Any]] = field(default_factory=list)
+    motivation_evidence_manifest: List[Dict[str, Any]] = field(default_factory=list)
+
+    def normalized(self) -> "AgentObservation":
+        norm = copy.deepcopy(self)
+        norm.hardware_context = copy.deepcopy(norm.hardware_context or {})
+        norm.backend_context = copy.deepcopy(norm.backend_context or {})
+        norm.model_context = copy.deepcopy(norm.model_context or {})
+        norm.workload_context = copy.deepcopy(norm.workload_context or {})
+        norm.runtime_evidence = copy.deepcopy(norm.runtime_evidence or {})
+        norm.evidence_record = copy.deepcopy(norm.evidence_record or {})
+        norm.failure_modes = [copy.deepcopy(item) for item in (norm.failure_modes or [])]
+        norm.derived_bottlenecks = [copy.deepcopy(item) for item in (norm.derived_bottlenecks or [])]
+        norm.optimization_hints = [copy.deepcopy(item) for item in (norm.optimization_hints or [])]
+        norm.motivation_evidence_manifest = [
+            copy.deepcopy(item) for item in (norm.motivation_evidence_manifest or [])
+        ]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "hardware_context": norm.hardware_context,
+            "backend_context": norm.backend_context,
+            "model_context": norm.model_context,
+            "workload_context": norm.workload_context,
+            "runtime_evidence": norm.runtime_evidence,
+            "evidence_record": norm.evidence_record,
+            "failure_modes": norm.failure_modes,
+            "derived_bottlenecks": norm.derived_bottlenecks,
+            "optimization_hints": norm.optimization_hints,
+            "motivation_evidence_manifest": norm.motivation_evidence_manifest,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "AgentObservation":
+        return cls(
+            hardware_context=copy.deepcopy(payload.get("hardware_context") or {}),
+            backend_context=copy.deepcopy(payload.get("backend_context") or {}),
+            model_context=copy.deepcopy(payload.get("model_context") or {}),
+            workload_context=copy.deepcopy(payload.get("workload_context") or {}),
+            runtime_evidence=copy.deepcopy(payload.get("runtime_evidence") or {}),
+            evidence_record=copy.deepcopy(payload.get("evidence_record") or {}),
+            failure_modes=[copy.deepcopy(item) for item in (payload.get("failure_modes") or [])],
+            derived_bottlenecks=[copy.deepcopy(item) for item in (payload.get("derived_bottlenecks") or [])],
+            optimization_hints=[copy.deepcopy(item) for item in (payload.get("optimization_hints") or [])],
+            motivation_evidence_manifest=[
+                copy.deepcopy(item) for item in (payload.get("motivation_evidence_manifest") or [])
+            ],
+        )
+
+
+@dataclass
+class VerifierReport:
+    is_legal: bool = True
+    legality: Dict[str, Any] = field(default_factory=dict)
+    cost: Dict[str, Any] = field(default_factory=dict)
+    diagnosis: List[str] = field(default_factory=list)
+    rejection_reason: Optional[str] = None
+    switch_cost: float = 0.0
+    next_scope_hint: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_legal": bool(self.is_legal),
+            "legality": copy.deepcopy(self.legality),
+            "cost": copy.deepcopy(self.cost),
+            "diagnosis": list(self.diagnosis),
+            "rejection_reason": self.rejection_reason,
+            "switch_cost": float(self.switch_cost),
+            "next_scope_hint": self.next_scope_hint,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VerifierReport":
+        return cls(
+            is_legal=bool(payload.get("is_legal", True)),
+            legality=copy.deepcopy(payload.get("legality") or {}),
+            cost=copy.deepcopy(payload.get("cost") or {}),
+            diagnosis=[str(item) for item in (payload.get("diagnosis") or [])],
+            rejection_reason=payload.get("rejection_reason"),
+            switch_cost=float(payload.get("switch_cost", 0.0) or 0.0),
+            next_scope_hint=payload.get("next_scope_hint"),
+        )
+
+
+@dataclass
+class AgentProposal:
+    proposal_id: str
+    scope: str
+    program: MegatronProgram = field(default_factory=MegatronProgram)
+    rationale: Optional[str] = None
+    priority_rank: int = 0
+    source: str = "heuristic"
+    verifier_report: Optional[Dict[str, Any]] = None
+
+    def normalized(self) -> "AgentProposal":
+        norm = copy.deepcopy(self)
+        norm.proposal_id = str(norm.proposal_id or "proposal")
+        norm.scope = str(norm.scope or "local")
+        norm.program = norm.program.normalized()
+        norm.rationale = str(norm.rationale).strip() if norm.rationale is not None else None
+        norm.priority_rank = int(norm.priority_rank or 0)
+        norm.source = str(norm.source or "heuristic")
+        norm.verifier_report = copy.deepcopy(norm.verifier_report) if norm.verifier_report is not None else None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "proposal_id": norm.proposal_id,
+            "scope": norm.scope,
+            "program": norm.program.to_dict(),
+            "rationale": norm.rationale,
+            "priority_rank": int(norm.priority_rank),
+            "source": norm.source,
+            "verifier_report": copy.deepcopy(norm.verifier_report),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "AgentProposal":
+        return cls(
+            proposal_id=str(payload.get("proposal_id", "proposal")),
+            scope=str(payload.get("scope", "local")),
+            program=MegatronProgram.from_dict(payload.get("program") or {}),
+            rationale=payload.get("rationale"),
+            priority_rank=int(payload.get("priority_rank", 0) or 0),
+            source=str(payload.get("source", "heuristic")),
+            verifier_report=copy.deepcopy(payload.get("verifier_report")),
+        )
+
+
+@dataclass
+class ReplanDecision:
+    trigger: str = "steady"
+    scope: str = "none"
+    rationale: str = "current context does not require replanning"
+    expected_switch_cost: float = 0.0
+    fallback_if_rejected: str = "none"
+    failure_modes: List[Dict[str, Any]] = field(default_factory=list)
+
+    def normalized(self) -> "ReplanDecision":
+        norm = copy.deepcopy(self)
+        norm.trigger = str(norm.trigger or "steady")
+        norm.scope = str(norm.scope or "none")
+        norm.rationale = str(norm.rationale or "current context does not require replanning")
+        norm.expected_switch_cost = max(float(norm.expected_switch_cost or 0.0), 0.0)
+        norm.fallback_if_rejected = str(norm.fallback_if_rejected or "none")
+        norm.failure_modes = [copy.deepcopy(item) for item in (norm.failure_modes or [])]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "trigger": norm.trigger,
+            "scope": norm.scope,
+            "rationale": norm.rationale,
+            "expected_switch_cost": float(norm.expected_switch_cost),
+            "fallback_if_rejected": norm.fallback_if_rejected,
+            "failure_modes": norm.failure_modes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ReplanDecision":
+        return cls(
+            trigger=str(payload.get("trigger", "steady")),
+            scope=str(payload.get("scope", "none")),
+            rationale=str(payload.get("rationale", "current context does not require replanning")),
+            expected_switch_cost=float(payload.get("expected_switch_cost", 0.0) or 0.0),
+            fallback_if_rejected=str(payload.get("fallback_if_rejected", "none")),
+            failure_modes=[copy.deepcopy(item) for item in (payload.get("failure_modes") or [])],
+        )
+
+
+@dataclass
+class ExperimentSpec:
+    experiment_id: str
+    category: str
+    label: str
+    objective: str
+    program_kinds: List[str] = field(default_factory=list)
+    notes: Optional[str] = None
+
+    def normalized(self) -> "ExperimentSpec":
+        norm = copy.deepcopy(self)
+        norm.experiment_id = str(norm.experiment_id or "experiment")
+        norm.category = str(norm.category or "A")
+        norm.label = str(norm.label or norm.experiment_id)
+        norm.objective = str(norm.objective or "study")
+        norm.program_kinds = [str(item) for item in (norm.program_kinds or [])]
+        norm.notes = str(norm.notes).strip() if norm.notes is not None else None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "experiment_id": norm.experiment_id,
+            "category": norm.category,
+            "label": norm.label,
+            "objective": norm.objective,
+            "program_kinds": list(norm.program_kinds),
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ExperimentSpec":
+        return cls(
+            experiment_id=str(payload.get("experiment_id", "experiment")),
+            category=str(payload.get("category", "A")),
+            label=str(payload.get("label", payload.get("experiment_id", "experiment"))),
+            objective=str(payload.get("objective", "study")),
+            program_kinds=[str(item) for item in (payload.get("program_kinds") or [])],
+            notes=payload.get("notes"),
+        )
+
+
+def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
+    norm = copy.deepcopy(program)
+    strategy_ir = norm.strategy_ir.normalized() if hasattr(norm, "strategy_ir") else StrategyIRSpec()
+    if strategy_ir.apipe and strategy_ir.placement and strategy_ir.local_parallel:
+        return strategy_ir.normalized()
+
+    total_layers = max(int(norm.model.num_layers), 1)
+    logical_group_size = max(int(norm.cluster.world_size) // max(int(norm.parallel.pp_degree), 1), 1)
+    attention_boundary = max(total_layers // 3, 1)
+    decoder_cursor = 0
+    apipe: List[SubgraphSpec] = []
+    placement: List[PlacementEntrySpec] = []
+    local_parallel: List[LocalParallelSpec] = []
+    stage_device_counts = list(norm.layout.stage_device_counts or [])
+    if len(stage_device_counts) < len(norm.partition.stages):
+        stage_device_counts.extend([logical_group_size] * (len(norm.partition.stages) - len(stage_device_counts)))
+
+    for stage_index, stage in enumerate(norm.partition.stages):
+        decoder_layers = max(int(stage.decoder_layers), 0)
+        decoder_start = decoder_cursor
+        decoder_end = decoder_cursor + max(decoder_layers - 1, 0)
+        decoder_cursor += decoder_layers
+        has_embedding = "E" in set(stage.special_tokens or [])
+        has_loss = "L" in set(stage.special_tokens or [])
+        if has_embedding and has_loss:
+            module_family = "embedding_decoder_loss"
+        elif has_embedding:
+            module_family = "embedding_decoder"
+        elif has_loss:
+            module_family = "decoder_loss"
+        else:
+            module_family = "decoder"
+        stage_name = f"subg_stage_{stage_index}"
+        attention_heavy = decoder_layers > 0 and decoder_start <= attention_boundary
+        apipe.append(
+            SubgraphSpec(
+                name=stage_name,
+                stage_index=stage_index,
+                decoder_start=decoder_start,
+                decoder_end=decoder_end,
+                module_family=module_family,
+                special_tokens=list(stage.special_tokens),
+                attention_heavy=attention_heavy,
+                loss_heavy=has_loss,
+            )
+        )
+        nodes = [str(norm.layout.stage_to_node[stage_index])] if stage_index < len(norm.layout.stage_to_node) else []
+        placement.append(
+            PlacementEntrySpec(
+                subgraph=stage_name,
+                nodes=nodes,
+                device_group_size=max(int(stage_device_counts[stage_index]), 1),
+                device_type=str(norm.machine_profile.device_class if norm.machine_profile is not None else "gpu"),
+                topology_domain="intra_node" if len(set(nodes)) <= 1 else "cross_node_ib",
+            )
+        )
+        local_parallel.append(
+            LocalParallelSpec(
+                subgraph=stage_name,
+                vpp_degree=max(int(norm.parallel.vpp_degree), 1),
+                cp_degree=max(int(norm.parallel.cp_degree), 1),
+                fsdp_scope=str((norm.metadata or {}).get("local_fsdp_scope") or "none"),
+                device_group_size=max(int(stage_device_counts[stage_index]), 1),
+                device_group_type=str(norm.machine_profile.device_class if norm.machine_profile is not None else "gpu"),
+            )
+        )
+
+    strategy_ir = StrategyIRSpec(
+        apipe=apipe,
+        placement=placement,
+        local_parallel=local_parallel,
+        pipe=PipeRuntimeSpec(
+            template=str(norm.schedule.template),
+            microbatch_order=str(norm.schedule.dispatch_order),
+            steady_state_group_size=norm.schedule.microbatch_group_size_per_vp_stage,
+            warmup_policy="default",
+            cooldown_policy="default",
+        ),
+    )
+    return strategy_ir.normalized()
+
+
+def _target_node_speed_map(target: str, nodes: List[str]) -> Dict[str, float]:
+    if str(target) == "dual_g4_g5":
+        return {str(node): (1.18 if str(node) == "g5" else 1.0) for node in nodes}
+    return {str(node): 1.0 for node in nodes}
+
+
+def default_grouped_stage_to_node(target: str, pp_degree: int) -> List[str]:
+    target_name = str(target)
+    degree = max(int(pp_degree), 1)
+    if target_name == "dual_g4_g5":
+        first_count = max(degree // 2, 1)
+        return ["g4"] * first_count + ["g5"] * max(degree - first_count, 0)
+    if target_name == "dual_g5_g5":
+        first_count = max(degree // 2, 1)
+        return ["g5_0"] * first_count + ["g5_1"] * max(degree - first_count, 0)
+    node_name = "g4" if target_name == "single_g4" else "g5"
+    return [node_name] * degree
+
+
+def weighted_stage_layer_allocation(target: str, num_layers: int, stage_to_node: List[str]) -> List[int]:
+    total_layers = max(int(num_layers), 0)
+    stages = [str(node) for node in (stage_to_node or [])]
+    if total_layers <= 0 or not stages:
+        return []
+    if total_layers < len(stages):
+        layers = [1] * total_layers + [0] * (len(stages) - total_layers)
+        return layers
+
+    speed_map = _target_node_speed_map(str(target), stages)
+    weights: List[float] = []
+    last_index = len(stages) - 1
+    for index, node in enumerate(stages):
+        weight = max(float(speed_map.get(node, 1.0)), 0.1)
+        if index == 0:
+            weight *= 0.82
+        elif index == last_index:
+            weight *= 0.95
+        elif len(stages) > 3 and index in {1, last_index - 1}:
+            weight *= 1.04
+        weights.append(weight)
+
+    base = [1] * len(stages)
+    remaining = total_layers - len(stages)
+    if remaining <= 0:
+        return base
+
+    total_weight = max(sum(weights), 1e-6)
+    fractional = [remaining * (weight / total_weight) for weight in weights]
+    allocated = [int(value) for value in fractional]
+    residual = remaining - sum(allocated)
+    order = sorted(
+        range(len(fractional)),
+        key=lambda index: (fractional[index] - allocated[index], weights[index], -index),
+        reverse=True,
+    )
+    for index in order[:residual]:
+        allocated[index] += 1
+    return [base[index] + allocated[index] for index in range(len(stages))]
+
+
 def default_cluster_spec(target: str) -> ClusterSpec:
+    if str(target) == "dual_g5_g5":
+        return ClusterSpec(target="dual_g5_g5", nodes=["g5_0", "g5_1"], gpus_per_node=8)
     if str(target) == "dual_g4_g5":
         return ClusterSpec(target="dual_g4_g5", nodes=["g4", "g5"], gpus_per_node=8)
     if str(target) == "single_g4":
@@ -794,6 +1658,18 @@ def default_cluster_spec(target: str) -> ClusterSpec:
 
 
 def default_machine_profile(target: str) -> MachineProfile:
+    if str(target) == "dual_g5_g5":
+        return MachineProfile(
+            name="dual_node_5090d_pair",
+            device_class="consumer_gpu",
+            device_memory_gb=32,
+            interconnect_class="cross_node_consumer",
+            communication_sensitivity="high",
+            prefer_small_tp=True,
+            prefer_pp_for_scaling=True,
+            supports_te_path=True,
+            notes="homogeneous dual-node 5090D profile with node-local TP preference and grouped PP scaling",
+        )
     if str(target) == "single_g4":
         return MachineProfile(
             name="consumer_single_node_4090d",
@@ -858,13 +1734,79 @@ def default_backend_caps(transformer_impl: str = "local") -> BackendCaps:
     )
 
 
+def default_length_bucket_policies() -> List[LengthBucketPolicy]:
+    return [
+        LengthBucketPolicy(
+            name="short",
+            min_seq_len=1,
+            max_seq_len=1024,
+            preferred_program_kind="pp_first",
+            cp_cap=1,
+            micro_batch_cap=2,
+            schedule_templates=["fixed_1f1b", "interleaved_grouped_g2"],
+        ),
+        LengthBucketPolicy(
+            name="mid",
+            min_seq_len=1025,
+            max_seq_len=2048,
+            preferred_program_kind="pp_vpp",
+            cp_cap=1,
+            micro_batch_cap=1,
+            schedule_templates=["interleaved_grouped_g2", "pp4_frontload"],
+        ),
+        LengthBucketPolicy(
+            name="long",
+            min_seq_len=2049,
+            max_seq_len=4096,
+            preferred_program_kind="pp_vpp_cp",
+            cp_cap=2,
+            micro_batch_cap=1,
+            schedule_templates=["interleaved_grouped_g4", "pp4_middle_relief"],
+        ),
+        LengthBucketPolicy(
+            name="xlong",
+            min_seq_len=4097,
+            max_seq_len=None,
+            preferred_program_kind="memory_relief",
+            cp_cap=2,
+            micro_batch_cap=1,
+            schedule_templates=["pp4_middle_relief"],
+        ),
+    ]
+
+
 def default_dense_program(target: str = "single_g5") -> MegatronProgram:
     cluster = default_cluster_spec(target)
-    parallel = MegatronParallelSpec(tp_degree=4, pp_degree=1, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=True)
+    parallel = MegatronParallelSpec(tp_degree=2, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=False)
+    memory_budget = float(default_machine_profile(target).device_memory_gb or 24)
+    batch_plan = BatchPlanSpec(
+        micro_batch_size=1,
+        global_batch_size=16,
+        grad_accum_steps=8,
+        target_tokens_per_step=16 * 1024,
+    )
     partition = PartitionSpec(stages=[PartitionStageSpec(decoder_layers=40, special_tokens=["E", "L"])])
     layout = LayoutSpec(stage_to_node=[cluster.nodes[-1]], vpp_degree=1)
+    if target == "dual_g5_g5":
+        parallel = MegatronParallelSpec(tp_degree=4, pp_degree=4, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=False)
+        stage_to_node = default_grouped_stage_to_node(target, parallel.pp_degree)
+        stage_layers = weighted_stage_layer_allocation(target, 40, stage_to_node)
+        partition = PartitionSpec(
+            stages=[
+                PartitionStageSpec(decoder_layers=stage_layers[index], special_tokens=(["E"] if index == 0 else []) + (["L"] if index == len(stage_layers) - 1 else []))
+                for index in range(len(stage_layers))
+            ]
+        )
+        layout = LayoutSpec(stage_to_node=stage_to_node, vpp_degree=1)
+    if target == "single_g5":
+        partition = PartitionSpec(
+            stages=[
+                PartitionStageSpec(decoder_layers=20, special_tokens=["E"]),
+                PartitionStageSpec(decoder_layers=20, special_tokens=["L"]),
+            ]
+        )
+        layout = LayoutSpec(stage_to_node=["g5", "g5"], vpp_degree=1)
     if target == "single_g4":
-        parallel = MegatronParallelSpec(tp_degree=2, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=True)
         partition = PartitionSpec(
             stages=[
                 PartitionStageSpec(decoder_layers=20, special_tokens=["E"]),
@@ -873,14 +1815,16 @@ def default_dense_program(target: str = "single_g5") -> MegatronProgram:
         )
         layout = LayoutSpec(stage_to_node=["g4", "g4"], vpp_degree=1)
     if target == "dual_g4_g5":
-        parallel = MegatronParallelSpec(tp_degree=2, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=True)
+        parallel = MegatronParallelSpec(tp_degree=4, pp_degree=4, vpp_degree=1, cp_degree=1, ep_degree=1, sp_enabled=False)
+        stage_to_node = default_grouped_stage_to_node(target, parallel.pp_degree)
+        stage_layers = weighted_stage_layer_allocation(target, 40, stage_to_node)
         partition = PartitionSpec(
             stages=[
-                PartitionStageSpec(decoder_layers=20, special_tokens=["E"]),
-                PartitionStageSpec(decoder_layers=20, special_tokens=["L"]),
+                PartitionStageSpec(decoder_layers=stage_layers[index], special_tokens=(["E"] if index == 0 else []) + (["L"] if index == len(stage_layers) - 1 else []))
+                for index in range(len(stage_layers))
             ]
         )
-        layout = LayoutSpec(stage_to_node=["g4", "g5"], vpp_degree=1)
+        layout = LayoutSpec(stage_to_node=stage_to_node, vpp_degree=1)
     return MegatronProgram(
         cluster=cluster,
         model=ModelSpec(track="dense", model_name="qwen3_14b", num_layers=40),
@@ -892,9 +1836,11 @@ def default_dense_program(target: str = "single_g5") -> MegatronProgram:
             moe=None,
             enabled=False,
         ),
-        schedule=ScheduleSpec(),
-        constraints=ConstraintSpec(required_node_local_axes=["tp"]),
+        schedule=ScheduleSpec(template="fixed_1f1b"),
+        batch_plan=batch_plan,
+        constraints=ConstraintSpec(required_node_local_axes=["tp"], memory_budget_gb=memory_budget),
         search_space=SearchSpaceSpec(),
+        length_bucket_policies=default_length_bucket_policies(),
         machine_profile=default_machine_profile(target),
         backend_caps=default_backend_caps("local"),
         metadata={"program_kind": "baseline_dense"},
@@ -903,11 +1849,36 @@ def default_dense_program(target: str = "single_g5") -> MegatronProgram:
 
 def default_moe_smoke_program(target: str = "single_g5") -> MegatronProgram:
     cluster = default_cluster_spec(target)
-    parallel = MegatronParallelSpec(tp_degree=2, pp_degree=1, vpp_degree=1, cp_degree=1, ep_degree=2, expert_tp_degree=1, sp_enabled=True)
+    parallel = MegatronParallelSpec(tp_degree=1, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=2, expert_tp_degree=1, sp_enabled=False)
+    memory_budget = float(default_machine_profile(target).device_memory_gb or 24)
+    batch_plan = BatchPlanSpec(
+        micro_batch_size=1,
+        global_batch_size=8,
+        grad_accum_steps=4,
+        target_tokens_per_step=8 * 512,
+    )
     partition = PartitionSpec(stages=[PartitionStageSpec(decoder_layers=8, special_tokens=["E", "L"])])
     layout = LayoutSpec(stage_to_node=[cluster.nodes[-1]], vpp_degree=1)
+    if target == "dual_g5_g5":
+        parallel = MegatronParallelSpec(tp_degree=2, pp_degree=4, vpp_degree=1, cp_degree=1, ep_degree=2, expert_tp_degree=1, sp_enabled=False)
+        stage_to_node = default_grouped_stage_to_node(target, parallel.pp_degree)
+        stage_layers = weighted_stage_layer_allocation(target, 8, stage_to_node)
+        partition = PartitionSpec(
+            stages=[
+                PartitionStageSpec(decoder_layers=stage_layers[index], special_tokens=(["E"] if index == 0 else []) + (["L"] if index == len(stage_layers) - 1 else []))
+                for index in range(len(stage_layers))
+            ]
+        )
+        layout = LayoutSpec(stage_to_node=stage_to_node, vpp_degree=1)
+    if target == "single_g5":
+        partition = PartitionSpec(
+            stages=[
+                PartitionStageSpec(decoder_layers=4, special_tokens=["E"]),
+                PartitionStageSpec(decoder_layers=4, special_tokens=["L"]),
+            ]
+        )
+        layout = LayoutSpec(stage_to_node=["g5", "g5"], vpp_degree=1)
     if target == "single_g4":
-        parallel = MegatronParallelSpec(tp_degree=1, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=2, expert_tp_degree=1, sp_enabled=False)
         partition = PartitionSpec(
             stages=[
                 PartitionStageSpec(decoder_layers=4, special_tokens=["E"]),
@@ -916,7 +1887,6 @@ def default_moe_smoke_program(target: str = "single_g5") -> MegatronProgram:
         )
         layout = LayoutSpec(stage_to_node=["g4", "g4"], vpp_degree=1)
     if target == "dual_g4_g5":
-        parallel = MegatronParallelSpec(tp_degree=1, pp_degree=2, vpp_degree=1, cp_degree=1, ep_degree=2, expert_tp_degree=1, sp_enabled=False)
         partition = PartitionSpec(
             stages=[
                 PartitionStageSpec(decoder_layers=4, special_tokens=["E"]),
@@ -940,11 +1910,13 @@ def default_moe_smoke_program(target: str = "single_g5") -> MegatronProgram:
         plane_map=PlaneMapSpec(
             attention=PlaneParallelSpec(tp_degree=max(parallel.tp_degree, 1), cp_degree=parallel.cp_degree),
             moe=PlaneParallelSpec(tp_degree=1, cp_degree=1, ep_degree=parallel.ep_degree, expert_tp_degree=parallel.expert_tp_degree),
-            enabled=True,
+            enabled=False,
         ),
-        schedule=ScheduleSpec(),
-        constraints=ConstraintSpec(required_node_local_axes=["tp", "ep"]),
+        schedule=ScheduleSpec(template="fixed_1f1b"),
+        batch_plan=batch_plan,
+        constraints=ConstraintSpec(required_node_local_axes=["tp", "ep"], memory_budget_gb=memory_budget),
         search_space=SearchSpaceSpec(),
+        length_bucket_policies=default_length_bucket_policies(),
         machine_profile=default_machine_profile(target),
         backend_caps=default_backend_caps("local"),
         metadata={"program_kind": "baseline_moe_smoke"},

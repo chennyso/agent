@@ -336,7 +336,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         param_in_param_group_index = {}
         for i, group in enumerate(self.param_groups):
             for p_id, param in enumerate(group["params"]):
-                inner_param = self.param_to_inner_param[param]
+                # DistributedOptimizer can rebuild param groups with inner/shard
+                # params directly, so tolerate both the original param objects
+                # and already-materialized inner params here.
+                if param in self.param_to_inner_param:
+                    inner_param = self.param_to_inner_param[param]
+                elif param in self.inner_param_to_orig_param:
+                    inner_param = param
+                else:
+                    inner_param = param
                 param_in_param_group_index[inner_param] = (i, p_id)
 
         for optimizer in self.sub_optimizers:
@@ -346,7 +354,40 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 # After sync-up the sub-optimizer last update, we need to sync-up the
                 # HDO new param_groups attributes to the sub-optimizer.
                 assert len(group["params"]) > 0, "param_groups should not be empty"
-                group_id, _ = param_in_param_group_index[group["params"][0]]
+                group_ref = None
+                for param in group["params"]:
+                    if param in param_in_param_group_index:
+                        group_ref = param
+                        break
+
+                    orig_param = self.inner_param_to_orig_param.get(param)
+                    if orig_param is not None:
+                        mapped_param = self.param_to_inner_param.get(orig_param, orig_param)
+                        if mapped_param in param_in_param_group_index:
+                            group_ref = mapped_param
+                            break
+
+                    for candidate in param_in_param_group_index:
+                        if (
+                            candidate.shape == param.shape
+                            and candidate.dtype == param.dtype
+                            and candidate.device == param.device
+                            and candidate.data_ptr() == param.data_ptr()
+                        ):
+                            group_ref = candidate
+                            break
+                    if group_ref is not None:
+                        break
+
+                # Some distributed-offload combinations rebuild param groups
+                # with tensor wrappers that no longer match the original keys.
+                # In that case, keep the existing group attributes rather than
+                # crashing during optimizer.step().
+                if group_ref is None:
+                    new_param_groups.append(new_group)
+                    continue
+
+                group_id, _ = param_in_param_group_index[group_ref]
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
                 new_group.update(update_group_attrs)

@@ -2125,11 +2125,20 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            mfu = None
+            if getattr(args, 'gpu_peak_tflops', None):
+                if args.gpu_peak_tflops > 0:
+                    mfu = 100.0 * throughput / args.gpu_peak_tflops
+                    log_string += f' MFU (%): {mfu:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    if mfu is not None:
+                        writer.add_scalar('mfu_percent', mfu, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
+                    if mfu is not None:
+                        wandb_writer.log({'mfu_percent': mfu}, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration

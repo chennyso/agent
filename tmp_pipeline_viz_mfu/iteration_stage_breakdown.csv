@@ -1,0 +1,2 @@
+iteration,timestamp,elapsed_ms,throughput_tflops_per_gpu,mfu_percent,learning_rate,lm_loss,global_batch_size,batch-generator,forward-compute,backward-compute,embedding-grads-all-reduce,all-grads-sync,optimizer-copy-to-main-grad,optimizer-inner-step,optimizer-copy-main-to-model-params,batch-generator,forward-backward,optimizer,other_detailed,other_macro
+20,2026-03-24 09:22:22.430606,4673.3,37.3,17.8,1e-05,12.92848,16,18.6,1567.82,1811.55,0.02,4.83,0.36,1246.45,7.78,18.6,3407.22,1255.72,15.890000000000327,0.0

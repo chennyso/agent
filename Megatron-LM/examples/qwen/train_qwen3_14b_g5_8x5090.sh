@@ -6,6 +6,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export MEGATRON_SKIP_LEGACY_FUSED_KERNELS=${MEGATRON_SKIP_LEGACY_FUSED_KERNELS:-0}
 
 RUN_TARGET=${RUN_TARGET:-single_g5}
 MODEL_TRACK=${MODEL_TRACK:-dense}
@@ -13,12 +14,12 @@ PRESET=${PRESET:-auto}
 
 if [[ "$PRESET" == "safe_single_node" ]]; then
   MODEL_TRACK="dense"
-  if [[ "$RUN_TARGET" == "dual_g4_g5" ]]; then
+  if [[ "$RUN_TARGET" == "dual_g4_g5" || "$RUN_TARGET" == "dual_g5_g5" ]]; then
     RUN_TARGET="single_g5"
   fi
 elif [[ "$PRESET" == "vpp_research" ]]; then
   MODEL_TRACK="dense"
-  if [[ "$RUN_TARGET" == "dual_g4_g5" ]]; then
+  if [[ "$RUN_TARGET" == "dual_g4_g5" || "$RUN_TARGET" == "dual_g5_g5" ]]; then
     RUN_TARGET="single_g5"
   fi
 fi
@@ -26,6 +27,8 @@ fi
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_NODES=${NUM_NODES:-1}
 if [[ "$RUN_TARGET" == "dual_g4_g5" ]]; then
+  NUM_NODES=${NUM_NODES:-2}
+elif [[ "$RUN_TARGET" == "dual_g5_g5" ]]; then
   NUM_NODES=${NUM_NODES:-2}
 fi
 NODE_RANK=${NODE_RANK:-0}
@@ -93,6 +96,7 @@ MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-}
 NUM_LAYERS=${NUM_LAYERS:-}
 PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-}
 SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-}
+SCHEDULE_TEMPLATE=${SCHEDULE_TEMPLATE:-fixed_1f1b}
 NUM_LAYERS_PER_VIRTUAL_STAGE=${NUM_LAYERS_PER_VIRTUAL_STAGE:-}
 
 MOE_NUM_EXPERTS=${MOE_NUM_EXPERTS:-4}
@@ -152,14 +156,17 @@ append_if_enabled() {
 
 if [[ "$MODEL_TRACK" == "dense" ]]; then
   if [[ "$RUN_TARGET" == "dual_g4_g5" ]]; then
-    TP_SIZE=${TP_SIZE:-2}
-    PP_SIZE=${PP_SIZE:-2}
+    TP_SIZE=${TP_SIZE:-4}
+    PP_SIZE=${PP_SIZE:-4}
+  elif [[ "$RUN_TARGET" == "dual_g5_g5" ]]; then
+    TP_SIZE=${TP_SIZE:-4}
+    PP_SIZE=${PP_SIZE:-4}
   elif [[ "$RUN_TARGET" == "single_g4" ]]; then
     TP_SIZE=${TP_SIZE:-2}
     PP_SIZE=${PP_SIZE:-2}
   else
-    TP_SIZE=${TP_SIZE:-4}
-    PP_SIZE=${PP_SIZE:-1}
+    TP_SIZE=${TP_SIZE:-2}
+    PP_SIZE=${PP_SIZE:-2}
   fi
   NUM_LAYERS=${NUM_LAYERS:-40}
   SEQ_LENGTH=${SEQ_LENGTH:-1024}
@@ -170,12 +177,15 @@ elif [[ "$MODEL_TRACK" == "moe" ]]; then
   if [[ "$RUN_TARGET" == "dual_g4_g5" ]]; then
     TP_SIZE=${TP_SIZE:-1}
     PP_SIZE=${PP_SIZE:-2}
+  elif [[ "$RUN_TARGET" == "dual_g5_g5" ]]; then
+    TP_SIZE=${TP_SIZE:-2}
+    PP_SIZE=${PP_SIZE:-4}
   elif [[ "$RUN_TARGET" == "single_g4" ]]; then
     TP_SIZE=${TP_SIZE:-1}
     PP_SIZE=${PP_SIZE:-2}
   else
-    TP_SIZE=${TP_SIZE:-2}
-    PP_SIZE=${PP_SIZE:-1}
+    TP_SIZE=${TP_SIZE:-1}
+    PP_SIZE=${PP_SIZE:-2}
   fi
   EP_SIZE=${EP_SIZE:-2}
   EXPERT_TP_SIZE=${EXPERT_TP_SIZE:-1}
@@ -225,6 +235,10 @@ if [[ "$RUN_TARGET" == "single_g5" ]] && (( NUM_NODES != 1 )); then
 fi
 if [[ "$RUN_TARGET" == "dual_g4_g5" ]] && (( NUM_NODES < 2 )); then
   echo "dual_g4_g5 target requires NUM_NODES>=2"
+  exit 1
+fi
+if [[ "$RUN_TARGET" == "dual_g5_g5" ]] && (( NUM_NODES < 2 )); then
+  echo "dual_g5_g5 target requires NUM_NODES>=2"
   exit 1
 fi
 
@@ -336,9 +350,11 @@ TRAINING_ARGS=(
   --adam-eps 1.0e-8
   --calculate-per-token-loss
   --use-distributed-optimizer
-  --overlap-grad-reduce
-  --overlap-param-gather
-)
+  --optimizer-cpu-offload
+  --optimizer-offload-fraction 1.0
+  --use-precision-aware-optimizer
+  --use-torch-optimizer-for-cpu-offload
+  )
 if [[ "$USE_BF16" == "1" ]]; then
   TRAINING_ARGS+=(--bf16)
 elif [[ "$USE_FP16" == "1" ]]; then
@@ -430,6 +446,9 @@ fi
 if (( ENABLE_LOG_TIMERS_TO_TENSORBOARD > 0 )); then
   LOGGING_ARGS+=(--log-timers-to-tensorboard)
 fi
+if [[ -n "${GPU_PEAK_TFLOPS:-}" ]]; then
+  LOGGING_ARGS+=(--gpu-peak-tflops "$GPU_PEAK_TFLOPS")
+fi
 if (( ENABLE_LOG_MEMORY_TO_TENSORBOARD > 0 )); then
   LOGGING_ARGS+=(--log-memory-to-tensorboard)
 fi
@@ -474,8 +493,11 @@ echo "  PRECISION=${PRECISION_NAME}"
 echo "  WORLD_SIZE=${WORLD_SIZE} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} CP=${CP_SIZE} EP=${EP_SIZE} ETP=${EXPERT_TP_SIZE}"
 echo "  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-<none>}"
 echo "  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-<none>}"
+echo "  SCHEDULE_TEMPLATE=${SCHEDULE_TEMPLATE}"
 echo "  ENABLE_PLANE_MAP=${ENABLE_PLANE_MAP} ATTN_TP=${ATTENTION_TP_SIZE} ATTN_CP=${ATTENTION_CP_SIZE} MOE_EP=${MOE_EP_SIZE} MOE_ETP=${MOE_EXPERT_TP_SIZE}"
 echo "  OBSERVABILITY_PRESET=${OBSERVABILITY_PRESET} PROFILE=${ENABLE_PROFILE} PYTORCH_PROFILER=${ENABLE_PYTORCH_PROFILER} STRAGGLER=${ENABLE_STRAGGLER_LOG} MEMORY_HISTORY=${ENABLE_MEMORY_HISTORY} NSYS=${ENABLE_NSYS}"
+echo "  GPU_PEAK_TFLOPS=${GPU_PEAK_TFLOPS:-<none>}"
+echo "  MEGATRON_SKIP_LEGACY_FUSED_KERNELS=${MEGATRON_SKIP_LEGACY_FUSED_KERNELS}"
 echo "  TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH}"
 echo "  TORCH_PROFILE_PATH=$(dirname "$TENSORBOARD_LOGS_PATH")/torch_profile"
 echo "  MEMORY_SNAPSHOT_PATH=${MEMORY_SNAPSHOT_PATH}"

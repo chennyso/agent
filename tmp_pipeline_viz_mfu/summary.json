@@ -1,0 +1,23 @@
+{
+  "iterations": 1,
+  "iteration_range": [
+    20,
+    20
+  ],
+  "avg_elapsed_ms": 4673.3,
+  "avg_throughput_tflops_per_gpu": 37.3,
+  "avg_mfu_percent": 17.8,
+  "avg_lm_loss": 12.92848,
+  "stage_avg_ms": {
+    "batch-generator": 18.6,
+    "forward-compute": 1567.82,
+    "backward-compute": 1811.55,
+    "embedding-grads-all-reduce": 0.02,
+    "all-grads-sync": 4.83,
+    "optimizer-copy-to-main-grad": 0.36,
+    "optimizer-inner-step": 1246.45,
+    "optimizer-copy-main-to-model-params": 7.78,
+    "forward-backward": 3407.22,
+    "optimizer": 1255.72
+  }
+}

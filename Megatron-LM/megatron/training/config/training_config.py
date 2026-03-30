@@ -208,6 +208,9 @@ class LoggerConfig:
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
+    gpu_peak_tflops: float | None = None
+    """Peak per-GPU TFLOP/s used to normalize throughput into MFU percentage."""
+
     log_throughput_to_tensorboard: bool = False
     """Enable throughput logging to tensorboard."""
 

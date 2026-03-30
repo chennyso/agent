@@ -10,11 +10,15 @@ import copy
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig
+from torchtitan.config.configs import ActivationCheckpointConfig, ParallelismConfig
 from torchtitan.tools.logging import logger
-from torchtitan.trainer import Trainer
+
+if TYPE_CHECKING:
+    from torchtitan.trainer import Trainer
+else:
+    Trainer = Any
 
 
 def _ensure_int(value: Any, context: str, *, min_value: int = 0) -> int:
@@ -166,17 +170,35 @@ def apply_hybrid_policy(
             )
     else:
         fsdp_enabled = bool(fsdp2.get("enabled", False))
+    explicit_dp_replicate = fsdp2.get("replicate_degree")
+    if explicit_dp_replicate is not None:
+        cfg.parallelism.data_parallel_replicate_degree = _ensure_int(
+            explicit_dp_replicate,
+            "hybrid_policy.fsdp2.replicate_degree",
+            min_value=1,
+        )
+    explicit_dp_shard = fsdp2.get("shard_degree")
     if fsdp_enabled:
-        current_dp_shard = int(cfg.parallelism.data_parallel_shard_degree)
-        if current_dp_shard <= 1:
-            cfg.parallelism.data_parallel_shard_degree = -1
-            logger.info(
-                "hybrid_policy enabled FSDP2 without explicit shard degree; "
-                "using inferred data_parallel_shard_degree from world_size / (pp * tp * cp)"
+        if explicit_dp_shard is not None:
+            cfg.parallelism.data_parallel_shard_degree = _ensure_int(
+                explicit_dp_shard,
+                "hybrid_policy.fsdp2.shard_degree",
+                min_value=1,
             )
         else:
-            cfg.parallelism.data_parallel_shard_degree = max(1, current_dp_shard)
+            current_dp_shard = int(cfg.parallelism.data_parallel_shard_degree)
+            if current_dp_shard <= 1:
+                cfg.parallelism.data_parallel_shard_degree = -1
+                logger.info(
+                    "hybrid_policy enabled FSDP2 without explicit shard degree; "
+                    "using inferred data_parallel_shard_degree from world_size / (pp * tp * cp)"
+                )
+            else:
+                cfg.parallelism.data_parallel_shard_degree = max(1, current_dp_shard)
     else:
+        cfg.parallelism.data_parallel_replicate_degree = max(
+            1, int(cfg.parallelism.data_parallel_replicate_degree)
+        )
         cfg.parallelism.data_parallel_shard_degree = 1
 
     reshard_per_stage = fsdp2.get("reshard_after_forward_per_stage")

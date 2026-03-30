@@ -6,17 +6,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from megatron_agent.config import (
+    AgentObservation,
+    AgentProposal,
     BackendCaps,
+    BatchPlanSpec,
     ConstraintRuleSpec,
+    ExperimentSpec,
+    ProgramBank,
+    ProgramTemplate,
+    ReplanDecision,
     MachineProfile,
     MegatronProgram,
     SearchSpaceSpec,
+    VerifierReport,
     default_backend_caps,
     default_dense_program,
+    default_grouped_stage_to_node,
+    default_length_bucket_policies,
     default_machine_profile,
     default_moe_smoke_program,
+    weighted_stage_layer_allocation,
 )
-from megatron_agent.programs import check_program, classify_program_family, compile_program
+from megatron_agent.programs import (
+    assess_vpp_comm_tradeoff,
+    check_program,
+    classify_program_family,
+    compile_program,
+    estimate_program_memory,
+    verify_program,
+)
+from megatron_agent.trace_reducer import (
+    build_agent_observation,
+    build_context_record,
+    build_trial_artifact,
+    build_program_bank,
+    classify_bottleneck,
+    detect_failure_modes,
+    reduce_trial_trace,
+    select_program_templates,
+)
 from megatron_agent.trial_runner import (
     DEFAULT_DATA_PATH,
     DEFAULT_LAUNCHER_SCRIPT,
@@ -29,6 +57,145 @@ from megatron_agent.trial_runner import (
 
 def _clone_program(program: MegatronProgram) -> MegatronProgram:
     return MegatronProgram.from_dict(program.to_dict())
+
+
+def _data_parallel_size(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    product = (
+        int(norm.parallel.tp_degree)
+        * int(norm.parallel.pp_degree)
+        * int(norm.parallel.cp_degree)
+        * int(norm.parallel.ep_degree)
+        * int(norm.parallel.expert_tp_degree)
+    )
+    if product <= 0:
+        return 1
+    return max(int(norm.cluster.world_size) // product, 1)
+
+
+def _resolved_grad_accum_steps(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    if norm.batch_plan.grad_accum_steps is not None:
+        return max(int(norm.batch_plan.grad_accum_steps), 1)
+    denom = max(int(norm.batch_plan.micro_batch_size) * _data_parallel_size(norm), 1)
+    return max(int(norm.batch_plan.global_batch_size) // denom, 1)
+
+
+def _sync_batch_plan_metadata(program: MegatronProgram) -> MegatronProgram:
+    candidate = _clone_program(program)
+    candidate.batch_plan.grad_accum_steps = _resolved_grad_accum_steps(candidate)
+    candidate.metadata["micro_batch_size"] = int(candidate.batch_plan.micro_batch_size)
+    candidate.metadata["global_batch_size"] = int(candidate.batch_plan.global_batch_size)
+    candidate.metadata["grad_accum_steps"] = int(candidate.batch_plan.grad_accum_steps or 1)
+    if candidate.batch_plan.target_tokens_per_step is None:
+        candidate.batch_plan.target_tokens_per_step = (
+            int(candidate.batch_plan.global_batch_size) * int(candidate.metadata.get("seq_len", 1024) or 1024)
+        )
+    candidate.metadata["target_tokens_per_step"] = int(candidate.batch_plan.target_tokens_per_step or 0)
+    candidate.strategy_ir.pipe.template = str(candidate.schedule.template)
+    candidate.strategy_ir.pipe.microbatch_order = str(candidate.schedule.dispatch_order)
+    candidate.strategy_ir.pipe.steady_state_group_size = candidate.schedule.microbatch_group_size_per_vp_stage
+    local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
+    for subgraph in candidate.strategy_ir.apipe:
+        entry = local_by_name.get(subgraph.name)
+        if entry is None:
+            continue
+        entry.vpp_degree = max(int(candidate.parallel.vpp_degree), 1)
+        entry.cp_degree = max(entry.cp_degree, int(candidate.parallel.cp_degree))
+    return candidate.normalized()
+
+
+def _virtual_stage_layout(decoder_layers: List[int]) -> str:
+    tokens_per_stage: List[str] = []
+    total = len(decoder_layers)
+    for index, layers in enumerate(decoder_layers):
+        prefix = "E" if index == 0 else ""
+        suffix = "L" if index == total - 1 else ""
+        tokens_per_stage.append(f"{prefix}{'t' * max(int(layers), 0)}{suffix}")
+    return "|".join(tokens_per_stage)
+
+
+def _pp_vpp_layout_counts(pp_degree: int, num_layers: int, template: str) -> Optional[List[int]]:
+    if int(pp_degree) == 2 and int(num_layers) == 40:
+        if template == "interleaved_grouped_g2":
+            return [8, 12, 12, 8]
+        return [10, 10, 10, 10]
+    if int(pp_degree) == 4 and int(num_layers) == 40:
+        if template == "pp4_middle_relief":
+            return [6, 4, 4, 6, 6, 4, 4, 6]
+        if template in {"pp4_frontload", "interleaved_grouped_g4"}:
+            return [4, 6, 6, 4, 4, 6, 6, 4]
+        return [5, 5, 5, 5, 5, 5, 5, 5]
+    total_virtual = int(pp_degree) * 2
+    if total_virtual <= 0 or int(num_layers) % total_virtual != 0:
+        return None
+    return [int(num_layers) // total_virtual] * total_virtual
+
+
+def _set_schedule_template(
+    program: MegatronProgram,
+    *,
+    template: str,
+    group_size: Optional[int],
+    dispatch_order: str,
+    skeleton: Optional[str] = None,
+) -> MegatronProgram:
+    candidate = _clone_program(program)
+    candidate.schedule.template = str(template)
+    candidate.schedule.skeleton = str(skeleton or ("fixed_1f1b" if template == "fixed_1f1b" else "stage_aware_grouped"))
+    candidate.schedule.dispatch_order = str(dispatch_order)
+    candidate.schedule.microbatch_group_size_per_vp_stage = group_size
+    return candidate.normalized()
+
+
+def _candidate_sort_key(program: MegatronProgram) -> tuple:
+    template = str(program.schedule.template or "fixed_1f1b")
+    evidence_score = _safe_float((program.metadata or {}).get("evidence_score")) or 0.0
+    effective_rank = float(program.metadata.get("priority_rank", 0) or 0.0) - 20.0 * evidence_score
+    return (
+        1 if str((program.metadata or {}).get("vpp_veto_reason") or "") else 0,
+        round(effective_rank, 4),
+        {
+            "fixed_1f1b": 0,
+            "interleaved_grouped_g2": 1,
+            "interleaved_grouped_g4": 2,
+            "pp4_frontload": 3,
+            "pp4_middle_relief": 4,
+            "torchtitan_zero_bubble": 5,
+            "torchtitan_dualpipev": 6,
+        }.get(template, 99),
+        str(program.metadata.get("program_kind") or ""),
+    )
+
+
+def _structural_program_key(program: MegatronProgram) -> str:
+    norm = program.normalized()
+    payload = {
+        "cluster": norm.cluster.to_dict(),
+        "model": norm.model.to_dict(),
+        "parallel": norm.parallel.to_dict() if hasattr(norm.parallel, "to_dict") else {
+            "tp_degree": int(norm.parallel.tp_degree),
+            "pp_degree": int(norm.parallel.pp_degree),
+            "vpp_degree": int(norm.parallel.vpp_degree),
+            "ep_degree": int(norm.parallel.ep_degree),
+            "cp_degree": int(norm.parallel.cp_degree),
+            "expert_tp_degree": int(norm.parallel.expert_tp_degree),
+            "sp_enabled": bool(norm.parallel.sp_enabled),
+        },
+        "partition": norm.partition.to_dict(),
+        "layout": norm.layout.to_dict(),
+        "plane_map": norm.plane_map.to_dict(),
+        "schedule": norm.schedule.to_dict(),
+        "batch_plan": norm.batch_plan.to_dict(),
+        "constraints": norm.constraints.to_dict(),
+        "micro_batch_size": int(norm.metadata.get("micro_batch_size", 1) or 1),
+        "global_batch_size": int(norm.metadata.get("global_batch_size", 1) or 1),
+        "seq_len": int(norm.metadata.get("seq_len", 1) or 1),
+        "use_bf16": bool(norm.metadata.get("use_bf16", True)),
+        "use_fp16": bool(norm.metadata.get("use_fp16", False)),
+        "recompute_granularity": norm.metadata.get("recompute_granularity"),
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
 def _score(metrics: Dict[str, Any]) -> float:
@@ -61,6 +228,340 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _median(values: List[float]) -> float:
+    ordered = sorted(float(value) for value in values if float(value) > 0.0)
+    if not ordered:
+        return 0.0
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _relative_stage_spread(values: List[float]) -> float:
+    center = _median(values)
+    if center <= 0.0:
+        return 0.0
+    return max((max(values) - center) / center, 0.0)
+
+
+def _edge_tail_delta(values: List[float]) -> float:
+    center = _median(values)
+    if center <= 0.0 or not values:
+        return 0.0
+    first_delta = max((float(values[0]) - center) / center, 0.0)
+    last_delta = max((float(values[-1]) - center) / center, 0.0)
+    return max(first_delta, last_delta)
+
+
+def _stage_signal_series(context_record: Dict[str, Any], key: str, expected_count: int) -> List[float]:
+    evidence = list((((context_record or {}).get("evidence_record") or {}).get("stage_evidence")) or [])
+    by_stage: Dict[int, float] = {}
+    for item in evidence:
+        stage_id = _safe_int((item or {}).get("stage_id"))
+        if stage_id is None:
+            continue
+        by_stage[stage_id] = float((item or {}).get(key) or 0.0)
+    return [float(by_stage.get(index, 0.0) or 0.0) for index in range(max(expected_count, 0))]
+
+
+def _project_stage_signal(
+    current_stage_layers: List[int],
+    observed_stage_values: List[float],
+    candidate_stage_layers: List[int],
+    *,
+    first_stage_bias: float = 0.0,
+    last_stage_bias: float = 0.0,
+) -> List[float]:
+    expanded: List[float] = []
+    total_layers = sum(max(int(layers), 0) for layers in current_stage_layers)
+    for index, layers in enumerate(current_stage_layers):
+        stage_layers = max(int(layers), 1)
+        observed = max(float(observed_stage_values[index] if index < len(observed_stage_values) else 0.0), 0.0)
+        fixed_bias = 0.0
+        if index == 0:
+            fixed_bias += first_stage_bias
+        if index == len(current_stage_layers) - 1:
+            fixed_bias += last_stage_bias
+        per_layer = max(observed - fixed_bias, 0.0) / float(stage_layers)
+        expanded.extend([per_layer] * stage_layers)
+    if len(expanded) < total_layers:
+        expanded.extend([0.0] * (total_layers - len(expanded)))
+    projected: List[float] = []
+    cursor = 0
+    last_index = len(candidate_stage_layers) - 1
+    for index, layers in enumerate(candidate_stage_layers):
+        stage_layers = max(int(layers), 1)
+        window = sum(expanded[cursor : cursor + stage_layers])
+        if index == 0:
+            window += first_stage_bias
+        if index == last_index:
+            window += last_stage_bias
+        projected.append(float(window))
+        cursor += stage_layers
+    return projected
+
+
+def _tail_aware_partition_breakdown(
+    baseline: MegatronProgram,
+    candidate: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[Dict[str, float]]:
+    baseline_layers = [int(stage.decoder_layers) for stage in baseline.partition.stages]
+    candidate_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+    if not baseline_layers or not candidate_layers or sum(baseline_layers) != sum(candidate_layers):
+        return None
+    completion = _stage_signal_series(context_record, "completion_ms", len(baseline_layers))
+    if not any(value > 0.0 for value in completion):
+        return None
+    memory = _stage_signal_series(context_record, "peak_reserved_gib", len(baseline_layers))
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    mem_skew_ratio = float(runtime.get("mem_skew_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    cross_node_ratio = float(runtime.get("cross_node_exposed_ratio") or 0.0)
+    first_stage_bias = 0.10 * float(completion[0] if completion else 0.0)
+    last_stage_bias = 0.08 * float(completion[-1] if completion else 0.0)
+    first_memory_bias = 0.12 * float(memory[0] if memory else 0.0)
+    last_memory_bias = 0.08 * float(memory[-1] if memory else 0.0)
+    predicted_completion = _project_stage_signal(
+        baseline_layers,
+        completion,
+        candidate_layers,
+        first_stage_bias=first_stage_bias,
+        last_stage_bias=last_stage_bias,
+    )
+    predicted_memory = _project_stage_signal(
+        baseline_layers,
+        memory,
+        candidate_layers,
+        first_stage_bias=first_memory_bias,
+        last_stage_bias=last_memory_bias,
+    ) if any(value > 0.0 for value in memory) else []
+    baseline_completion = _project_stage_signal(
+        baseline_layers,
+        completion,
+        baseline_layers,
+        first_stage_bias=first_stage_bias,
+        last_stage_bias=last_stage_bias,
+    )
+    baseline_memory = _project_stage_signal(
+        baseline_layers,
+        memory,
+        baseline_layers,
+        first_stage_bias=first_memory_bias,
+        last_stage_bias=last_memory_bias,
+    ) if any(value > 0.0 for value in memory) else []
+    candidate_virtual_edges = max(int(candidate.parallel.pp_degree) * max(int(candidate.parallel.vpp_degree), 1) - 1, 0)
+    baseline_virtual_edges = max(int(baseline.parallel.pp_degree) * max(int(baseline.parallel.vpp_degree), 1) - 1, 0)
+    boundary_growth = max(candidate_virtual_edges - baseline_virtual_edges, 0) / float(max(baseline_virtual_edges, 1))
+    comm_penalty = boundary_growth * (comm_exposure_ratio + 0.50 * cross_node_ratio)
+    predicted_mem_skew = _relative_stage_spread(predicted_memory) if predicted_memory else 0.0
+    baseline_mem_skew = _relative_stage_spread(baseline_memory) if baseline_memory else 0.0
+    stable_stage_time = _relative_stage_spread(predicted_completion)
+    baseline_stable_stage_time = _relative_stage_spread(baseline_completion)
+    edge_tail_delta = _edge_tail_delta(predicted_completion)
+    baseline_edge_tail_delta = _edge_tail_delta(baseline_completion)
+    candidate_objective = (
+        0.45 * stable_stage_time
+        + 0.20 * edge_tail_delta
+        + 0.20 * comm_penalty
+        + 0.15 * (predicted_mem_skew * max(mem_skew_ratio, 0.10))
+    )
+    baseline_objective = (
+        0.45 * baseline_stable_stage_time
+        + 0.20 * baseline_edge_tail_delta
+        + 0.15 * (baseline_mem_skew * max(mem_skew_ratio, 0.10))
+    )
+    return {
+        "candidate_objective": round(float(candidate_objective), 4),
+        "baseline_objective": round(float(baseline_objective), 4),
+        "improvement": round(float(baseline_objective - candidate_objective), 4),
+        "stable_stage_time": round(float(stable_stage_time), 4),
+        "edge_tail_delta": round(float(edge_tail_delta), 4),
+        "comm_penalty": round(float(comm_penalty), 4),
+        "predicted_mem_skew": round(float(predicted_mem_skew), 4),
+    }
+
+
+def _cross_node_boundary_count(stage_to_node: List[str]) -> int:
+    boundaries = 0
+    for index in range(1, len(stage_to_node)):
+        if str(stage_to_node[index]) != str(stage_to_node[index - 1]):
+            boundaries += 1
+    return boundaries
+
+
+def _dual_node_placement_breakdown(
+    baseline: MegatronProgram,
+    candidate: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[Dict[str, float]]:
+    if not _is_dual_target(candidate.cluster.target):
+        return None
+    candidate_nodes = [str(node) for node in (candidate.layout.stage_to_node or [])]
+    baseline_nodes = [str(node) for node in (baseline.layout.stage_to_node or [])]
+    if not candidate_nodes or not baseline_nodes:
+        return None
+    if sum(int(stage.decoder_layers) for stage in candidate.partition.stages) <= 0:
+        return None
+
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    bubble_ratio = float(runtime.get("bubble_ratio") or 0.0)
+    stage_tail_ratio = float(runtime.get("stage_tail_ratio") or 0.0)
+    cross_node_ratio = float(runtime.get("cross_node_exposed_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    speed_map = _node_speed_map(candidate)
+    fastest_node = _fastest_node(candidate)
+
+    def _objective(program: MegatronProgram) -> Dict[str, float]:
+        stage_nodes = [str(node) for node in (program.layout.stage_to_node or [])]
+        total_layers = max(sum(int(stage.decoder_layers) for stage in program.partition.stages), 1)
+        node_loads: Dict[str, float] = {}
+        for stage, node in zip(program.partition.stages, stage_nodes):
+            node_loads[node] = node_loads.get(node, 0.0) + float(int(stage.decoder_layers))
+        total_speed = max(sum(float(speed_map.get(node, 1.0)) for node in set(stage_nodes)), 1e-6)
+        share_mismatch = 0.0
+        for node in set(stage_nodes):
+            ideal = float(speed_map.get(node, 1.0)) / total_speed
+            actual = float(node_loads.get(node, 0.0)) / float(total_layers)
+            share_mismatch += abs(actual - ideal)
+        share_mismatch *= 0.5
+
+        boundary_penalty = float(max(_cross_node_boundary_count(stage_nodes) - 1, 0)) * (
+            cross_node_ratio + 0.50 * comm_exposure_ratio
+        )
+        depth_gain = max(int(program.parallel.pp_degree) - int(baseline.parallel.pp_degree), 0) / float(
+            max(int(program.parallel.pp_degree), 1)
+        )
+        depth_bonus = depth_gain * (0.35 * bubble_ratio + 0.15 * stage_tail_ratio)
+        placement_bonus = 0.0
+        if fastest_node is not None and stage_nodes:
+            if stage_nodes[-1] == fastest_node:
+                placement_bonus += 0.04 + 0.18 * stage_tail_ratio
+            if str(program.cluster.target) == "dual_g4_g5" and stage_nodes[0] != fastest_node:
+                placement_bonus += 0.02
+        objective = share_mismatch + boundary_penalty - placement_bonus - depth_bonus
+        return {
+            "objective": round(float(objective), 4),
+            "share_mismatch": round(float(share_mismatch), 4),
+            "boundary_penalty": round(float(boundary_penalty), 4),
+            "placement_bonus": round(float(placement_bonus), 4),
+            "depth_bonus": round(float(depth_bonus), 4),
+        }
+
+    candidate_metrics = _objective(candidate)
+    baseline_metrics = _objective(baseline)
+    return {
+        "candidate_objective": float(candidate_metrics["objective"]),
+        "baseline_objective": float(baseline_metrics["objective"]),
+        "improvement": round(float(baseline_metrics["objective"] - candidate_metrics["objective"]), 4),
+        "share_mismatch": float(candidate_metrics["share_mismatch"]),
+        "boundary_penalty": float(candidate_metrics["boundary_penalty"]),
+        "placement_bonus": float(candidate_metrics["placement_bonus"]),
+        "depth_bonus": float(candidate_metrics["depth_bonus"]),
+    }
+
+
+def _hybrid_shard_breakdown(candidate: MegatronProgram, context_record: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    shard_modes = [str(item.shard_strategy or "none") for item in (candidate.strategy_ir.local_parallel or [])]
+    if not any(mode in {"fsdp", "hsdp"} for mode in shard_modes):
+        return None
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    mem_skew_ratio = float(runtime.get("mem_skew_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    cross_node_ratio = float(runtime.get("cross_node_exposed_ratio") or 0.0)
+    hsdp_fraction = sum(1.0 for mode in shard_modes if mode == "hsdp") / float(len(shard_modes) or 1)
+    relief_score = (0.45 * peak_reserved_ratio + 0.35 * mem_skew_ratio + 0.10 * hsdp_fraction)
+    comm_penalty = (0.20 * comm_exposure_ratio + 0.10 * cross_node_ratio) * (1.0 - 0.35 * hsdp_fraction)
+    return {
+        "relief_score": round(float(relief_score), 4),
+        "comm_penalty": round(float(comm_penalty), 4),
+        "improvement": round(float(relief_score - comm_penalty), 4),
+        "hsdp_fraction": round(float(hsdp_fraction), 4),
+    }
+
+
+def _annotate_candidate_runtime_evidence(
+    baseline: MegatronProgram,
+    candidate: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> MegatronProgram:
+    annotated = _sync_batch_plan_metadata(candidate)
+    for key in (
+        "tail_partition_score",
+        "tail_partition_objective",
+        "tail_partition_components",
+        "dual_node_score",
+        "dual_node_objective",
+        "dual_node_components",
+        "hybrid_shard_score",
+        "hybrid_shard_components",
+        "vpp_tradeoff",
+        "vpp_veto_reason",
+        "evidence_score",
+    ):
+        annotated.metadata.pop(key, None)
+    evidence_score = 0.0
+    partition_changed = (
+        [int(stage.decoder_layers) for stage in annotated.partition.stages]
+        != [int(stage.decoder_layers) for stage in baseline.partition.stages]
+        or int(annotated.parallel.pp_degree) != int(baseline.parallel.pp_degree)
+    )
+    if partition_changed:
+        breakdown = _tail_aware_partition_breakdown(baseline, annotated, context_record)
+        if breakdown is not None:
+            annotated.metadata["tail_partition_score"] = float(breakdown.get("improvement") or 0.0)
+            annotated.metadata["tail_partition_objective"] = float(breakdown.get("candidate_objective") or 0.0)
+            annotated.metadata["tail_partition_components"] = {
+                "stable_stage_time": float(breakdown.get("stable_stage_time") or 0.0),
+                "edge_tail_delta": float(breakdown.get("edge_tail_delta") or 0.0),
+                "comm_penalty": float(breakdown.get("comm_penalty") or 0.0),
+                "predicted_mem_skew": float(breakdown.get("predicted_mem_skew") or 0.0),
+            }
+            evidence_score += float(breakdown.get("improvement") or 0.0)
+    dual_node_breakdown = _dual_node_placement_breakdown(baseline, annotated, context_record)
+    if dual_node_breakdown is not None:
+        annotated.metadata["dual_node_score"] = float(dual_node_breakdown.get("improvement") or 0.0)
+        annotated.metadata["dual_node_objective"] = float(dual_node_breakdown.get("candidate_objective") or 0.0)
+        annotated.metadata["dual_node_components"] = {
+            "share_mismatch": float(dual_node_breakdown.get("share_mismatch") or 0.0),
+            "boundary_penalty": float(dual_node_breakdown.get("boundary_penalty") or 0.0),
+            "placement_bonus": float(dual_node_breakdown.get("placement_bonus") or 0.0),
+            "depth_bonus": float(dual_node_breakdown.get("depth_bonus") or 0.0),
+        }
+        evidence_score += float(dual_node_breakdown.get("improvement") or 0.0)
+    hybrid_shard = _hybrid_shard_breakdown(annotated, context_record)
+    if hybrid_shard is not None:
+        annotated.metadata["hybrid_shard_score"] = float(hybrid_shard.get("improvement") or 0.0)
+        annotated.metadata["hybrid_shard_components"] = {
+            "relief_score": float(hybrid_shard.get("relief_score") or 0.0),
+            "comm_penalty": float(hybrid_shard.get("comm_penalty") or 0.0),
+            "hsdp_fraction": float(hybrid_shard.get("hsdp_fraction") or 0.0),
+        }
+        evidence_score += float(hybrid_shard.get("improvement") or 0.0)
+    if int(annotated.parallel.vpp_degree) > 1:
+        tradeoff = assess_vpp_comm_tradeoff(
+            annotated,
+            runtime_summary=dict((context_record or {}).get("runtime_evidence") or {}),
+        )
+        annotated.metadata["vpp_tradeoff"] = tradeoff
+        evidence_score += float(tradeoff.get("bubble_relief_score") or 0.0) - float(tradeoff.get("comm_pressure_score") or 0.0)
+        if bool(tradeoff.get("should_veto")):
+            annotated.metadata["vpp_veto_reason"] = str(tradeoff.get("reason") or "comm-exposure-aware VPP veto")
+    annotated.metadata["evidence_score"] = round(float(evidence_score), 4)
+    return annotated.normalized()
+
+
 def _stage_load_variance(payload: Optional[Dict[str, Any]]) -> Optional[float]:
     if not payload:
         return None
@@ -79,6 +580,39 @@ def _stage_load_variance(payload: Optional[Dict[str, Any]]) -> Optional[float]:
     if mean <= 0:
         return 0.0
     return sum(((value / mean) - 1.0) ** 2 for value in windows) / float(len(windows))
+
+
+def _stage_window_values(payload: Optional[Dict[str, Any]], expected_count: Optional[int] = None) -> List[float]:
+    if not payload:
+        return []
+    stage_summary = payload.get("stage_window_summary") or {}
+    indexed: List[Tuple[int, float]] = []
+    for key, item in stage_summary.items():
+        window_ms = _safe_float((item or {}).get("window_ms"))
+        if window_ms is None or window_ms <= 0:
+            continue
+        try:
+            stage_id = int(str(key))
+        except Exception:
+            stage_id = len(indexed)
+        indexed.append((stage_id, window_ms))
+    indexed.sort(key=lambda pair: pair[0])
+    values = [value for _, value in indexed]
+    if expected_count is not None and expected_count > 0:
+        if len(values) < expected_count:
+            values.extend([0.0] * (expected_count - len(values)))
+        elif len(values) > expected_count:
+            values = values[:expected_count]
+    return values
+
+
+def _dominant_stage_indices(payload: Optional[Dict[str, Any]], expected_count: int) -> Tuple[Optional[int], Optional[int], List[float]]:
+    values = _stage_window_values(payload, expected_count=expected_count)
+    if len(values) < 2 or max(values) <= 0:
+        return None, None, values
+    slow_idx = max(range(len(values)), key=lambda idx: values[idx])
+    fast_idx = min(range(len(values)), key=lambda idx: values[idx])
+    return slow_idx, fast_idx, values
 
 
 def _observed_comm_ratio(payload: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -108,6 +642,58 @@ def _throughput_speedup(best_value: Optional[float], baseline_value: Optional[fl
     if best_value is None or baseline_value is None or baseline_value <= 0:
         return None
     return best_value / baseline_value
+
+
+def _normalize_lower_is_better(values: Dict[str, float]) -> Dict[str, float]:
+    if not values:
+        return {}
+    low = min(values.values())
+    high = max(values.values())
+    if high <= low:
+        return {key: 0.0 for key in values}
+    return {key: (value - low) / (high - low) for key, value in values.items()}
+
+
+def _rank_trials(tested: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    valid_trials = [
+        trial for trial in tested if trial.get("returncode") in (0, None) and not trial.get("oom")
+    ]
+    if not valid_trials:
+        return tested
+
+    step_map: Dict[str, float] = {}
+    peak_map: Dict[str, float] = {}
+    bubble_map: Dict[str, float] = {}
+    stall_map: Dict[str, float] = {}
+    for trial in valid_trials:
+        key = str(trial.get("config_name") or trial.get("program_hash") or len(step_map))
+        trace_summary = trial.get("trace_summary") or {}
+        step_map[key] = float(
+            trace_summary.get("steady_state_step_time_ms_p50")
+            or trial.get("step_time_ms_p50")
+            or 0.0
+        )
+        peak_map[key] = float(trace_summary.get("peak_reserved_ratio") or 0.0)
+        bubble_map[key] = float(trace_summary.get("bubble_ratio") or trial.get("bubble_ratio") or 0.0)
+        stall_map[key] = float(trace_summary.get("stall_ratio") or 0.0)
+
+    step_norm = _normalize_lower_is_better(step_map)
+    peak_norm = _normalize_lower_is_better(peak_map)
+    bubble_norm = _normalize_lower_is_better(bubble_map)
+    stall_norm = _normalize_lower_is_better(stall_map)
+
+    for trial in valid_trials:
+        key = str(trial.get("config_name") or trial.get("program_hash") or "")
+        trial["selection_score"] = 1.0 - (
+            0.50 * step_norm.get(key, 0.0)
+            + 0.20 * peak_norm.get(key, 0.0)
+            + 0.20 * bubble_norm.get(key, 0.0)
+            + 0.10 * stall_norm.get(key, 0.0)
+        )
+    for trial in tested:
+        if trial not in valid_trials:
+            trial["selection_score"] = float("-inf")
+    return sorted(tested, key=lambda item: float(item.get("selection_score", float("-inf"))), reverse=True)
 
 
 def _build_baseline_vs_best(
@@ -154,6 +740,9 @@ def _export_programs(
     baseline: MegatronProgram,
     candidates: List[MegatronProgram],
     programs_dir: Path,
+    *,
+    context_record: Optional[Dict[str, Any]] = None,
+    previous_program: Optional[MegatronProgram] = None,
 ) -> List[Dict[str, Any]]:
     programs_dir.mkdir(parents=True, exist_ok=True)
     manifest: List[Dict[str, Any]] = []
@@ -167,7 +756,12 @@ def _export_programs(
         output_path = programs_dir / filename
         output_path.write_text(json.dumps(program.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
         family = classify_program_family(program).to_dict()
-        legality = check_program(program).to_dict()
+        verifier_report = verify_program(
+            program,
+            observation=context_record,
+            previous_program=(previous_program if execution_order > 0 else None),
+        ).to_dict()
+        legality = dict(verifier_report.get("legality") or {})
         compile_success = False
         compile_error = None
         try:
@@ -185,6 +779,7 @@ def _export_programs(
                 "program_path": str(output_path),
                 "family": family,
                 "legality": legality,
+                "verifier_report": verifier_report,
                 "compile_success": compile_success,
                 "compile_error": compile_error,
             }
@@ -196,11 +791,248 @@ def _candidate_entries(candidate_manifest: List[Dict[str, Any]]) -> List[Dict[st
     return [entry for entry in candidate_manifest if not bool(entry.get("is_baseline"))]
 
 
+def _proposal_scope_fallback(scope: str) -> str:
+    current = str(scope or "none")
+    if current == "pipe":
+        return "local_parallel"
+    if current == "local_parallel":
+        return "skeleton"
+    return "none"
+
+
+def _make_agent_observation(
+    program: MegatronProgram,
+    *,
+    runtime_summary: Optional[Dict[str, Any]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    trace_summary: Optional[Dict[str, Any]] = None,
+    motivation_evidence_manifest: Optional[List[Dict[str, Any]]] = None,
+) -> AgentObservation:
+    return build_agent_observation(
+        program,
+        runtime_summary=runtime_summary,
+        metrics=metrics,
+        trace_summary=trace_summary,
+        motivation_evidence_manifest=motivation_evidence_manifest,
+    )
+
+
+def _build_agent_proposal(
+    program: MegatronProgram,
+    *,
+    scope: str,
+    rationale: str,
+    source: str,
+) -> AgentProposal:
+    norm = _sync_batch_plan_metadata(program)
+    norm.metadata["replan_scope"] = str(scope)
+    return AgentProposal(
+        proposal_id=str(norm.metadata.get("program_kind") or f"{scope}_proposal"),
+        scope=str(scope),
+        program=norm,
+        rationale=str(rationale),
+        priority_rank=int(norm.metadata.get("priority_rank", 0) or 0),
+        source=str(source),
+    ).normalized()
+
+
+def _annotate_local_parallel(program: MegatronProgram, context_record: Dict[str, Any]) -> MegatronProgram:
+    candidate = _clone_program(program)
+    hot_subgraphs = {
+        str(item.get("anchor")): str(item.get("label"))
+        for item in (context_record.get("failure_modes") or [])
+        if str(item.get("anchor") or "")
+    }
+    for local in candidate.strategy_ir.local_parallel:
+        label = hot_subgraphs.get(local.subgraph)
+        if label == "schedule_coupling":
+            local.vpp_degree = max(int(local.vpp_degree), 2)
+        elif label == "memory_hotspot":
+            local.cp_degree = max(int(local.cp_degree), 2)
+            local.fsdp_scope = "selective"
+        elif label == "compute_imbalance":
+            local.vpp_degree = max(int(local.vpp_degree), int(candidate.parallel.vpp_degree))
+    candidate.strategy_ir.pipe.template = str(candidate.schedule.template)
+    candidate.strategy_ir.pipe.microbatch_order = str(candidate.schedule.dispatch_order)
+    candidate.strategy_ir.pipe.steady_state_group_size = candidate.schedule.microbatch_group_size_per_vp_stage
+    return candidate.normalized()
+
+
+def _build_evidence_matrix(
+    baseline: MegatronProgram,
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    evidence_programs: List[MegatronProgram] = []
+    baseline_fixed = _clone_program(baseline)
+    baseline_fixed.metadata["program_kind"] = "evidence_pp_fixed_pipe"
+    evidence_programs.append(_annotate_local_parallel(_sync_batch_plan_metadata(baseline_fixed), context_record))
+
+    stage_aware = _build_stage_aware_schedule(baseline)
+    if stage_aware is not None:
+        stage_aware.metadata["program_kind"] = "evidence_pp_vpp"
+        evidence_programs.append(_annotate_local_parallel(stage_aware, context_record))
+
+    cp_probe = _build_long_context_cp_candidate(stage_aware or baseline)
+    if cp_probe is not None:
+        cp_probe.metadata["program_kind"] = "evidence_pp_vpp_cp"
+        evidence_programs.append(_annotate_local_parallel(cp_probe, context_record))
+
+    fsdp_probe = _clone_program(cp_probe or stage_aware or baseline)
+    if fsdp_probe.strategy_ir.local_parallel:
+        for local in fsdp_probe.strategy_ir.local_parallel:
+            if local.cp_degree > 1 or int(fsdp_probe.parallel.pp_degree) > 1:
+                local.fsdp_scope = "selective"
+        fsdp_probe.metadata["program_kind"] = "evidence_pp_vpp_cp_fsdp_scope"
+        evidence_programs.append(_sync_batch_plan_metadata(fsdp_probe))
+
+    if rewrite.allow_stage_aware_schedule:
+        drift_probe = _build_runtime_guided_schedule(stage_aware or baseline, runtime_summary)
+        if drift_probe is not None:
+            drift_probe.metadata["program_kind"] = "evidence_dynamic_drift_probe"
+            evidence_programs.append(_annotate_local_parallel(drift_probe, context_record))
+
+    ordered: List[MegatronProgram] = []
+    seen: set[str] = set()
+    for program in evidence_programs:
+        key = _structural_program_key(program)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(program)
+    return ordered
+
+
+def _resolve_replan_decision(
+    baseline: MegatronProgram,
+    context_record: Dict[str, Any],
+    previous_context: Optional[Dict[str, Any]] = None,
+) -> ReplanDecision:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    workload = dict((context_record or {}).get("workload_context") or {})
+    optimization_hints = list((context_record or {}).get("optimization_hints") or [])
+    previous_workload = dict((previous_context or {}).get("workload_context") or {})
+    previous_runtime = dict((previous_context or {}).get("runtime_evidence") or {})
+
+    seq_changed = str(workload.get("length_bucket") or "") != str(previous_workload.get("length_bucket") or "")
+    cross_node_worsened = float(runtime.get("cross_node_exposed_ratio") or 0.0) > float(previous_runtime.get("cross_node_exposed_ratio") or 0.0) + 0.05
+    memory_worsened = float(runtime.get("peak_reserved_ratio") or 0.0) > float(previous_runtime.get("peak_reserved_ratio") or 0.0) + 0.08
+    bubble_worsened = float(runtime.get("bubble_ratio") or 0.0) > max(float(previous_runtime.get("bubble_ratio") or 0.0), 0.08)
+    stage_imbalance = any(str(item.get("label")) == "compute_imbalance" for item in (context_record.get("failure_modes") or []))
+    tail_heavy = any(str(item.get("label")) == "tail_heavy" for item in (context_record.get("derived_bottlenecks") or []))
+    comm_exposed = any(str(item.get("label")) in {"comm_exposed", "topology_mismatch"} for item in (context_record.get("derived_bottlenecks") or []))
+
+    scope = "none"
+    trigger = "steady"
+    rationale = "current context does not require replanning"
+    expected_switch_cost = 0.0
+    if seq_changed or bubble_worsened:
+        scope = "pipe"
+        trigger = "workload_drift" if seq_changed else "bubble_spike"
+        rationale = "prefer low-cost pipe adaptation before touching local or global structure"
+        expected_switch_cost = 0.06
+    if memory_worsened or any(str(item.get("label")) == "memory_hotspot" for item in (context_record.get("failure_modes") or [])):
+        scope = "local_parallel"
+        trigger = "memory_pressure"
+        rationale = "promote CP/FSDP relief on hotspot subgraphs before changing PP skeleton"
+        expected_switch_cost = 0.14
+    if cross_node_worsened or stage_imbalance:
+        scope = "skeleton" if cross_node_worsened else "local_parallel"
+        trigger = "topology_shift" if cross_node_worsened else "stage_imbalance"
+        rationale = "communication drift or persistent imbalance requires broader repartitioning"
+        expected_switch_cost = 0.28 if cross_node_worsened else 0.14
+    if tail_heavy:
+        scope = "skeleton"
+        trigger = "tail_drift"
+        rationale = "tail-heavy execution suggests PP boundaries or virtual chunks should be rebalanced before smaller tweaks"
+        expected_switch_cost = 0.22
+    if comm_exposed and scope == "none":
+        scope = "local_parallel"
+        trigger = "comm_exposure"
+        rationale = "communication exposure is better handled with placement and VPP chunk tuning before changing the full skeleton"
+        expected_switch_cost = 0.14
+    if optimization_hints:
+        top_scope = str((optimization_hints[0] or {}).get("scope") or scope or "none")
+        if scope == "none" and top_scope in {"pipe", "local_parallel", "skeleton"}:
+            scope = top_scope
+            trigger = "agent_hint"
+            rationale = str((optimization_hints[0] or {}).get("rationale") or rationale)
+            expected_switch_cost = {"pipe": 0.06, "local_parallel": 0.14, "skeleton": 0.22}.get(scope, expected_switch_cost)
+
+    return ReplanDecision(
+        trigger=trigger,
+        scope=scope,
+        rationale=rationale,
+        expected_switch_cost=expected_switch_cost,
+        fallback_if_rejected=_proposal_scope_fallback(scope),
+        failure_modes=list(context_record.get("failure_modes") or []),
+    ).normalized()
+
+
+def _build_replan_decision(
+    baseline: MegatronProgram,
+    context_record: Dict[str, Any],
+    previous_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _resolve_replan_decision(
+        baseline,
+        context_record,
+        previous_context=previous_context,
+    ).to_dict()
+
+
+def _build_experiment_specs(
+    baseline: MegatronProgram,
+    evidence_programs: List[MegatronProgram],
+    candidates: List[MegatronProgram],
+) -> List[ExperimentSpec]:
+    baseline_kind = str(baseline.metadata.get("program_kind") or "baseline")
+    evidence_kinds = [str(program.metadata.get("program_kind") or f"evidence_{index:02d}") for index, program in enumerate(evidence_programs)]
+    candidate_kinds = [str(program.metadata.get("program_kind") or f"candidate_{index:02d}") for index, program in enumerate(candidates)]
+    dynamic_kinds = [kind for kind in evidence_kinds + candidate_kinds if "drift" in kind or "runtime_guided" in kind or "schedule" in kind]
+    ablation_kinds = [kind for kind in candidate_kinds if any(token in kind for token in ("cp", "fsdp", "vpp", "schedule"))]
+    return [
+        ExperimentSpec(
+            experiment_id="A_problem_existence",
+            category="A",
+            label="problem_existence",
+            objective="show that fixed or restricted strategy spaces miss stable failure modes",
+            program_kinds=[baseline_kind] + evidence_kinds,
+        ).normalized(),
+        ExperimentSpec(
+            experiment_id="B_overall_effect",
+            category="B",
+            label="overall_effect",
+            objective="compare static baseline against verifier-guided candidates",
+            program_kinds=[baseline_kind] + candidate_kinds,
+        ).normalized(),
+        ExperimentSpec(
+            experiment_id="C_ablation",
+            category="C",
+            label="ablation",
+            objective="measure which local policy and pipe components drive gains",
+            program_kinds=[baseline_kind] + (ablation_kinds or candidate_kinds),
+        ).normalized(),
+        ExperimentSpec(
+            experiment_id="D_dynamic_replanning",
+            category="D",
+            label="dynamic_scene",
+            objective="measure low-cost replanning under workload drift and topology changes",
+            program_kinds=dynamic_kinds or evidence_kinds,
+        ).normalized(),
+    ]
+
+
 def _build_summary_payload(
     *,
     export_only: bool,
     programs_dir: Path,
     runtime_summary: Dict[str, Any],
+    runtime_signature: Dict[str, Any],
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    bottleneck_signature: Dict[str, Any],
     rewrite: SearchSpaceSpec,
     baseline: MegatronProgram,
     baseline_metrics: Optional[Dict[str, Any]],
@@ -210,6 +1042,11 @@ def _build_summary_payload(
     family_outside_trials: List[Dict[str, Any]],
     rejected_candidates: List[Dict[str, Any]],
     candidate_manifest: List[Dict[str, Any]],
+    program_bank: ProgramBank,
+    evidence_manifest: List[Dict[str, Any]],
+    experiment_specs: Optional[List[ExperimentSpec]] = None,
+    paper_artifacts: Optional[List[Dict[str, Any]]] = None,
+    agent_proposals: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     candidate_entries = _candidate_entries(candidate_manifest)
     compile_success_rate = None
@@ -227,6 +1064,13 @@ def _build_summary_payload(
         "mode": "program_synthesis_export_only" if export_only else "program_synthesis_executor",
         "programs_dir": str(programs_dir),
         "runtime_summary": runtime_summary,
+        "runtime_signature": runtime_signature,
+        "context_record": context_record,
+        "failure_modes": list(context_record.get("failure_modes") or []),
+        "derived_bottlenecks": list(context_record.get("derived_bottlenecks") or []),
+        "optimization_hints": list(context_record.get("optimization_hints") or []),
+        "replan_decision": replan_decision,
+        "bottleneck_signature": bottleneck_signature,
         "space_rewrite": rewrite.to_dict(),
         "baseline_program": baseline.to_dict(),
         "baseline_family": classify_program_family(baseline).to_dict(),
@@ -237,11 +1081,18 @@ def _build_summary_payload(
         "family_outside_trials": family_outside_trials,
         "rejected_candidates": rejected_candidates,
         "candidate_manifest": candidate_manifest,
+        "motivation_evidence_manifest": evidence_manifest,
+        "experiment_specs": [item.to_dict() for item in (experiment_specs or [])],
+        "paper_artifacts": list(paper_artifacts or []),
+        "agent_proposals": list(agent_proposals or []),
         "recommended_execution_order": [entry["config_name"] for entry in candidate_manifest],
+        "program_bank": program_bank.to_dict(),
         "candidate_generation_count": len(candidate_entries),
         "candidate_execution_count": max(len(tested) - (1 if baseline_metrics is not None else 0), 0),
         "compile_success_rate": compile_success_rate,
         "family_outside_ratio": family_outside_ratio,
+        "baseline_estimated_memory": estimate_program_memory(baseline).to_dict(),
+        "best_estimated_memory": estimate_program_memory(best_program).to_dict() if best_program is not None else None,
         "stage_load_variance": _first_observed_value(
             best_metrics,
             baseline_metrics,
@@ -276,6 +1127,46 @@ def _profile_prefers_small_tp(profile: MachineProfile) -> bool:
     return bool(profile.prefer_small_tp or profile.communication_sensitivity in {"high", "very_high"})
 
 
+def _is_dual_target(target: Any) -> bool:
+    return str(target or "") in {"dual_g4_g5", "dual_g5_g5"}
+
+
+def _node_speed_map(program: MegatronProgram) -> Dict[str, float]:
+    nodes = [str(node) for node in (program.cluster.nodes or [])]
+    if str(program.cluster.target) == "dual_g4_g5":
+        return {node: (1.18 if node == "g5" else 1.0) for node in nodes}
+    return {node: 1.0 for node in nodes}
+
+
+def _fastest_node(program: MegatronProgram) -> Optional[str]:
+    speeds = _node_speed_map(program)
+    if not speeds:
+        return None
+    return max(speeds.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _preferred_module_nodes(program: MegatronProgram) -> Dict[str, str]:
+    if str(program.cluster.target) == "dual_g4_g5":
+        return {"embedding": "g4", "loss": "g5"}
+    if str(program.cluster.target) == "dual_g5_g5":
+        return {"embedding": "g5_0", "loss": "g5_1"}
+    node_name = str(program.cluster.nodes[-1]) if program.cluster.nodes else "g5"
+    return {"embedding": node_name, "loss": node_name}
+
+
+def _execution_backend_family(program: MegatronProgram, context_record: Optional[Dict[str, Any]] = None) -> str:
+    if context_record is not None:
+        backend_family = str(((context_record.get("backend_context") or {}).get("backend_family")) or "").strip().lower()
+        if backend_family:
+            return backend_family
+    hint = str(
+        (program.metadata or {}).get("execution_backend")
+        or (program.metadata or {}).get("planner_backend")
+        or "megatron_core"
+    ).strip().lower()
+    return "torchtitan" if "torchtitan" in hint else "megatron_core"
+
+
 def _profile_max_tp(program: MegatronProgram, profile: MachineProfile) -> int:
     cluster_limit = max(int(program.cluster.gpus_per_node), 1)
     baseline_tp = max(int(program.parallel.tp_degree), 1)
@@ -286,20 +1177,33 @@ def _profile_max_tp(program: MegatronProgram, profile: MachineProfile) -> int:
 
 def _profile_max_pp(program: MegatronProgram, profile: MachineProfile) -> int:
     base = max(int(program.parallel.pp_degree), 1)
+    if _is_dual_target(program.cluster.target):
+        preferred = 4
+        if program.model.track == "dense" and int(program.model.num_layers) >= 16:
+            preferred = 8 if int(program.cluster.world_size) >= 16 else 4
+        return min(int(program.cluster.world_size), max(base, preferred))
     if bool(profile.prefer_pp_for_scaling):
-        return min(int(program.cluster.world_size), max(base, 2))
+        preferred = 2
+        if program.model.track == "dense" and int(program.model.num_layers) >= 8:
+            preferred = 4
+        return min(int(program.cluster.world_size), max(base, preferred))
     return min(int(program.cluster.world_size), base)
 
 
 def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
     program = default_moe_smoke_program(args.run_target) if args.model_track == "moe" else default_dense_program(args.run_target)
+    explicit_tp = int(args.tp or 0) > 0
+    explicit_pp = int(args.pp or 0) > 0
+    explicit_cp = int(args.cp or 0) > 0
+    explicit_ep = int(args.ep or 0) > 0
+    explicit_expert_tp = int(args.expert_tp or 0) > 0
     program.parallel.tp_degree = int(args.tp or program.parallel.tp_degree)
     program.parallel.pp_degree = int(args.pp or program.parallel.pp_degree)
     program.parallel.vpp_degree = int(args.vpp or program.parallel.vpp_degree)
     program.parallel.ep_degree = int(args.ep or program.parallel.ep_degree)
     program.parallel.cp_degree = int(args.cp or program.parallel.cp_degree)
     program.parallel.expert_tp_degree = int(args.expert_tp or program.parallel.expert_tp_degree)
-    program.parallel.sp_enabled = bool(int(program.parallel.tp_degree) > 1)
+    program.parallel.sp_enabled = False
     program.layout.vpp_degree = int(program.parallel.vpp_degree)
     program.model.num_layers = int(args.num_layers or program.model.num_layers)
     if int(program.parallel.pp_degree) != program.partition.num_stages:
@@ -318,14 +1222,70 @@ def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
                 special_tokens.append("L")
             stages.append({"decoder_layers": stage_layers, "special_tokens": special_tokens})
         program.partition = program.partition.from_dict({"stages": stages})
-        if args.run_target == "dual_g4_g5":
-            midpoint = int(program.parallel.pp_degree) // 2
-            program.layout.stage_to_node = ["g4"] * midpoint + ["g5"] * (int(program.parallel.pp_degree) - midpoint)
+        if _is_dual_target(args.run_target):
+            program.layout.stage_to_node = default_grouped_stage_to_node(args.run_target, int(program.parallel.pp_degree))
         else:
             program.layout.stage_to_node = [str(program.cluster.nodes[-1])] * int(program.parallel.pp_degree)
     requested_impl = str(getattr(args, "transformer_impl", "auto") or "auto").strip().lower()
     program.machine_profile = default_machine_profile(args.run_target)
     program.backend_caps = default_backend_caps("local" if requested_impl == "auto" else requested_impl)
+    program.parallel.sp_enabled = bool(int(program.parallel.tp_degree) > 1 and program.backend_caps.supports_sequence_parallel)
+
+    if args.model_track == "dense":
+        memory_budget = float(program.constraints.memory_budget_gb or program.machine_profile.device_memory_gb or 24.0)
+        program.constraints.memory_budget_gb = memory_budget
+        if (
+            not explicit_cp
+            and int(args.seq_len) >= 2048
+            and int(program.parallel.cp_degree) == 1
+        ):
+            product_without_cp = (
+                int(program.parallel.tp_degree)
+                * int(program.parallel.pp_degree)
+                * int(program.parallel.ep_degree)
+                * int(program.parallel.expert_tp_degree)
+            )
+            if int(program.cluster.world_size) % max(product_without_cp * 2, 1) == 0:
+                program.parallel.cp_degree = 2
+                program.plane_map.attention.cp_degree = 2
+
+        if (
+            not explicit_tp
+            and not explicit_pp
+            and args.run_target in {"single_g4", "single_g5"}
+            and int(program.parallel.pp_degree) == 1
+        ):
+            program.parallel.tp_degree = 2
+            program.parallel.pp_degree = 2
+            program.parallel.vpp_degree = 1
+            program.parallel.sp_enabled = bool(int(program.parallel.tp_degree) > 1 and program.backend_caps.supports_sequence_parallel)
+            first = int(program.model.num_layers) // 2
+            second = int(program.model.num_layers) - first
+            node_name = str(program.cluster.nodes[-1])
+            program.partition = program.partition.from_dict(
+                {
+                    "stages": [
+                        {"decoder_layers": first, "special_tokens": ["E"]},
+                        {"decoder_layers": second, "special_tokens": ["L"]},
+                    ]
+                }
+            )
+            program.layout.stage_to_node = [node_name, node_name]
+            program.layout.vpp_degree = 1
+
+    if args.model_track == "moe":
+        if not explicit_ep:
+            program.parallel.ep_degree = max(2, int(program.parallel.ep_degree))
+        if not explicit_expert_tp:
+            program.parallel.expert_tp_degree = max(1, int(program.parallel.expert_tp_degree))
+
+    program.batch_plan = BatchPlanSpec(
+        micro_batch_size=int(args.micro_batch_size),
+        global_batch_size=int(args.global_batch_size),
+        grad_accum_steps=None,
+        target_tokens_per_step=int(args.global_batch_size) * int(args.seq_len),
+    )
+    program.length_bucket_policies = default_length_bucket_policies()
     program.metadata.update(
         {
             "micro_batch_size": int(args.micro_batch_size),
@@ -338,15 +1298,45 @@ def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
         }
     )
     program.search_space = SearchSpaceSpec()
-    return program.normalized()
+    return _sync_batch_plan_metadata(program)
 
 
 def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) -> SearchSpaceSpec:
-    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
-    stage_spread = float(runtime_summary.get("stage_spread_ratio") or 0.0)
-    cross_node_exposed = float(runtime_summary.get("cross_node_exposed_ratio") or runtime_summary.get("exposed_comm_ratio") or 0.0)
-    is_dual = program.cluster.target == "dual_g4_g5"
+    trace_summary = reduce_trial_trace(program, runtime_summary=runtime_summary)
+    bottleneck = classify_bottleneck(program, trace_summary)
+    context_record = build_context_record(program, runtime_summary=runtime_summary)
+    backend_family = _execution_backend_family(program, context_record)
+    failure_labels = {str(item.get("label")) for item in (context_record.get("failure_modes") or [])}
+    runtime_evidence = dict(context_record.get("runtime_evidence") or {})
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or trace_summary.get("bubble_ratio") or runtime_summary.get("bubble_ratio") or 0.0)
+    stage_spread = float(
+        runtime_evidence.get("stage_load_variance")
+        or runtime_summary.get("stage_spread_ratio")
+        or trace_summary.get("stage_load_variance")
+        or 0.0
+    )
+    cross_node_exposed = float(
+        runtime_evidence.get("cross_node_exposed_ratio")
+        or trace_summary.get("cross_node_exposed_ratio")
+        or runtime_summary.get("cross_node_exposed_ratio")
+        or runtime_summary.get("exposed_comm_ratio")
+        or 0.0
+    )
+    oom_detected = bool(runtime_summary.get("oom") or runtime_summary.get("last_trial_oom") or runtime_summary.get("baseline_oom"))
+    peak_memory_ratio = float(
+        runtime_evidence.get("peak_reserved_ratio")
+        or trace_summary.get("peak_reserved_ratio")
+        or runtime_summary.get("peak_memory_ratio")
+        or runtime_summary.get("memory_utilization_ratio")
+        or runtime_summary.get("memory_pressure_ratio")
+        or 0.0
+    )
+    is_dual = _is_dual_target(program.cluster.target)
     machine_profile, backend_caps = _profile_context(program)
+    baseline_memory = estimate_program_memory(program)
+    current_micro_batch = max(int(program.metadata.get("micro_batch_size", 1) or 1), 1)
+    current_seq_len = max(int(program.metadata.get("seq_len", 1024) or 1024), 1)
+    length_bucket_policy = trace_summary.get("length_bucket_policy") or {}
 
     rules: List[ConstraintRuleSpec] = []
     required_local_axes = ["tp"] if is_dual else []
@@ -357,6 +1347,7 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         is_dual
         or int(program.parallel.pp_degree) > 1
         or stage_spread >= 0.08
+        or "compute_imbalance" in failure_labels
         or machine_profile.communication_sensitivity in {"high", "very_high"}
     )
     if allow_nonuniform:
@@ -420,6 +1411,8 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
     allow_asymmetric_vpp = bool(
         int(program.parallel.pp_degree) > 1 and int(program.model.num_layers) % (int(program.parallel.pp_degree) * 2) == 0
     )
+    if oom_detected or baseline_memory.pressure_score >= 1.0 or peak_memory_ratio >= 0.92:
+        allow_asymmetric_vpp = False
     if allow_asymmetric_vpp:
         rules.append(
             ConstraintRuleSpec(
@@ -453,7 +1446,10 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
             is_dual
             or bubble_ratio >= 0.03
             or stage_spread >= 0.08
+            or str((bottleneck or {}).get("dominant_label")) in {"tp_overpartitioned", "stage_imbalanced", "memory_underfilled"}
+            or "schedule_coupling" in failure_labels
             or machine_profile.communication_sensitivity in {"high", "very_high"}
+            or machine_profile.prefer_pp_for_scaling
         )
     )
     if allow_stage_aware:
@@ -466,6 +1462,25 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
                     "stage_spread_ratio": stage_spread,
                     "communication_sensitivity": machine_profile.communication_sensitivity,
                 },
+            )
+        )
+
+    allow_torchtitan_schedule_sandbox = bool(
+        backend_family == "torchtitan"
+        and int(program.parallel.pp_degree) > 1
+        and (
+            bubble_ratio >= 0.08
+            or stage_spread >= 0.08
+            or "schedule_coupling" in failure_labels
+            or "tail_heavy" in {str(item.get("label")) for item in (context_record.get("derived_bottlenecks") or [])}
+        )
+    )
+    if allow_torchtitan_schedule_sandbox:
+        rules.append(
+            ConstraintRuleSpec(
+                name="allow_torchtitan_schedule_sandbox",
+                rationale="torchtitan backend can probe richer zero-bubble or DualPipe-style schedule families when bubble/tail evidence is persistent",
+                params={"backend_family": backend_family, "bubble_ratio": bubble_ratio},
             )
         )
 
@@ -497,6 +1512,78 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
                 params={"cross_node_exposed_ratio": cross_node_exposed},
             )
         )
+    if "communication_drag" in failure_labels:
+        rules.append(
+            ConstraintRuleSpec(
+                name="promote_local_parallel_replan",
+                rationale="communication drag suggests higher-frequency adjustments should stay local to hot subgraphs first",
+                params={"failure_mode": "communication_drag"},
+            )
+        )
+
+    prefer_memory_relief = bool(
+        oom_detected
+        or baseline_memory.pressure_score >= 1.0
+        or peak_memory_ratio >= 0.92
+        or "memory_hotspot" in failure_labels
+        or (machine_profile.device_memory_gb or 0) <= 24 and current_seq_len >= 2048
+    )
+    max_micro_batch_size = current_micro_batch
+    max_estimated_memory_pressure = 1.15
+    if prefer_memory_relief:
+        max_micro_batch_size = 1
+        max_estimated_memory_pressure = 1.60 if oom_detected else 1.12
+        rules.append(
+            ConstraintRuleSpec(
+                name="tighten_memory_budget",
+                rationale="OOM or high memory pressure indicates the search must stay inside a smaller memory envelope",
+                params={
+                    "oom_detected": oom_detected,
+                    "peak_memory_ratio": peak_memory_ratio,
+                    "baseline_pressure_score": round(float(baseline_memory.pressure_score), 4),
+                    "budget_gb": round(float(baseline_memory.budget_gb), 3),
+                },
+            )
+        )
+
+    if prefer_memory_relief and int(program.parallel.pp_degree) == 1 and program.cluster.target in {"single_g4", "single_g5"}:
+        allow_nonuniform = True
+        allow_single_node_pp_split = bool(int(program.model.num_layers) >= 4)
+        rules.append(
+            ConstraintRuleSpec(
+                name="prefer_pp_for_memory_relief",
+                rationale="single-node OOM should first try to split layers across PP stages before exploring higher-risk schedules",
+                params={"pp_degree": int(program.parallel.pp_degree), "num_layers": int(program.model.num_layers)},
+            )
+        )
+
+    if prefer_memory_relief and current_seq_len >= 2048 and int(program.parallel.cp_degree) == 1:
+        rules.append(
+            ConstraintRuleSpec(
+                name="allow_cp_for_long_context_memory_relief",
+                rationale="long-context profile may use CP candidates to reduce attention memory pressure",
+                params={"seq_len": current_seq_len},
+            )
+        )
+
+    allow_hybrid_shard = bool(
+        backend_family == "torchtitan"
+        and (
+            prefer_memory_relief
+            or is_dual
+            or current_seq_len >= 2048
+            or "memory_hotspot" in failure_labels
+            or "memory_bound" in failure_labels
+        )
+    )
+    if allow_hybrid_shard:
+        rules.append(
+            ConstraintRuleSpec(
+                name="allow_hybrid_shard",
+                rationale="torchtitan sandbox can probe HSDP/FSDP2 mesh and reshard policies when memory pressure or dual-node asymmetry is present",
+                params={"backend_family": backend_family, "seq_len": current_seq_len},
+            )
+        )
 
     search_space = SearchSpaceSpec(
         allow_nonuniform_partition=allow_nonuniform,
@@ -505,21 +1592,42 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         allow_asymmetric_vpp=allow_asymmetric_vpp,
         allow_dual_plane=allow_dual_plane,
         allow_stage_aware_schedule=allow_stage_aware,
+        allow_hybrid_shard=allow_hybrid_shard,
+        allow_torchtitan_schedule_sandbox=allow_torchtitan_schedule_sandbox,
         allow_subgraph_submeshes=False,
         allow_heterogeneous_apipe=False,
         max_tp_size=max_tp_size,
         max_pp_size=max_pp_size,
         max_ep_size=int(program.cluster.gpus_per_node) if is_dual else None,
-        max_cp_size=int(program.cluster.gpus_per_node) if is_dual else None,
+        max_cp_size=min(
+            int(program.cluster.gpus_per_node),
+            int(length_bucket_policy.get("cp_cap") or (int(program.cluster.gpus_per_node) if (is_dual or current_seq_len >= 2048) else 1)),
+        ),
         max_vpp_size=2 if allow_asymmetric_vpp else 1,
+        max_shard_group_size=min(int(program.cluster.gpus_per_node), 8) if allow_hybrid_shard else None,
+        max_replicate_group_size=max(len(program.cluster.nodes), 1) if allow_hybrid_shard else None,
+        max_micro_batch_size=min(max_micro_batch_size, int(length_bucket_policy.get("micro_batch_cap") or max_micro_batch_size)),
+        max_estimated_memory_pressure=max_estimated_memory_pressure,
+        prefer_memory_relief=prefer_memory_relief,
         required_node_local_axes=required_local_axes,
-        preferred_node_for_module={"embedding": "g4", "loss": "g5"}
-        if is_dual
-        else {"embedding": str(program.cluster.nodes[-1]), "loss": str(program.cluster.nodes[-1])},
-        forbidden_axes_by_node={"g5": ["tp"]} if is_dual and cross_node_exposed >= 0.05 else {},
+        preferred_node_for_module=_preferred_module_nodes(program),
+        forbidden_axes_by_node={"g5": ["tp"]} if str(program.cluster.target) == "dual_g4_g5" and cross_node_exposed >= 0.05 else {},
         allowed_schedule_skeletons=["fixed_1f1b", "stage_aware_grouped"] if allow_stage_aware else ["fixed_1f1b"],
+        allowed_schedule_templates=(
+            (
+                list(length_bucket_policy.get("schedule_templates") or [])
+                + (["fixed_1f1b"] if "fixed_1f1b" not in set(length_bucket_policy.get("schedule_templates") or []) else [])
+                + (
+                    ["torchtitan_zero_bubble", "torchtitan_dualpipev"]
+                    if allow_torchtitan_schedule_sandbox
+                    else []
+                )
+            )
+            if allow_stage_aware
+            else (["fixed_1f1b"] + (["torchtitan_zero_bubble", "torchtitan_dualpipev"] if allow_torchtitan_schedule_sandbox else []))
+        ),
         rewrite_rules=rules,
-        notes="space rewrite derived from explicit profile/capability priors plus runtime summary",
+        notes="space rewrite derived from explicit profile/capability priors plus runtime summary and memory envelope",
     )
     return search_space.normalized()
 
@@ -540,7 +1648,126 @@ def _build_nonuniform_partition(program: MegatronProgram) -> Optional[MegatronPr
         stage.decoder_layers = stage_layers[index]
     candidate.layout.pipeline_layout = None
     candidate.metadata["program_kind"] = "candidate_nonuniform_partition"
-    return candidate.normalized()
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _partition_from_stage_layers(stage_layers: List[int]) -> Dict[str, Any]:
+    stages: List[Dict[str, Any]] = []
+    last_index = len(stage_layers) - 1
+    for index, stage_layers_count in enumerate(stage_layers):
+        special_tokens: List[str] = []
+        if index == 0:
+            special_tokens.append("E")
+        if index == last_index:
+            special_tokens.append("L")
+        stages.append({"decoder_layers": int(stage_layers_count), "special_tokens": special_tokens})
+    return {"stages": stages}
+
+
+def _grouped_stage_nodes(program: MegatronProgram, pp_degree: int) -> List[str]:
+    return default_grouped_stage_to_node(str(program.cluster.target), int(pp_degree))
+
+
+def _apply_grouped_pp_layout(
+    candidate: MegatronProgram,
+    *,
+    target_tp: int,
+    target_pp: int,
+) -> Optional[MegatronProgram]:
+    world_size = int(candidate.cluster.world_size)
+    product = (
+        int(target_tp)
+        * int(target_pp)
+        * int(candidate.parallel.cp_degree)
+        * int(candidate.parallel.ep_degree)
+        * int(candidate.parallel.expert_tp_degree)
+    )
+    if product <= 0 or world_size % product != 0:
+        return None
+    stage_to_node = _grouped_stage_nodes(candidate, int(target_pp))
+    stage_layers = weighted_stage_layer_allocation(str(candidate.cluster.target), int(candidate.model.num_layers), stage_to_node)
+    if sum(stage_layers) != int(candidate.model.num_layers):
+        return None
+    candidate.parallel.tp_degree = int(target_tp)
+    candidate.parallel.pp_degree = int(target_pp)
+    candidate.parallel.vpp_degree = 1
+    candidate.parallel.sp_enabled = bool(int(target_tp) > 1 and candidate.backend_caps.supports_sequence_parallel)
+    candidate.partition = candidate.partition.from_dict(_partition_from_stage_layers(stage_layers))
+    candidate.layout.stage_to_node = list(stage_to_node)
+    candidate.layout.vpp_degree = 1
+    candidate.layout.pipeline_layout = _virtual_stage_layout(stage_layers)
+    candidate.schedule.template = "fixed_1f1b"
+    candidate.schedule.skeleton = "fixed_1f1b"
+    candidate.schedule.dispatch_order = "default"
+    candidate.schedule.microbatch_group_size_per_vp_stage = None
+    candidate.plane_map.attention.tp_degree = int(target_tp)
+    candidate.plane_map.attention.cp_degree = int(candidate.parallel.cp_degree)
+    return candidate
+
+
+def _build_dual_node_pp4_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
+    if not _is_dual_target(program.cluster.target):
+        return None
+    candidate = _clone_program(program)
+    target_pp = 4
+    product_without_tp = (
+        target_pp
+        * int(candidate.parallel.cp_degree)
+        * int(candidate.parallel.ep_degree)
+        * int(candidate.parallel.expert_tp_degree)
+    )
+    if product_without_tp <= 0 or int(candidate.cluster.world_size) % product_without_tp != 0:
+        return None
+    target_tp = int(candidate.cluster.world_size) // product_without_tp
+    if target_tp <= 0 or target_tp > int(candidate.cluster.gpus_per_node):
+        return None
+    desired_stage_to_node = _grouped_stage_nodes(candidate, target_pp)
+    desired_stage_layers = weighted_stage_layer_allocation(str(candidate.cluster.target), int(candidate.model.num_layers), desired_stage_to_node)
+    if (
+        int(program.parallel.tp_degree) == target_tp
+        and int(program.parallel.pp_degree) == target_pp
+        and list(program.layout.stage_to_node) == list(desired_stage_to_node)
+        and [int(stage.decoder_layers) for stage in program.partition.stages] == list(desired_stage_layers)
+    ):
+        return None
+    candidate = _apply_grouped_pp_layout(candidate, target_tp=target_tp, target_pp=target_pp)
+    if candidate is None:
+        return None
+    candidate.metadata["program_kind"] = "candidate_dual_node_pp4_node_aware"
+    candidate.metadata["priority_rank"] = 12
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_runtime_guided_partition(program: MegatronProgram, runtime_summary: Dict[str, Any]) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) < 2:
+        return None
+    slow_idx, fast_idx, stage_windows = _dominant_stage_indices(runtime_summary, int(program.parallel.pp_degree))
+    if slow_idx is None or fast_idx is None or slow_idx == fast_idx:
+        return None
+    candidate = _clone_program(program)
+    stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+    if slow_idx >= len(stage_layers) or fast_idx >= len(stage_layers):
+        return None
+    if stage_layers[slow_idx] <= 1:
+        return None
+    slow_value = stage_windows[slow_idx]
+    fast_value = stage_windows[fast_idx]
+    if slow_value <= 0:
+        return None
+    spread_ratio = (slow_value - fast_value) / slow_value
+    if spread_ratio < 0.08:
+        return None
+    shift = 2 if spread_ratio >= 0.20 and stage_layers[slow_idx] > 2 else 1
+    stage_layers[slow_idx] -= shift
+    stage_layers[fast_idx] += shift
+    for index, stage in enumerate(candidate.partition.stages):
+        stage.decoder_layers = stage_layers[index]
+    candidate.layout.pipeline_layout = None
+    candidate.metadata["program_kind"] = "candidate_runtime_guided_partition"
+    candidate.metadata["slow_stage_index"] = int(slow_idx)
+    candidate.metadata["fast_stage_index"] = int(fast_idx)
+    candidate.metadata["stage_spread_ratio"] = round(float(spread_ratio), 4)
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _build_single_node_pipeline_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
@@ -568,8 +1795,26 @@ def _build_single_node_pipeline_candidate(program: MegatronProgram) -> Optional[
     )
     node_name = str(candidate.cluster.nodes[-1])
     candidate.layout.stage_to_node = [node_name, node_name]
+    candidate.schedule.template = "fixed_1f1b"
     candidate.metadata["program_kind"] = "candidate_single_node_pp_split"
-    return candidate.normalized()
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_pp_scaleout_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
+    world_size = int(program.cluster.world_size)
+    current_pp = int(program.parallel.pp_degree)
+    current_tp = int(program.parallel.tp_degree)
+    if world_size < 4 or current_pp >= 4 or current_tp <= 1:
+        return None
+    target_pp = 4
+    target_tp = max(1, current_tp // 2)
+    candidate = _clone_program(program)
+    candidate = _apply_grouped_pp_layout(candidate, target_tp=target_tp, target_pp=target_pp)
+    if candidate is None:
+        return None
+    candidate.metadata["program_kind"] = "candidate_pp_scaleout"
+    candidate.metadata["priority_rank"] = 30
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _build_stage_aware_schedule(program: MegatronProgram) -> Optional[MegatronProgram]:
@@ -577,17 +1822,143 @@ def _build_stage_aware_schedule(program: MegatronProgram) -> Optional[MegatronPr
         return None
     candidate = _clone_program(program)
     if int(candidate.parallel.vpp_degree) == 1:
-        total_virtual = int(candidate.parallel.pp_degree) * 2
-        if int(candidate.model.num_layers) % total_virtual != 0:
+        counts = _pp_vpp_layout_counts(int(candidate.parallel.pp_degree), int(candidate.model.num_layers), "interleaved_grouped_g2")
+        if counts is None:
             return None
         candidate.parallel.vpp_degree = 2
         candidate.layout.vpp_degree = 2
         candidate.parallel.sp_enabled = bool(int(candidate.parallel.tp_degree) > 1)
+        candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
     candidate.schedule.microbatch_group_size_per_vp_stage = 2
     candidate.schedule.skeleton = "stage_aware_grouped"
+    candidate.schedule.template = "interleaved_grouped_g2"
     candidate.schedule.dispatch_order = "frontload_forward"
     candidate.metadata["program_kind"] = "candidate_stage_aware_schedule"
-    return candidate.normalized()
+    candidate.metadata["priority_rank"] = 20
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_runtime_guided_schedule(program: MegatronProgram, runtime_summary: Dict[str, Any]) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    slow_idx, _, stage_windows = _dominant_stage_indices(runtime_summary, int(program.parallel.pp_degree))
+    if bubble_ratio < 0.03 and slow_idx is None:
+        return None
+    candidate = _clone_program(program)
+    if int(candidate.parallel.vpp_degree) == 1:
+        counts = _pp_vpp_layout_counts(int(candidate.parallel.pp_degree), int(candidate.model.num_layers), "interleaved_grouped_g2")
+        if counts is not None:
+            candidate.parallel.vpp_degree = 2
+            candidate.layout.vpp_degree = 2
+            candidate.parallel.sp_enabled = bool(int(candidate.parallel.tp_degree) > 1)
+            candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+    group_size = 2
+    template = "interleaved_grouped_g2"
+    if bubble_ratio >= 0.15:
+        group_size = 4
+        template = "interleaved_grouped_g4"
+    elif bubble_ratio >= 0.08:
+        group_size = 3
+    dispatch_order = "default"
+    if slow_idx is not None and stage_windows:
+        if slow_idx >= max(len(stage_windows) - 1, 0):
+            dispatch_order = "frontload_forward"
+        elif slow_idx == 0:
+            dispatch_order = "balanced_round_robin"
+        else:
+            dispatch_order = "middle_stage_relief"
+    candidate.schedule.microbatch_group_size_per_vp_stage = group_size
+    candidate.schedule.skeleton = "stage_aware_grouped"
+    candidate.schedule.template = template
+    candidate.schedule.dispatch_order = dispatch_order
+    candidate.metadata["program_kind"] = "candidate_runtime_guided_schedule"
+    candidate.metadata["bubble_ratio"] = round(float(bubble_ratio), 4)
+    if slow_idx is not None:
+        candidate.metadata["slow_stage_index"] = int(slow_idx)
+    candidate.metadata["priority_rank"] = 25
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_pp_vpp_scaleout_candidate(program: MegatronProgram, runtime_summary: Dict[str, Any]) -> Optional[MegatronProgram]:
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    base = _build_pp_scaleout_candidate(program)
+    if base is None:
+        return None
+    template = "pp4_middle_relief" if bubble_ratio >= 0.08 else "pp4_frontload"
+    counts = _pp_vpp_layout_counts(int(base.parallel.pp_degree), int(base.model.num_layers), template)
+    if counts is None:
+        return None
+    base.parallel.vpp_degree = 2
+    base.layout.vpp_degree = 2
+    base.parallel.sp_enabled = bool(int(base.parallel.tp_degree) > 1 and program.backend_caps.supports_sequence_parallel)
+    base.layout.pipeline_layout = _virtual_stage_layout(counts)
+    base.schedule.microbatch_group_size_per_vp_stage = 4 if bubble_ratio >= 0.12 else 2
+    base.schedule.skeleton = "stage_aware_grouped"
+    base.schedule.template = template if bubble_ratio >= 0.08 else "interleaved_grouped_g4"
+    if bubble_ratio < 0.08:
+        base.schedule.dispatch_order = "balanced_round_robin"
+    else:
+        base.schedule.dispatch_order = "frontload_forward" if template == "pp4_frontload" else "middle_stage_relief"
+    base.metadata["program_kind"] = "candidate_pp_vpp_scaleout"
+    base.metadata["bubble_ratio"] = round(float(bubble_ratio), 4)
+    base.metadata["priority_rank"] = 40
+    return _sync_batch_plan_metadata(base)
+
+
+def _build_memory_relief_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
+    candidate = _clone_program(program)
+    current_micro = max(int(candidate.batch_plan.micro_batch_size or candidate.metadata.get("micro_batch_size", 1) or 1), 1)
+    current_seq = max(int(candidate.metadata.get("seq_len", 1024) or 1024), 1)
+    changed = False
+
+    if current_micro > 1:
+        candidate.batch_plan.micro_batch_size = max(1, current_micro // 2)
+        changed = True
+
+    product_without_cp = (
+        int(candidate.parallel.tp_degree)
+        * int(candidate.parallel.pp_degree)
+        * int(candidate.parallel.ep_degree)
+        * int(candidate.parallel.expert_tp_degree)
+    )
+    if current_seq >= 2048 and int(candidate.parallel.cp_degree) == 1:
+        if int(candidate.cluster.world_size) % max(product_without_cp * 2, 1) == 0:
+            candidate.parallel.cp_degree = 2
+            candidate.plane_map.attention.cp_degree = 2
+            changed = True
+
+    if (
+        candidate.cluster.target in {"single_g4", "single_g5"}
+        and int(candidate.parallel.pp_degree) == 1
+        and int(candidate.model.num_layers) >= 4
+        and int(candidate.model.num_layers) % 2 == 0
+    ):
+        candidate.parallel.tp_degree = max(1, int(candidate.parallel.tp_degree) // 2)
+        candidate.parallel.pp_degree = 2
+        candidate.parallel.vpp_degree = 1
+        candidate.parallel.sp_enabled = bool(int(candidate.parallel.tp_degree) > 1)
+        first = int(candidate.model.num_layers) // 2
+        second = int(candidate.model.num_layers) - first
+        node_name = str(candidate.cluster.nodes[-1])
+        candidate.partition = candidate.partition.from_dict(
+            {
+                "stages": [
+                    {"decoder_layers": first, "special_tokens": ["E"]},
+                    {"decoder_layers": second, "special_tokens": ["L"]},
+                ]
+            }
+        )
+        candidate.layout.stage_to_node = [node_name, node_name]
+        candidate.layout.vpp_degree = 1
+        changed = True
+
+    if not changed:
+        return None
+
+    candidate.metadata["program_kind"] = "candidate_memory_relief"
+    candidate.metadata["priority_rank"] = 10
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _build_sequence_parallel_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
@@ -597,7 +1968,7 @@ def _build_sequence_parallel_candidate(program: MegatronProgram) -> Optional[Meg
     candidate.parallel.sp_enabled = not bool(program.parallel.sp_enabled)
     candidate.metadata["program_kind"] = "candidate_sequence_parallel_toggle"
     candidate.metadata["sequence_parallel_target_state"] = bool(candidate.parallel.sp_enabled)
-    return candidate.normalized()
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _build_dual_plane_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
@@ -615,17 +1986,263 @@ def _build_dual_plane_candidate(program: MegatronProgram) -> Optional[MegatronPr
         candidate.plane_map.moe.ep_degree = max(2, int(candidate.parallel.ep_degree))
         candidate.plane_map.moe.expert_tp_degree = max(1, int(candidate.parallel.expert_tp_degree))
     candidate.metadata["program_kind"] = "candidate_dual_plane"
-    return candidate.normalized()
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _apply_torchtitan_hybrid_shard_policy(
+    program: MegatronProgram,
+    *,
+    selective_only: bool,
+    hot_subgraphs: Optional[Dict[str, str]] = None,
+) -> MegatronProgram:
+    candidate = _clone_program(program)
+    candidate.metadata["execution_backend"] = "torchtitan"
+    shard_group_size = min(int(candidate.cluster.gpus_per_node), 4 if _is_dual_target(candidate.cluster.target) else 8)
+    replicate_group_size = max(len(candidate.cluster.nodes), 1) if _is_dual_target(candidate.cluster.target) else 1
+    hot_subgraphs = dict(hot_subgraphs or {})
+    for local in candidate.strategy_ir.local_parallel:
+        is_hot = not selective_only or str(local.subgraph) in hot_subgraphs
+        if not is_hot:
+            continue
+        local.fsdp_scope = "selective" if selective_only else "full"
+        local.shard_strategy = "hsdp" if replicate_group_size > 1 else "fsdp"
+        local.reshard_policy = "intra_node" if replicate_group_size > 1 else "full"
+        local.shard_group_size = shard_group_size
+        local.replicate_group_size = replicate_group_size
+        local.offload_policy = "none"
+        local.reduce_dtype = "bf16"
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_torchtitan_hsdp_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if _execution_backend_family(program, context_record) != "torchtitan":
+        return None
+    failure_modes = list((context_record or {}).get("failure_modes") or [])
+    hot_subgraphs = {
+        str(item.get("anchor")): str(item.get("label"))
+        for item in failure_modes
+        if str(item.get("anchor") or "").startswith("subg_stage_")
+    }
+    if not hot_subgraphs and not any(str(item.get("label")) in {"memory_hotspot", "memory_skew"} for item in failure_modes):
+        return None
+    candidate = _apply_torchtitan_hybrid_shard_policy(program, selective_only=True, hot_subgraphs=hot_subgraphs)
+    candidate.metadata["program_kind"] = "candidate_torchtitan_hsdp_mesh"
+    candidate.metadata["priority_rank"] = 14
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_pp_hsdp_hybrid_candidate(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if _execution_backend_family(program, context_record) != "torchtitan":
+        return None
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    if float(runtime_summary.get("bubble_ratio") or 0.0) < 0.03 and not any(
+        str(item.get("label")) in {"memory_hotspot", "memory_skew"} for item in (context_record.get("failure_modes") or [])
+    ):
+        return None
+    base = _clone_program(program)
+    if _is_dual_target(base.cluster.target) and int(base.parallel.pp_degree) < 4:
+        promoted = _build_dual_node_pp4_candidate(base)
+        if promoted is not None:
+            base = promoted
+    hot_subgraphs = {
+        str(item.get("anchor")): str(item.get("label"))
+        for item in (context_record.get("failure_modes") or [])
+        if str(item.get("anchor") or "").startswith("subg_stage_")
+    }
+    candidate = _apply_torchtitan_hybrid_shard_policy(base, selective_only=True, hot_subgraphs=hot_subgraphs)
+    candidate.metadata["program_kind"] = "candidate_pp_hsdp_hybrid"
+    candidate.metadata["priority_rank"] = 19
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_torchtitan_zero_bubble_schedule_candidate(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if _execution_backend_family(program, context_record) != "torchtitan":
+        return None
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    if bubble_ratio < 0.08:
+        return None
+    candidate = _clone_program(program)
+    candidate.schedule.skeleton = "stage_aware_grouped"
+    candidate.schedule.template = "torchtitan_zero_bubble"
+    candidate.schedule.dispatch_order = "zero_bubble_greedy"
+    candidate.schedule.microbatch_group_size_per_vp_stage = 4 if bubble_ratio >= 0.15 else 2
+    candidate.strategy_ir.pipe.template = "torchtitan_zero_bubble"
+    candidate.strategy_ir.pipe.microbatch_order = "zero_bubble_greedy"
+    candidate.strategy_ir.pipe.warmup_policy = "max_forward_fill"
+    candidate.strategy_ir.pipe.cooldown_policy = "drain_with_w"
+    candidate.metadata["execution_backend"] = "torchtitan"
+    candidate.metadata["program_kind"] = "candidate_torchtitan_zero_bubble_schedule"
+    candidate.metadata["priority_rank"] = 17
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_torchtitan_dualpipev_schedule_candidate(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if _execution_backend_family(program, context_record) != "torchtitan":
+        return None
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    comm_exposure_ratio = float(((context_record.get("runtime_evidence") or {}).get("comm_exposure_ratio")) or 0.0)
+    if bubble_ratio < 0.12 or comm_exposure_ratio >= 0.18:
+        return None
+    candidate = _clone_program(program)
+    if int(candidate.parallel.vpp_degree) == 1:
+        counts = _pp_vpp_layout_counts(int(candidate.parallel.pp_degree), int(candidate.model.num_layers), "interleaved_grouped_g2")
+        if counts is None:
+            return None
+        candidate.parallel.vpp_degree = 2
+        candidate.layout.vpp_degree = 2
+        candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+    candidate.schedule.skeleton = "stage_aware_grouped"
+    candidate.schedule.template = "torchtitan_dualpipev"
+    candidate.schedule.dispatch_order = "dualpipe_overlap"
+    candidate.schedule.microbatch_group_size_per_vp_stage = 2
+    candidate.strategy_ir.pipe.template = "torchtitan_dualpipev"
+    candidate.strategy_ir.pipe.microbatch_order = "dualpipe_overlap"
+    candidate.strategy_ir.pipe.warmup_policy = "prefill_overlap"
+    candidate.strategy_ir.pipe.cooldown_policy = "staggered_wgrad"
+    candidate.metadata["execution_backend"] = "torchtitan"
+    candidate.metadata["program_kind"] = "candidate_torchtitan_dualpipev_schedule"
+    candidate.metadata["priority_rank"] = 21
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_dual_node_pp8_scaleout_candidate(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if not _is_dual_target(program.cluster.target):
+        return None
+    target_pp = 8
+    if int(program.cluster.world_size) < target_pp or int(program.parallel.pp_degree) >= target_pp:
+        return None
+    if int(program.model.num_layers) < target_pp:
+        return None
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    if bubble_ratio < 0.04 and int(program.parallel.pp_degree) >= 4:
+        return None
+    candidate = _clone_program(program)
+    product_without_tp = (
+        target_pp
+        * int(candidate.parallel.cp_degree)
+        * int(candidate.parallel.ep_degree)
+        * int(candidate.parallel.expert_tp_degree)
+    )
+    if product_without_tp <= 0 or int(candidate.cluster.world_size) % product_without_tp != 0:
+        return None
+    target_tp = int(candidate.cluster.world_size) // product_without_tp
+    if target_tp <= 0 or target_tp > int(candidate.cluster.gpus_per_node):
+        return None
+    candidate = _apply_grouped_pp_layout(candidate, target_tp=target_tp, target_pp=target_pp)
+    if candidate is None:
+        return None
+    candidate.metadata["program_kind"] = "candidate_dual_node_pp8_scaleout"
+    candidate.metadata["bubble_ratio"] = round(float(bubble_ratio), 4)
+    candidate.metadata["priority_rank"] = 22 if bubble_ratio >= 0.08 else 34
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_dual_node_orientation_candidate(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if str(program.cluster.target) != "dual_g4_g5" or int(program.parallel.pp_degree) < 4:
+        return None
+    slow_idx, _, stage_windows = _dominant_stage_indices(runtime_summary, int(program.parallel.pp_degree))
+    if slow_idx is None or not stage_windows:
+        return None
+    midpoint = max(len(stage_windows) // 2, 1)
+    first_half = stage_windows[:midpoint]
+    second_half = stage_windows[midpoint:]
+    if not first_half or not second_half:
+        return None
+    first_avg = sum(first_half) / float(len(first_half))
+    second_avg = sum(second_half) / float(len(second_half))
+    if first_avg <= second_avg * 1.08 and slow_idx >= midpoint:
+        return None
+    candidate = _clone_program(program)
+    stage_to_node = ["g5"] * midpoint + ["g4"] * max(int(candidate.parallel.pp_degree) - midpoint, 0)
+    if stage_to_node == list(candidate.layout.stage_to_node):
+        return None
+    stage_layers = weighted_stage_layer_allocation(str(candidate.cluster.target), int(candidate.model.num_layers), stage_to_node)
+    if sum(stage_layers) != int(candidate.model.num_layers):
+        return None
+    candidate.partition = candidate.partition.from_dict(_partition_from_stage_layers(stage_layers))
+    candidate.layout.stage_to_node = list(stage_to_node)
+    candidate.layout.pipeline_layout = _virtual_stage_layout(stage_layers)
+    candidate.metadata["program_kind"] = "candidate_dual_node_orientation_flip"
+    candidate.metadata["slow_stage_index"] = int(slow_idx)
+    candidate.metadata["priority_rank"] = 16
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _build_topology_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
-    if program.cluster.target != "dual_g4_g5" or int(program.parallel.pp_degree) < 2:
+    if not _is_dual_target(program.cluster.target) or int(program.parallel.pp_degree) < 2:
         return None
     candidate = _clone_program(program)
-    midpoint = max(int(candidate.parallel.pp_degree) // 2, 1)
-    candidate.layout.stage_to_node = ["g4"] * midpoint + ["g5"] * (int(candidate.parallel.pp_degree) - midpoint)
+    candidate.layout.stage_to_node = _grouped_stage_nodes(candidate, int(candidate.parallel.pp_degree))
+    if list(candidate.layout.stage_to_node) == list(program.layout.stage_to_node):
+        return None
     candidate.metadata["program_kind"] = "candidate_topology_layout"
-    return candidate.normalized()
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_batch_plan_fill_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
+    candidate = _clone_program(program)
+    current_micro = max(int(candidate.batch_plan.micro_batch_size), 1)
+    current_global = max(int(candidate.batch_plan.global_batch_size), 1)
+    current_grad_accum = max(int(candidate.batch_plan.grad_accum_steps or _resolved_grad_accum_steps(candidate)), 1)
+    if current_micro > 1:
+        return None
+    candidate.batch_plan.grad_accum_steps = min(current_grad_accum * 2, current_grad_accum + 8)
+    candidate.batch_plan.global_batch_size = int(candidate.batch_plan.micro_batch_size) * _data_parallel_size(candidate) * int(candidate.batch_plan.grad_accum_steps)
+    if int(candidate.batch_plan.global_batch_size) <= current_global:
+        return None
+    candidate.metadata["program_kind"] = "candidate_batch_plan_fill"
+    candidate.metadata["priority_rank"] = 15
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_long_context_cp_candidate(program: MegatronProgram) -> Optional[MegatronProgram]:
+    candidate = _clone_program(program)
+    current_seq = max(int(candidate.metadata.get("seq_len", 1024) or 1024), 1)
+    if current_seq < 2048 or int(candidate.parallel.cp_degree) > 1:
+        return None
+    product_without_cp = (
+        int(candidate.parallel.tp_degree)
+        * int(candidate.parallel.pp_degree)
+        * int(candidate.parallel.ep_degree)
+        * int(candidate.parallel.expert_tp_degree)
+    )
+    if int(candidate.cluster.world_size) % max(product_without_cp * 2, 1) != 0:
+        return None
+    candidate.parallel.cp_degree = 2
+    candidate.plane_map.attention.cp_degree = 2
+    if str(candidate.schedule.template or "") == "fixed_1f1b" and int(candidate.parallel.vpp_degree) > 1:
+        candidate.schedule.template = "interleaved_grouped_g4"
+        candidate.schedule.skeleton = "stage_aware_grouped"
+        candidate.schedule.microbatch_group_size_per_vp_stage = 4
+    candidate.metadata["program_kind"] = "candidate_long_context_cp_relief"
+    candidate.metadata["priority_rank"] = 50
+    return _sync_batch_plan_metadata(candidate)
 
 
 def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSpaceSpec) -> Tuple[bool, str]:
@@ -633,6 +2250,11 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
     is_single_node_pp_split = program_kind == "candidate_single_node_pp_split"
     is_sequence_parallel_toggle = program_kind == "candidate_sequence_parallel_toggle"
     is_dual_plane_candidate = program_kind == "candidate_dual_plane"
+    uses_hybrid_shard = any(
+        str(item.shard_strategy or "none") in {"fsdp", "hsdp"}
+        for item in (program.strategy_ir.local_parallel or [])
+    )
+    uses_torchtitan_schedule = str(program.schedule.template or "") in {"torchtitan_zero_bubble", "torchtitan_dualpipev"}
     if search_space.max_tp_size is not None and int(program.parallel.tp_degree) > int(search_space.max_tp_size):
         return False, f"tp_degree={program.parallel.tp_degree} exceeds search-space max_tp_size={search_space.max_tp_size}"
     if search_space.max_pp_size is not None and int(program.parallel.pp_degree) > int(search_space.max_pp_size):
@@ -643,14 +2265,45 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
         return False, f"cp_degree={program.parallel.cp_degree} exceeds search-space max_cp_size={search_space.max_cp_size}"
     if search_space.max_vpp_size is not None and int(program.parallel.vpp_degree) > int(search_space.max_vpp_size):
         return False, f"vpp_degree={program.parallel.vpp_degree} exceeds search-space max_vpp_size={search_space.max_vpp_size}"
+    candidate_micro_batch = max(int(program.metadata.get("micro_batch_size", 1) or 1), 1)
+    if search_space.max_micro_batch_size is not None and candidate_micro_batch > int(search_space.max_micro_batch_size):
+        return (
+            False,
+            f"micro_batch_size={candidate_micro_batch} exceeds search-space max_micro_batch_size={search_space.max_micro_batch_size}",
+        )
+    memory_estimate = estimate_program_memory(program)
+    if (
+        search_space.max_estimated_memory_pressure is not None
+        and float(memory_estimate.pressure_score) > float(search_space.max_estimated_memory_pressure)
+    ):
+        return (
+            False,
+            "estimated memory pressure "
+            f"{memory_estimate.pressure_score:.2f} exceeds search-space ceiling "
+            f"{float(search_space.max_estimated_memory_pressure):.2f}",
+        )
     if is_dual_plane_candidate and not search_space.allow_dual_plane:
         return False, "dual-plane mapping is not allowed in the current search space"
     if not search_space.allow_stage_aware_schedule and program.schedule.skeleton != "fixed_1f1b":
         return False, "stage-aware schedule is not allowed in the current search space"
+    if uses_hybrid_shard and not search_space.allow_hybrid_shard:
+        return False, "hybrid shard candidates are not allowed in the current search space"
+    if uses_torchtitan_schedule and not search_space.allow_torchtitan_schedule_sandbox:
+        return False, "torchtitan schedule sandbox is not allowed in the current search space"
     if program.schedule.skeleton not in set(search_space.allowed_schedule_skeletons):
         return False, f"schedule skeleton {program.schedule.skeleton} is outside allowed search-space skeletons"
+    if program.schedule.template not in set(search_space.allowed_schedule_templates):
+        return False, f"schedule template {program.schedule.template} is outside allowed search-space templates"
     if not search_space.allow_asymmetric_vpp and int(program.parallel.vpp_degree) > 1:
         return False, "asymmetric VPP is not allowed in the current search space"
+    if search_space.max_shard_group_size is not None:
+        for local in (program.strategy_ir.local_parallel or []):
+            if local.shard_group_size is not None and int(local.shard_group_size) > int(search_space.max_shard_group_size):
+                return False, f"shard_group_size={local.shard_group_size} exceeds search-space max_shard_group_size={search_space.max_shard_group_size}"
+    if search_space.max_replicate_group_size is not None:
+        for local in (program.strategy_ir.local_parallel or []):
+            if local.replicate_group_size is not None and int(local.replicate_group_size) > int(search_space.max_replicate_group_size):
+                return False, f"replicate_group_size={local.replicate_group_size} exceeds search-space max_replicate_group_size={search_space.max_replicate_group_size}"
     if is_single_node_pp_split and not search_space.allow_single_node_pp_split:
         return False, "single-node PP split is not allowed in the current search space"
     if is_sequence_parallel_toggle and not search_space.allow_sequence_parallel_toggle:
@@ -664,51 +2317,276 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
     return True, "allowed"
 
 
-def _synthesize_programs(
+def _build_skeleton_candidates(
     baseline: MegatronProgram,
     rewrite: SearchSpaceSpec,
-    candidate_limit: int,
-) -> Tuple[List[MegatronProgram], List[Dict[str, Any]]]:
+    runtime_summary: Dict[str, Any],
+) -> List[MegatronProgram]:
     candidates: List[MegatronProgram] = []
-    rejected: List[Dict[str, Any]] = []
-    seen = {baseline.semantic_hash()}
-
-    builders = []
+    if _is_dual_target(baseline.cluster.target):
+        dual_pp4 = _build_dual_node_pp4_candidate(baseline)
+        if dual_pp4 is not None:
+            candidates.append(dual_pp4)
+    if rewrite.prefer_memory_relief:
+        memory_relief = _build_memory_relief_candidate(baseline)
+        if memory_relief is not None:
+            candidates.append(memory_relief)
     if rewrite.allow_single_node_pp_split:
-        builders.append(_build_single_node_pipeline_candidate)
+        single_node = _build_single_node_pipeline_candidate(baseline)
+        if single_node is not None:
+            candidates.append(single_node)
     if rewrite.allow_nonuniform_partition:
-        builders.append(_build_nonuniform_partition)
-    if rewrite.allow_stage_aware_schedule:
-        builders.append(_build_stage_aware_schedule)
-    if rewrite.allow_dual_plane:
-        builders.append(_build_dual_plane_candidate)
-    if baseline.cluster.target == "dual_g4_g5":
-        builders.append(_build_topology_candidate)
-    if rewrite.allow_sequence_parallel_toggle:
-        builders.append(_build_sequence_parallel_candidate)
+        nonuniform = _build_nonuniform_partition(baseline)
+        if nonuniform is not None:
+            candidates.append(nonuniform)
+        runtime_guided = _build_runtime_guided_partition(baseline, runtime_summary)
+        if runtime_guided is not None:
+            candidates.append(runtime_guided)
+    if rewrite.max_pp_size is not None and int(rewrite.max_pp_size) >= 4:
+        pp4 = _build_pp_scaleout_candidate(baseline)
+        if pp4 is not None:
+            candidates.append(pp4)
+    if rewrite.max_pp_size is not None and int(rewrite.max_pp_size) >= 8:
+        pp8 = _build_dual_node_pp8_scaleout_candidate(baseline, runtime_summary)
+        if pp8 is not None:
+            candidates.append(pp8)
+    if _is_dual_target(baseline.cluster.target):
+        topology = _build_topology_candidate(baseline)
+        if topology is not None:
+            candidates.append(topology)
+    if str(baseline.cluster.target) == "dual_g4_g5":
+        orientation = _build_dual_node_orientation_candidate(baseline, runtime_summary)
+        if orientation is not None:
+            candidates.append(orientation)
+    return candidates
 
-    for builder in builders:
-        candidate = builder(baseline)
-        if candidate is None:
-            continue
-        hash_value = candidate.semantic_hash()
+
+def _build_local_parallel_candidates(
+    baseline: MegatronProgram,
+    skeletons: List[MegatronProgram],
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    trace_summary = reduce_trial_trace(baseline, runtime_summary=runtime_summary)
+    bottleneck = classify_bottleneck(baseline, trace_summary)
+    failure_labels = {str(item.get("label")) for item in (context_record.get("failure_modes") or [])}
+    candidates: List[MegatronProgram] = []
+    seeds = [baseline] + list(skeletons)
+
+    if "memory_underfilled" in set(bottleneck.get("labels") or []):
+        for seed in seeds:
+            filled = _build_batch_plan_fill_candidate(seed)
+            if filled is not None:
+                candidates.append(_annotate_local_parallel(filled, context_record))
+
+    if rewrite.max_cp_size is not None and int(rewrite.max_cp_size) > 1 and (
+        "memory_hotspot" in failure_labels or "long_context_attention_heavy" in set(bottleneck.get("labels") or [])
+    ):
+        for seed in seeds:
+            cp_candidate = _build_long_context_cp_candidate(seed)
+            if cp_candidate is not None:
+                candidates.append(_annotate_local_parallel(cp_candidate, context_record))
+
+    if "memory_hotspot" in failure_labels:
+        for seed in seeds:
+            fsdp_candidate = _clone_program(seed)
+            touched = False
+            for local in fsdp_candidate.strategy_ir.local_parallel:
+                if int(local.cp_degree) > 1 or int(fsdp_candidate.parallel.pp_degree) > 1:
+                    local.fsdp_scope = "selective"
+                    touched = True
+            if touched:
+                fsdp_candidate.metadata["program_kind"] = "candidate_local_fsdp_scope"
+                fsdp_candidate.metadata["priority_rank"] = 18
+                candidates.append(_sync_batch_plan_metadata(fsdp_candidate))
+
+    if rewrite.allow_dual_plane:
+        dual_plane = _build_dual_plane_candidate(baseline)
+        if dual_plane is not None:
+            candidates.append(_annotate_local_parallel(dual_plane, context_record))
+
+    if rewrite.allow_sequence_parallel_toggle:
+        sp_candidate = _build_sequence_parallel_candidate(baseline)
+        if sp_candidate is not None:
+            candidates.append(_annotate_local_parallel(sp_candidate, context_record))
+
+    if rewrite.allow_hybrid_shard:
+        hsdp_candidate = _build_torchtitan_hsdp_candidate(baseline, context_record)
+        if hsdp_candidate is not None:
+            candidates.append(_annotate_local_parallel(hsdp_candidate, context_record))
+        for seed in seeds:
+            hybrid_candidate = _build_pp_hsdp_hybrid_candidate(seed, runtime_summary, context_record)
+            if hybrid_candidate is not None:
+                candidates.append(_annotate_local_parallel(hybrid_candidate, context_record))
+
+    return candidates
+
+
+def _build_schedule_candidates(
+    baseline: MegatronProgram,
+    skeletons: List[MegatronProgram],
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    if not rewrite.allow_stage_aware_schedule:
+        return []
+    candidates: List[MegatronProgram] = []
+    stage_aware = _build_stage_aware_schedule(baseline)
+    if stage_aware is not None:
+        candidates.append(_annotate_local_parallel(stage_aware, context_record))
+    runtime_guided = _build_runtime_guided_schedule(baseline, runtime_summary)
+    if runtime_guided is not None:
+        candidates.append(_annotate_local_parallel(runtime_guided, context_record))
+    if rewrite.allow_torchtitan_schedule_sandbox:
+        zero_bubble = _build_torchtitan_zero_bubble_schedule_candidate(baseline, runtime_summary, context_record)
+        if zero_bubble is not None:
+            candidates.append(_annotate_local_parallel(zero_bubble, context_record))
+        dualpipev = _build_torchtitan_dualpipev_schedule_candidate(baseline, runtime_summary, context_record)
+        if dualpipev is not None:
+            candidates.append(_annotate_local_parallel(dualpipev, context_record))
+    for skeleton in skeletons:
+        if int(skeleton.parallel.pp_degree) >= 4:
+            scaled = _build_pp_vpp_scaleout_candidate(skeleton, runtime_summary)
+            if scaled is not None:
+                candidates.append(_annotate_local_parallel(scaled, context_record))
+    return candidates
+
+
+def _build_agent_proposals(
+    baseline: MegatronProgram,
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+) -> List[AgentProposal]:
+    optimization_hints = list((context_record or {}).get("optimization_hints") or [])
+    hinted_rationales: Dict[str, str] = {}
+    for item in optimization_hints:
+        scope = str((item or {}).get("scope") or "")
+        rationale = str((item or {}).get("rationale") or "")
+        if scope and rationale and scope not in hinted_rationales:
+            hinted_rationales[scope] = rationale
+    skeletons = _build_skeleton_candidates(baseline, rewrite, runtime_summary)
+    skeletons = [
+        _annotate_candidate_runtime_evidence(
+            baseline,
+            _annotate_local_parallel(program, context_record),
+            context_record,
+        )
+        for program in skeletons
+    ]
+    local_parallel = [
+        _annotate_candidate_runtime_evidence(baseline, program, context_record)
+        for program in _build_local_parallel_candidates(baseline, skeletons, rewrite, runtime_summary, context_record)
+    ]
+    schedules = [
+        _annotate_candidate_runtime_evidence(baseline, program, context_record)
+        for program in _build_schedule_candidates(baseline, skeletons, rewrite, runtime_summary, context_record)
+    ]
+
+    if str(replan_decision.get("scope")) == "pipe":
+        ordered_pool = (
+            [(program, "pipe", hinted_rationales.get("pipe", "runtime evidence prefers schedule adaptation before touching local or global structure")) for program in schedules]
+            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "schedule fix is insufficient; escalate to local subgraph policy")) for program in local_parallel]
+            + [(program, "skeleton", hinted_rationales.get("skeleton", "schedule/local adaptations are exhausted; escalate to PP skeleton change")) for program in skeletons]
+        )
+    elif str(replan_decision.get("scope")) == "local_parallel":
+        ordered_pool = (
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
+            + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in schedules]
+            + [(program, "skeleton", hinted_rationales.get("skeleton", "persistent local failures justify skeleton repartitioning")) for program in skeletons]
+        )
+    else:
+        ordered_pool = (
+            [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons]
+            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "after skeleton changes, refine local CP/VPP/FSDP policy")) for program in local_parallel]
+            + [(program, "pipe", hinted_rationales.get("pipe", "pipe is last-mile tuning after broader structural changes")) for program in schedules]
+        )
+    proposals: List[AgentProposal] = []
+    for program, scope, rationale in sorted(ordered_pool, key=lambda item: _candidate_sort_key(item[0])):
+        proposals.append(_build_agent_proposal(program, scope=scope, rationale=rationale, source="heuristic_supervisor"))
+    return proposals
+
+
+def _verify_agent_proposals(
+    baseline: MegatronProgram,
+    rewrite: SearchSpaceSpec,
+    proposals: List[AgentProposal],
+    *,
+    observation: Dict[str, Any],
+    candidate_limit: int,
+) -> Tuple[List[AgentProposal], List[Dict[str, Any]]]:
+    accepted: List[AgentProposal] = []
+    rejected: List[Dict[str, Any]] = []
+    seen = {_structural_program_key(baseline)}
+    for proposal in proposals:
+        candidate = proposal.program.normalized()
+        hash_value = _structural_program_key(candidate)
         if hash_value in seen:
             continue
         seen.add(hash_value)
         candidate.search_space = rewrite.normalized()
         allowed, allowed_reason = _candidate_allowed_by_space(candidate, rewrite)
         if not allowed:
-            rejected.append({"program": candidate.to_dict(), "reason": allowed_reason})
+            rejected.append({"proposal": proposal.to_dict(), "reason": allowed_reason})
             continue
-        legality = check_program(candidate)
-        if not legality.is_valid:
-            rejected.append({"program": candidate.to_dict(), "reason": legality.to_dict()})
+        report = verify_program(candidate, observation=observation, previous_program=baseline)
+        proposal.verifier_report = report.to_dict()
+        if not report.is_legal:
+            rejected.append({"proposal": proposal.to_dict(), "reason": report.to_dict()})
             continue
-        candidates.append(candidate)
-        if len(candidates) >= int(candidate_limit):
+        accepted.append(proposal.normalized())
+        if len(accepted) >= int(candidate_limit):
             break
+    return accepted, rejected
 
-    return candidates, rejected
+
+def _synthesize_proposals(
+    baseline: MegatronProgram,
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Optional[Dict[str, Any]] = None,
+    context_record: Optional[Dict[str, Any]] = None,
+    replan_decision: Optional[Dict[str, Any]] = None,
+    candidate_limit: int = 4,
+) -> Tuple[List[AgentProposal], List[Dict[str, Any]]]:
+    runtime_summary = runtime_summary or {}
+    context_record = context_record or build_context_record(baseline, runtime_summary=runtime_summary)
+    replan_decision = replan_decision or _build_replan_decision(baseline, context_record)
+    proposals = _build_agent_proposals(
+        baseline,
+        rewrite,
+        runtime_summary=runtime_summary,
+        context_record=context_record,
+        replan_decision=replan_decision,
+    )
+    return _verify_agent_proposals(
+        baseline,
+        rewrite,
+        proposals,
+        observation=context_record,
+        candidate_limit=candidate_limit,
+    )
+
+
+def _synthesize_programs(
+    baseline: MegatronProgram,
+    rewrite: SearchSpaceSpec,
+    runtime_summary: Optional[Dict[str, Any]] = None,
+    context_record: Optional[Dict[str, Any]] = None,
+    replan_decision: Optional[Dict[str, Any]] = None,
+    candidate_limit: int = 4,
+) -> Tuple[List[MegatronProgram], List[Dict[str, Any]]]:
+    proposals, rejected = _synthesize_proposals(
+        baseline,
+        rewrite,
+        runtime_summary=runtime_summary,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+    )
+    return [proposal.program for proposal in proposals], rejected
 
 
 def parse_args() -> argparse.Namespace:
@@ -718,7 +2596,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--programs-dir", type=str, default=None)
     parser.add_argument("--runtime-summary", type=str, default=None)
     parser.add_argument("--candidate-limit", type=int, default=4)
-    parser.add_argument("--run-target", type=str, choices=["single_g4", "single_g5", "dual_g4_g5"], default="single_g5")
+    parser.add_argument("--run-target", type=str, choices=["single_g4", "single_g5", "dual_g4_g5", "dual_g5_g5"], default="single_g5")
     parser.add_argument("--model-track", type=str, choices=["dense", "moe"], default="dense")
     parser.add_argument("--nproc", type=int, default=8)
     parser.add_argument("--nnodes", type=int, default=1)
@@ -789,7 +2667,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.run_target == "dual_g4_g5":
+    if args.run_target in {"dual_g4_g5", "dual_g5_g5"}:
         args.nnodes = max(int(args.nnodes), 2)
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -797,20 +2675,82 @@ def main() -> None:
 
     runtime_summary = _load_runtime_summary(args.runtime_summary)
     baseline = _build_baseline_program(args)
+    runtime_signature = reduce_trial_trace(baseline, runtime_summary=runtime_summary)
+    observation = _make_agent_observation(baseline, runtime_summary=runtime_summary)
+    context_record = observation.to_dict()
+    previous_context = dict(runtime_summary.get("previous_context_record") or {}) if isinstance(runtime_summary, dict) else {}
+    replan_decision_obj = _resolve_replan_decision(baseline, context_record, previous_context=previous_context or None)
+    replan_decision = replan_decision_obj.to_dict()
+    bottleneck_signature = classify_bottleneck(baseline, runtime_signature)
     baseline_legality = check_program(baseline)
     if not baseline_legality.is_valid:
         raise ValueError(f"Baseline program is invalid: {json.dumps(baseline_legality.to_dict(), ensure_ascii=False)}")
 
-    rewrite = _rewrite_space(baseline, runtime_summary)
+    rewrite = _rewrite_space(baseline, runtime_signature)
     baseline.search_space = rewrite.normalized()
-    candidates, rejected_candidates = _synthesize_programs(
+    evidence_programs = _build_evidence_matrix(baseline, rewrite, runtime_signature, context_record)
+    proposal_pool, rejected_candidates = _synthesize_proposals(
         baseline,
         rewrite=rewrite,
+        runtime_summary=runtime_signature,
+        context_record=context_record,
+        replan_decision=replan_decision,
         candidate_limit=int(args.candidate_limit),
     )
-    candidate_manifest = _export_programs(baseline, candidates, programs_dir)
+    candidates = [proposal.program for proposal in proposal_pool]
+    experiment_specs = _build_experiment_specs(baseline, evidence_programs, candidates)
+    initial_bank = build_program_bank(
+        [baseline] + evidence_programs + candidates,
+        trace_summaries={str(baseline.metadata.get("program_kind")): runtime_signature},
+    )
+    ordered_templates = select_program_templates(
+        initial_bank,
+        run_target=str(args.run_target),
+        model_track=str(args.model_track),
+        length_bucket=str(runtime_signature.get("length_bucket") or "default"),
+        bottleneck_signature=bottleneck_signature,
+    )
+    ordered_programs: List[MegatronProgram] = []
+    kind_to_program = {
+        str(program.metadata.get("program_kind") or "program"): program
+        for program in [baseline] + evidence_programs + candidates
+    }
+    for template in ordered_templates:
+        program = kind_to_program.get(template.name)
+        if program is None or program is baseline or program in evidence_programs:
+            continue
+        ordered_programs.append(program)
+    ordered_candidates = ordered_programs + [program for program in candidates if program not in ordered_programs]
+    candidates = ordered_candidates[: int(args.candidate_limit)]
+    proposal_by_kind = {proposal.proposal_id: proposal for proposal in proposal_pool}
+    candidate_manifest = _export_programs(
+        baseline,
+        candidates,
+        programs_dir,
+        context_record=context_record,
+        previous_program=baseline,
+    )
+    evidence_manifest = []
+    for index, program in enumerate(evidence_programs):
+        program_kind = str(program.metadata.get("program_kind") or f"evidence_{index:02d}")
+        verifier_report = verify_program(program, observation=context_record, previous_program=baseline)
+        evidence_manifest.append(
+            {
+                "config_name": program_kind,
+                "program_hash": program.semantic_hash(),
+                "family": classify_program_family(program).to_dict(),
+                "legality": dict(verifier_report.legality or {}),
+                "verifier_report": verifier_report.to_dict(),
+                "experiment_ids": [
+                    spec.experiment_id for spec in experiment_specs if program_kind in set(spec.program_kinds)
+                ],
+            }
+        )
+    observation.motivation_evidence_manifest = list(evidence_manifest)
+    context_record = observation.to_dict()
 
     tested: List[Dict[str, Any]] = []
+    paper_artifacts: List[Dict[str, Any]] = []
     family_outside_trials: List[Dict[str, Any]] = []
     baseline_metrics: Optional[Dict[str, Any]] = None
     best_program: Optional[MegatronProgram] = None
@@ -819,30 +2759,113 @@ def main() -> None:
     if not args.export_only:
         baseline_metrics = run_trial(args, baseline, trial_id=0)
         baseline_metrics["config_name"] = "baseline"
+        baseline_metrics["trace_summary"] = reduce_trial_trace(baseline, metrics=baseline_metrics, runtime_summary=runtime_signature)
+        baseline_metrics["bottleneck_signature"] = classify_bottleneck(baseline, baseline_metrics["trace_summary"])
+        baseline_observation = _make_agent_observation(baseline, trace_summary=baseline_metrics["trace_summary"], motivation_evidence_manifest=evidence_manifest)
+        baseline_metrics["context_record"] = baseline_observation.to_dict()
+        baseline_metrics["trial_artifact"] = build_trial_artifact(
+            baseline,
+            baseline_observation,
+            bottleneck_signature=baseline_metrics["bottleneck_signature"],
+            experiment=next(
+                (
+                    spec
+                    for spec in experiment_specs
+                    if str(baseline.metadata.get("program_kind") or "baseline") in set(spec.program_kinds)
+                ),
+                None,
+            ),
+        )
         tested.append(baseline_metrics)
+        paper_artifacts.append(dict(baseline_metrics.get("trial_artifact") or {}))
         if bool((baseline_metrics.get("family") or {}).get("is_family_outside")):
             family_outside_trials.append(baseline_metrics)
 
-        best_program = baseline
-        best_metrics = baseline_metrics
-        best_score = _score(baseline_metrics)
+        trial_queue: List[Tuple[str, MegatronProgram, Optional[ExperimentSpec]]] = []
+        for program in evidence_programs:
+            kind = str(program.metadata.get("program_kind") or "evidence")
+            trial_queue.append(
+                (
+                    kind,
+                    program,
+                    next((spec for spec in experiment_specs if kind in set(spec.program_kinds)), None),
+                )
+            )
+        for candidate in candidates:
+            kind = str(candidate.metadata.get("program_kind") or "candidate")
+            trial_queue.append(
+                (
+                    kind,
+                    candidate,
+                    next((spec for spec in experiment_specs if kind in set(spec.program_kinds)), None),
+                )
+            )
 
-        for index, candidate in enumerate(candidates, start=1):
+        for index, (config_name, candidate, experiment_spec) in enumerate(trial_queue, start=1):
             metrics = run_trial(args, candidate, trial_id=index)
-            metrics["config_name"] = candidate.metadata.get("program_kind", f"candidate_{index:02d}")
+            metrics["config_name"] = config_name
+            metrics["trace_summary"] = reduce_trial_trace(candidate, metrics=metrics)
+            metrics["bottleneck_signature"] = classify_bottleneck(candidate, metrics["trace_summary"])
+            candidate_observation = _make_agent_observation(
+                candidate,
+                trace_summary=metrics["trace_summary"],
+                motivation_evidence_manifest=evidence_manifest,
+            )
+            metrics["context_record"] = candidate_observation.to_dict()
+            metrics["trial_artifact"] = build_trial_artifact(
+                candidate,
+                candidate_observation,
+                bottleneck_signature=metrics["bottleneck_signature"],
+                experiment=experiment_spec,
+            )
             tested.append(metrics)
+            paper_artifacts.append(dict(metrics.get("trial_artifact") or {}))
             if bool((metrics.get("family") or {}).get("is_family_outside")):
                 family_outside_trials.append(metrics)
-            score = _score(metrics)
-            if score > best_score:
-                best_score = score
-                best_program = candidate
-                best_metrics = metrics
+
+        ranked_trials = _rank_trials(tested)
+        best_metrics = ranked_trials[0] if ranked_trials else baseline_metrics
+        selected_hash = str(best_metrics.get("program_hash") or baseline.semantic_hash()) if best_metrics is not None else baseline.semantic_hash()
+        all_programs = [baseline] + evidence_programs + candidates
+        best_program = next((program for program in all_programs if program.semantic_hash() == selected_hash), baseline)
+    else:
+        ranked_trials = []
+        paper_artifacts = [
+            build_trial_artifact(
+                program,
+                context_record,
+                bottleneck_signature=bottleneck_signature,
+                experiment=next(
+                    (spec for spec in experiment_specs if str(program.metadata.get("program_kind") or "baseline") in set(spec.program_kinds)),
+                    None,
+                ),
+            )
+            for program in [baseline] + evidence_programs + candidates
+        ]
+
+    trace_summaries = {
+        str(item.get("config_name") or item.get("program_hash") or "program"): dict(item.get("trace_summary") or {})
+        for item in tested
+    }
+    selection_scores = {
+        str(item.get("config_name") or item.get("program_hash") or "program"): float(item.get("selection_score") or 0.0)
+        for item in tested
+        if item.get("selection_score") is not None
+    }
+    program_bank = build_program_bank(
+        [baseline] + evidence_programs + candidates,
+        trace_summaries=trace_summaries,
+        selection_scores=selection_scores,
+    )
 
     summary = _build_summary_payload(
         export_only=bool(args.export_only),
         programs_dir=programs_dir,
         runtime_summary=runtime_summary,
+        runtime_signature=runtime_signature,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        bottleneck_signature=bottleneck_signature,
         rewrite=rewrite,
         baseline=baseline,
         baseline_metrics=baseline_metrics,
@@ -852,6 +2875,11 @@ def main() -> None:
         family_outside_trials=family_outside_trials,
         rejected_candidates=rejected_candidates,
         candidate_manifest=candidate_manifest,
+        program_bank=program_bank,
+        evidence_manifest=evidence_manifest,
+        experiment_specs=experiment_specs,
+        paper_artifacts=paper_artifacts,
+        agent_proposals=[proposal.to_dict() for proposal in proposal_pool],
     )
     summary_path = workdir / "summary_megatron.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
