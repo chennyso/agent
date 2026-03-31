@@ -65,6 +65,11 @@ _VSTAGE_PATTERNS = {
     ),
 }
 
+_TIMER_RE = re.compile(
+    r"^\s+([A-Za-z0-9_\-/\.]+)\s*\.+:\s*\(([0-9.]+),\s*([0-9.]+)\)",
+    re.MULTILINE,
+)
+
 
 def _extract_floats(patterns: List[re.Pattern], text: str) -> List[float]:
     out: List[float] = []
@@ -75,6 +80,14 @@ def _extract_floats(patterns: List[re.Pattern], text: str) -> List[float]:
             except Exception:
                 continue
     return out
+
+
+def _parse_timer_summary(texts: Iterable[str]) -> Dict[str, float]:
+    buckets: Dict[str, List[float]] = {}
+    for text in texts:
+        for name, _min_value, max_value in _TIMER_RE.findall(text or ""):
+            buckets.setdefault(str(name), []).append(float(max_value))
+    return {name: float(_p50(values) or 0.0) for name, values in buckets.items()}
 
 
 def _p50(values: List[float]) -> Optional[float]:
@@ -221,6 +234,12 @@ def _window_summary(entry: Dict[str, float]) -> Dict[str, float]:
     }
 
 
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
 def _summarize_stage_windows(stage_metrics: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
     if not stage_metrics:
         return {}
@@ -232,9 +251,13 @@ def _summarize_stage_windows(stage_metrics: Dict[str, Dict[str, float]]) -> Dict
     min_item = min(ordered, key=lambda item: item[1]["window_ms"])
     comm_total = sum(item[1]["comm_ms"] for item in ordered)
     window_total = sum(item[1]["window_ms"] for item in ordered)
+    window_mean = (sum(window_values) / len(window_values)) if window_values else None
     spread_ratio = None
     if max_item[1]["window_ms"] > 0:
         spread_ratio = (max_item[1]["window_ms"] - min_item[1]["window_ms"]) / max_item[1]["window_ms"]
+    stage_skew = None
+    if window_mean is not None and window_mean > 0:
+        stage_skew = max_item[1]["window_ms"] / window_mean
     bubble_ratio = None
     if window_total > 0:
         bubble_ratio = sum(bubble_values) / window_total
@@ -244,7 +267,9 @@ def _summarize_stage_windows(stage_metrics: Dict[str, Dict[str, float]]) -> Dict
         "longest_stage_window_ms": max_item[1]["window_ms"],
         "stage_spread_ratio": spread_ratio,
         "bubble_ratio_from_stages": bubble_ratio,
+        "bubble_exposure_ratio": bubble_ratio,
         "comm_ratio_from_stages": (comm_total / window_total) if window_total > 0 else None,
+        "stage_skew": stage_skew,
         "peak_stage_reserved_gib": max(item[1]["peak_reserved_gib"] for item in ordered),
         "peak_stage_active_gib": max(item[1]["peak_active_gib"] for item in ordered),
         "stage_window_ms_p50": _p50(window_values),
@@ -286,6 +311,7 @@ def parse_megatron_logs(
         tokens_per_s = float(global_batch_size) * float(seq_len) / (step_time_ms_p50 / 1000.0)
 
     pp_idle_ms = _extract_pp_idle_ms(texts)
+    timer_summary = _parse_timer_summary(texts)
     stage_metrics, vstage_metrics = _extract_structured_stage_metrics(texts)
     stage_summary = _summarize_stage_windows(stage_metrics)
     vstage_summary = _summarize_vstage_windows(vstage_metrics)
@@ -294,17 +320,67 @@ def parse_megatron_logs(
     if bubble_ratio is None and pp_idle_ms is not None and step_time_ms_p50 is not None and step_time_ms_p50 > 0:
         bubble_ratio = pp_idle_ms / max(step_time_ms_p50 + pp_idle_ms, 1e-6)
 
+    forward_backward_ms = _safe_float(timer_summary.get("forward-backward"))
+    optimizer_total_ms = _safe_float(timer_summary.get("optimizer"))
+    optimizer_inner_step_ms = _safe_float(timer_summary.get("optimizer-inner-step"))
+    optimizer_copy_to_main_grad_ms = _safe_float(timer_summary.get("optimizer-copy-to-main-grad"))
+    optimizer_copy_main_to_model_ms = _safe_float(
+        timer_summary.get("optimizer-copy-main-to-model-params")
+    )
+    forward_recv_ms = _safe_float(timer_summary.get("forward-recv")) or 0.0
+    backward_recv_ms = _safe_float(timer_summary.get("backward-recv")) or 0.0
+    forward_send_backward_recv_ms = (
+        _safe_float(timer_summary.get("forward-send-backward-recv")) or 0.0
+    )
+    backward_send_forward_recv_ms = (
+        _safe_float(timer_summary.get("backward-send-forward-recv")) or 0.0
+    )
+    pipeline_wait_ms = (
+        forward_recv_ms
+        + backward_recv_ms
+        + forward_send_backward_recv_ms
+        + backward_send_forward_recv_ms
+    )
+    pipeline_wait_ratio = _safe_ratio(pipeline_wait_ms, step_time_ms_p50)
+    optimizer_exposed_ms = None
+    if optimizer_total_ms is not None and step_time_ms_p50 is not None:
+        tail_after_fb = max(
+            float(step_time_ms_p50) - float(forward_backward_ms or 0.0),
+            0.0,
+        )
+        optimizer_exposed_ms = min(float(optimizer_total_ms), tail_after_fb)
+    optimizer_exposed_ratio = _safe_ratio(optimizer_exposed_ms, step_time_ms_p50)
+    optimizer_ratio = _safe_ratio(optimizer_total_ms, step_time_ms_p50)
+
     out: Dict[str, Any] = {
         "step_time_ms_p50": step_time_ms_p50,
         "step_time_ms_p95": step_time_ms_p95,
         "throughput_tokens_per_s": tokens_per_s,
         "pp_idle_ms": pp_idle_ms,
         "bubble_ratio": bubble_ratio,
+        "bubble_exposure_ratio": bubble_ratio,
+        "forward_backward_ms": forward_backward_ms,
+        "optimizer_total_ms": optimizer_total_ms,
+        "optimizer_inner_step_ms": optimizer_inner_step_ms,
+        "optimizer_copy_to_main_grad_ms": optimizer_copy_to_main_grad_ms,
+        "optimizer_copy_main_to_model_ms": optimizer_copy_main_to_model_ms,
+        "optimizer_ratio": optimizer_ratio,
+        "optimizer_exposed_ms": optimizer_exposed_ms,
+        "optimizer_exposed_ratio": optimizer_exposed_ratio,
+        "forward_recv_ms": forward_recv_ms,
+        "backward_recv_ms": backward_recv_ms,
+        "forward_send_backward_recv_ms": forward_send_backward_recv_ms,
+        "backward_send_forward_recv_ms": backward_send_forward_recv_ms,
+        "pipeline_wait_ms": pipeline_wait_ms,
+        "pipeline_wait_ratio": pipeline_wait_ratio,
         "telemetry_stage_count": len(stage_metrics),
         "telemetry_vstage_count": len(vstage_metrics),
+        "timer_summary": timer_summary,
     }
     out.update(stage_summary)
     out.update(vstage_summary)
+    if "stage_skew" not in out:
+        out["stage_skew"] = None
     if stage_metrics:
         out["stage_metrics_raw"] = stage_metrics
     if vstage_metrics:

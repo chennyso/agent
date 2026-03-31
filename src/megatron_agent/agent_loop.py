@@ -95,13 +95,41 @@ def _sync_batch_plan_metadata(program: MegatronProgram) -> MegatronProgram:
     candidate.strategy_ir.pipe.template = str(candidate.schedule.template)
     candidate.strategy_ir.pipe.microbatch_order = str(candidate.schedule.dispatch_order)
     candidate.strategy_ir.pipe.steady_state_group_size = candidate.schedule.microbatch_group_size_per_vp_stage
+    stage_local_vpp_by_stage: Dict[int, int] = {}
+    raw_stage_local_vpp = candidate.metadata.get("stage_local_vpp_vector")
+    if isinstance(raw_stage_local_vpp, dict):
+        for key, value in raw_stage_local_vpp.items():
+            stage_id = _safe_int(key)
+            stage_vpp = _safe_int(value)
+            if stage_id is None or stage_vpp is None:
+                continue
+            stage_local_vpp_by_stage[int(stage_id)] = max(int(stage_vpp), 1)
+    elif isinstance(raw_stage_local_vpp, list):
+        for stage_id, value in enumerate(raw_stage_local_vpp):
+            stage_vpp = _safe_int(value)
+            if stage_vpp is None:
+                continue
+            stage_local_vpp_by_stage[int(stage_id)] = max(int(stage_vpp), 1)
+    preserve_stage_local_vpp = bool(candidate.metadata.get("preserve_stage_local_vpp", False))
     local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
     for subgraph in candidate.strategy_ir.apipe:
         entry = local_by_name.get(subgraph.name)
         if entry is None:
             continue
-        entry.vpp_degree = max(int(candidate.parallel.vpp_degree), 1)
+        stage_index = int(subgraph.stage_index)
+        if stage_index in stage_local_vpp_by_stage:
+            entry.vpp_degree = max(int(stage_local_vpp_by_stage[stage_index]), 1)
+        elif not preserve_stage_local_vpp:
+            entry.vpp_degree = max(int(candidate.parallel.vpp_degree), 1)
+        else:
+            entry.vpp_degree = max(int(entry.vpp_degree), 1)
         entry.cp_degree = max(entry.cp_degree, int(candidate.parallel.cp_degree))
+    if stage_local_vpp_by_stage:
+        max_stage_index = max(stage_local_vpp_by_stage)
+        candidate.metadata["stage_local_vpp_vector"] = [
+            int(stage_local_vpp_by_stage.get(index, max(int(candidate.parallel.vpp_degree), 1)))
+            for index in range(max_stage_index + 1)
+        ]
     return candidate.normalized()
 
 
@@ -272,6 +300,290 @@ def _stage_signal_series(context_record: Dict[str, Any], key: str, expected_coun
             continue
         by_stage[stage_id] = float((item or {}).get(key) or 0.0)
     return [float(by_stage.get(index, 0.0) or 0.0) for index in range(max(expected_count, 0))]
+
+
+def _stage_cost_entries(context_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    entries = list(evidence.get("stage_cost_model") or [])
+    cleaned: List[Dict[str, Any]] = []
+    for item in entries:
+        stage_id = _safe_int((item or {}).get("stage_id"))
+        if stage_id is None:
+            continue
+        cleaned.append(
+            {
+                "stage_id": int(stage_id),
+                "T_stable_ms": float((item or {}).get("T_stable_ms") or 0.0),
+                "delta_first_ms": float((item or {}).get("delta_first_ms") or 0.0),
+                "delta_last_ms": float((item or {}).get("delta_last_ms") or 0.0),
+                "boundary_exposed_ms": float((item or {}).get("boundary_exposed_ms") or 0.0),
+                "fragmentation_ms": float((item or {}).get("fragmentation_ms") or 0.0),
+                "memory_risk_ms": float((item or {}).get("memory_risk_ms") or 0.0),
+                "total_cost_ms": float((item or {}).get("total_cost_ms") or 0.0),
+            }
+        )
+    return sorted(cleaned, key=lambda item: int(item.get("stage_id") or 0))
+
+
+def _boundary_semantic_entries(context_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    entries = list(evidence.get("boundary_semantics") or [])
+    cleaned: List[Dict[str, Any]] = []
+    for item in entries:
+        boundary_id = str((item or {}).get("boundary_id") or "").strip()
+        if not boundary_id:
+            continue
+        cleaned.append(
+            {
+                "boundary_id": boundary_id,
+                "left_stage": int((item or {}).get("left_stage") or 0),
+                "right_stage": int((item or {}).get("right_stage") or 0),
+                "semantic": str((item or {}).get("semantic") or "normal").strip().lower(),
+                "boundary_wait_ms": float((item or {}).get("boundary_wait_ms") or 0.0),
+                "cross_node": bool((item or {}).get("cross_node")),
+                "actions": [str(action) for action in ((item or {}).get("actions") or [])],
+            }
+        )
+    return sorted(cleaned, key=lambda item: float(item.get("boundary_wait_ms") or 0.0), reverse=True)
+
+
+def _local_parallel_by_stage(program: MegatronProgram) -> Dict[int, Any]:
+    norm = program.normalized()
+    local_by_name = {entry.subgraph: entry for entry in (norm.strategy_ir.local_parallel or [])}
+    mapped: Dict[int, Any] = {}
+    for subgraph in (norm.strategy_ir.apipe or []):
+        entry = local_by_name.get(subgraph.name)
+        if entry is None:
+            continue
+        mapped[int(subgraph.stage_index)] = entry
+    return mapped
+
+
+def _nonuniform_vpp_vector_from_evidence(
+    context_record: Dict[str, Any],
+    *,
+    stage_count: int,
+    fallback_vpp: int,
+) -> Tuple[List[int], Dict[int, List[List[int]]]]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    payload = dict(evidence.get("nonuniform_vpp_shape") or {})
+    per_stage = list(payload.get("per_stage_candidates") or [])
+    vector = [max(int(fallback_vpp), 1) for _ in range(max(stage_count, 0))]
+    chunk_shapes: Dict[int, List[List[int]]] = {}
+    for item in per_stage:
+        stage_id = _safe_int((item or {}).get("stage_id"))
+        if stage_id is None or stage_id < 0 or stage_id >= stage_count:
+            continue
+        legal_values = [max(int(value), 1) for value in ((item or {}).get("currently_executable_values") or []) if _safe_int(value) is not None]
+        recommended = max(int((item or {}).get("recommended_v") or 1), 1)
+        if legal_values:
+            if recommended in set(legal_values):
+                target_v = recommended
+            else:
+                target_v = max(legal_values)
+        else:
+            target_v = min(recommended, 2)
+        vector[int(stage_id)] = max(int(target_v), 1)
+        raw_shapes = list((item or {}).get("candidate_chunk_shapes") or [])
+        cleaned_shapes: List[List[int]] = []
+        for shape in raw_shapes:
+            if not isinstance(shape, list) or not shape:
+                continue
+            parsed = [max(int(value), 1) for value in shape]
+            cleaned_shapes.append(parsed)
+        if cleaned_shapes:
+            chunk_shapes[int(stage_id)] = cleaned_shapes
+    return vector, chunk_shapes
+
+
+def _stage_cost_breakdown(
+    baseline: MegatronProgram,
+    candidate: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    stage_costs = _stage_cost_entries(context_record)
+    if not stage_costs:
+        return None
+    baseline_norm = baseline.normalized()
+    candidate_norm = candidate.normalized()
+    baseline_locals = _local_parallel_by_stage(baseline_norm)
+    candidate_locals = _local_parallel_by_stage(candidate_norm)
+    template = str(candidate_norm.schedule.template or "fixed_1f1b")
+    dispatch = str(candidate_norm.schedule.dispatch_order or "default").lower()
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    bubble_ratio = float(runtime.get("bubble_ratio") or 0.0)
+
+    stable_factor = 1.0
+    first_factor = 1.0
+    last_factor = 1.0
+    boundary_factor = 1.0
+    frag_factor = 1.0
+    memory_factor = 1.0
+    if template == "interleaved_grouped_g2":
+        stable_factor *= 0.96
+        first_factor *= 0.90
+        last_factor *= 0.90
+        frag_factor *= 1.05
+    elif template in {"interleaved_grouped_g4", "pp4_frontload", "pp4_middle_relief"}:
+        stable_factor *= 0.93
+        first_factor *= 0.84
+        last_factor *= 0.84
+        boundary_factor *= 0.92
+        frag_factor *= 1.10
+    elif template == "torchtitan_zero_bubble":
+        stable_factor *= 0.90
+        first_factor *= 0.76
+        last_factor *= 0.76
+        boundary_factor *= 0.82
+        frag_factor *= 1.16
+    elif template == "torchtitan_dualpipev":
+        stable_factor *= 0.92
+        first_factor *= 0.80
+        last_factor *= 0.80
+        boundary_factor *= 0.86
+        frag_factor *= 1.13
+    if "frontload" in dispatch or "tail" in dispatch:
+        first_factor *= 0.86
+        last_factor *= 0.92
+    if "middle" in dispatch:
+        stable_factor *= 0.95
+    if "boundary" in dispatch or "comm" in dispatch:
+        boundary_factor *= 0.86
+
+    semantic = str((candidate_norm.metadata or {}).get("boundary_semantic_focus") or "").strip().lower()
+    boundary_id = str((candidate_norm.metadata or {}).get("boundary_semantic_boundary") or "")
+    boundary_stage_ids: List[int] = []
+    if "->" in boundary_id:
+        left, _, right = boundary_id.partition("->")
+        left_id = _safe_int(left)
+        right_id = _safe_int(right)
+        if left_id is not None:
+            boundary_stage_ids.append(int(left_id))
+        if right_id is not None:
+            boundary_stage_ids.append(int(right_id))
+    if semantic == "comm-aware":
+        boundary_factor *= 0.82
+    elif semantic == "tail-aware":
+        first_factor *= 0.80
+        last_factor *= 0.80
+    elif semantic == "memory-aware":
+        memory_factor *= 0.78
+        frag_factor *= 0.95
+
+    policy_stage_ids = {
+        int(item.get("stage_id"))
+        for item in list((candidate_norm.metadata or {}).get("stage_local_memory_policy") or [])
+        if _safe_int((item or {}).get("stage_id")) is not None
+    }
+
+    baseline_components = {
+        "T_stable_ms": 0.0,
+        "delta_first_ms": 0.0,
+        "delta_last_ms": 0.0,
+        "boundary_exposed_ms": 0.0,
+        "fragmentation_ms": 0.0,
+        "memory_risk_ms": 0.0,
+    }
+    candidate_components = {
+        "T_stable_ms": 0.0,
+        "delta_first_ms": 0.0,
+        "delta_last_ms": 0.0,
+        "boundary_exposed_ms": 0.0,
+        "fragmentation_ms": 0.0,
+        "memory_risk_ms": 0.0,
+    }
+
+    max_stage_id = max((int(item.get("stage_id") or 0) for item in stage_costs), default=0)
+    for item in stage_costs:
+        stage_id = int(item.get("stage_id") or 0)
+        is_edge = stage_id in {0, max_stage_id}
+        stage_stable = stable_factor
+        stage_first = first_factor
+        stage_last = last_factor
+        stage_boundary = boundary_factor
+        stage_frag = frag_factor
+        stage_memory = memory_factor
+        if is_edge and bubble_ratio >= 0.08:
+            stage_first *= 0.94
+            stage_last *= 0.94
+        if stage_id in boundary_stage_ids and semantic == "comm-aware":
+            stage_boundary *= 0.80
+        if stage_id in policy_stage_ids:
+            stage_memory *= 0.84
+            stage_stable *= 1.03
+
+        baseline_local = baseline_locals.get(stage_id)
+        candidate_local = candidate_locals.get(stage_id)
+        base_cp = int(baseline_local.cp_degree) if baseline_local is not None else int(baseline_norm.parallel.cp_degree)
+        cand_cp = int(candidate_local.cp_degree) if candidate_local is not None else int(candidate_norm.parallel.cp_degree)
+        cp_delta = max(cand_cp - base_cp, 0)
+        if cp_delta > 0:
+            stage_memory *= max(0.65, 1.0 - 0.12 * float(cp_delta))
+            stage_boundary *= max(0.80, 1.0 - 0.05 * float(cp_delta))
+        base_vpp = int(baseline_local.vpp_degree) if baseline_local is not None else int(baseline_norm.parallel.vpp_degree)
+        cand_vpp = int(candidate_local.vpp_degree) if candidate_local is not None else int(candidate_norm.parallel.vpp_degree)
+        vpp_delta = cand_vpp - base_vpp
+        if vpp_delta > 0:
+            stage_stable *= max(0.80, 1.0 - 0.04 * float(vpp_delta) * max(1.0 + bubble_ratio, 1.0))
+            stage_frag *= 1.0 + 0.11 * float(vpp_delta)
+        elif vpp_delta < 0:
+            stage_frag *= max(0.75, 1.0 + 0.06 * float(vpp_delta))
+        base_sharded = bool(
+            baseline_local is not None
+            and (
+                str(baseline_local.shard_strategy or "none") in {"fsdp", "hsdp"}
+                or str(baseline_local.fsdp_scope or "none") not in {"none", "off"}
+            )
+        )
+        cand_sharded = bool(
+            candidate_local is not None
+            and (
+                str(candidate_local.shard_strategy or "none") in {"fsdp", "hsdp"}
+                or str(candidate_local.fsdp_scope or "none") not in {"none", "off"}
+            )
+        )
+        if cand_sharded and not base_sharded:
+            stage_memory *= 0.78
+        if candidate_local is not None and str(candidate_local.reshard_policy or "default") not in {"default", "none"}:
+            stage_memory *= 0.93
+
+        baseline_components["T_stable_ms"] += float(item.get("T_stable_ms") or 0.0)
+        baseline_components["delta_first_ms"] += float(item.get("delta_first_ms") or 0.0)
+        baseline_components["delta_last_ms"] += float(item.get("delta_last_ms") or 0.0)
+        baseline_components["boundary_exposed_ms"] += float(item.get("boundary_exposed_ms") or 0.0)
+        baseline_components["fragmentation_ms"] += float(item.get("fragmentation_ms") or 0.0)
+        baseline_components["memory_risk_ms"] += float(item.get("memory_risk_ms") or 0.0)
+
+        candidate_components["T_stable_ms"] += float(item.get("T_stable_ms") or 0.0) * stage_stable
+        candidate_components["delta_first_ms"] += float(item.get("delta_first_ms") or 0.0) * stage_first
+        candidate_components["delta_last_ms"] += float(item.get("delta_last_ms") or 0.0) * stage_last
+        candidate_components["boundary_exposed_ms"] += float(item.get("boundary_exposed_ms") or 0.0) * stage_boundary
+        candidate_components["fragmentation_ms"] += float(item.get("fragmentation_ms") or 0.0) * stage_frag
+        candidate_components["memory_risk_ms"] += float(item.get("memory_risk_ms") or 0.0) * stage_memory
+
+    def _objective(components: Dict[str, float]) -> float:
+        return (
+            float(components.get("T_stable_ms") or 0.0)
+            + 0.55 * float(components.get("delta_first_ms") or 0.0)
+            + 0.55 * float(components.get("delta_last_ms") or 0.0)
+            + 0.90 * float(components.get("boundary_exposed_ms") or 0.0)
+            + 0.70 * float(components.get("fragmentation_ms") or 0.0)
+            + 1.20 * float(components.get("memory_risk_ms") or 0.0)
+        )
+
+    baseline_objective = _objective(baseline_components)
+    candidate_objective = _objective(candidate_components)
+    if baseline_objective <= 0.0:
+        return None
+    normalized_improvement = (baseline_objective - candidate_objective) / baseline_objective
+    return {
+        "candidate_objective": round(float(candidate_objective), 4),
+        "baseline_objective": round(float(baseline_objective), 4),
+        "improvement_ratio": round(float(normalized_improvement), 4),
+        "components": {
+            key: round(float(candidate_components.get(key) or 0.0), 4) for key in candidate_components
+        },
+    }
 
 
 def _project_stage_signal(
@@ -506,6 +818,10 @@ def _annotate_candidate_runtime_evidence(
         "dual_node_components",
         "hybrid_shard_score",
         "hybrid_shard_components",
+        "stage_cost_score",
+        "stage_cost_objective",
+        "stage_cost_components",
+        "stage_cost_improvement_ratio",
         "vpp_tradeoff",
         "vpp_veto_reason",
         "evidence_score",
@@ -549,6 +865,13 @@ def _annotate_candidate_runtime_evidence(
             "hsdp_fraction": float(hybrid_shard.get("hsdp_fraction") or 0.0),
         }
         evidence_score += float(hybrid_shard.get("improvement") or 0.0)
+    stage_cost = _stage_cost_breakdown(baseline, annotated, context_record)
+    if stage_cost is not None:
+        annotated.metadata["stage_cost_score"] = float(stage_cost.get("improvement_ratio") or 0.0)
+        annotated.metadata["stage_cost_objective"] = float(stage_cost.get("candidate_objective") or 0.0)
+        annotated.metadata["stage_cost_components"] = dict(stage_cost.get("components") or {})
+        annotated.metadata["stage_cost_improvement_ratio"] = float(stage_cost.get("improvement_ratio") or 0.0)
+        evidence_score += float(stage_cost.get("improvement_ratio") or 0.0)
     if int(annotated.parallel.vpp_degree) > 1:
         tradeoff = assess_vpp_comm_tradeoff(
             annotated,
@@ -613,6 +936,136 @@ def _dominant_stage_indices(payload: Optional[Dict[str, Any]], expected_count: i
     slow_idx = max(range(len(values)), key=lambda idx: values[idx])
     fast_idx = min(range(len(values)), key=lambda idx: values[idx])
     return slow_idx, fast_idx, values
+
+
+def _stage_window_component_values(
+    payload: Optional[Dict[str, Any]],
+    metric: str,
+    expected_count: int,
+) -> List[float]:
+    if not payload:
+        return [0.0] * max(int(expected_count), 0)
+    stage_summary = payload.get("stage_window_summary") or {}
+    indexed: List[Tuple[int, float]] = []
+    for key, item in stage_summary.items():
+        value = _safe_float((item or {}).get(metric))
+        if value is None or value < 0.0:
+            value = 0.0
+        try:
+            stage_id = int(str(key))
+        except Exception:
+            stage_id = len(indexed)
+        indexed.append((stage_id, float(value)))
+    indexed.sort(key=lambda pair: pair[0])
+    values = [value for _, value in indexed]
+    if len(values) < expected_count:
+        values.extend([0.0] * (expected_count - len(values)))
+    elif len(values) > expected_count:
+        values = values[:expected_count]
+    return values
+
+
+def _position_aware_partition_focus(runtime_summary: Dict[str, Any]) -> str:
+    optimizer_exposed_ratio = float(runtime_summary.get("optimizer_exposed_ratio") or 0.0)
+    pipeline_wait_ratio = float(runtime_summary.get("pipeline_wait_ratio") or 0.0)
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    if optimizer_exposed_ratio >= max(0.18, pipeline_wait_ratio + 0.03):
+        return "tail-aware"
+    if pipeline_wait_ratio >= 0.10 or bubble_ratio >= 0.10:
+        return "comm-aware"
+    return "position-aware"
+
+
+def _runtime_guided_partition_plan(
+    stage_layers: List[int],
+    runtime_summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    expected_count = len(stage_layers)
+    if expected_count < 2:
+        return None
+    window_ms = _stage_window_values(runtime_summary, expected_count=expected_count)
+    if len(window_ms) < 2 or max(window_ms) <= 0.0:
+        return None
+    compute_ms = _stage_window_component_values(runtime_summary, "compute_ms", expected_count)
+    comm_ms = _stage_window_component_values(runtime_summary, "comm_ms", expected_count)
+    bubble_ms = _stage_window_component_values(runtime_summary, "bubble_ms", expected_count)
+    peak_reserved_gib = _stage_window_component_values(runtime_summary, "peak_reserved_gib", expected_count)
+    pipeline_wait_ratio = float(runtime_summary.get("pipeline_wait_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_summary.get("optimizer_exposed_ratio") or 0.0)
+    bubble_ratio = float(runtime_summary.get("bubble_ratio") or 0.0)
+    stage_skew = float(runtime_summary.get("stage_skew") or 0.0)
+    focus = _position_aware_partition_focus(runtime_summary)
+    mean_window = sum(value for value in window_ms if value > 0.0) / float(max(sum(1 for value in window_ms if value > 0.0), 1))
+
+    stage_objectives: List[float] = []
+    last_index = expected_count - 1
+    for idx in range(expected_count):
+        compute = float(compute_ms[idx] or 0.0)
+        comm = float(comm_ms[idx] or 0.0)
+        bubble = float(bubble_ms[idx] or 0.0)
+        memory = float(peak_reserved_gib[idx] or 0.0)
+        objective = compute + 0.85 * comm + 0.65 * bubble
+        edge_wait_penalty = mean_window * pipeline_wait_ratio * (0.85 if idx in {0, last_index} else 0.35)
+        tail_penalty = 0.0
+        if idx == last_index:
+            tail_penalty = mean_window * optimizer_exposed_ratio * 0.95
+        elif idx == 0:
+            tail_penalty = mean_window * optimizer_exposed_ratio * 0.35
+        memory_penalty = mean_window * 0.02 * max(memory - _median(peak_reserved_gib), 0.0)
+        if focus == "comm-aware":
+            objective += edge_wait_penalty + 0.35 * mean_window * bubble_ratio * (1.0 if idx in {0, last_index} else 0.5)
+        elif focus == "tail-aware":
+            objective += 0.60 * edge_wait_penalty + tail_penalty
+        else:
+            objective += 0.75 * edge_wait_penalty + 0.45 * tail_penalty
+        objective += memory_penalty
+        stage_objectives.append(float(objective))
+
+    donor = max(range(expected_count), key=lambda idx: stage_objectives[idx])
+    receiver_candidates = sorted(range(expected_count), key=lambda idx: stage_objectives[idx])
+    receiver = None
+    min_objective = stage_objectives[receiver_candidates[0]]
+    relaxed_threshold = min_objective * 1.05 if min_objective > 0.0 else min_objective + 1.0
+    for idx in receiver_candidates:
+        if idx == donor:
+            continue
+        if stage_objectives[idx] <= relaxed_threshold:
+            if receiver is None or abs(idx - donor) < abs(receiver - donor):
+                receiver = idx
+    if receiver is None:
+        receiver = min((idx for idx in range(expected_count) if idx != donor), key=lambda idx: stage_objectives[idx], default=None)
+    if receiver is None:
+        return None
+    donor_value = float(stage_objectives[donor] or 0.0)
+    receiver_value = float(stage_objectives[receiver] or 0.0)
+    if donor_value <= 0.0:
+        return None
+    spread_ratio = max((donor_value - receiver_value) / donor_value, 0.0)
+    if spread_ratio < 0.08 and stage_skew < 1.08:
+        return None
+    if stage_layers[donor] <= 1:
+        return None
+    shift = 1
+    if spread_ratio >= 0.16:
+        shift += 1
+    if spread_ratio >= 0.28:
+        shift += 1
+    if donor in {0, last_index} and pipeline_wait_ratio >= 0.10:
+        shift += 1
+    if donor == last_index and optimizer_exposed_ratio >= 0.18:
+        shift += 1
+    shift = max(1, min(shift, stage_layers[donor] - 1, 3))
+    return {
+        "donor_stage_index": int(donor),
+        "receiver_stage_index": int(receiver),
+        "shift_layers": int(shift),
+        "focus": focus,
+        "spread_ratio": round(float(spread_ratio), 4),
+        "stage_objectives": [round(float(value), 4) for value in stage_objectives],
+        "pipeline_wait_ratio": round(float(pipeline_wait_ratio), 4),
+        "optimizer_exposed_ratio": round(float(optimizer_exposed_ratio), 4),
+        "stage_skew": round(float(stage_skew), 4),
+    }
 
 
 def _observed_comm_ratio(payload: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -838,6 +1291,7 @@ def _build_agent_proposal(
 
 def _annotate_local_parallel(program: MegatronProgram, context_record: Dict[str, Any]) -> MegatronProgram:
     candidate = _clone_program(program)
+    preserve_stage_local_vpp = bool(candidate.metadata.get("preserve_stage_local_vpp", False))
     hot_subgraphs = {
         str(item.get("anchor")): str(item.get("label"))
         for item in (context_record.get("failure_modes") or [])
@@ -845,12 +1299,12 @@ def _annotate_local_parallel(program: MegatronProgram, context_record: Dict[str,
     }
     for local in candidate.strategy_ir.local_parallel:
         label = hot_subgraphs.get(local.subgraph)
-        if label == "schedule_coupling":
+        if label == "schedule_coupling" and not preserve_stage_local_vpp:
             local.vpp_degree = max(int(local.vpp_degree), 2)
         elif label == "memory_hotspot":
             local.cp_degree = max(int(local.cp_degree), 2)
             local.fsdp_scope = "selective"
-        elif label == "compute_imbalance":
+        elif label == "compute_imbalance" and not preserve_stage_local_vpp:
             local.vpp_degree = max(int(local.vpp_degree), int(candidate.parallel.vpp_degree))
     candidate.strategy_ir.pipe.template = str(candidate.schedule.template)
     candidate.strategy_ir.pipe.microbatch_order = str(candidate.schedule.dispatch_order)
@@ -1741,23 +2195,16 @@ def _build_dual_node_pp4_candidate(program: MegatronProgram) -> Optional[Megatro
 def _build_runtime_guided_partition(program: MegatronProgram, runtime_summary: Dict[str, Any]) -> Optional[MegatronProgram]:
     if int(program.parallel.pp_degree) < 2:
         return None
-    slow_idx, fast_idx, stage_windows = _dominant_stage_indices(runtime_summary, int(program.parallel.pp_degree))
-    if slow_idx is None or fast_idx is None or slow_idx == fast_idx:
-        return None
     candidate = _clone_program(program)
     stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
-    if slow_idx >= len(stage_layers) or fast_idx >= len(stage_layers):
+    plan = _runtime_guided_partition_plan(stage_layers, runtime_summary)
+    if plan is None:
         return None
-    if stage_layers[slow_idx] <= 1:
+    slow_idx = int(plan["donor_stage_index"])
+    fast_idx = int(plan["receiver_stage_index"])
+    shift = int(plan["shift_layers"])
+    if slow_idx >= len(stage_layers) or fast_idx >= len(stage_layers) or slow_idx == fast_idx:
         return None
-    slow_value = stage_windows[slow_idx]
-    fast_value = stage_windows[fast_idx]
-    if slow_value <= 0:
-        return None
-    spread_ratio = (slow_value - fast_value) / slow_value
-    if spread_ratio < 0.08:
-        return None
-    shift = 2 if spread_ratio >= 0.20 and stage_layers[slow_idx] > 2 else 1
     stage_layers[slow_idx] -= shift
     stage_layers[fast_idx] += shift
     for index, stage in enumerate(candidate.partition.stages):
@@ -1766,7 +2213,14 @@ def _build_runtime_guided_partition(program: MegatronProgram, runtime_summary: D
     candidate.metadata["program_kind"] = "candidate_runtime_guided_partition"
     candidate.metadata["slow_stage_index"] = int(slow_idx)
     candidate.metadata["fast_stage_index"] = int(fast_idx)
-    candidate.metadata["stage_spread_ratio"] = round(float(spread_ratio), 4)
+    candidate.metadata["stage_spread_ratio"] = float(plan["spread_ratio"])
+    candidate.metadata["runtime_partition_focus"] = str(plan["focus"])
+    candidate.metadata["runtime_partition_shift"] = int(shift)
+    candidate.metadata["runtime_partition_stage_objectives"] = list(plan["stage_objectives"])
+    candidate.metadata["boundary_semantic_focus"] = str(plan["focus"])
+    candidate.metadata["pipeline_wait_ratio"] = float(plan["pipeline_wait_ratio"])
+    candidate.metadata["optimizer_exposed_ratio"] = float(plan["optimizer_exposed_ratio"])
+    candidate.metadata["stage_skew"] = float(plan["stage_skew"])
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -2245,6 +2699,301 @@ def _build_long_context_cp_candidate(program: MegatronProgram) -> Optional[Megat
     return _sync_batch_plan_metadata(candidate)
 
 
+def _build_stage_local_vpp_shape_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    stage_count = int(program.partition.num_stages)
+    target_vector, chunk_shapes = _nonuniform_vpp_vector_from_evidence(
+        context_record,
+        stage_count=stage_count,
+        fallback_vpp=int(program.parallel.vpp_degree),
+    )
+    if not target_vector:
+        return None
+    baseline_by_stage = _local_parallel_by_stage(program)
+    baseline_vector = [
+        int((baseline_by_stage.get(stage_id) or {}).vpp_degree if stage_id in baseline_by_stage else int(program.parallel.vpp_degree))
+        for stage_id in range(stage_count)
+    ]
+    if list(target_vector) == list(baseline_vector) and not chunk_shapes:
+        return None
+
+    candidate = _clone_program(program)
+    candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in target_vector]
+    candidate.metadata["preserve_stage_local_vpp"] = True
+    if chunk_shapes:
+        candidate.metadata["stage_local_chunk_shapes"] = {str(key): value for key, value in chunk_shapes.items()}
+
+    local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
+    for subgraph in (candidate.strategy_ir.apipe or []):
+        entry = local_by_name.get(subgraph.name)
+        if entry is None:
+            continue
+        stage_id = int(subgraph.stage_index)
+        if stage_id < len(target_vector):
+            entry.vpp_degree = max(int(target_vector[stage_id]), 1)
+
+    if any(int(value) > 1 for value in target_vector):
+        target_global_vpp = min(max(max(int(value) for value in target_vector), int(candidate.parallel.vpp_degree)), 2)
+        candidate.parallel.vpp_degree = int(target_global_vpp)
+        candidate.layout.vpp_degree = int(target_global_vpp)
+        if int(target_global_vpp) > 1:
+            counts = _pp_vpp_layout_counts(
+                int(candidate.parallel.pp_degree),
+                int(candidate.model.num_layers),
+                "interleaved_grouped_g2",
+            )
+            if counts is None:
+                total_virtual = int(candidate.parallel.pp_degree) * int(target_global_vpp)
+                if total_virtual > 0 and int(candidate.model.num_layers) % total_virtual == 0:
+                    counts = [int(candidate.model.num_layers) // total_virtual] * total_virtual
+            if counts is not None:
+                candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+            candidate.schedule.skeleton = "stage_aware_grouped"
+            if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
+                candidate.schedule.template = "interleaved_grouped_g2"
+            candidate.schedule.dispatch_order = "stage_local_nonuniform_vpp"
+            candidate.schedule.microbatch_group_size_per_vp_stage = max(
+                int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+                2,
+            )
+
+    candidate.metadata["program_kind"] = "candidate_nonuniform_vpp_shape"
+    candidate.metadata["priority_rank"] = 44
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_stage_local_memory_policy_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    local_memory = dict(evidence.get("local_memory_search_space") or {})
+    policies = list(local_memory.get("per_stage_policy") or [])
+    if not policies:
+        return None
+    policy_by_stage: Dict[int, Dict[str, Any]] = {}
+    for item in policies:
+        stage_id = _safe_int((item or {}).get("stage_id"))
+        if stage_id is None:
+            continue
+        policy_by_stage[int(stage_id)] = dict(item or {})
+    if not policy_by_stage:
+        return None
+
+    candidate = _clone_program(program)
+    local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
+    selected_policies: List[Dict[str, Any]] = []
+    touched = False
+    for subgraph in (candidate.strategy_ir.apipe or []):
+        stage_id = int(subgraph.stage_index)
+        policy = dict(policy_by_stage.get(stage_id) or {})
+        if not policy:
+            continue
+        checkpoint_policy = str(policy.get("checkpoint_policy") or "keep").strip().lower()
+        remat_policy = str(policy.get("remat_policy") or "off").strip().lower()
+        prefetch_policy = str(policy.get("prefetch_policy") or "default").strip().lower()
+        if checkpoint_policy == "keep" and remat_policy in {"off", "none"} and prefetch_policy == "default":
+            continue
+        entry = local_by_name.get(subgraph.name)
+        if entry is None:
+            continue
+        if checkpoint_policy in {"full", "selective"}:
+            entry.fsdp_scope = "selective"
+            touched = True
+        if remat_policy in {"on", "attention_first", "full"}:
+            entry.cp_degree = max(int(entry.cp_degree), 2)
+            touched = True
+        if prefetch_policy in {"guarded", "conservative"}:
+            entry.vpp_degree = 1
+            touched = True
+        selected_policies.append(
+            {
+                "stage_id": int(stage_id),
+                "subgraph": str(subgraph.name),
+                "checkpoint_policy": checkpoint_policy,
+                "remat_policy": remat_policy,
+                "prefetch_policy": prefetch_policy,
+                "reason": str(policy.get("reason") or ""),
+            }
+        )
+    if not touched:
+        return None
+    if int(candidate.parallel.vpp_degree) > 1:
+        candidate.parallel.vpp_degree = 1
+        candidate.layout.vpp_degree = 1
+        candidate.layout.pipeline_layout = None
+        candidate.schedule.template = "fixed_1f1b"
+        candidate.schedule.skeleton = "fixed_1f1b"
+        candidate.schedule.dispatch_order = "default"
+        candidate.schedule.microbatch_group_size_per_vp_stage = None
+    candidate.metadata["stage_local_memory_policy"] = selected_policies
+    candidate.metadata["program_kind"] = "candidate_stage_local_memory_policy"
+    candidate.metadata["priority_rank"] = 42
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_boundary_semantic_schedule_candidates(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return []
+    boundaries = _boundary_semantic_entries(context_record)
+    if not boundaries:
+        return []
+    candidates: List[MegatronProgram] = []
+    seen_semantics: set[str] = set()
+    for boundary in boundaries:
+        semantic = str(boundary.get("semantic") or "normal").strip().lower()
+        if semantic in {"", "normal"} or semantic in seen_semantics:
+            continue
+        seen_semantics.add(semantic)
+        candidate = _clone_program(program)
+        candidate.metadata["boundary_semantic_focus"] = semantic
+        candidate.metadata["boundary_semantic_boundary"] = str(boundary.get("boundary_id") or "")
+        candidate.metadata["boundary_semantic_actions"] = list(boundary.get("actions") or [])
+        if semantic in {"comm-aware", "tail-aware"}:
+            if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
+                candidate.schedule.template = "interleaved_grouped_g2"
+            candidate.schedule.skeleton = "stage_aware_grouped"
+            candidate.schedule.microbatch_group_size_per_vp_stage = max(
+                int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+                2,
+            )
+        if semantic == "comm-aware":
+            candidate.schedule.dispatch_order = "boundary_comm_aware"
+            candidate.strategy_ir.pipe.warmup_policy = "comm_shy"
+            candidate.strategy_ir.pipe.cooldown_policy = "late_wait"
+            candidate.metadata["program_kind"] = "candidate_boundary_semantic_comm"
+            candidate.metadata["priority_rank"] = 44
+        elif semantic == "tail-aware":
+            if int(candidate.parallel.vpp_degree) == 1:
+                counts = _pp_vpp_layout_counts(
+                    int(candidate.parallel.pp_degree),
+                    int(candidate.model.num_layers),
+                    "interleaved_grouped_g2",
+                )
+                if counts is not None:
+                    candidate.parallel.vpp_degree = 2
+                    candidate.layout.vpp_degree = 2
+                    candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+            candidate.schedule.dispatch_order = "tail_boundary_rewrite"
+            candidate.strategy_ir.pipe.warmup_policy = "tail_prefill"
+            candidate.strategy_ir.pipe.cooldown_policy = "tail_drain"
+            candidate.metadata["program_kind"] = "candidate_boundary_semantic_tail"
+            candidate.metadata["priority_rank"] = 45
+        elif semantic == "memory-aware":
+            left_stage = int(boundary.get("left_stage") or 0)
+            right_stage = int(boundary.get("right_stage") or 0)
+            local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
+            for subgraph in (candidate.strategy_ir.apipe or []):
+                if int(subgraph.stage_index) not in {left_stage, right_stage}:
+                    continue
+                entry = local_by_name.get(subgraph.name)
+                if entry is None:
+                    continue
+                entry.cp_degree = max(int(entry.cp_degree), 2)
+                entry.fsdp_scope = "selective"
+                entry.vpp_degree = 1
+            if int(candidate.parallel.vpp_degree) > 1:
+                candidate.parallel.vpp_degree = 1
+                candidate.layout.vpp_degree = 1
+                candidate.layout.pipeline_layout = None
+            candidate.schedule.template = "fixed_1f1b"
+            candidate.schedule.skeleton = "fixed_1f1b"
+            candidate.schedule.dispatch_order = "memory_boundary_guard"
+            candidate.schedule.microbatch_group_size_per_vp_stage = None
+            candidate.strategy_ir.pipe.warmup_policy = "default"
+            candidate.strategy_ir.pipe.cooldown_policy = "default"
+            candidate.metadata["program_kind"] = "candidate_boundary_semantic_memory"
+            candidate.metadata["priority_rank"] = 41
+        else:
+            continue
+        candidates.append(_sync_batch_plan_metadata(candidate))
+    return candidates
+
+
+def _build_pipe_search_space_candidates(
+    program: MegatronProgram,
+    runtime_summary: Dict[str, Any],
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return []
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    pipe_space = dict(evidence.get("pipe_search_space") or {})
+    variants = list(pipe_space.get("variants") or [])
+    if not variants:
+        return []
+    backend_family = _execution_backend_family(program, context_record)
+    candidates: List[MegatronProgram] = []
+    for variant in variants:
+        name = str((variant or {}).get("name") or "").strip().lower()
+        status = str((variant or {}).get("status") or "").strip().lower()
+        if not name or status not in {"executable_now", "sandbox_now"}:
+            continue
+        if name in {"fixed_1f1b", "stage_aware_grouped"}:
+            continue
+        candidate: Optional[MegatronProgram] = None
+        if name == "fixed_1f1b":
+            if str(program.schedule.template or "fixed_1f1b") != "fixed_1f1b":
+                candidate = _set_schedule_template(
+                    program,
+                    template="fixed_1f1b",
+                    group_size=None,
+                    dispatch_order="default",
+                    skeleton="fixed_1f1b",
+                )
+        elif name == "stage_aware_grouped":
+            candidate = _build_stage_aware_schedule(program)
+        elif name == "zero_bubble_family":
+            if backend_family == "torchtitan":
+                candidate = _build_torchtitan_zero_bubble_schedule_candidate(program, runtime_summary, context_record)
+            if candidate is None:
+                candidate = _clone_program(program)
+                if int(candidate.parallel.vpp_degree) == 1:
+                    counts = _pp_vpp_layout_counts(
+                        int(candidate.parallel.pp_degree),
+                        int(candidate.model.num_layers),
+                        "interleaved_grouped_g4",
+                    )
+                    if counts is not None:
+                        candidate.parallel.vpp_degree = 2
+                        candidate.layout.vpp_degree = 2
+                        candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+                candidate.schedule.skeleton = "stage_aware_grouped"
+                candidate.schedule.template = "interleaved_grouped_g4"
+                candidate.schedule.dispatch_order = "zero_bubble_proxy"
+                candidate.schedule.microbatch_group_size_per_vp_stage = 4
+                candidate = _sync_batch_plan_metadata(candidate)
+        elif name == "comm_aware_boundary_schedule":
+            candidate = _clone_program(program)
+            candidate.schedule.skeleton = "stage_aware_grouped"
+            candidate.schedule.template = "interleaved_grouped_g2"
+            candidate.schedule.dispatch_order = "boundary_localized"
+            candidate.schedule.microbatch_group_size_per_vp_stage = max(
+                int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+                2,
+            )
+            candidate = _sync_batch_plan_metadata(candidate)
+        if candidate is None:
+            continue
+        tagged = _clone_program(candidate)
+        tagged.strategy_ir.pipe.warmup_policy = str((variant or {}).get("warmup") or tagged.strategy_ir.pipe.warmup_policy or "default")
+        tagged.strategy_ir.pipe.cooldown_policy = str((variant or {}).get("cooldown") or tagged.strategy_ir.pipe.cooldown_policy or "default")
+        tagged.metadata["pipe_variant_name"] = name
+        tagged.metadata["pipe_variant_status"] = status
+        tagged.metadata["pipe_variant_issue_wait"] = str((variant or {}).get("issue_wait") or "")
+        tagged.metadata["program_kind"] = f"candidate_pipe_variant_{name}"
+        tagged.metadata["priority_rank"] = 46
+        candidates.append(_sync_batch_plan_metadata(tagged))
+    return candidates
+
+
 def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSpaceSpec) -> Tuple[bool, str]:
     program_kind = str(program.metadata.get("program_kind") or "")
     is_single_node_pp_split = program_kind == "candidate_single_node_pp_split"
@@ -2420,6 +3169,18 @@ def _build_local_parallel_candidates(
             if hybrid_candidate is not None:
                 candidates.append(_annotate_local_parallel(hybrid_candidate, context_record))
 
+    if rewrite.allow_asymmetric_vpp or rewrite.allow_stage_aware_schedule:
+        for seed in seeds:
+            stage_local_vpp = _build_stage_local_vpp_shape_candidate(seed, context_record)
+            if stage_local_vpp is not None:
+                candidates.append(_annotate_local_parallel(stage_local_vpp, context_record))
+
+    if rewrite.prefer_memory_relief or "memory_hotspot" in failure_labels or "memory_skew" in failure_labels:
+        for seed in seeds:
+            local_memory_policy = _build_stage_local_memory_policy_candidate(seed, context_record)
+            if local_memory_policy is not None:
+                candidates.append(_annotate_local_parallel(local_memory_policy, context_record))
+
     return candidates
 
 
@@ -2432,6 +3193,7 @@ def _build_schedule_candidates(
 ) -> List[MegatronProgram]:
     if not rewrite.allow_stage_aware_schedule:
         return []
+    allowed_templates = set(rewrite.allowed_schedule_templates or ["fixed_1f1b"])
     candidates: List[MegatronProgram] = []
     stage_aware = _build_stage_aware_schedule(baseline)
     if stage_aware is not None:
@@ -2451,6 +3213,15 @@ def _build_schedule_candidates(
             scaled = _build_pp_vpp_scaleout_candidate(skeleton, runtime_summary)
             if scaled is not None:
                 candidates.append(_annotate_local_parallel(scaled, context_record))
+    for seed in [baseline] + list(skeletons):
+        for boundary_candidate in _build_boundary_semantic_schedule_candidates(seed, context_record):
+            if str(boundary_candidate.schedule.template or "") not in allowed_templates:
+                continue
+            candidates.append(_annotate_local_parallel(boundary_candidate, context_record))
+        for pipe_candidate in _build_pipe_search_space_candidates(seed, runtime_summary, context_record):
+            if str(pipe_candidate.schedule.template or "") not in allowed_templates:
+                continue
+            candidates.append(_annotate_local_parallel(pipe_candidate, context_record))
     return candidates
 
 
@@ -2537,9 +3308,8 @@ def _verify_agent_proposals(
         if not report.is_legal:
             rejected.append({"proposal": proposal.to_dict(), "reason": report.to_dict()})
             continue
-        accepted.append(proposal.normalized())
-        if len(accepted) >= int(candidate_limit):
-            break
+        if len(accepted) < int(candidate_limit):
+            accepted.append(proposal.normalized())
     return accepted, rejected
 
 

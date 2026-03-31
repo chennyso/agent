@@ -49,6 +49,7 @@ if "tyro" not in sys.modules:
     sys.modules["tyro"] = tyro_stub
 
 from megatron_agent import agent_loop, trial_runner  # noqa: E402
+from megatron_agent.metrics_parser import parse_megatron_logs  # noqa: E402
 from megatron_agent.torchtitan_hybrid import (  # noqa: E402
     TorchTitanHybridController,
     TorchTitanHybridEvidence,
@@ -1339,6 +1340,27 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertGreater(scores["candidate_runtime_guided_partition"], scores["candidate_nonuniform_partition"])
         self.assertEqual(str(proposals[0].program.metadata.get("program_kind")), "candidate_runtime_guided_partition")
 
+    def test_runtime_guided_partition_adds_position_aware_metadata(self) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.09,
+            "pipeline_wait_ratio": 0.18,
+            "optimizer_exposed_ratio": 0.24,
+            "stage_skew": 1.22,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1180.0, "comm_ms": 260.0, "bubble_ms": 120.0, "window_ms": 1560.0, "peak_reserved_gib": 24.5},
+                "1": {"compute_ms": 720.0, "comm_ms": 70.0, "bubble_ms": 22.0, "window_ms": 812.0, "peak_reserved_gib": 18.0},
+            },
+        }
+        candidate = agent_loop._build_runtime_guided_partition(baseline, runtime_summary)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(str(candidate.metadata.get("program_kind")), "candidate_runtime_guided_partition")
+        self.assertEqual(str(candidate.metadata.get("runtime_partition_focus")), "tail-aware")
+        self.assertGreaterEqual(int(candidate.metadata.get("runtime_partition_shift") or 0), 1)
+        self.assertLess(int(candidate.partition.stages[0].decoder_layers), int(baseline.partition.stages[0].decoder_layers))
+        self.assertGreater(int(candidate.partition.stages[1].decoder_layers), int(baseline.partition.stages[1].decoder_layers))
+        self.assertIn("runtime_partition_stage_objectives", candidate.metadata)
+
     def test_verify_program_rejects_vpp_when_comm_pressure_outweighs_bubble_relief(self) -> None:
         baseline = default_dense_program("single_g5")
         candidate = agent_loop._build_stage_aware_schedule(baseline)
@@ -1692,6 +1714,54 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             return handle.name
         finally:
             handle.close()
+
+
+class TestMegatronMetricsParser(unittest.TestCase):
+    def test_parse_megatron_logs_derives_optimizer_exposure_and_pipeline_wait(self) -> None:
+        stdout = """
+        stage_metrics/stage_0/fwd(ms): 100
+        stage_metrics/stage_0/bwd(ms): 200
+        stage_metrics/stage_0/ag_estimated(ms): 10
+        stage_metrics/stage_0/rs_estimated(ms): 5
+        stage_metrics/stage_0/bubble(ms): 20
+        stage_metrics/stage_0/peak_reserved(GiB): 25
+        stage_metrics/stage_1/fwd(ms): 90
+        stage_metrics/stage_1/bwd(ms): 180
+        stage_metrics/stage_1/ag_estimated(ms): 8
+        stage_metrics/stage_1/rs_estimated(ms): 4
+        stage_metrics/stage_1/bubble(ms): 15
+        stage_metrics/stage_1/peak_reserved(GiB): 24
+        INFO:megatron.core.timers:(min, max) time across ranks (ms):
+            forward-backward ...............................: (4300.00, 4400.00)
+            all-grads-sync .................................: (4.20, 6.00)
+            optimizer-copy-to-main-grad ....................: (0.20, 0.30)
+            optimizer-inner-step ...........................: (4100.00, 4200.00)
+            optimizer-copy-main-to-model-params ............: (0.10, 0.20)
+            optimizer ......................................: (5100.00, 5200.00)
+            forward-recv ...................................: (30.00, 40.00)
+            backward-recv ..................................: (50.00, 60.00)
+            forward-send-backward-recv .....................: (950.00, 1000.00)
+            backward-send-forward-recv .....................: (10.00, 20.00)
+         [2026-03-31 07:27:16.160756] iteration        4/       6 | consumed samples:          128 | elapsed time per iteration (ms): 10000.0 | throughput per GPU (TFLOP/s/GPU): 34.8 | learning rate: 8.000000E-05 | global batch size:    32 | lm loss: 1.407003E+01 |
+         [2026-03-31 07:27:26.160756] iteration        5/       6 | consumed samples:          160 | elapsed time per iteration (ms): 10200.0 | throughput per GPU (TFLOP/s/GPU): 34.0 | learning rate: 8.000000E-05 | global batch size:    32 | lm loss: 1.307003E+01 |
+         [2026-03-31 07:27:36.160756] iteration        6/       6 | consumed samples:          192 | elapsed time per iteration (ms): 9800.0 | throughput per GPU (TFLOP/s/GPU): 35.1 | learning rate: 8.000000E-05 | global batch size:    32 | lm loss: 1.207003E+01 |
+        """
+        parsed = parse_megatron_logs(
+            stdout=stdout,
+            stderr="",
+            global_batch_size=32,
+            seq_len=1024,
+        )
+
+        self.assertAlmostEqual(float(parsed["optimizer_total_ms"] or 0.0), 5200.0, places=4)
+        self.assertAlmostEqual(float(parsed["optimizer_exposed_ms"] or 0.0), 5200.0, places=4)
+        self.assertAlmostEqual(float(parsed["pipeline_wait_ms"] or 0.0), 1120.0, places=4)
+        self.assertAlmostEqual(float(parsed["pipeline_wait_ratio"] or 0.0), 0.112, places=3)
+        self.assertAlmostEqual(float(parsed["optimizer_exposed_ratio"] or 0.0), 0.52, places=3)
+        self.assertAlmostEqual(float(parsed["bubble_exposure_ratio"] or 0.0), 35.0 / 632.0, places=4)
+        self.assertAlmostEqual(float(parsed["stage_skew"] or 0.0), 335.0 / ((335.0 + 297.0) / 2.0), places=4)
+        self.assertIn("timer_summary", parsed)
+        self.assertIn("stage_window_summary", parsed)
 
 
 if __name__ == "__main__":

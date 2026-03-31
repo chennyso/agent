@@ -441,6 +441,7 @@ def _build_bottleneck_breakdown(
         ),
         "cp_collective": sum(float(item.get("cp_collective_ms") or 0.0) for item in subgraph_evidence),
         "pipeline_idle": sum(float(item.get("idle_ms") or 0.0) for item in stage_evidence),
+        "optimizer_exposed": float(runtime_evidence.get("optimizer_exposed_ms") or 0.0),
     }
     labels = {
         "forward_compute": "compute",
@@ -449,6 +450,7 @@ def _build_bottleneck_breakdown(
         "fsdp_collective": "communication",
         "cp_collective": "communication",
         "pipeline_idle": "bubble",
+        "optimizer_exposed": "optimizer",
     }
     breakdown = [
         {
@@ -625,6 +627,316 @@ def _build_perfetto_trace(
     }
 
 
+def _derive_stage_costs(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    step_time_ms = max(float(runtime_evidence.get("steady_state_step_time_ms_p50") or 0.0), 1.0)
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    completion_values = [
+        float(item.get("completion_ms") or 0.0)
+        for item in stage_evidence
+        if float(item.get("completion_ms") or 0.0) > 0.0
+    ]
+    median_completion = _median(completion_values) or 1.0
+    stage_costs: List[Dict[str, Any]] = []
+    last_index = max(len(stage_evidence) - 1, 0)
+    for index, item in enumerate(stage_evidence):
+        forward_ms = float(item.get("forward_ms") or 0.0)
+        backward_ms = float(item.get("backward_ms") or 0.0)
+        send_recv_ms = float(item.get("send_recv_ms") or 0.0)
+        fsdp_ms = float(item.get("fsdp_ag_ms") or 0.0) + float(item.get("fsdp_rs_ms") or 0.0)
+        cp_ms = float(item.get("cp_collective_ms") or 0.0)
+        idle_ms = float(item.get("idle_ms") or 0.0)
+        completion_ms = float(item.get("completion_ms") or (forward_ms + backward_ms + send_recv_ms + fsdp_ms + cp_ms + idle_ms))
+        peak_reserved_gib = float(item.get("peak_reserved_gib") or 0.0)
+        t_stable = max(completion_ms - idle_ms, 0.0)
+        first_bias = 1.0 + (0.40 if index == 0 else 0.0) + (0.15 if index == last_index else 0.0)
+        last_bias = 1.0 + (0.15 if index == 0 else 0.0) + (0.40 if index == last_index else 0.0)
+        delta_first = first_bias * (0.10 * forward_ms + 0.18 * send_recv_ms + 0.06 * fsdp_ms)
+        delta_last = last_bias * (0.10 * backward_ms + 0.14 * send_recv_ms + 0.05 * fsdp_ms)
+        boundary_exposed = 0.55 * send_recv_ms + 0.25 * cp_ms + 0.20 * fsdp_ms
+        fragmentation = (
+            0.10 * float(item.get("vpp_delta") or 0.0) * step_time_ms
+            + 0.06 * bubble_ratio * completion_ms
+            + 0.03 * max(completion_ms - median_completion, 0.0)
+        )
+        memory_budget_gib = float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or 0.0)
+        local_peak_ratio = (peak_reserved_gib / memory_budget_gib) if memory_budget_gib > 0.0 else peak_reserved_ratio
+        memory_risk = max(local_peak_ratio - 0.75, 0.0) * step_time_ms
+        total_cost = (
+            t_stable
+            + 0.55 * delta_first
+            + 0.55 * delta_last
+            + 0.90 * boundary_exposed
+            + 0.70 * fragmentation
+            + 1.20 * memory_risk
+        )
+        stage_costs.append(
+            {
+                "stage_id": int(item.get("stage_id") or index),
+                "subgraph": str(item.get("subgraph") or f"subg_stage_{index}"),
+                "T_stable_ms": round(t_stable, 4),
+                "delta_first_ms": round(delta_first, 4),
+                "delta_last_ms": round(delta_last, 4),
+                "boundary_exposed_ms": round(boundary_exposed, 4),
+                "fragmentation_ms": round(fragmentation, 4),
+                "memory_risk_ms": round(memory_risk, 4),
+                "comm_sensitive": bool(send_recv_ms + fsdp_ms + cp_ms >= 0.15 * max(completion_ms, 1.0)),
+                "peak_reserved_gib": round(peak_reserved_gib, 4),
+                "total_cost_ms": round(total_cost, 4),
+                "ratio_of_step": round(total_cost / step_time_ms, 4),
+                "global_comm_exposure_ratio": round(comm_exposure_ratio, 4),
+            }
+        )
+    return sorted(stage_costs, key=lambda item: float(item.get("total_cost_ms") or 0.0), reverse=True)
+
+
+def _build_boundary_semantics(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    boundaries: List[Dict[str, Any]] = []
+    stage_to_node = list(program.layout.stage_to_node or [])
+    budget_gib = float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or 0.0)
+    for left, right in zip(stage_evidence[:-1], stage_evidence[1:]):
+        left_stage = int(left.get("stage_id") or 0)
+        right_stage = int(right.get("stage_id") or left_stage + 1)
+        left_node = stage_to_node[left_stage] if left_stage < len(stage_to_node) else "unknown"
+        right_node = stage_to_node[right_stage] if right_stage < len(stage_to_node) else left_node
+        cross_node = str(left_node) != str(right_node)
+        left_wait = float(left.get("send_recv_ms") or 0.0) + float(left.get("idle_ms") or 0.0) * 0.35
+        right_wait = float(right.get("send_recv_ms") or 0.0) + float(right.get("idle_ms") or 0.0) * 0.35
+        boundary_wait_ms = 0.5 * (left_wait + right_wait)
+        left_mem_ratio = (float(left.get("peak_reserved_gib") or 0.0) / budget_gib) if budget_gib > 0.0 else float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+        right_mem_ratio = (float(right.get("peak_reserved_gib") or 0.0) / budget_gib) if budget_gib > 0.0 else float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+        left_tail = max(float(left.get("completion_ms") or 0.0) - float(left.get("forward_ms") or 0.0), 0.0)
+        right_tail = max(float(right.get("completion_ms") or 0.0) - float(right.get("forward_ms") or 0.0), 0.0)
+        if max(left_mem_ratio, right_mem_ratio) >= 0.88:
+            semantic = "memory-aware"
+            actions = ["local_remat", "boundary_prefetch_guard", "reduced_vpp_near_boundary"]
+        elif cross_node or boundary_wait_ms >= 0.08 * max(float(runtime_evidence.get("steady_state_step_time_ms_p50") or 0.0), 1.0):
+            semantic = "comm-aware"
+            actions = ["early_issue_send", "late_wait", "boundary_overlap_probe"]
+        elif max(left_tail, right_tail) >= 0.85 * max(boundary_wait_ms, 1.0):
+            semantic = "tail-aware"
+            actions = ["first_last_microbatch_rewrite", "boundary_frontload", "tail_slot_probe"]
+        else:
+            semantic = "normal"
+            actions = ["default_boundary"]
+        boundaries.append(
+            {
+                "boundary_id": f"{left_stage}->{right_stage}",
+                "left_stage": left_stage,
+                "right_stage": right_stage,
+                "left_node": left_node,
+                "right_node": right_node,
+                "cross_node": cross_node,
+                "semantic": semantic,
+                "boundary_wait_ms": round(boundary_wait_ms, 4),
+                "left_peak_ratio": round(left_mem_ratio, 4),
+                "right_peak_ratio": round(right_mem_ratio, 4),
+                "actions": actions,
+            }
+        )
+    return boundaries
+
+
+def _build_nonuniform_vpp_candidates(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    stage_layers = [int(stage.decoder_layers) for stage in program.partition.stages]
+    step_time_ms = max(float(runtime_evidence.get("steady_state_step_time_ms_p50") or 0.0), 1.0)
+    candidates: List[Dict[str, Any]] = []
+    for index, layers in enumerate(stage_layers):
+        evidence = stage_evidence[index] if index < len(stage_evidence) else {}
+        completion_ms = float(evidence.get("completion_ms") or 0.0)
+        peak_reserved_gib = float(evidence.get("peak_reserved_gib") or 0.0)
+        send_recv_ms = float(evidence.get("send_recv_ms") or 0.0)
+        bubble_ms = float(evidence.get("idle_ms") or 0.0)
+        recommended_v = 1
+        if layers >= 8 and bubble_ms >= 0.06 * step_time_ms and send_recv_ms <= 0.08 * step_time_ms:
+            recommended_v = 2
+        if layers >= 12 and bubble_ms >= 0.10 * step_time_ms and send_recv_ms <= 0.05 * step_time_ms and peak_reserved_gib <= 0.82 * float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or max(peak_reserved_gib, 1.0)):
+            recommended_v = 3
+        legal_values = [1, 2]
+        research_values = [3] if layers >= 12 else []
+        equal_split = [layers // recommended_v] * recommended_v if recommended_v > 0 else [layers]
+        if recommended_v > 0 and sum(equal_split) < layers:
+            equal_split[-1] += layers - sum(equal_split)
+        skewed_split = list(equal_split)
+        if len(skewed_split) >= 2 and layers >= 4:
+            skewed_split[0] = max(skewed_split[0] - 1, 1)
+            skewed_split[-1] += 1
+        candidates.append(
+            {
+                "stage_id": index,
+                "decoder_layers": layers,
+                "completion_ms": round(completion_ms, 4),
+                "bubble_ms": round(bubble_ms, 4),
+                "send_recv_ms": round(send_recv_ms, 4),
+                "recommended_v": recommended_v,
+                "currently_executable_values": legal_values,
+                "research_values": research_values,
+                "candidate_chunk_shapes": [equal_split] + ([skewed_split] if skewed_split != equal_split else []),
+                "rationale": (
+                    "bubble-dominant and communication-light stage can benefit from finer virtual chunks"
+                    if recommended_v > 1
+                    else "keep chunking coarse because communication or memory pressure dominates"
+                ),
+            }
+        )
+    return {
+        "vector_form": "v = (v1, v2, ..., vS)",
+        "status": "research_gap_with_partial_artifact_support",
+        "per_stage_candidates": candidates,
+    }
+
+
+def _build_pipe_search_space(
+    runtime_evidence: Dict[str, Any],
+    bottleneck_signature: Dict[str, Any],
+) -> Dict[str, Any]:
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    dominant = str((bottleneck_signature or {}).get("dominant_label") or "balanced")
+    variants = [
+        {
+            "name": "fixed_1f1b",
+            "order": "depth_first",
+            "warmup": "default",
+            "cooldown": "default",
+            "issue_wait": "synchronous",
+            "tail_rewrite": "none",
+            "grad_slot": "default",
+            "status": "executable_now",
+        },
+        {
+            "name": "stage_aware_grouped",
+            "order": "frontload_forward_or_middle_relief",
+            "warmup": "grouped",
+            "cooldown": "grouped",
+            "issue_wait": "grouped",
+            "tail_rewrite": "first_last_microbatch_bias",
+            "grad_slot": "default",
+            "status": "executable_now",
+        },
+    ]
+    if bubble_ratio >= 0.08 or dominant in {"tail_heavy", "stage_imbalanced"}:
+        variants.append(
+            {
+                "name": "zero_bubble_family",
+                "order": "greedy_overlap",
+                "warmup": "bubble_fill",
+                "cooldown": "bubble_fill",
+                "issue_wait": "early_issue_late_wait",
+                "tail_rewrite": "enabled",
+                "grad_slot": "repositioned",
+                "status": "sandbox_now",
+            }
+        )
+    if comm_exposure_ratio >= 0.10:
+        variants.append(
+            {
+                "name": "comm_aware_boundary_schedule",
+                "order": "boundary_localized",
+                "warmup": "comm_shy",
+                "cooldown": "comm_shy",
+                "issue_wait": "asymmetric_issue_wait",
+                "tail_rewrite": "boundary_conditioned",
+                "grad_slot": "delayed_on_comm_hot_boundaries",
+                "status": "research_gap",
+            }
+        )
+    return {
+        "status": "mixed",
+        "variants": variants,
+    }
+
+
+def _build_local_memory_search_space(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    budget_gib = float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or 0.0)
+    policies: List[Dict[str, Any]] = []
+    for item in stage_evidence:
+        stage_id = int(item.get("stage_id") or 0)
+        peak_reserved_gib = float(item.get("peak_reserved_gib") or 0.0)
+        local_ratio = (peak_reserved_gib / budget_gib) if budget_gib > 0.0 else 0.0
+        policy = {
+            "stage_id": stage_id,
+            "checkpoint_policy": "keep",
+            "remat_policy": "off",
+            "prefetch_policy": "default",
+            "offload_policy": "none",
+            "reason": "balanced stage",
+        }
+        if local_ratio >= 0.88:
+            policy.update(
+                {
+                    "checkpoint_policy": "selective",
+                    "remat_policy": "attention_first",
+                    "prefetch_policy": "guarded",
+                    "offload_policy": "research_only_cpu_partial",
+                    "reason": "high local memory pressure",
+                }
+            )
+        elif local_ratio >= 0.80:
+            policy.update(
+                {
+                    "checkpoint_policy": "full",
+                    "remat_policy": "on",
+                    "prefetch_policy": "conservative",
+                    "reason": "moderate memory pressure",
+                }
+            )
+        policies.append(policy)
+    return {
+        "status": "partially_executable",
+        "per_stage_policy": policies,
+    }
+
+
+def _build_single_node_deep_stats(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+    stage_costs: Sequence[Dict[str, Any]],
+    boundaries: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if str(program.cluster.target) not in {"single_g4", "single_g5"}:
+        return {}
+    completion_values = [float(item.get("completion_ms") or 0.0) for item in stage_evidence]
+    memory_values = [float(item.get("peak_reserved_gib") or 0.0) for item in stage_evidence]
+    if not completion_values:
+        return {}
+    max_completion = max(completion_values)
+    min_completion = min(completion_values)
+    max_memory = max(memory_values) if memory_values else 0.0
+    min_memory = min(memory_values) if memory_values else 0.0
+    hottest = dict(stage_costs[0]) if stage_costs else {}
+    hottest_boundary = max(boundaries, key=lambda item: float(item.get("boundary_wait_ms") or 0.0), default={})
+    return {
+        "mode": "single_node_8gpu",
+        "stage_completion_spread_ms": round(max_completion - min_completion, 4),
+        "stage_completion_spread_ratio": round((max_completion - min_completion) / max(min_completion, 1.0), 4),
+        "stage_memory_spread_gib": round(max_memory - min_memory, 4),
+        "dominant_stage_cost": hottest,
+        "dominant_boundary": hottest_boundary,
+        "optimizer_ratio": round(float(runtime_evidence.get("optimizer_ratio") or 0.0), 4),
+        "stall_ratio": round(float(runtime_evidence.get("stall_ratio") or 0.0), 4),
+        "comm_exposure_ratio": round(float(runtime_evidence.get("comm_exposure_ratio") or 0.0), 4),
+        "bubble_ratio": round(float(runtime_evidence.get("bubble_ratio") or 0.0), 4),
+    }
+
+
 def _candidate_schedule_templates(backend_family: str, seq_len: int) -> List[str]:
     templates = ["fixed_1f1b", "interleaved_grouped_g2", "interleaved_grouped_g4"]
     if seq_len >= 1024:
@@ -674,6 +986,20 @@ def _search_space_blueprint(
             "rationale": "only open virtual chunks when bubble relief is likely to outweigh comm overhead",
         },
         {
+            "name": "parallel.vpp_vector",
+            "scope": "pipe",
+            "status": "research_gap_with_partial_artifact_support",
+            "values": "per-stage v_i and chunk shapes",
+            "rationale": "uniform VPP is a convenience assumption; stages can prefer different virtual chunk granularities",
+        },
+        {
+            "name": "boundary.semantic_type",
+            "scope": "placement",
+            "status": "research_gap_with_partial_artifact_support",
+            "values": ["normal", "tail-aware", "comm-aware", "memory-aware"],
+            "rationale": "boundaries are performance-sensitive execution objects, not only partition outputs",
+        },
+        {
             "name": "schedule.template",
             "scope": "pipe",
             "status": "executable_now",
@@ -693,6 +1019,13 @@ def _search_space_blueprint(
             "status": "executable_now",
             "values": [1, 2, 3, 4],
             "rationale": "coarse grouped interleave knob that affects bubble versus communication tradeoff",
+        },
+        {
+            "name": "pipe.issue_wait_and_tail_rewrite",
+            "scope": "pipe",
+            "status": "research_gap_with_partial_artifact_support",
+            "values": "issue/wait timing, tail rewrite, grad slot positioning",
+            "rationale": "pipe should be a searched object rather than a fixed 1F1B template family",
         },
         {
             "name": "parallel.cp_degree",
@@ -937,6 +1270,18 @@ def _build_context_from_trace(
         bottleneck_signature=bottleneck_signature,
     )
     bottleneck_breakdown = _build_bottleneck_breakdown(stage_evidence, subgraph_evidence, runtime_evidence)
+    stage_cost_model = _derive_stage_costs(norm, stage_evidence, runtime_evidence)
+    boundary_semantics = _build_boundary_semantics(norm, stage_evidence, runtime_evidence)
+    nonuniform_vpp_shape = _build_nonuniform_vpp_candidates(norm, stage_evidence, runtime_evidence)
+    pipe_search_space = _build_pipe_search_space(runtime_evidence, bottleneck_signature)
+    local_memory_search_space = _build_local_memory_search_space(norm, stage_evidence)
+    single_node_deep_stats = _build_single_node_deep_stats(
+        norm,
+        stage_evidence,
+        runtime_evidence,
+        stage_cost_model,
+        boundary_semantics,
+    )
     search_space_blueprint = _search_space_blueprint(norm, runtime_evidence, backend_context, bottleneck_signature)
     perfetto_trace = _build_perfetto_trace(norm, stage_evidence, subgraph_evidence, runtime_evidence)
     return {
@@ -948,6 +1293,12 @@ def _build_context_from_trace(
         "evidence_record": {
             **evidence_record,
             "bottleneck_breakdown": bottleneck_breakdown,
+            "stage_cost_model": stage_cost_model,
+            "boundary_semantics": boundary_semantics,
+            "nonuniform_vpp_shape": nonuniform_vpp_shape,
+            "pipe_search_space": pipe_search_space,
+            "local_memory_search_space": local_memory_search_space,
+            "single_node_deep_stats": single_node_deep_stats,
             "search_space_blueprint": search_space_blueprint,
             "visualization_artifacts": {
                 "perfetto_trace": perfetto_trace,
@@ -1082,6 +1433,12 @@ def build_trial_artifact(
         "stage_time_distribution": list(evidence.get("stage_evidence") or []),
         "subgraph_time_distribution": list(evidence.get("subgraph_evidence") or []),
         "bottleneck_breakdown": list(evidence.get("bottleneck_breakdown") or []),
+        "stage_cost_model": list(evidence.get("stage_cost_model") or []),
+        "boundary_semantics": list(evidence.get("boundary_semantics") or []),
+        "nonuniform_vpp_shape": dict(evidence.get("nonuniform_vpp_shape") or {}),
+        "pipe_search_space": dict(evidence.get("pipe_search_space") or {}),
+        "local_memory_search_space": dict(evidence.get("local_memory_search_space") or {}),
+        "single_node_deep_stats": dict(evidence.get("single_node_deep_stats") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
         "search_space_blueprint": dict(evidence.get("search_space_blueprint") or {}),
         "decomposition": {
@@ -1142,9 +1499,25 @@ def reduce_trial_trace(
         or 0.0
     )
     optimizer_ms = _safe_float(timer_summary.get("optimizer")) or 0.0
+    optimizer_exposed_ms = (
+        _safe_float(merged.get("optimizer_exposed_ms"))
+        or _safe_float(timer_summary.get("optimizer-exposed"))
+        or 0.0
+    )
     all_grads_sync_ms = _safe_float(timer_summary.get("all-grads-sync")) or 0.0
+    pipeline_wait_ms = (
+        _safe_float(merged.get("pipeline_wait_ms"))
+        or (
+            (_safe_float(timer_summary.get("forward-recv")) or 0.0)
+            + (_safe_float(timer_summary.get("backward-recv")) or 0.0)
+            + (_safe_float(timer_summary.get("forward-send-backward-recv")) or 0.0)
+            + (_safe_float(timer_summary.get("backward-send-forward-recv")) or 0.0)
+        )
+    )
     optimizer_ratio = optimizer_ms / max(float(steady_state_p50 or 0.0), 1.0)
+    optimizer_exposed_ratio = optimizer_exposed_ms / max(float(steady_state_p50 or 0.0), 1.0)
     stall_ratio = all_grads_sync_ms / max(float(steady_state_p50 or 0.0), 1.0)
+    pipeline_wait_ratio = pipeline_wait_ms / max(float(steady_state_p50 or 0.0), 1.0)
 
     tp_degree = max(int(norm.parallel.tp_degree), 1)
     pp_degree = max(int(norm.parallel.pp_degree), 1)
@@ -1165,8 +1538,13 @@ def reduce_trial_trace(
         "peak_reserved_gib": peak_reserved_gib,
         "peak_reserved_ratio": peak_reserved_ratio,
         "optimizer_ratio": optimizer_ratio,
+        "optimizer_exposed_ms": optimizer_exposed_ms,
+        "optimizer_exposed_ratio": optimizer_exposed_ratio,
         "stall_ratio": stall_ratio,
+        "pipeline_wait_ms": pipeline_wait_ms,
+        "pipeline_wait_ratio": pipeline_wait_ratio,
         "bubble_ratio": bubble_ratio,
+        "bubble_exposure_ratio": _safe_float(merged.get("bubble_exposure_ratio")) or bubble_ratio,
         "stage_load_variance": stage_load_variance,
         "cross_node_exposed_ratio": cross_node_exposed_ratio,
         "tp_overpartition_proxy": tp_overpartition_proxy,
