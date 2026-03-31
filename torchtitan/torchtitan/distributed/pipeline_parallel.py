@@ -284,6 +284,12 @@ def pipeline_llm(
             "pipeline_parallel_stage_to_node must have one label per pipeline stage. "
             f"Got {len(stage_to_node)} labels for {num_virtual_stages} stages."
         )
+    stage_hbm_budget_gib = parallelism.fsdp_stage_hbm_budget_gib
+    if stage_hbm_budget_gib is not None and len(stage_hbm_budget_gib) != num_virtual_stages:
+        raise ValueError(
+            "fsdp_stage_hbm_budget_gib must have one value per pipeline stage. "
+            f"Got {len(stage_hbm_budget_gib)} budgets for {num_virtual_stages} stages."
+        )
     local_stage_indices = [
         int(getattr(stage, "stage_index", local_idx))
         for local_idx, stage in enumerate(stages)
@@ -296,6 +302,11 @@ def pipeline_llm(
         setattr(model_part, "_tt_stage_to_node", tuple(stage_to_node))
         setattr(model_part, "_tt_stage_node", stage_to_node[stage_idx])
         setattr(model_part, "_tt_is_last_local_stage", stage_idx == last_local_stage_idx)
+        setattr(
+            model_part,
+            "_tt_stage_hbm_budget_gib",
+            float(stage_hbm_budget_gib[stage_idx]) if stage_hbm_budget_gib is not None else 0.0,
+        )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
     # We need to iterate through model_parts to apply SPMD parallelisms, compilation,

@@ -59,6 +59,11 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _safe_module_isinstance(module: torch.nn.Module, candidate_type: object) -> bool:
+    """Best-effort isinstance that tolerates optional TE symbols resolving to non-types."""
+    return isinstance(candidate_type, type) and isinstance(module, candidate_type)
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -206,7 +211,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
             if not is_expert_param(name, param) and tp_size > 1:
                 m_name, direct_module = param_to_direct_module[param]
-                if isinstance(direct_module, (TELinear,)):
+                if _safe_module_isinstance(direct_module, TELinear):
                     parallel_mode = getattr(direct_module, "parallel_mode", None)
                     if parallel_mode is None:
                         setattr(param, "_mcore_tp", True)

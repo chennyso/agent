@@ -637,6 +637,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             setattr(model, "_tt_stage_to_node", (host_label,))
             setattr(model, "_tt_stage_node", host_label)
             setattr(model, "_tt_is_last_local_stage", True)
+            stage_budget_gib = 0.0
+            if config.parallelism.fsdp_stage_hbm_budget_gib:
+                stage_budget_gib = float(config.parallelism.fsdp_stage_hbm_budget_gib[0])
+            setattr(model, "_tt_stage_hbm_budget_gib", stage_budget_gib)
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor

@@ -222,8 +222,14 @@ def apply_hybrid_policy(
     cfg.parallelism.fsdp_mlp_scope = str(
         fsdp2.get("mlp_scope") or cfg.parallelism.fsdp_mlp_scope
     )
+    cfg.parallelism.fsdp_mlp_output_scope = str(
+        fsdp2.get("mlp_output_scope") or cfg.parallelism.fsdp_mlp_output_scope
+    )
     cfg.parallelism.fsdp_embhead_scope = str(
         fsdp2.get("embhead_scope") or cfg.parallelism.fsdp_embhead_scope
+    )
+    cfg.parallelism.fsdp_mlp_unit_mode = str(
+        fsdp2.get("mlp_unit_mode") or cfg.parallelism.fsdp_mlp_unit_mode
     )
     cfg.parallelism.fsdp_node_local_reshard_size = _ensure_int(
         fsdp2.get(
@@ -233,6 +239,28 @@ def apply_hybrid_policy(
         "hybrid_policy.fsdp2.node_local_reshard_size",
         min_value=0,
     )
+    cfg.parallelism.fsdp_prefetch_window = _ensure_int(
+        fsdp2.get("prefetch_window", cfg.parallelism.fsdp_prefetch_window),
+        "hybrid_policy.fsdp2.prefetch_window",
+        min_value=1,
+    )
+    cfg.parallelism.fsdp_recompute_forward_prefetch = str(
+        fsdp2.get("recompute_forward_prefetch")
+        or cfg.parallelism.fsdp_recompute_forward_prefetch
+    )
+    cfg.parallelism.fsdp_recompute_backward_prefetch = str(
+        fsdp2.get("recompute_backward_prefetch")
+        or cfg.parallelism.fsdp_recompute_backward_prefetch
+    )
+    cfg.parallelism.fsdp_materialization_watermark_gib = float(
+        fsdp2.get(
+            "materialization_watermark_gib",
+            cfg.parallelism.fsdp_materialization_watermark_gib,
+        )
+    )
+    stage_hbm_budget_gib = pipeline.get("stage_hbm_budget_gib", fsdp2.get("stage_hbm_budget_gib"))
+    if stage_hbm_budget_gib is not None:
+        cfg.parallelism.fsdp_stage_hbm_budget_gib = [float(x) for x in stage_hbm_budget_gib]
     cfg.parallelism.fsdp_policy_trace = bool(
         fsdp2.get("policy_trace", cfg.parallelism.fsdp_policy_trace)
     )

@@ -135,8 +135,23 @@ class ParallelismConfig:
     fsdp_mlp_scope: Literal["auto", "global", "node", "keep"] = "auto"
     """Experimental reshard scope for MLP groups under module-group FSDP."""
 
+    fsdp_mlp_output_scope: Literal["auto", "global", "node", "keep"] = "auto"
+    """
+    Experimental reshard scope for the MLP output/down projection (`w2`) when
+    module-group FSDP is allowed to split the FFN into `w1/w3` and `w2`.
+    """
+
     fsdp_embhead_scope: Literal["auto", "global", "node", "keep"] = "auto"
     """Experimental reshard scope for embedding/head groups under module-group FSDP."""
+
+    fsdp_mlp_unit_mode: Literal["auto", "block", "split_gate_up_down"] = "auto"
+    """
+    Experimental MLP sharding unit for module-group FSDP.
+
+    - "block": keep the FFN as one FSDP unit.
+    - "split_gate_up_down": split FFN into (`w1`, `w3`) and (`w2`) units.
+    - "auto": enable the split only on budget-constrained or PP-sensitive stages.
+    """
 
     fsdp_node_local_reshard_size: int = 0
     """
@@ -161,6 +176,38 @@ class ParallelismConfig:
     - "auto": choose a conservative profile based on PP/VPP topology.
     - "none": disable explicit backward prefetch.
     - "block": prefetch the previous transformer block during backward.
+    """
+
+    fsdp_recompute_forward_prefetch: Literal["inherit", "none", "block"] = "inherit"
+    """
+    Optional forward-prefetch override to use when activation checkpointing/recompute is enabled.
+    "inherit" keeps `fsdp_forward_prefetch`.
+    """
+
+    fsdp_recompute_backward_prefetch: Literal["inherit", "none", "block"] = "inherit"
+    """
+    Optional backward-prefetch override to use when activation checkpointing/recompute is enabled.
+    "inherit" keeps `fsdp_backward_prefetch`.
+    """
+
+    fsdp_prefetch_window: int = 1
+    """
+    Maximum number of neighboring block-level FSDP units to wire into explicit
+    prefetch chains. Values <= 1 preserve the current next/previous-block behavior.
+    """
+
+    fsdp_materialization_watermark_gib: float = 0.0
+    """
+    Optional per-stage HBM watermark. When `fsdp_stage_hbm_budget_gib` is set and a stage's
+    budget is at or below this watermark, module-group FSDP automatically chooses a more
+    conservative lifecycle policy (tighter scopes and no explicit prefetch).
+    """
+
+    fsdp_stage_hbm_budget_gib: list[float] | None = None
+    """
+    Optional per-stage HBM budgets used by the module-group FSDP planner.
+    This does not enforce memory limits in the runtime; it exposes stage-local budgets to
+    policy resolution so Agent- or policy-driven configs can tighten hotspots first.
     """
 
     tensor_parallel_degree: int = 1

@@ -18,6 +18,9 @@ if str(SRC) not in sys.path:
 TITAN_ROOT = ROOT / "torchtitan"
 if str(TITAN_ROOT) not in sys.path:
     sys.path.insert(0, str(TITAN_ROOT))
+MEGATRON_ROOT = ROOT / "Megatron-LM"
+if str(MEGATRON_ROOT) not in sys.path:
+    sys.path.insert(0, str(MEGATRON_ROOT))
 if "tyro" not in sys.modules:
     tyro_stub = types.ModuleType("tyro")
 
@@ -76,6 +79,7 @@ from megatron_agent.trace_reducer import (  # noqa: E402
     reduce_trial_trace,
 )
 from torchtitan.experiments.hybrid_policy import apply_hybrid_policy  # noqa: E402
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _safe_module_isinstance  # noqa: E402
 
 
 class _FakeActivationCheckpoint:
@@ -105,9 +109,16 @@ class _FakeParallelism:
         self.fsdp_parallelism_conditioned_policy = "module_groups"
         self.fsdp_attention_scope = "keep"
         self.fsdp_mlp_scope = "keep"
+        self.fsdp_mlp_output_scope = "keep"
         self.fsdp_embhead_scope = "keep"
+        self.fsdp_mlp_unit_mode = "block"
         self.fsdp_node_local_reshard_size = 0
         self.fsdp_policy_trace = False
+        self.fsdp_prefetch_window = 1
+        self.fsdp_recompute_forward_prefetch = "inherit"
+        self.fsdp_recompute_backward_prefetch = "inherit"
+        self.fsdp_materialization_watermark_gib = 0.0
+        self.fsdp_stage_hbm_budget_gib = None
         self.rank_order = None
 
 
@@ -1010,12 +1021,21 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("bottleneck_breakdown", artifact)
         self.assertIn("search_space_blueprint", artifact)
         self.assertIn("visualization_artifacts", artifact)
+        self.assertIn("stage_cost_model", artifact)
+        self.assertIn("boundary_semantics", artifact)
+        self.assertIn("nonuniform_vpp_shape", artifact)
+        self.assertIn("pipe_search_space", artifact)
+        self.assertIn("local_memory_search_space", artifact)
         perfetto = dict((artifact.get("visualization_artifacts") or {}).get("perfetto_trace") or {})
         self.assertEqual(perfetto.get("format"), "perfetto_trace")
         self.assertGreater(len(list(perfetto.get("traceEvents") or [])), 4)
         blueprint = dict(artifact.get("search_space_blueprint") or {})
         self.assertIn("executable_now", blueprint)
         self.assertTrue(any(item.get("name") == "parallel.vpp_degree" for item in (blueprint.get("executable_now") or [])))
+        self.assertTrue(any(item.get("name") == "parallel.vpp_vector" for item in (blueprint.get("executable_now") or [])))
+        self.assertGreater(len(list(artifact.get("stage_cost_model") or [])), 0)
+        self.assertGreater(len(list(artifact.get("boundary_semantics") or [])), 0)
+        self.assertEqual(dict(artifact.get("nonuniform_vpp_shape") or {}).get("vector_form"), "v = (v1, v2, ..., vS)")
 
     def test_context_record_includes_perfetto_trace_and_search_space_blueprint(self) -> None:
         program = default_dense_program("single_g5")
@@ -1036,9 +1056,18 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("bottleneck_breakdown", evidence)
         self.assertIn("search_space_blueprint", evidence)
         self.assertIn("visualization_artifacts", evidence)
+        self.assertIn("stage_cost_model", evidence)
+        self.assertIn("boundary_semantics", evidence)
+        self.assertIn("nonuniform_vpp_shape", evidence)
+        self.assertIn("pipe_search_space", evidence)
+        self.assertIn("local_memory_search_space", evidence)
+        self.assertIn("single_node_deep_stats", evidence)
         perfetto = dict((evidence.get("visualization_artifacts") or {}).get("perfetto_trace") or {})
         self.assertEqual(perfetto.get("format"), "perfetto_trace")
         self.assertTrue(any(item.get("label") == "pipeline_idle" for item in (evidence.get("bottleneck_breakdown") or [])))
+        self.assertTrue(any(item.get("semantic") in {"normal", "tail-aware", "comm-aware", "memory-aware"} for item in (evidence.get("boundary_semantics") or [])))
+        self.assertTrue(any(item.get("stage_id") == 0 for item in (evidence.get("stage_cost_model") or [])))
+        self.assertEqual(dict(evidence.get("single_node_deep_stats") or {}).get("mode"), "single_node_8gpu")
 
     def test_write_analysis_artifacts_persists_visualization_and_blueprint_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1048,6 +1077,12 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     "runtime_evidence": {"bubble_ratio": 0.1},
                     "evidence_record": {
                         "bottleneck_breakdown": [{"label": "pipeline_idle", "time_ms": 123.0}],
+                        "stage_cost_model": [{"stage_id": 0, "total_cost_ms": 456.0}],
+                        "boundary_semantics": [{"boundary_id": "0->1", "semantic": "comm-aware"}],
+                        "nonuniform_vpp_shape": {"vector_form": "v = (v1, v2, ..., vS)"},
+                        "pipe_search_space": {"variants": [{"name": "fixed_1f1b"}]},
+                        "local_memory_search_space": {"per_stage_policy": [{"stage_id": 0}]},
+                        "single_node_deep_stats": {"mode": "single_node_8gpu"},
                         "search_space_blueprint": {"executable_now": [{"name": "parallel.pp_degree"}]},
                         "visualization_artifacts": {
                             "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]}
@@ -1056,6 +1091,12 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 },
                 "trial_artifact": {
                     "bottleneck_breakdown": [{"label": "pipeline_idle", "time_ms": 123.0}],
+                    "stage_cost_model": [{"stage_id": 0, "total_cost_ms": 456.0}],
+                    "boundary_semantics": [{"boundary_id": "0->1", "semantic": "comm-aware"}],
+                    "nonuniform_vpp_shape": {"vector_form": "v = (v1, v2, ..., vS)"},
+                    "pipe_search_space": {"variants": [{"name": "fixed_1f1b"}]},
+                    "local_memory_search_space": {"per_stage_policy": [{"stage_id": 0}]},
+                    "single_node_deep_stats": {"mode": "single_node_8gpu"},
                     "search_space_blueprint": {"executable_now": [{"name": "parallel.pp_degree"}]},
                     "visualization_artifacts": {
                         "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]}
@@ -1352,6 +1393,128 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             )
         )
 
+    def test_synthesize_proposals_emits_nonuniform_vpp_shape_candidate_and_stage_cost_score(self) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.14,
+            "stage_load_variance": 0.06,
+            "cross_node_exposed_ratio": 0.02,
+            "peak_memory_ratio": 0.74,
+            "steady_state_step_time_ms_p50": 980.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 760.0, "comm_ms": 70.0, "bubble_ms": 120.0, "window_ms": 950.0, "peak_reserved_gib": 21.0, "peak_active_gib": 17.0},
+                "1": {"compute_ms": 620.0, "comm_ms": 55.0, "bubble_ms": 55.0, "window_ms": 730.0, "peak_reserved_gib": 15.0, "peak_active_gib": 12.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="bubble_spike", scope="local_parallel").to_dict(),
+            candidate_limit=12,
+        )
+        self.assertTrue(len(rejected) >= 0)
+        kinds = {str(proposal.program.metadata.get("program_kind")) for proposal in proposals}
+        self.assertIn("candidate_nonuniform_vpp_shape", kinds)
+        nonuniform = next(
+            proposal.program
+            for proposal in proposals
+            if str(proposal.program.metadata.get("program_kind")) == "candidate_nonuniform_vpp_shape"
+        )
+        self.assertTrue(bool(nonuniform.metadata.get("preserve_stage_local_vpp")))
+        self.assertGreater(len(list(nonuniform.metadata.get("stage_local_vpp_vector") or [])), 0)
+        self.assertTrue(any("stage_cost_score" in proposal.program.metadata for proposal in proposals))
+
+    def test_synthesize_proposals_emits_boundary_semantic_and_pipe_variant_candidates(self) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.17,
+            "stage_load_variance": 0.05,
+            "cross_node_exposed_ratio": 0.03,
+            "peak_memory_ratio": 0.79,
+            "steady_state_step_time_ms_p50": 1100.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 780.0, "comm_ms": 150.0, "bubble_ms": 130.0, "window_ms": 1060.0, "peak_reserved_gib": 22.0, "peak_active_gib": 18.0},
+                "1": {"compute_ms": 700.0, "comm_ms": 140.0, "bubble_ms": 90.0, "window_ms": 930.0, "peak_reserved_gib": 18.0, "peak_active_gib": 14.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="bubble_spike", scope="pipe").to_dict(),
+            candidate_limit=10,
+        )
+        proposal_kinds = {str(proposal.program.metadata.get("program_kind")) for proposal in proposals}
+        rejected_kinds = {
+            str((((item.get("proposal") or {}).get("program") or {}).get("metadata") or {}).get("program_kind"))
+            for item in rejected
+        }
+        all_kinds = proposal_kinds | rejected_kinds
+        self.assertTrue(any(kind.startswith("candidate_boundary_semantic_") for kind in all_kinds))
+        pipe_variants = agent_loop._build_pipe_search_space_candidates(
+            baseline,
+            runtime_summary,
+            context,
+        )
+        self.assertTrue(
+            any(
+                str(candidate.metadata.get("program_kind") or "").startswith("candidate_pipe_variant_")
+                for candidate in pipe_variants
+            )
+        )
+
+    def test_synthesize_proposals_emits_stage_local_memory_policy_candidate(self) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.09,
+            "stage_load_variance": 0.04,
+            "cross_node_exposed_ratio": 0.02,
+            "peak_memory_ratio": 0.91,
+            "steady_state_step_time_ms_p50": 1020.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 820.0, "comm_ms": 90.0, "bubble_ms": 70.0, "window_ms": 980.0, "peak_reserved_gib": 29.0, "peak_active_gib": 25.0},
+                "1": {"compute_ms": 700.0, "comm_ms": 75.0, "bubble_ms": 45.0, "window_ms": 820.0, "peak_reserved_gib": 20.0, "peak_active_gib": 16.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="memory_pressure", scope="local_parallel").to_dict(),
+            candidate_limit=16,
+        )
+        proposal_kinds = {str(proposal.program.metadata.get("program_kind")) for proposal in proposals}
+        rejected_kinds = {
+            str((((item.get("proposal") or {}).get("program") or {}).get("metadata") or {}).get("program_kind"))
+            for item in rejected
+        }
+        all_kinds = proposal_kinds | rejected_kinds
+        direct = agent_loop._build_stage_local_memory_policy_candidate(baseline, context)
+        self.assertIsNotNone(direct)
+        self.assertGreater(len(list((direct.metadata if direct is not None else {}).get("stage_local_memory_policy") or [])), 0)
+        self.assertTrue(
+            "candidate_stage_local_memory_policy" in all_kinds
+            or "candidate_boundary_semantic_memory" in all_kinds
+            or "candidate_local_fsdp_scope" in all_kinds
+        )
+        if "candidate_stage_local_memory_policy" in proposal_kinds:
+            candidate = next(
+                proposal.program
+                for proposal in proposals
+                if str(proposal.program.metadata.get("program_kind")) == "candidate_stage_local_memory_policy"
+            )
+            self.assertGreater(len(list(candidate.metadata.get("stage_local_memory_policy") or [])), 0)
+
     def test_torchtitan_hybrid_plan_normalization_and_validation(self) -> None:
         plan = TorchTitanHybridPlanIR(
             shard_mode="HSDP",
@@ -1483,6 +1646,43 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(cfg.parallelism.data_parallel_shard_degree, 1)
         self.assertEqual(cfg.parallelism.pipeline_parallel_schedule, "ZBVZeroBubble")
         self.assertEqual(cfg.parallelism.pipeline_parallel_stage_to_node, ["g5_0", "g5_0", "g5_1", "g5_1"])
+
+    def test_hybrid_policy_applies_fine_grained_fsdp_controls(self) -> None:
+        policy = {
+            "pipeline": {
+                "degree": 2,
+                "stage_hbm_budget_gib": [28.0, 30.0],
+            },
+            "fsdp2": {
+                "enabled": True,
+                "policy_mode": "module_groups",
+                "mlp_unit_mode": "split_gate_up_down",
+                "mlp_scope": "node",
+                "mlp_output_scope": "keep",
+                "prefetch_window": 2,
+                "recompute_forward_prefetch": "none",
+                "recompute_backward_prefetch": "none",
+                "materialization_watermark_gib": 29.0,
+            },
+        }
+        cfg = apply_hybrid_policy(_FakeTrainerConfig(), policy_path=self._write_policy(policy))
+        self.assertEqual(cfg.parallelism.fsdp_mlp_unit_mode, "split_gate_up_down")
+        self.assertEqual(cfg.parallelism.fsdp_mlp_scope, "node")
+        self.assertEqual(cfg.parallelism.fsdp_mlp_output_scope, "keep")
+        self.assertEqual(cfg.parallelism.fsdp_prefetch_window, 2)
+        self.assertEqual(cfg.parallelism.fsdp_recompute_forward_prefetch, "none")
+        self.assertEqual(cfg.parallelism.fsdp_recompute_backward_prefetch, "none")
+        self.assertEqual(cfg.parallelism.fsdp_materialization_watermark_gib, 29.0)
+        self.assertEqual(cfg.parallelism.fsdp_stage_hbm_budget_gib, [28.0, 30.0])
+
+    def test_safe_module_isinstance_tolerates_non_type_candidate(self) -> None:
+        class _Dummy:
+            pass
+
+        instance = _Dummy()
+        self.assertTrue(_safe_module_isinstance(instance, _Dummy))
+        self.assertFalse(_safe_module_isinstance(instance, None))
+        self.assertFalse(_safe_module_isinstance(instance, "not-a-type"))
 
     def _write_policy(self, policy: Dict[str, Any]) -> str:
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")

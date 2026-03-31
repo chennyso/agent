@@ -105,6 +105,7 @@ def _resolve_qwen3_group_scope(
     stage_to_node: tuple[str, ...],
     is_last_local_stage: bool,
     base_reshard: bool,
+    budget_tight: bool,
 ) -> str:
     if configured_scope != "auto":
         return configured_scope
@@ -123,6 +124,11 @@ def _resolve_qwen3_group_scope(
     )
     near_cross_node_boundary = crosses_prev or crosses_next
 
+    if budget_tight:
+        if group_name == "mlp" and parallelism.fsdp_node_local_reshard_size > 0:
+            return "node"
+        return "keep"
+
     if group_name == "attention":
         if parallel_dims.tp_enabled or parallel_dims.cp_enabled:
             return "keep"
@@ -135,6 +141,13 @@ def _resolve_qwen3_group_scope(
         return _default_scope_name(base_reshard)
 
     if group_name == "mlp":
+        if near_cross_node_boundary and parallelism.fsdp_node_local_reshard_size > 0:
+            return "node"
+        if has_multi_stage_pipeline and is_last_local_stage:
+            return "keep"
+        return _default_scope_name(base_reshard)
+
+    if group_name == "mlp_output":
         if near_cross_node_boundary and parallelism.fsdp_node_local_reshard_size > 0:
             return "node"
         if has_multi_stage_pipeline and is_last_local_stage:
@@ -158,9 +171,13 @@ def _resolve_qwen3_prefetch_profile(
     num_stages: int,
     stage_to_node: tuple[str, ...],
     is_last_local_stage: bool,
+    budget_tight: bool,
 ) -> str:
     if configured_profile != "auto":
         return configured_profile
+
+    if budget_tight:
+        return "none"
 
     if not parallel_dims.pp_enabled or num_stages <= 1:
         return "none"
@@ -212,28 +229,28 @@ def _apply_explicit_prefetch_policy(
     backward_profile: str,
     stage_idx: int,
     trace: bool,
+    prefetch_window: int,
 ) -> None:
     transformer_blocks = list(model.layers.values())
     if not transformer_blocks:
         return
+    window = max(1, int(prefetch_window))
 
     forward_updates = 0
     if forward_profile == "block":
-        next_transformer_blocks = transformer_blocks[1:] + [None]
         if model.tok_embeddings is not None:
             forward_updates += int(
                 _set_modules_to_prefetch(
                     model.tok_embeddings,
                     direction="forward",
-                    targets=[transformer_blocks[0]],
+                    targets=transformer_blocks[:window],
                 )
             )
-        for transformer_block, next_transformer_block in zip(
-            transformer_blocks, next_transformer_blocks
-        ):
+        for idx, transformer_block in enumerate(transformer_blocks):
             targets: list[nn.Module] = []
-            if next_transformer_block is not None:
-                targets = [next_transformer_block]
+            next_blocks = transformer_blocks[idx + 1 : idx + 1 + window]
+            if next_blocks:
+                targets = next_blocks
             elif model.norm is not None and model.output is not None:
                 targets = [model.norm, model.output]
             forward_updates += int(
@@ -247,19 +264,16 @@ def _apply_explicit_prefetch_policy(
     backward_updates = 0
     if backward_profile == "block":
         reversed_transformer_blocks = list(reversed(transformer_blocks))
-        prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
         if model.norm is not None and model.output is not None:
             backward_updates += int(
                 _set_modules_to_prefetch(
                     model.output,
                     direction="backward",
-                    targets=[reversed_transformer_blocks[0]],
+                    targets=reversed_transformer_blocks[:window],
                 )
             )
-        for transformer_block, prev_transformer_block in zip(
-            reversed_transformer_blocks, prev_transformer_blocks
-        ):
-            targets = [prev_transformer_block] if prev_transformer_block is not None else []
+        for idx, transformer_block in enumerate(reversed_transformer_blocks):
+            targets = reversed_transformer_blocks[idx + 1 : idx + 1 + window]
             if not targets and model.tok_embeddings is not None:
                 targets = [model.tok_embeddings]
             backward_updates += int(
@@ -273,9 +287,26 @@ def _apply_explicit_prefetch_policy(
     if trace and (forward_updates or backward_updates):
         logger.info(
             "[fsdp-policy] "
-            f"stage={stage_idx} explicit_prefetch forward={forward_profile}({forward_updates}) "
+            f"stage={stage_idx} explicit_prefetch window={window} "
+            f"forward={forward_profile}({forward_updates}) "
             f"backward={backward_profile}({backward_updates})"
         )
+
+
+def _resolve_qwen3_mlp_unit_mode(
+    *,
+    configured_mode: str,
+    budget_tight: bool,
+    parallel_dims: ParallelDims,
+    is_last_local_stage: bool,
+) -> str:
+    if configured_mode != "auto":
+        return configured_mode
+    if budget_tight:
+        return "split_gate_up_down"
+    if parallel_dims.pp_enabled and is_last_local_stage:
+        return "split_gate_up_down"
+    return "block"
 
 
 def apply_parallelism_conditioned_fsdp(
@@ -289,6 +320,7 @@ def apply_parallelism_conditioned_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ac_mode: str = "none",
 ) -> None:
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
@@ -302,6 +334,12 @@ def apply_parallelism_conditioned_fsdp(
     num_stages = int(getattr(model, "_tt_num_stages", 1))
     stage_to_node = tuple(getattr(model, "_tt_stage_to_node", tuple()))
     is_last_local_stage = bool(getattr(model, "_tt_is_last_local_stage", True))
+    stage_hbm_budget_gib = float(getattr(model, "_tt_stage_hbm_budget_gib", 0.0) or 0.0)
+    budget_tight = (
+        parallelism.fsdp_materialization_watermark_gib > 0
+        and stage_hbm_budget_gib > 0
+        and stage_hbm_budget_gib <= float(parallelism.fsdp_materialization_watermark_gib)
+    )
 
     attention_scope = _resolve_qwen3_group_scope(
         group_name="attention",
@@ -313,6 +351,7 @@ def apply_parallelism_conditioned_fsdp(
         stage_to_node=stage_to_node,
         is_last_local_stage=is_last_local_stage,
         base_reshard=base_reshard,
+        budget_tight=budget_tight,
     )
     mlp_scope = _resolve_qwen3_group_scope(
         group_name="mlp",
@@ -324,6 +363,19 @@ def apply_parallelism_conditioned_fsdp(
         stage_to_node=stage_to_node,
         is_last_local_stage=is_last_local_stage,
         base_reshard=base_reshard,
+        budget_tight=budget_tight,
+    )
+    mlp_output_scope = _resolve_qwen3_group_scope(
+        group_name="mlp_output",
+        configured_scope=parallelism.fsdp_mlp_output_scope,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        stage_idx=stage_idx,
+        num_stages=num_stages,
+        stage_to_node=stage_to_node,
+        is_last_local_stage=is_last_local_stage,
+        base_reshard=base_reshard,
+        budget_tight=budget_tight,
     )
     embhead_scope = _resolve_qwen3_group_scope(
         group_name="embhead",
@@ -335,6 +387,7 @@ def apply_parallelism_conditioned_fsdp(
         stage_to_node=stage_to_node,
         is_last_local_stage=is_last_local_stage,
         base_reshard=base_reshard,
+        budget_tight=budget_tight,
     )
 
     attention_reshard = _scope_to_reshard_value(
@@ -347,27 +400,47 @@ def apply_parallelism_conditioned_fsdp(
         base_reshard=base_reshard,
         node_local_size=parallelism.fsdp_node_local_reshard_size,
     )
+    mlp_output_reshard = _scope_to_reshard_value(
+        mlp_output_scope,
+        base_reshard=base_reshard,
+        node_local_size=parallelism.fsdp_node_local_reshard_size,
+    )
     embhead_reshard = _scope_to_reshard_value(
         embhead_scope,
         base_reshard=base_reshard,
         node_local_size=parallelism.fsdp_node_local_reshard_size,
     )
+    effective_forward_prefetch = parallelism.fsdp_forward_prefetch
+    effective_backward_prefetch = parallelism.fsdp_backward_prefetch
+    if ac_mode != "none":
+        if parallelism.fsdp_recompute_forward_prefetch != "inherit":
+            effective_forward_prefetch = parallelism.fsdp_recompute_forward_prefetch
+        if parallelism.fsdp_recompute_backward_prefetch != "inherit":
+            effective_backward_prefetch = parallelism.fsdp_recompute_backward_prefetch
     forward_prefetch_profile = _resolve_qwen3_prefetch_profile(
         direction="forward",
-        configured_profile=parallelism.fsdp_forward_prefetch,
+        configured_profile=effective_forward_prefetch,
         parallel_dims=parallel_dims,
         stage_idx=stage_idx,
         num_stages=num_stages,
         stage_to_node=stage_to_node,
         is_last_local_stage=is_last_local_stage,
+        budget_tight=budget_tight,
     )
     backward_prefetch_profile = _resolve_qwen3_prefetch_profile(
         direction="backward",
-        configured_profile=parallelism.fsdp_backward_prefetch,
+        configured_profile=effective_backward_prefetch,
         parallel_dims=parallel_dims,
         stage_idx=stage_idx,
         num_stages=num_stages,
         stage_to_node=stage_to_node,
+        is_last_local_stage=is_last_local_stage,
+        budget_tight=budget_tight,
+    )
+    mlp_unit_mode = _resolve_qwen3_mlp_unit_mode(
+        configured_mode=parallelism.fsdp_mlp_unit_mode,
+        budget_tight=budget_tight,
+        parallel_dims=parallel_dims,
         is_last_local_stage=is_last_local_stage,
     )
 
@@ -376,10 +449,15 @@ def apply_parallelism_conditioned_fsdp(
             "[fsdp-policy] "
             f"stage={stage_idx} local_last={is_last_local_stage} "
             f"stage_node={getattr(model, '_tt_stage_node', 'n/a')} "
+            f"stage_hbm_budget_gib={stage_hbm_budget_gib:.2f} "
+            f"budget_tight={budget_tight} "
             f"attention={attention_scope}->{attention_reshard} "
             f"mlp={mlp_scope}->{mlp_reshard} "
+            f"mlp_output={mlp_output_scope}->{mlp_output_reshard} "
             f"embhead={embhead_scope}->{embhead_reshard} "
-            f"prefetch={forward_prefetch_profile}/{backward_prefetch_profile}"
+            f"mlp_unit_mode={mlp_unit_mode} "
+            f"prefetch={forward_prefetch_profile}/{backward_prefetch_profile} "
+            f"prefetch_window={parallelism.fsdp_prefetch_window}"
         )
 
     if getattr(model, "enable_weight_tying", False):
@@ -426,11 +504,37 @@ def apply_parallelism_conditioned_fsdp(
                 reshard_after_forward=mlp_reshard,
             )
         else:
-            fully_shard(
-                [transformer_block.ffn_norm, transformer_block.feed_forward],
-                **fsdp_config,
-                reshard_after_forward=mlp_reshard,
-            )
+            if (
+                mlp_unit_mode == "split_gate_up_down"
+                and hasattr(transformer_block.feed_forward, "w1")
+                and hasattr(transformer_block.feed_forward, "w2")
+                and hasattr(transformer_block.feed_forward, "w3")
+            ):
+                fully_shard(
+                    [
+                        transformer_block.ffn_norm,
+                        transformer_block.feed_forward.w1,
+                        transformer_block.feed_forward.w3,
+                    ],
+                    **fsdp_config,
+                    reshard_after_forward=mlp_reshard,
+                )
+                fully_shard(
+                    transformer_block.feed_forward.w2,
+                    **fsdp_config,
+                    reshard_after_forward=mlp_output_reshard,
+                )
+                fully_shard(
+                    transformer_block.feed_forward,
+                    **fsdp_config,
+                    reshard_after_forward=base_reshard,
+                )
+            else:
+                fully_shard(
+                    [transformer_block.ffn_norm, transformer_block.feed_forward],
+                    **fsdp_config,
+                    reshard_after_forward=mlp_reshard,
+                )
         fully_shard(
             transformer_block,
             **fsdp_config,
@@ -449,6 +553,7 @@ def apply_parallelism_conditioned_fsdp(
                 backward_profile=backward_prefetch_profile,
                 stage_idx=stage_idx,
                 trace=parallelism.fsdp_policy_trace,
+                prefetch_window=parallelism.fsdp_prefetch_window,
             )
 
 
@@ -585,6 +690,7 @@ def parallelize_qwen3(
                     pp_enabled=parallel_dims.pp_enabled,
                     cpu_offload=training.enable_cpu_offload,
                     reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+                    ac_mode=ac_config.mode,
                 )
                 logger.info("Applied module-group conditioned FSDP to the model")
         else:
