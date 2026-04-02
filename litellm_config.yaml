@@ -1,6 +1,0 @@
-model_list:
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://airouter.service.itstudio.club/v1
-      api_key: sk-C5yf03j4owoJzjqQnXeHrYyd4nVKGEGcmny2OFc5rsfOXjce
