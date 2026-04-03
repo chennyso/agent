@@ -958,6 +958,86 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         env["SCHEDULE_WARMUP_POLICY"] = str(norm.strategy_ir.pipe.warmup_policy)
     if norm.strategy_ir.pipe.cooldown_policy:
         env["SCHEDULE_COOLDOWN_POLICY"] = str(norm.strategy_ir.pipe.cooldown_policy)
+    schedule_warmup_checkpoint_policy = str(
+        (norm.metadata or {}).get("schedule_warmup_checkpoint_policy") or ""
+    ).strip()
+    if schedule_warmup_checkpoint_policy:
+        env["SCHEDULE_WARMUP_CHECKPOINT_POLICY"] = schedule_warmup_checkpoint_policy
+    schedule_steady_checkpoint_policy = str(
+        (norm.metadata or {}).get("schedule_steady_checkpoint_policy") or ""
+    ).strip()
+    if schedule_steady_checkpoint_policy:
+        env["SCHEDULE_STEADY_CHECKPOINT_POLICY"] = schedule_steady_checkpoint_policy
+    schedule_warmup_p2p_policy = str(
+        (norm.metadata or {}).get("schedule_warmup_p2p_policy") or ""
+    ).strip()
+    if schedule_warmup_p2p_policy:
+        env["SCHEDULE_WARMUP_P2P_POLICY"] = schedule_warmup_p2p_policy
+    schedule_cooldown_p2p_policy = str(
+        (norm.metadata or {}).get("schedule_cooldown_p2p_policy") or ""
+    ).strip()
+    if schedule_cooldown_p2p_policy:
+        env["SCHEDULE_COOLDOWN_P2P_POLICY"] = schedule_cooldown_p2p_policy
+    schedule_warmup_combined_policy = str(
+        (norm.metadata or {}).get("schedule_warmup_combined_policy") or ""
+    ).strip()
+    if schedule_warmup_combined_policy:
+        env["SCHEDULE_WARMUP_COMBINED_POLICY"] = schedule_warmup_combined_policy
+    schedule_steady_combined_policy = str(
+        (norm.metadata or {}).get("schedule_steady_combined_policy") or ""
+    ).strip()
+    if schedule_steady_combined_policy:
+        env["SCHEDULE_STEADY_COMBINED_POLICY"] = schedule_steady_combined_policy
+    schedule_cooldown_combined_policy = str(
+        (norm.metadata or {}).get("schedule_cooldown_combined_policy") or ""
+    ).strip()
+    if schedule_cooldown_combined_policy:
+        env["SCHEDULE_COOLDOWN_COMBINED_POLICY"] = schedule_cooldown_combined_policy
+    runtime_recompute_granularity = str(
+        (norm.metadata or {}).get("runtime_recompute_granularity")
+        or strategy.recompute_granularity
+        or ""
+    ).strip()
+    if runtime_recompute_granularity:
+        env["RECOMPUTE_GRANULARITY"] = runtime_recompute_granularity
+        env["ENABLE_RECOMPUTE_ACTIVATIONS"] = (
+            "1"
+            if bool((norm.metadata or {}).get("runtime_enable_recompute_activations", True))
+            else "0"
+        )
+    runtime_recompute_modules = (norm.metadata or {}).get("runtime_recompute_modules")
+    if isinstance(runtime_recompute_modules, list):
+        parsed = []
+        for item in runtime_recompute_modules:
+            token = str(item).strip()
+            if token:
+                parsed.append(token)
+        if parsed:
+            env["RECOMPUTE_MODULES"] = ",".join(parsed)
+    runtime_offload_modules = (norm.metadata or {}).get("runtime_offload_modules")
+    if bool((norm.metadata or {}).get("runtime_enable_fine_grained_activation_offloading", False)):
+        env["ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING"] = "1"
+        parsed = []
+        if isinstance(runtime_offload_modules, list):
+            for item in runtime_offload_modules:
+                token = str(item).strip()
+                if token:
+                    parsed.append(token)
+        if parsed:
+            env["OFFLOAD_MODULES"] = ",".join(parsed)
+    flush_order_policy = str((norm.metadata or {}).get("flush_order_policy") or "").strip()
+    if flush_order_policy:
+        env["SCHEDULE_FLUSH_ORDER_POLICY"] = flush_order_policy
+    flush_microbatches = (norm.metadata or {}).get("flush_microbatches")
+    if isinstance(flush_microbatches, list):
+        parsed = []
+        for item in flush_microbatches:
+            try:
+                parsed.append(str(int(item)))
+            except Exception:
+                continue
+        if parsed:
+            env["SCHEDULE_FLUSH_MICROBATCHES"] = ",".join(parsed)
     fsdp_scopes = {
         str(item.subgraph): str(item.fsdp_scope)
         for item in (norm.strategy_ir.local_parallel or [])

@@ -130,6 +130,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     pre_backward=None,
     post_forward=None,
     post_backward=None,
+    checkpoint_activations_microbatch=None,
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
@@ -214,7 +215,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         post_forward=post_forward,
         post_backward=post_backward,
         collect_non_loss_data=collect_non_loss_data,
-        checkpoint_activations_microbatch=None,
+        checkpoint_activations_microbatch=checkpoint_activations_microbatch,
         is_first_microbatch=check_first_val_step(
             is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
             if f_virtual_microbatch_id is not None
@@ -226,7 +227,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
         if input_tensor is not None:

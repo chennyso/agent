@@ -143,6 +143,44 @@ def _virtual_stage_layout(decoder_layers: List[int]) -> str:
     return "|".join(tokens_per_stage)
 
 
+def _stage_local_virtual_counts(
+    stage_layers: List[int],
+    stage_vpp_vector: List[int],
+    *,
+    global_vpp: int,
+    focus: str = "balanced",
+) -> List[int]:
+    if global_vpp <= 1:
+        return [max(int(value), 0) for value in stage_layers]
+
+    stage_slot_counts: List[List[int]] = []
+    for stage_id, layers in enumerate(stage_layers):
+        local_vpp = 1
+        if stage_id < len(stage_vpp_vector):
+            local_vpp = max(min(int(stage_vpp_vector[stage_id]), int(global_vpp)), 1)
+        layers = max(int(layers), 0)
+        slots = [0 for _ in range(global_vpp)]
+        if local_vpp == 1:
+            slots[0] = layers
+        else:
+            base = layers // local_vpp
+            rem = layers % local_vpp
+            for slot_index in range(local_vpp):
+                slots[slot_index] = base
+            distribute_order = list(range(local_vpp))
+            if focus == "tail-aware":
+                distribute_order = list(reversed(distribute_order))
+            for offset in range(rem):
+                slots[distribute_order[offset % len(distribute_order)]] += 1
+        stage_slot_counts.append(slots)
+
+    counts: List[int] = []
+    for virtual_slot in range(global_vpp):
+        for stage_id in range(len(stage_layers)):
+            counts.append(int(stage_slot_counts[stage_id][virtual_slot]))
+    return counts
+
+
 def _pp_vpp_layout_counts(pp_degree: int, num_layers: int, template: str) -> Optional[List[int]]:
     if int(pp_degree) == 2 and int(num_layers) == 40:
         if template == "interleaved_grouped_g2":
@@ -2773,6 +2811,7 @@ def _build_stage_local_memory_policy_candidate(
     evidence = dict((context_record or {}).get("evidence_record") or {})
     local_memory = dict(evidence.get("local_memory_search_space") or {})
     policies = list(local_memory.get("per_stage_policy") or [])
+    runtime_policy = dict(local_memory.get("runtime_policy") or {})
     if not policies:
         return None
     policy_by_stage: Dict[int, Dict[str, Any]] = {}
@@ -2785,7 +2824,6 @@ def _build_stage_local_memory_policy_candidate(
         return None
 
     candidate = _clone_program(program)
-    local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
     selected_policies: List[Dict[str, Any]] = []
     touched = False
     for subgraph in (candidate.strategy_ir.apipe or []):
@@ -2798,18 +2836,7 @@ def _build_stage_local_memory_policy_candidate(
         prefetch_policy = str(policy.get("prefetch_policy") or "default").strip().lower()
         if checkpoint_policy == "keep" and remat_policy in {"off", "none"} and prefetch_policy == "default":
             continue
-        entry = local_by_name.get(subgraph.name)
-        if entry is None:
-            continue
-        if checkpoint_policy in {"full", "selective"}:
-            entry.fsdp_scope = "selective"
-            touched = True
-        if remat_policy in {"on", "attention_first", "full"}:
-            entry.cp_degree = max(int(entry.cp_degree), 2)
-            touched = True
-        if prefetch_policy in {"guarded", "conservative"}:
-            entry.vpp_degree = 1
-            touched = True
+        touched = True
         selected_policies.append(
             {
                 "stage_id": int(stage_id),
@@ -2817,20 +2844,55 @@ def _build_stage_local_memory_policy_candidate(
                 "checkpoint_policy": checkpoint_policy,
                 "remat_policy": remat_policy,
                 "prefetch_policy": prefetch_policy,
+                "runtime_recompute_modules": list(policy.get("runtime_recompute_modules") or []),
+                "runtime_offload_modules": list(policy.get("runtime_offload_modules") or []),
                 "reason": str(policy.get("reason") or ""),
             }
         )
+    runtime_recompute_modules = [
+        str(item)
+        for item in list(runtime_policy.get("recompute_modules") or [])
+        if str(item).strip()
+    ]
+    runtime_offload_modules = [
+        str(item)
+        for item in list(runtime_policy.get("offload_modules") or [])
+        if str(item).strip()
+    ]
+    if runtime_recompute_modules:
+        candidate.metadata["runtime_recompute_granularity"] = str(
+            runtime_policy.get("recompute_granularity") or "selective"
+        )
+        candidate.metadata["runtime_enable_recompute_activations"] = bool(
+            runtime_policy.get("enable_recompute_activations", True)
+        )
+        candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+        candidate.metadata["schedule_warmup_checkpoint_policy"] = str(
+            runtime_policy.get("warmup_checkpoint_policy") or "full"
+        )
+        candidate.metadata["schedule_steady_checkpoint_policy"] = str(
+            runtime_policy.get("steady_checkpoint_policy") or "default"
+        )
+        candidate.metadata["schedule_warmup_combined_policy"] = str(
+            runtime_policy.get("warmup_combined_policy") or "serial"
+        )
+        touched = True
+    if runtime_offload_modules:
+        candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = bool(
+            runtime_policy.get("fine_grained_activation_offloading", True)
+        )
+        candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
+        touched = True
     if not touched:
         return None
-    if int(candidate.parallel.vpp_degree) > 1:
-        candidate.parallel.vpp_degree = 1
-        candidate.layout.vpp_degree = 1
-        candidate.layout.pipeline_layout = None
-        candidate.schedule.template = "fixed_1f1b"
-        candidate.schedule.skeleton = "fixed_1f1b"
-        candidate.schedule.dispatch_order = "default"
-        candidate.schedule.microbatch_group_size_per_vp_stage = None
     candidate.metadata["stage_local_memory_policy"] = selected_policies
+    candidate.metadata["runtime_memory_policy_mode"] = "module_level_activation_relief"
+    candidate.metadata["runtime_memory_expected_effect"] = str(
+        runtime_policy.get("expected_effect") or ""
+    )
+    candidate.metadata["runtime_memory_performance_hypothesis"] = str(
+        runtime_policy.get("performance_hypothesis") or ""
+    )
     candidate.metadata["program_kind"] = "candidate_stage_local_memory_policy"
     candidate.metadata["priority_rank"] = 42
     return _sync_batch_plan_metadata(candidate)
@@ -2884,6 +2946,9 @@ def _build_boundary_semantic_schedule_candidates(
             candidate.schedule.dispatch_order = "tail_boundary_rewrite"
             candidate.strategy_ir.pipe.warmup_policy = "tail_prefill"
             candidate.strategy_ir.pipe.cooldown_policy = "tail_drain"
+            candidate.metadata["flush_order_policy"] = "reverse_last_group"
+            candidate.metadata["schedule_cooldown_p2p_policy"] = "serial"
+            candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
             candidate.metadata["program_kind"] = "candidate_boundary_semantic_tail"
             candidate.metadata["priority_rank"] = 45
         elif semantic == "memory-aware":
@@ -2985,12 +3050,174 @@ def _build_pipe_search_space_candidates(
         tagged = _clone_program(candidate)
         tagged.strategy_ir.pipe.warmup_policy = str((variant or {}).get("warmup") or tagged.strategy_ir.pipe.warmup_policy or "default")
         tagged.strategy_ir.pipe.cooldown_policy = str((variant or {}).get("cooldown") or tagged.strategy_ir.pipe.cooldown_policy or "default")
+        flush_order = str((variant or {}).get("flush_order") or "").strip()
+        if flush_order:
+            tagged.metadata["flush_order_policy"] = flush_order
         tagged.metadata["pipe_variant_name"] = name
         tagged.metadata["pipe_variant_status"] = status
         tagged.metadata["pipe_variant_issue_wait"] = str((variant or {}).get("issue_wait") or "")
         tagged.metadata["program_kind"] = f"candidate_pipe_variant_{name}"
         tagged.metadata["priority_rank"] = 46
         candidates.append(_sync_batch_plan_metadata(tagged))
+    return candidates
+
+
+def _build_apipe_pipe_heuristic_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    plan = dict(evidence.get("apipe_heuristic_plan") or {})
+    runtime_controls = dict(plan.get("runtime_controls") or {})
+    actions = list(plan.get("actions") or [])
+    if not runtime_controls and not actions:
+        return None
+
+    candidate = _clone_program(program)
+    stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+    if not stage_layers:
+        return None
+
+    for action in actions:
+        name = str((action or {}).get("name") or "").strip().lower()
+        status = str((action or {}).get("status") or "").strip().lower()
+        if not status.startswith("executable"):
+            continue
+        if name == "move_boundary":
+            donor = _safe_int((action or {}).get("donor_stage"))
+            receiver = _safe_int((action or {}).get("receiver_stage"))
+            shift = max(int((action or {}).get("shift_blocks") or 1), 1)
+            if (
+                donor is None
+                or receiver is None
+                or donor < 0
+                or receiver < 0
+                or donor >= len(stage_layers)
+                or receiver >= len(stage_layers)
+                or donor == receiver
+            ):
+                continue
+            transferable = max(stage_layers[donor] - 1, 0)
+            shift = min(shift, transferable)
+            if shift <= 0:
+                continue
+            stage_layers[donor] -= shift
+            stage_layers[receiver] += shift
+        elif name == "set_local_vpp":
+            target_vector = [max(int(value), 1) for value in ((action or {}).get("vpp_vector") or [])]
+            if not target_vector:
+                continue
+            global_vpp = max(
+                min(int((action or {}).get("global_vpp_cap") or 1), 2),
+                max(int(candidate.parallel.vpp_degree), max(target_vector)),
+            )
+            candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in target_vector]
+            candidate.metadata["preserve_stage_local_vpp"] = True
+            candidate.parallel.vpp_degree = max(int(global_vpp), 1)
+            candidate.layout.vpp_degree = max(int(global_vpp), 1)
+            local_by_name = {entry.subgraph: entry for entry in (candidate.strategy_ir.local_parallel or [])}
+            for subgraph in (candidate.strategy_ir.apipe or []):
+                entry = local_by_name.get(subgraph.name)
+                if entry is None:
+                    continue
+                stage_id = int(subgraph.stage_index)
+                if stage_id < len(target_vector):
+                    entry.vpp_degree = max(int(target_vector[stage_id]), 1)
+            if int(candidate.parallel.vpp_degree) > 1:
+                focus = str(
+                    (next((item for item in actions if str((item or {}).get("name") or "").strip().lower() == "move_boundary"), {}) or {}).get("focus")
+                    or candidate.metadata.get("boundary_semantic_focus")
+                    or "balanced"
+                )
+                counts = _stage_local_virtual_counts(
+                    stage_layers,
+                    target_vector,
+                    global_vpp=int(candidate.parallel.vpp_degree),
+                    focus=str(focus),
+                )
+                candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+        elif name == "reorder_flush_microbatches":
+            policy = str((action or {}).get("policy") or "").strip()
+            if policy:
+                candidate.metadata["flush_order_policy"] = policy
+
+    for index, stage in enumerate(candidate.partition.stages):
+        stage.decoder_layers = int(stage_layers[index])
+
+    template = str(runtime_controls.get("template") or candidate.schedule.template or "fixed_1f1b")
+    dispatch_order = str(
+        runtime_controls.get("dispatch_order") or candidate.schedule.dispatch_order or "default"
+    )
+    group_size = runtime_controls.get("steady_state_group_size")
+    candidate.schedule.template = template
+    candidate.schedule.skeleton = "fixed_1f1b" if template == "fixed_1f1b" else "stage_aware_grouped"
+    candidate.schedule.dispatch_order = dispatch_order
+    candidate.schedule.microbatch_group_size_per_vp_stage = (
+        max(int(group_size), 1) if group_size is not None else candidate.schedule.microbatch_group_size_per_vp_stage
+    )
+    candidate.strategy_ir.pipe.warmup_policy = str(
+        runtime_controls.get("warmup_policy") or candidate.strategy_ir.pipe.warmup_policy or "default"
+    )
+    candidate.strategy_ir.pipe.cooldown_policy = str(
+        runtime_controls.get("cooldown_policy") or candidate.strategy_ir.pipe.cooldown_policy or "default"
+    )
+    flush_order_policy = str(runtime_controls.get("flush_order_policy") or "").strip()
+    if flush_order_policy:
+        candidate.metadata["flush_order_policy"] = flush_order_policy
+        candidate.metadata["schedule_cooldown_p2p_policy"] = "serial"
+        candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
+
+    candidate.metadata["program_kind"] = "candidate_apipe_pipe_heuristic_v1"
+    candidate.metadata["priority_rank"] = 47
+    candidate.metadata["apipe_pipe_heuristic_actions"] = actions
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _runtime_branch_plan(context_record: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    return dict(evidence.get("runtime_branch_plan") or {})
+
+
+def _build_runtime_branch_candidates(
+    baseline: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> List[MegatronProgram]:
+    branch_plan = _runtime_branch_plan(context_record)
+    branches = list(branch_plan.get("branches") or [])
+    if not branches:
+        return []
+    candidates: List[MegatronProgram] = []
+    for branch in branches:
+        if not bool((branch or {}).get("active")):
+            continue
+        branch_id = str((branch or {}).get("branch_id") or "").strip()
+        builder = str((branch or {}).get("builder") or "").strip().lower()
+        priority_rank = int((branch or {}).get("priority_rank") or 40)
+        candidate: Optional[MegatronProgram] = None
+        if builder == "stage_local_vpp_shape":
+            candidate = _build_stage_local_vpp_shape_candidate(baseline, context_record)
+        elif builder == "stage_local_memory_policy":
+            candidate = _build_stage_local_memory_policy_candidate(baseline, context_record)
+            if candidate is not None and branch_id == "branch_moe_skew_memory_policy":
+                candidate.metadata["runtime_memory_policy_mode"] = "moe_skew_relief"
+        elif builder == "apipe_pipe_heuristic":
+            candidate = _build_apipe_pipe_heuristic_candidate(baseline, context_record)
+        if candidate is None:
+            continue
+        candidate.metadata["runtime_branch_id"] = branch_id
+        candidate.metadata["runtime_branch_scope"] = str((branch or {}).get("scope") or "")
+        candidate.metadata["runtime_branch_label"] = str((branch or {}).get("label") or branch_id)
+        candidate.metadata["runtime_branch_trigger_rule_id"] = str((branch or {}).get("trigger_rule_id") or "")
+        candidate.metadata["runtime_branch_target_stage_ids"] = [
+            int(item) for item in list((branch or {}).get("target_stage_ids") or []) if _safe_int(item) is not None
+        ]
+        candidate.metadata["runtime_branch_status"] = str((branch or {}).get("status") or "")
+        candidate.metadata["priority_rank"] = min(int(candidate.metadata.get("priority_rank") or priority_rank), priority_rank)
+        if branch_id:
+            candidate.metadata["program_kind"] = f"candidate_{branch_id}"
+        candidates.append(_annotate_local_parallel(candidate, context_record))
     return candidates
 
 
@@ -3208,6 +3435,12 @@ def _build_schedule_candidates(
         dualpipev = _build_torchtitan_dualpipev_schedule_candidate(baseline, runtime_summary, context_record)
         if dualpipev is not None:
             candidates.append(_annotate_local_parallel(dualpipev, context_record))
+    apipe_heuristic = _build_apipe_pipe_heuristic_candidate(baseline, context_record)
+    if (
+        apipe_heuristic is not None
+        and str(apipe_heuristic.schedule.template or "fixed_1f1b") in allowed_templates
+    ):
+        candidates.append(_annotate_local_parallel(apipe_heuristic, context_record))
     for skeleton in skeletons:
         if int(skeleton.parallel.pp_degree) >= 4:
             scaled = _build_pp_vpp_scaleout_candidate(skeleton, runtime_summary)
@@ -3248,6 +3481,11 @@ def _build_agent_proposals(
         )
         for program in skeletons
     ]
+    runtime_branch_candidates = [
+        _annotate_candidate_runtime_evidence(baseline, program, context_record)
+        for program in _build_runtime_branch_candidates(baseline, context_record)
+        if _candidate_allowed_by_space(program, rewrite)[0]
+    ]
     local_parallel = [
         _annotate_candidate_runtime_evidence(baseline, program, context_record)
         for program in _build_local_parallel_candidates(baseline, skeletons, rewrite, runtime_summary, context_record)
@@ -3259,19 +3497,24 @@ def _build_agent_proposals(
 
     if str(replan_decision.get("scope")) == "pipe":
         ordered_pool = (
-            [(program, "pipe", hinted_rationales.get("pipe", "runtime evidence prefers schedule adaptation before touching local or global structure")) for program in schedules]
+            [(program, "pipe", hinted_rationales.get("pipe", "active runtime branch indicates a low-cost schedule-local intervention is worth trying first")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"]
+            + [(program, "pipe", hinted_rationales.get("pipe", "runtime evidence prefers schedule adaptation before touching local or global structure")) for program in schedules]
+            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says a local relief branch is already justified")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
             + [(program, "local_parallel", hinted_rationales.get("local_parallel", "schedule fix is insufficient; escalate to local subgraph policy")) for program in local_parallel]
             + [(program, "skeleton", hinted_rationales.get("skeleton", "schedule/local adaptations are exhausted; escalate to PP skeleton change")) for program in skeletons]
         )
     elif str(replan_decision.get("scope")) == "local_parallel":
         ordered_pool = (
-            [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says local policy relief is worth trying before broader search")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
+            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
+            + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"]
             + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in schedules]
             + [(program, "skeleton", hinted_rationales.get("skeleton", "persistent local failures justify skeleton repartitioning")) for program in skeletons]
         )
     else:
         ordered_pool = (
-            [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons]
+            [(program, str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), hinted_rationales.get(str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), "active runtime branch offers the cheapest next intervention")) for program in runtime_branch_candidates]
+            + [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons]
             + [(program, "local_parallel", hinted_rationales.get("local_parallel", "after skeleton changes, refine local CP/VPP/FSDP policy")) for program in local_parallel]
             + [(program, "pipe", hinted_rationales.get("pipe", "pipe is last-mile tuning after broader structural changes")) for program in schedules]
         )

@@ -844,44 +844,250 @@ def get_pp_rank_microbatches(
     )
 
 
+def _edge_interleave(values: List[int]) -> List[int]:
+    ordered: List[int] = []
+    left = 0
+    right = len(values) - 1
+    while left <= right:
+        ordered.append(values[left])
+        left += 1
+        if left <= right:
+            ordered.append(values[right])
+            right -= 1
+    return ordered
+
+
+def _center_out_order(num_items: int) -> List[int]:
+    if num_items <= 0:
+        return []
+    middle = num_items // 2
+    right = list(range(middle, num_items))
+    left = list(range(middle - 1, -1, -1))
+    return right + left
+
+
+def _resolve_group_phase(group_index: int, num_groups: int) -> str:
+    if num_groups <= 1:
+        return "steady"
+    if group_index == 0:
+        return "warmup"
+    if group_index == num_groups - 1:
+        return "cooldown"
+    return "steady"
+
+
+def _base_model_chunk_order(num_model_chunks: int, template: str) -> List[int]:
+    if template == "pp4_middle_relief" and num_model_chunks > 1:
+        if num_model_chunks == 2:
+            return [1, 0]
+        return _center_out_order(num_model_chunks)
+    return list(range(num_model_chunks))
+
+
+def _resolve_model_chunk_order(
+    num_model_chunks: int,
+    *,
+    template: str,
+    dispatch_order: str,
+    phase: str,
+    warmup_policy: str,
+    cooldown_policy: str,
+) -> List[int]:
+    order = _base_model_chunk_order(num_model_chunks, template)
+
+    if dispatch_order in {"balanced_round_robin"}:
+        order = _edge_interleave(order)
+    elif dispatch_order in {
+        "middle_stage_relief",
+        "stage_local_nonuniform_vpp",
+        "boundary_localized",
+        "boundary_comm_aware",
+    } and num_model_chunks > 2:
+        order = _center_out_order(num_model_chunks)
+
+    if phase == "warmup":
+        if warmup_policy in {"balanced_fill", "grouped", "bubble_fill"}:
+            order = _edge_interleave(order)
+        elif warmup_policy in {"tail_prefill"}:
+            order = list(reversed(order))
+    elif phase == "cooldown":
+        if cooldown_policy in {
+            "tail_min",
+            "opt_prioritized",
+            "tail_drain",
+            "drain_with_w",
+            "staggered_wgrad",
+            "late_wait",
+        } or dispatch_order in {"tail_boundary_rewrite", "zero_bubble_proxy"}:
+            order = list(reversed(order))
+
+    return order
+
+
+def _parse_explicit_flush_microbatch_ids(raw: str, valid_ids: List[int]) -> List[int]:
+    if not raw.strip():
+        return []
+    valid_set = set(valid_ids)
+    parsed: List[int] = []
+    seen: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value not in valid_set or value in seen:
+            continue
+        parsed.append(value)
+        seen.add(value)
+    if len(parsed) == len(valid_ids):
+        return parsed
+    return []
+
+
+def _resolve_microbatch_order(
+    microbatch_ids: List[int],
+    *,
+    phase: str,
+    dispatch_order: str,
+    cooldown_policy: str,
+    flush_order_policy: str,
+    explicit_flush_ids: str,
+) -> List[int]:
+    if not microbatch_ids:
+        return []
+
+    if phase == "cooldown":
+        explicit = _parse_explicit_flush_microbatch_ids(explicit_flush_ids, microbatch_ids)
+        if explicit:
+            return explicit
+        if flush_order_policy in {"reverse_last_group", "tail_min", "opt_prioritized"}:
+            return list(reversed(microbatch_ids))
+        if cooldown_policy in {
+            "tail_min",
+            "opt_prioritized",
+            "tail_drain",
+            "drain_with_w",
+            "staggered_wgrad",
+            "late_wait",
+        } or dispatch_order in {"tail_boundary_rewrite", "zero_bubble_proxy"}:
+            return list(reversed(microbatch_ids))
+
+    if dispatch_order == "balanced_round_robin":
+        return _edge_interleave(microbatch_ids)
+
+    return microbatch_ids
+
+
+def _default_checkpoint_activations_microbatch(
+    virtual_microbatch_id: int,
+    max_outstanding_backprops: Optional[int],
+    config,
+):
+    if max_outstanding_backprops is None:
+        return None
+    return (
+        virtual_microbatch_id % max_outstanding_backprops
+        >= config.num_microbatches_with_partial_activation_checkpoints
+    )
+
+
+def _resolve_phase_checkpoint_policy(phase: str, default_value):
+    raw = str(
+        os.environ.get(f"SCHEDULE_{phase.upper()}_CHECKPOINT_POLICY", "default") or "default"
+    ).strip().lower()
+    if raw in {"", "default", "inherit"}:
+        return default_value
+    if raw in {"full", "all", "force_full"}:
+        return True
+    if raw in {"partial", "off", "none", "disable", "false", "prefer_partial"}:
+        return False
+    return default_value
+
+
+def _phase_uses_p2p_overlap(phase: str, default_enabled: bool) -> bool:
+    if not default_enabled:
+        return False
+    raw = str(os.environ.get(f"SCHEDULE_{phase.upper()}_P2P_POLICY", "default") or "default").strip().lower()
+    if raw in {"", "default", "inherit", "overlap", "on", "enabled"}:
+        return True
+    if raw in {"serial", "off", "none", "defer", "disabled"}:
+        return False
+    return default_enabled
+
+
+def _resolve_execution_phase_for_virtual_microbatches(
+    f_virtual_microbatch_id=None, b_virtual_microbatch_id=None
+) -> str:
+    has_forward = f_virtual_microbatch_id is not None
+    has_backward = b_virtual_microbatch_id is not None
+    if has_forward and has_backward:
+        return "steady"
+    if has_forward:
+        return "warmup"
+    if has_backward:
+        return "cooldown"
+    return "steady"
+
+
+def _phase_uses_combined_overlap(phase: str, default_enabled: bool = True) -> bool:
+    if not default_enabled:
+        return False
+    raw = str(
+        os.environ.get(f"SCHEDULE_{phase.upper()}_COMBINED_POLICY", "default") or "default"
+    ).strip().lower()
+    if raw in {"", "default", "inherit", "combined", "overlap", "enabled", "on"}:
+        return True
+    if raw in {"serial", "off", "none", "disabled"}:
+        return False
+    return default_enabled
+
+
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
     template = str(os.environ.get("SCHEDULE_TEMPLATE", "fixed_1f1b") or "fixed_1f1b").strip()
-    if template == "pp4_middle_relief" and num_model_chunks > 1:
-        if num_model_chunks == 2:
-            model_chunk_order = [1, 0]
-        else:
-            middle = num_model_chunks // 2
-            left = list(range(middle - 1, -1, -1))
-            right = list(range(middle, num_model_chunks))
-            model_chunk_order = right + left
-    else:
-        model_chunk_order = list(range(num_model_chunks))
+    dispatch_order = str(os.environ.get("DISPATCH_ORDER", "default") or "default").strip()
+    warmup_policy = str(
+        os.environ.get("SCHEDULE_WARMUP_POLICY", "default") or "default"
+    ).strip()
+    cooldown_policy = str(
+        os.environ.get("SCHEDULE_COOLDOWN_POLICY", "default") or "default"
+    ).strip()
+    flush_order_policy = str(
+        os.environ.get("SCHEDULE_FLUSH_ORDER_POLICY", "default") or "default"
+    ).strip()
+    explicit_flush_ids = str(os.environ.get("SCHEDULE_FLUSH_MICROBATCHES", "") or "").strip()
+
     schedule_table = []
-    for min_microbatch_id_in_group in range(
-        0, num_microbatches, microbatch_group_size_per_vp_stage
+    group_starts = list(range(0, num_microbatches, microbatch_group_size_per_vp_stage))
+    for group_index, min_microbatch_id_in_group in enumerate(
+        group_starts
     ):
-        if min_microbatch_id_in_group + microbatch_group_size_per_vp_stage >= num_microbatches:
-            # Construct schedule for the last microbatch group
-            schedule_table.extend(
-                [
-                    (microbatch_id, model_chunk_id)
-                    for model_chunk_id in model_chunk_order
-                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
-                ]
-            )
-        else:
-            # Construct schedule for other microbatch groups
-            schedule_table.extend(
-                [
-                    (microbatch_id, model_chunk_id)
-                    for model_chunk_id in model_chunk_order
-                    for microbatch_id in range(
-                        min_microbatch_id_in_group,
-                        min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,
-                    )
-                ]
-            )
+        phase = _resolve_group_phase(group_index, len(group_starts))
+        max_microbatch_id = min(
+            min_microbatch_id_in_group + microbatch_group_size_per_vp_stage, num_microbatches
+        )
+        model_chunk_order = _resolve_model_chunk_order(
+            num_model_chunks,
+            template=template,
+            dispatch_order=dispatch_order,
+            phase=phase,
+            warmup_policy=warmup_policy,
+            cooldown_policy=cooldown_policy,
+        )
+        ordered_microbatch_ids = _resolve_microbatch_order(
+            list(range(min_microbatch_id_in_group, max_microbatch_id)),
+            phase=phase,
+            dispatch_order=dispatch_order,
+            cooldown_policy=cooldown_policy,
+            flush_order_policy=flush_order_policy,
+            explicit_flush_ids=explicit_flush_ids,
+        )
+        for model_chunk_id in model_chunk_order:
+            for microbatch_id in ordered_microbatch_ids:
+                schedule_table.append((microbatch_id, model_chunk_id))
     return schedule_table
 
 
@@ -1360,7 +1566,21 @@ def forward_backward_pipelining_with_interleaving(
         """
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
         """
-        if config.overlap_moe_expert_parallel_comm and not forward_only:  # Combined 1F1B path
+        execution_phase = _resolve_execution_phase_for_virtual_microbatches(
+            f_virtual_microbatch_id=f_virtual_microbatch_id,
+            b_virtual_microbatch_id=b_virtual_microbatch_id,
+        )
+        combined_overlap_enabled = _phase_uses_combined_overlap(
+            execution_phase,
+            default_enabled=bool(config.overlap_moe_expert_parallel_comm and not forward_only),
+        )
+        # The combined MoE overlap path does not support per-microbatch activation
+        # checkpoint selection. Fall back to the conventional interleaved path when a
+        # phase-local checkpoint policy requests an explicit True/False decision.
+        combined_overlap_enabled = (
+            combined_overlap_enabled and checkpoint_activations_microbatch is None
+        )
+        if combined_overlap_enabled:  # Combined 1F1B path
             return combined_1f1b_schedule_for_interleaved_pipelining(
                 config,
                 forward_step_func,
@@ -1447,11 +1667,17 @@ def forward_backward_pipelining_with_interleaving(
     send_next_wait_handle = None
     send_prev_wait_handle = None
     recv_next_wait_handles = []
+    warmup_overlap_p2p = _phase_uses_p2p_overlap(
+        "warmup", bool(config.overlap_p2p_comm_warmup_flush)
+    )
+    cooldown_overlap_p2p = _phase_uses_p2p_overlap(
+        "cooldown", bool(config.overlap_p2p_comm_warmup_flush)
+    )
 
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
 
-        if config.overlap_p2p_comm_warmup_flush:
+        if warmup_overlap_p2p:
             if (
                 not (
                     _is_vp_first_stage(vp_stage=cur_model_chunk_id) and is_pp_first_stage(pp_group)
@@ -1473,7 +1699,7 @@ def forward_backward_pipelining_with_interleaving(
             recv_prev = False
 
         # Prefetch recv for iteration k+1 for non-first ranks.
-        if config.overlap_p2p_comm_warmup_flush and not is_pp_first_stage(
+        if warmup_overlap_p2p and not is_pp_first_stage(
             p2p_communicator.pp_group
         ):
             fwd_recv_buffer[k % fwd_recv_buffer_size], fwd_wait_recv_handles = (
@@ -1489,13 +1715,12 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev_wait_handles.append(fwd_wait_recv_handles.pop("recv_prev"))
 
         # Decide to checkpoint all layers' activations of the current micro-batch.
-        if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
-                k % max_outstanding_backprops
-                >= config.num_microbatches_with_partial_activation_checkpoints
-            )
-        else:
-            checkpoint_activations_microbatch = None
+        checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
+            "warmup",
+            _default_checkpoint_activations_microbatch(
+                k, max_outstanding_backprops, config
+            ),
+        )
 
         output_tensor, _ = forward_backward_helper_wrapper(
             f_virtual_microbatch_id=k,
@@ -1508,7 +1733,7 @@ def forward_backward_pipelining_with_interleaving(
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
-        if not config.overlap_p2p_comm_warmup_flush:
+        if not warmup_overlap_p2p:
             if (
                 k == (num_warmup_microbatches - 1)
                 and not config.overlap_p2p_comm
@@ -1608,13 +1833,12 @@ def forward_backward_pipelining_with_interleaving(
         forward_k = k + num_warmup_microbatches
 
         # Decide to checkpoint all layers' activations of the current micro-batch.
-        if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
-                forward_k % max_outstanding_backprops
-                >= config.num_microbatches_with_partial_activation_checkpoints
-            )
-        else:
-            checkpoint_activations_microbatch = None
+        checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
+            "steady",
+            _default_checkpoint_activations_microbatch(
+                forward_k, max_outstanding_backprops, config
+            ),
+        )
 
         cur_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
         if config.overlap_p2p_comm:
@@ -1842,7 +2066,7 @@ def forward_backward_pipelining_with_interleaving(
                 not (_is_vp_last_stage(vp_stage=cur_model_chunk_id) and is_pp_last_stage(pp_group))
                 and k != 0
             ):
-                if config.overlap_p2p_comm_warmup_flush:
+                if cooldown_overlap_p2p:
                     assert recv_next_wait_handles, (
                         f'pp rank {pipeline_parallel_rank}, backward iteration {k}, '
                         'should have registered recv next handle'
@@ -1862,7 +2086,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = False
 
             # Prefetch recv for backward iteration k+1 for non last ranks.
-            if config.overlap_p2p_comm_warmup_flush and not is_pp_last_stage(
+            if cooldown_overlap_p2p and not is_pp_last_stage(
                 p2p_communicator.pp_group
             ):
                 bwd_recv_buffer[k % bwd_recv_buffer_size], bwd_wait_recv_handles = (
@@ -1883,7 +2107,7 @@ def forward_backward_pipelining_with_interleaving(
             if _is_vp_first_stage(vp_stage=cur_model_chunk_id) and is_pp_first_stage(pp_group):
                 input_tensor_grad = None
 
-            if config.overlap_p2p_comm_warmup_flush:
+            if cooldown_overlap_p2p:
                 if not is_pp_last_stage(p2p_communicator.pp_group):
                     _, bwd_wait_handles = p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
@@ -2207,13 +2431,12 @@ def forward_backward_pipelining_without_interleaving(
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
-        if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
-                i % max_outstanding_backprops
-                >= config.num_microbatches_with_partial_activation_checkpoints
-            )
-        else:
-            checkpoint_activations_microbatch = None
+        checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
+            "warmup",
+            _default_checkpoint_activations_microbatch(
+                i, max_outstanding_backprops, config
+            ),
+        )
 
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
@@ -2254,12 +2477,12 @@ def forward_backward_pipelining_without_interleaving(
         last_iteration = i == (num_microbatches_remaining - 1)
 
         # Decide to checkpoint all layers' activations of the current micro-batch
-        if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
-                (i + num_warmup_microbatches) % max_outstanding_backprops
-            ) >= config.num_microbatches_with_partial_activation_checkpoints
-        else:
-            checkpoint_activations_microbatch = None
+        checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
+            "steady",
+            _default_checkpoint_activations_microbatch(
+                i + num_warmup_microbatches, max_outstanding_backprops, config
+            ),
+        )
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,

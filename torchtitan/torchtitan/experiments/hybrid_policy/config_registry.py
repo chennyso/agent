@@ -146,6 +146,11 @@ def _env_int(name: str, default: int) -> int:
     return int(value) if value is not None else default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return float(value) if value is not None else default
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -163,6 +168,13 @@ def _env_int_list(name: str) -> list[int] | None:
     if value is None or not value.strip():
         return None
     return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _env_float_list(name: str) -> list[float] | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return [float(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def _configure_g5_telemetry(
@@ -478,6 +490,107 @@ def qwen3_14b_single_5090d_vpp_fsdp2_safe() -> Trainer.Config:
         f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}"
     )
     _warn_underfilled_vpp(cfg, config_name="qwen3_14b_single_5090d_vpp_fsdp2_safe")
+    return cfg
+
+
+def qwen3_14b_single_5090d_vpp_fsdp2_budgeted() -> Trainer.Config:
+    cfg = _base_qwen3_14b()
+    cfg.training.local_batch_size = _env_int("HYBRID_LOCAL_BATCH_SIZE", 4)
+    cfg.training.global_batch_size = _env_int("HYBRID_GLOBAL_BATCH_SIZE", 32)
+    cfg.training.seq_len = _env_int("HYBRID_SEQ_LEN", 1024)
+    cfg.training.steps = _env_int("HYBRID_STEPS", 3000)
+    cfg.training.gc_freq = _env_int("HYBRID_GC_FREQ", 400)
+    cfg.activation_checkpoint.mode = _env_str("HYBRID_AC_MODE", "full")
+    cfg.compile.enable = _env_bool("HYBRID_ENABLE_COMPILE", False)
+    _configure_g5_telemetry(cfg, default_log_freq=1, profiler_default=True)
+
+    stage_to_node = ["g5", "g5", "g5", "g5"]
+    stage_ranges = _joint_stage_ranges(
+        num_layers=40,
+        stage_mem_gb=[32, 32, 32, 32],
+        stage_to_node=stage_to_node,
+        first_stage_penalty=float(_env_int("HYBRID_PP_FIRST_STAGE_PENALTY", 5)),
+        last_stage_penalty=float(_env_int("HYBRID_PP_LAST_STAGE_PENALTY", 6)),
+        cross_node_penalty=0.0,
+        interleaved_penalty=float(_env_int("HYBRID_PP_INTERLEAVED_PENALTY", 1)),
+    )
+    stage_hbm_budget_gib = _env_float_list("HYBRID_STAGE_HBM_BUDGET_GIB") or [
+        28.5,
+        30.0,
+        30.0,
+        28.5,
+    ]
+
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=_env_int("HYBRID_DP_SHARD_DEGREE", 2),
+        tensor_parallel_degree=_env_int("HYBRID_TP_DEGREE", 2),
+        context_parallel_degree=1,
+        expert_parallel_degree=1,
+        pipeline_parallel_degree=2,
+        pipeline_parallel_vpp_per_rank=[2, 2],
+        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_microbatch_size=1,
+        module_fqns_per_model_part=_module_parts_from_stage_ranges(stage_ranges),
+        pipeline_parallel_stage_to_node=stage_to_node,
+        rank_order=_resolve_rank_order([8]),
+        fsdp_reshard_after_forward=_env_str(
+            "HYBRID_FSDP_RESHARD_AFTER_FORWARD", "always"
+        ),
+        fsdp_parallelism_conditioned_policy="module_groups",
+        fsdp_attention_scope=_env_str("HYBRID_FSDP_ATTENTION_SCOPE", "global"),
+        fsdp_mlp_scope=_env_str("HYBRID_FSDP_MLP_SCOPE", "global"),
+        fsdp_mlp_output_scope=_env_str("HYBRID_FSDP_MLP_OUTPUT_SCOPE", "global"),
+        fsdp_embhead_scope=_env_str("HYBRID_FSDP_EMBHEAD_SCOPE", "global"),
+        fsdp_mlp_unit_mode=_env_str("HYBRID_FSDP_MLP_UNIT_MODE", "auto"),
+        fsdp_node_local_reshard_size=_env_int(
+            "HYBRID_FSDP_NODE_LOCAL_RESHARD_SIZE", 0
+        ),
+        fsdp_policy_trace=_env_bool("HYBRID_FSDP_POLICY_TRACE", True),
+        fsdp_forward_prefetch=_env_str("HYBRID_FSDP_FORWARD_PREFETCH", "auto"),
+        fsdp_backward_prefetch=_env_str("HYBRID_FSDP_BACKWARD_PREFETCH", "auto"),
+        fsdp_recompute_forward_prefetch=_env_str(
+            "HYBRID_FSDP_RECOMPUTE_FORWARD_PREFETCH", "none"
+        ),
+        fsdp_recompute_backward_prefetch=_env_str(
+            "HYBRID_FSDP_RECOMPUTE_BACKWARD_PREFETCH", "none"
+        ),
+        fsdp_prefetch_window=_env_int("HYBRID_FSDP_PREFETCH_WINDOW", 1),
+        fsdp_materialization_watermark_gib=_env_float(
+            "HYBRID_FSDP_MATERIALIZATION_WATERMARK_GIB", 29.0
+        ),
+        fsdp_stage_hbm_budget_gib=stage_hbm_budget_gib,
+        enable_async_tensor_parallel=_env_bool("HYBRID_ENABLE_ASYNC_TP", False),
+        disable_loss_parallel=_env_bool("HYBRID_DISABLE_LOSS_PARALLEL", False),
+    )
+    if cfg.parallelism.enable_async_tensor_parallel and not cfg.compile.enable:
+        raise ValueError(
+            "Async TP requires compile; set HYBRID_ENABLE_COMPILE=1 or disable HYBRID_ENABLE_ASYNC_TP"
+        )
+    cfg.debug.pipeline_trace = _env_bool("HYBRID_PP_TRACE", False)
+    cfg.debug.pipeline_trace_collectives = _env_bool(
+        "HYBRID_PP_TRACE_COLLECTIVES", False
+    )
+    logger.info(
+        "Using g5 single-node Qwen3-14B budgeted VPP strategy: "
+        "PP=2, VPP=2, TP=2, FSDP2=2, CP=0, EP=0, "
+        f"stage_ranges={stage_ranges}, stage_hbm_budget_gib={stage_hbm_budget_gib}, "
+        f"seq_len={cfg.training.seq_len}, local_batch={cfg.training.local_batch_size}, "
+        f"global_batch={cfg.training.global_batch_size}, "
+        f"reshard={cfg.parallelism.fsdp_reshard_after_forward}, "
+        f"scopes={cfg.parallelism.fsdp_attention_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_scope}/"
+        f"{cfg.parallelism.fsdp_mlp_output_scope}/"
+        f"{cfg.parallelism.fsdp_embhead_scope}, "
+        f"mlp_unit_mode={cfg.parallelism.fsdp_mlp_unit_mode}, "
+        f"prefetch={cfg.parallelism.fsdp_forward_prefetch}/"
+        f"{cfg.parallelism.fsdp_backward_prefetch}, "
+        f"recompute_prefetch={cfg.parallelism.fsdp_recompute_forward_prefetch}/"
+        f"{cfg.parallelism.fsdp_recompute_backward_prefetch}, "
+        f"watermark={cfg.parallelism.fsdp_materialization_watermark_gib}"
+    )
+    _warn_underfilled_vpp(
+        cfg, config_name="qwen3_14b_single_5090d_vpp_fsdp2_budgeted"
+    )
     return cfg
 
 

@@ -820,11 +820,12 @@ def _build_pipe_search_space(
         {
             "name": "stage_aware_grouped",
             "order": "frontload_forward_or_middle_relief",
-            "warmup": "grouped",
-            "cooldown": "grouped",
+            "warmup": "balanced_fill",
+            "cooldown": "tail_min",
             "issue_wait": "grouped",
             "tail_rewrite": "first_last_microbatch_bias",
             "grad_slot": "default",
+            "flush_order": "default",
             "status": "executable_now",
         },
     ]
@@ -833,11 +834,12 @@ def _build_pipe_search_space(
             {
                 "name": "zero_bubble_family",
                 "order": "greedy_overlap",
-                "warmup": "bubble_fill",
-                "cooldown": "bubble_fill",
+                "warmup": "fast_fill",
+                "cooldown": "opt_prioritized",
                 "issue_wait": "early_issue_late_wait",
                 "tail_rewrite": "enabled",
                 "grad_slot": "repositioned",
+                "flush_order": "reverse_last_group",
                 "status": "sandbox_now",
             }
         )
@@ -851,6 +853,7 @@ def _build_pipe_search_space(
                 "issue_wait": "asymmetric_issue_wait",
                 "tail_rewrite": "boundary_conditioned",
                 "grad_slot": "delayed_on_comm_hot_boundaries",
+                "flush_order": "default",
                 "status": "research_gap",
             }
         )
@@ -860,47 +863,624 @@ def _build_pipe_search_space(
     }
 
 
+def _data_parallel_size(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    denom = (
+        max(int(norm.parallel.tp_degree), 1)
+        * max(int(norm.parallel.pp_degree), 1)
+        * max(int(norm.parallel.cp_degree), 1)
+        * max(int(norm.parallel.ep_degree), 1)
+        * max(int(norm.parallel.expert_tp_degree), 1)
+    )
+    world = max(int(norm.cluster.world_size), 1)
+    if denom <= 0:
+        return 1
+    return max(world // denom, 1)
+
+
+def _num_microbatches(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    micro_batch = max(int(norm.batch_plan.micro_batch_size), 1)
+    global_batch = max(int(norm.batch_plan.global_batch_size), 1)
+    dp = _data_parallel_size(norm)
+    divisor = max(micro_batch * dp, 1)
+    return max(global_batch // divisor, 1)
+
+
+def _apipe_subg_blocks(program: MegatronProgram) -> List[Dict[str, Any]]:
+    norm = program.normalized()
+    blocks: List[Dict[str, Any]] = [
+        {
+            "id": "u_0",
+            "kind": "embedding_preprocess",
+            "successor_boundary": "embedding_to_decoder",
+            "status": "fixed_special_block",
+        }
+    ]
+    for layer_id in range(1, int(norm.model.num_layers) + 1):
+        blocks.append(
+            {
+                "id": f"u_{layer_id}",
+                "kind": "decoder_block",
+                "layer_index": int(layer_id),
+                "successor_boundary": f"decoder_{layer_id}_to_{layer_id + 1}",
+                "status": "primary_search_block",
+            }
+        )
+    blocks.append(
+        {
+            "id": f"u_{int(norm.model.num_layers) + 1}",
+            "kind": "lm_head_loss",
+            "successor_boundary": "terminal",
+            "status": "fixed_special_block",
+        }
+    )
+    return blocks
+
+
+def _build_apipe_problem_formulation(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    num_microbatches = _num_microbatches(norm)
+    pp_degree = max(int(norm.parallel.pp_degree), 1)
+    structure_space = {
+        "P": [2, 4, 8],
+        "B": "contiguous stage boundaries over subG-blocks",
+        "v_k": [1, 2] if pp_degree > 1 else [1],
+        "r_k": ["head", "body", "tail"],
+    }
+    schedule_space = {
+        "pi_warmup": ["fast_fill", "balanced_fill"],
+        "pi_steady": ["standard", "wait_aware"],
+        "pi_flush": ["tail_min", "opt_prioritized"],
+        "Pi_m_flush": f"permutation over the final microbatch group (M={num_microbatches})",
+        "q_k": ["policy_head", "policy_body", "policy_tail"],
+    }
+    optimizer_space = {
+        "O": ["o_1_grad_ready", "o_2_state_update", "o_3_param_writeback"],
+        "Omega": "placement of optimizer slices into slack windows",
+        "status": "research_gap_with_runtime_hooks_pending",
+    }
+    constraints = {
+        "c_k": ["low", "mid", "high"],
+        "p_k": ["off", "low", "high"],
+        "note": "memory knobs participate in feasibility first, not as the primary search axis in V1",
+    }
+    return {
+        "status": "v1_partial_runtime_support",
+        "objective": "optimize Apipe + pipe before expanding TP/EP/CP/FSDP search",
+        "focus_metrics": {
+            "pipeline_wait_ratio": round(float(runtime_evidence.get("pipeline_wait_ratio") or 0.0), 4),
+            "optimizer_exposed_ratio": round(
+                float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0), 4
+            ),
+            "bubble_ratio": round(float(runtime_evidence.get("bubble_ratio") or 0.0), 4),
+        },
+        "subg_block_definition": "u_i = (contiguous compute ops, successor comm boundary)",
+        "subg_blocks": _apipe_subg_blocks(norm),
+        "search_space": {
+            "structure": structure_space,
+            "schedule": schedule_space,
+            "optimizer": optimizer_space,
+            "constraints": constraints,
+        },
+        "action_space": [
+            {
+                "name": "move_boundary",
+                "status": "executable_now",
+                "shape": "move_boundary(stage_i, left/right, blocks=1..2)",
+            },
+            {
+                "name": "set_local_vpp",
+                "status": "executable_now_with_global_vpp_approximation",
+                "shape": "set_local_vpp(stage_i, v_i')",
+            },
+            {
+                "name": "reorder_flush_microbatches",
+                "status": "executable_now",
+                "shape": "reorder_flush_microbatches(permutation)",
+            },
+            {
+                "name": "place_optimizer_slice",
+                "status": "research_gap",
+                "shape": "place_optimizer_slice(o_j, window_w)",
+            },
+        ],
+    }
+
+
+def _build_apipe_heuristic_plan(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    pp_degree = max(int(norm.parallel.pp_degree), 1)
+    stage_windows = dict(runtime_evidence.get("stage_window_summary") or {})
+    if not stage_windows and stage_evidence:
+        stage_windows = {
+            str(int(item.get("stage_id") or 0)): {
+                "window_ms": float(
+                    item.get("completion_ms")
+                    or item.get("window_ms")
+                    or (
+                        float(item.get("compute_ms") or 0.0)
+                        + float(item.get("send_recv_ms") or 0.0)
+                        + float(item.get("fsdp_ag_ms") or 0.0)
+                        + float(item.get("fsdp_rs_ms") or 0.0)
+                    )
+                )
+            }
+            for item in stage_evidence
+        }
+    pipeline_wait_ratio = float(runtime_evidence.get("pipeline_wait_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    stage_tail_ratio = float(runtime_evidence.get("stage_tail_ratio") or 0.0)
+    num_microbatches = _num_microbatches(norm)
+
+    actions: List[Dict[str, Any]] = []
+    hottest_stage = None
+    coolest_stage = None
+    if stage_windows:
+        ordered = sorted(
+            (
+                (int(stage_id), float((metrics or {}).get("window_ms") or 0.0))
+                for stage_id, metrics in stage_windows.items()
+            ),
+            key=lambda item: item[1],
+        )
+        if ordered:
+            coolest_stage = int(ordered[0][0])
+            hottest_stage = int(ordered[-1][0])
+    if (
+        pp_degree > 1
+        and hottest_stage is not None
+        and coolest_stage is not None
+        and hottest_stage != coolest_stage
+        and (pipeline_wait_ratio >= 0.08 or stage_tail_ratio >= 0.08)
+    ):
+        actions.append(
+            {
+                "name": "move_boundary",
+                "status": "executable_now",
+                "donor_stage": int(hottest_stage),
+                "receiver_stage": int(coolest_stage),
+                "shift_blocks": 2 if stage_tail_ratio >= 0.16 else 1,
+            }
+        )
+
+    target_vpp_vector = [1 for _ in range(max(pp_degree, 0))]
+    if pp_degree > 1 and int(norm.model.num_layers) % max(pp_degree * 2, 1) == 0:
+        if hottest_stage is not None and (bubble_ratio >= 0.06 or pipeline_wait_ratio >= 0.06):
+            target_vpp_vector[int(hottest_stage)] = 2
+        if optimizer_exposed_ratio >= 0.18 and pp_degree >= 2:
+            target_vpp_vector[-1] = 2
+        if any(int(value) > 1 for value in target_vpp_vector):
+            actions.append(
+                {
+                    "name": "set_local_vpp",
+                    "status": "executable_now_with_global_vpp_approximation",
+                    "vpp_vector": [int(value) for value in target_vpp_vector],
+                    "global_vpp_cap": 2,
+                }
+            )
+
+    flush_order_policy = "default"
+    if optimizer_exposed_ratio >= 0.18 or bubble_ratio >= 0.10:
+        flush_order_policy = "reverse_last_group"
+        actions.append(
+            {
+                "name": "reorder_flush_microbatches",
+                "status": "executable_now",
+                "policy": flush_order_policy,
+            }
+        )
+
+    actions.append(
+        {
+            "name": "place_optimizer_slice",
+            "status": "research_gap",
+            "reason": "Megatron runtime does not yet expose safe optimizer-slice placement windows as a first-class hook",
+        }
+    )
+
+    group_size = None
+    if pp_degree > 1:
+        if optimizer_exposed_ratio >= 0.18 and num_microbatches >= max(pp_degree, 8):
+            group_size = 8
+        elif bubble_ratio >= 0.08 and num_microbatches >= max(pp_degree, 4):
+            group_size = 4
+        elif num_microbatches >= max(pp_degree, 2):
+            group_size = max(pp_degree, 2)
+
+    dispatch_order = "default"
+    if flush_order_policy != "default":
+        dispatch_order = "tail_boundary_rewrite"
+    elif bubble_ratio >= 0.10:
+        dispatch_order = "balanced_round_robin"
+    elif pipeline_wait_ratio >= 0.08:
+        dispatch_order = "middle_stage_relief"
+
+    template = "fixed_1f1b"
+    if pp_degree > 1:
+        template = "pp4_middle_relief" if pp_degree == 4 else "interleaved_grouped_g2"
+
+    return {
+        "status": "executable_v1" if any(item.get("status", "").startswith("executable") for item in actions) else "observe_only",
+        "actions": actions,
+        "runtime_controls": {
+            "template": template,
+            "dispatch_order": dispatch_order,
+            "steady_state_group_size": group_size,
+            "warmup_policy": "balanced_fill" if bubble_ratio >= 0.08 else "fast_fill",
+            "cooldown_policy": "opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min",
+            "flush_order_policy": flush_order_policy,
+        },
+    }
+
+
 def _build_local_memory_search_space(
     program: MegatronProgram,
     stage_evidence: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     budget_gib = float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or 0.0)
     policies: List[Dict[str, Any]] = []
+    runtime_recompute_modules: set[str] = set()
+    runtime_offload_modules: set[str] = set()
+    hot_stage_ids: List[int] = []
     for item in stage_evidence:
         stage_id = int(item.get("stage_id") or 0)
         peak_reserved_gib = float(item.get("peak_reserved_gib") or 0.0)
         local_ratio = (peak_reserved_gib / budget_gib) if budget_gib > 0.0 else 0.0
+        completion_ms = float(item.get("completion_ms") or item.get("window_ms") or 0.0)
+        forward_ms = float(item.get("forward_ms") or 0.0)
+        lifetime_ms = max(completion_ms - forward_ms, 0.0)
+        lifetime_ratio = (lifetime_ms / max(completion_ms, 1.0)) if completion_ms > 0.0 else 0.0
         policy = {
             "stage_id": stage_id,
             "checkpoint_policy": "keep",
             "remat_policy": "off",
             "prefetch_policy": "default",
             "offload_policy": "none",
+            "runtime_recompute_modules": [],
+            "runtime_offload_modules": [],
+            "local_reserved_ratio": round(float(local_ratio), 4),
+            "lifetime_ratio": round(float(lifetime_ratio), 4),
             "reason": "balanced stage",
         }
-        if local_ratio >= 0.88:
+        if local_ratio >= 0.92 or lifetime_ratio >= 0.40:
             policy.update(
                 {
                     "checkpoint_policy": "selective",
                     "remat_policy": "attention_first",
                     "prefetch_policy": "guarded",
-                    "offload_policy": "research_only_cpu_partial",
-                    "reason": "high local memory pressure",
+                    "offload_policy": "fine_grained_attention",
+                    "runtime_recompute_modules": ["core_attn", "mlp"],
+                    "runtime_offload_modules": ["core_attn", "attn_proj"],
+                    "reason": "very high activation lifetime or memory pressure",
+                }
+            )
+        elif local_ratio >= 0.86 or lifetime_ratio >= 0.28:
+            policy.update(
+                {
+                    "checkpoint_policy": "selective",
+                    "remat_policy": "attention_first",
+                    "prefetch_policy": "conservative",
+                    "runtime_recompute_modules": ["core_attn"],
+                    "reason": "high memory pressure with cheap attention recompute opportunity",
                 }
             )
         elif local_ratio >= 0.80:
             policy.update(
                 {
-                    "checkpoint_policy": "full",
+                    "checkpoint_policy": "selective",
                     "remat_policy": "on",
                     "prefetch_policy": "conservative",
+                    "runtime_recompute_modules": ["core_attn"],
                     "reason": "moderate memory pressure",
                 }
             )
+        if policy["runtime_recompute_modules"] or policy["runtime_offload_modules"]:
+            hot_stage_ids.append(int(stage_id))
+            runtime_recompute_modules.update(str(item) for item in (policy["runtime_recompute_modules"] or []))
+            runtime_offload_modules.update(str(item) for item in (policy["runtime_offload_modules"] or []))
         policies.append(policy)
+    runtime_policy = {
+        "status": (
+            "executable_now_with_module_level_approximation"
+            if runtime_recompute_modules or runtime_offload_modules
+            else "observe_only"
+        ),
+        "enable_recompute_activations": bool(runtime_recompute_modules),
+        "recompute_granularity": "selective" if runtime_recompute_modules else None,
+        "recompute_modules": sorted(runtime_recompute_modules),
+        "fine_grained_activation_offloading": bool(runtime_offload_modules),
+        "offload_modules": sorted(runtime_offload_modules),
+        "warmup_checkpoint_policy": "full" if runtime_recompute_modules else "default",
+        "warmup_combined_policy": "serial" if runtime_recompute_modules else "default",
+        "steady_checkpoint_policy": "default",
+        "hot_stage_ids": sorted(set(hot_stage_ids)),
+        "expected_effect": (
+            "recover activation headroom for VPP or schedule-group experiments before changing topology"
+            if runtime_recompute_modules or runtime_offload_modules
+            else "no memory-runtime action recommended"
+        ),
+        "performance_hypothesis": (
+            "memory relief is real, but steady-state step time may worsen unless the freed headroom is spent on a better PP/VPP schedule"
+            if runtime_recompute_modules or runtime_offload_modules
+            else "no direct performance effect expected"
+        ),
+    }
     return {
-        "status": "partially_executable",
+        "status": runtime_policy["status"],
         "per_stage_policy": policies,
+        "runtime_policy": runtime_policy,
+    }
+
+
+def _trigger_rule(
+    rule_id: str,
+    *,
+    metric: str,
+    threshold: float,
+    observed_value: float,
+    operator: str = ">=",
+    branch_id: Optional[str] = None,
+    rationale: str = "",
+) -> Dict[str, Any]:
+    observed = float(observed_value)
+    limit = float(threshold)
+    if operator == ">":
+        satisfied = observed > limit
+    elif operator == "<":
+        satisfied = observed < limit
+    elif operator == "<=":
+        satisfied = observed <= limit
+    else:
+        satisfied = observed >= limit
+    return {
+        "rule_id": str(rule_id),
+        "branch_id": branch_id,
+        "metric": str(metric),
+        "operator": str(operator),
+        "threshold": round(limit, 4),
+        "observed_value": round(observed, 4),
+        "satisfied": bool(satisfied),
+        "rationale": str(rationale or ""),
+    }
+
+
+def _build_runtime_branch_plan(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+    nonuniform_vpp_shape: Dict[str, Any],
+    pipe_search_space: Dict[str, Any],
+    apipe_heuristic_plan: Dict[str, Any],
+    local_memory_search_space: Dict[str, Any],
+    single_node_deep_stats: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    pp_degree = int(norm.parallel.pp_degree)
+    stage_spread_ratio = float(
+        single_node_deep_stats.get("stage_completion_spread_ratio")
+        or runtime_evidence.get("stage_load_variance")
+        or 0.0
+    )
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    mem_skew_ratio = float(runtime_evidence.get("mem_skew_ratio") or 0.0)
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    pipeline_wait_ratio = float(runtime_evidence.get("pipeline_wait_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    routing_skew_ratio = float(runtime_evidence.get("routing_skew_ratio") or 0.0)
+    hottest_stage = int(
+        ((single_node_deep_stats.get("dominant_stage_cost") or {}).get("stage_id"))
+        if (single_node_deep_stats.get("dominant_stage_cost") or {}).get("stage_id") is not None
+        else 0
+    )
+    hot_memory_stages = list(
+        ((local_memory_search_space.get("runtime_policy") or {}).get("hot_stage_ids")) or []
+    )
+    vpp_candidates = list((nonuniform_vpp_shape.get("per_stage_candidates")) or [])
+    vpp_vector = [
+        max(int((item or {}).get("recommended_v") or 1), 1)
+        for item in vpp_candidates
+    ]
+    chunk_shapes = {
+        str(int((item or {}).get("stage_id") or 0)): list(((item or {}).get("candidate_chunk_shapes") or [])[0] or [])
+        for item in vpp_candidates
+        if list((item or {}).get("candidate_chunk_shapes") or [])
+    }
+    local_memory_runtime = dict(local_memory_search_space.get("runtime_policy") or {})
+    runtime_controls = dict(apipe_heuristic_plan.get("runtime_controls") or {})
+    trigger_rules: List[Dict[str, Any]] = []
+    branches: List[Dict[str, Any]] = []
+
+    hotspot_rule = _trigger_rule(
+        "trigger_hotspot_stage_skew",
+        metric="stage_completion_spread_ratio",
+        threshold=0.10,
+        observed_value=stage_spread_ratio,
+        branch_id="branch_hotspot_stage_local_vpp",
+        rationale="activate more uneven virtual chunking when stage completion skew persists",
+    )
+    trigger_rules.append(hotspot_rule)
+    if (
+        pp_degree > 1
+        and not any(int(value) > 1 for value in vpp_vector)
+        and hotspot_rule["satisfied"]
+        and int(norm.model.num_layers) % max(pp_degree * 2, 1) == 0
+    ):
+        vpp_vector = [1 for _ in range(max(pp_degree, 0))]
+        if hottest_stage < len(vpp_vector):
+            vpp_vector[hottest_stage] = 2
+    hotspot_active = bool(
+        pp_degree > 1
+        and vpp_vector
+        and any(int(value) > 1 for value in vpp_vector)
+        and hotspot_rule["satisfied"]
+    )
+    branches.append(
+        {
+            "branch_id": "branch_hotspot_stage_local_vpp",
+            "scope": "local_parallel",
+            "label": "hotspot_stage_local_vpp",
+            "status": (
+                "active_executable_now_with_global_vpp_approximation"
+                if hotspot_active
+                else "standby"
+            ),
+            "builder": "stage_local_vpp_shape",
+            "priority_rank": 28,
+            "active": hotspot_active,
+            "trigger_rule_id": hotspot_rule["rule_id"],
+            "target_stage_ids": [int(hottest_stage)] if vpp_vector else [],
+            "recommended_vpp_vector": [int(value) for value in vpp_vector],
+            "stage_local_chunk_shapes": {str(key): value for key, value in chunk_shapes.items()},
+            "rationale": "shift more virtual chunking capacity into hotspot stages before changing the full PP skeleton",
+        }
+    )
+
+    memory_rule = _trigger_rule(
+        "trigger_peak_window_memory",
+        metric="peak_reserved_ratio",
+        threshold=0.84,
+        observed_value=max(peak_reserved_ratio, mem_skew_ratio),
+        branch_id="branch_peak_window_memory_relief",
+        rationale="activate selective recompute or offload when memory watermark or skew gets high",
+    )
+    trigger_rules.append(memory_rule)
+    memory_active = bool(
+        local_memory_runtime
+        and local_memory_runtime.get("status") == "executable_now_with_module_level_approximation"
+        and memory_rule["satisfied"]
+    )
+    branches.append(
+        {
+            "branch_id": "branch_peak_window_memory_relief",
+            "scope": "local_parallel",
+            "label": "peak_window_memory_relief",
+            "status": "active_executable_now" if memory_active else "standby",
+            "builder": "stage_local_memory_policy",
+            "priority_rank": 24,
+            "active": memory_active,
+            "trigger_rule_id": memory_rule["rule_id"],
+            "target_stage_ids": [int(item) for item in hot_memory_stages],
+            "runtime_policy": {
+                "recompute_modules": list(local_memory_runtime.get("recompute_modules") or []),
+                "offload_modules": list(local_memory_runtime.get("offload_modules") or []),
+                "warmup_checkpoint_policy": str(local_memory_runtime.get("warmup_checkpoint_policy") or "default"),
+                "warmup_combined_policy": str(local_memory_runtime.get("warmup_combined_policy") or "default"),
+            },
+            "rationale": "raise recompute or offload only around peak windows instead of globally over-constraining the step",
+        }
+    )
+
+    reorder_rule = _trigger_rule(
+        "trigger_local_pipe_reorder",
+        metric="bubble_or_optimizer_exposed",
+        threshold=0.10,
+        observed_value=max(bubble_ratio, pipeline_wait_ratio, optimizer_exposed_ratio),
+        branch_id="branch_local_pipe_reorder",
+        rationale="activate local schedule reorder when wait, bubble, or optimizer exposure becomes visible",
+    )
+    trigger_rules.append(reorder_rule)
+    reorder_active = bool(
+        runtime_controls
+        and str(apipe_heuristic_plan.get("status") or "").startswith("executable")
+        and reorder_rule["satisfied"]
+    )
+    branches.append(
+        {
+            "branch_id": "branch_local_pipe_reorder",
+            "scope": "pipe",
+            "label": "local_pipe_reorder",
+            "status": "active_executable_now" if reorder_active else "standby",
+            "builder": "apipe_pipe_heuristic",
+            "priority_rank": 20,
+            "active": reorder_active,
+            "trigger_rule_id": reorder_rule["rule_id"],
+            "runtime_controls": dict(runtime_controls),
+            "rationale": "reorder local chunk execution and flush behavior before paying for larger topology changes",
+        }
+    )
+
+    moe_rule = _trigger_rule(
+        "trigger_moe_routing_skew",
+        metric="routing_skew_ratio",
+        threshold=0.12,
+        observed_value=routing_skew_ratio,
+        branch_id="branch_moe_skew_memory_policy",
+        rationale="if routing skew rises, bias memory relief toward the overloaded MoE stage set",
+    )
+    trigger_rules.append(moe_rule)
+    moe_active = bool(
+        str(norm.model.track) == "moe"
+        and moe_rule["satisfied"]
+        and local_memory_runtime.get("status") == "executable_now_with_module_level_approximation"
+    )
+    branches.append(
+        {
+            "branch_id": "branch_moe_skew_memory_policy",
+            "scope": "local_parallel",
+            "label": "moe_skew_memory_policy",
+            "status": "active_partial_runtime_support" if moe_active else "standby",
+            "builder": "stage_local_memory_policy",
+            "priority_rank": 30,
+            "active": moe_active,
+            "trigger_rule_id": moe_rule["rule_id"],
+            "target_stage_ids": [int(item) for item in hot_memory_stages],
+            "rationale": "current runtime support is still module-level, but the branch can be activated from MoE skew evidence",
+        }
+    )
+
+    activated_branches = [
+        {
+            "branch_id": str(branch.get("branch_id") or ""),
+            "scope": str(branch.get("scope") or ""),
+            "priority_rank": int(branch.get("priority_rank") or 99),
+            "status": str(branch.get("status") or ""),
+        }
+        for branch in branches
+        if bool(branch.get("active"))
+    ]
+    activated_branches.sort(key=lambda item: (int(item.get("priority_rank") or 99), str(item.get("branch_id") or "")))
+
+    return {
+        "status": "v1_executable_branch_pack",
+        "s_base": {
+            "parallel": {
+                "tp": int(norm.parallel.tp_degree),
+                "pp": int(norm.parallel.pp_degree),
+                "vpp": int(norm.parallel.vpp_degree),
+                "dp": max(
+                    int(norm.cluster.world_size)
+                    // max(
+                        int(norm.parallel.tp_degree)
+                        * int(norm.parallel.pp_degree)
+                        * int(norm.parallel.cp_degree)
+                        * int(norm.parallel.ep_degree),
+                        1,
+                    ),
+                    1,
+                ),
+                "cp": int(norm.parallel.cp_degree),
+                "ep": int(norm.parallel.ep_degree),
+            },
+            "micro_batch_size": int(norm.batch_plan.micro_batch_size),
+            "global_batch_size": int(norm.batch_plan.global_batch_size),
+            "schedule_template": str(norm.schedule.template),
+            "dispatch_order": str(norm.schedule.dispatch_order),
+            "pipeline_layout": str(norm.layout.pipeline_layout or ""),
+            "recompute_granularity": str((norm.metadata or {}).get("runtime_recompute_granularity") or ""),
+            "offload_policy": str((norm.metadata or {}).get("runtime_memory_policy_mode") or "none"),
+        },
+        "branches": branches,
+        "trigger_rules": trigger_rules,
+        "activated_branches": activated_branches,
     }
 
 
@@ -1010,7 +1590,13 @@ def _search_space_blueprint(
             "name": "schedule.dispatch_order",
             "scope": "pipe",
             "status": "executable_now",
-            "values": ["default", "frontload_forward", "balanced_round_robin", "middle_stage_relief"],
+            "values": [
+                "default",
+                "frontload_forward",
+                "balanced_round_robin",
+                "middle_stage_relief",
+                "tail_boundary_rewrite",
+            ],
             "rationale": "reorder microbatch/chunk traversal to reduce first/last-stage idle windows",
         },
         {
@@ -1019,6 +1605,13 @@ def _search_space_blueprint(
             "status": "executable_now",
             "values": [1, 2, 3, 4],
             "rationale": "coarse grouped interleave knob that affects bubble versus communication tradeoff",
+        },
+        {
+            "name": "schedule.flush_microbatch_order",
+            "scope": "pipe",
+            "status": "executable_now",
+            "values": ["default", "reverse_last_group", "explicit_last_group_permutation"],
+            "rationale": "flush-only microbatch reordering is the lowest-risk entry point for tail and optimizer exposed tuning",
         },
         {
             "name": "pipe.issue_wait_and_tail_rewrite",
@@ -1095,8 +1688,8 @@ def _search_space_blueprint(
             "name": "optimizer_overlap_schedule",
             "scope": "pipe",
             "status": "research_gap",
-            "values": "layer-wise validate/update overlap",
-            "rationale": "would require splitting and reordering optimizer work rather than only selecting a schedule template",
+            "values": "optimizer slice placement across slack windows",
+            "rationale": "would require splitting and reordering optimizer work rather than only selecting a schedule template or flush order",
         },
         {
             "name": "symbolic_interference_model",
@@ -1274,6 +1867,8 @@ def _build_context_from_trace(
     boundary_semantics = _build_boundary_semantics(norm, stage_evidence, runtime_evidence)
     nonuniform_vpp_shape = _build_nonuniform_vpp_candidates(norm, stage_evidence, runtime_evidence)
     pipe_search_space = _build_pipe_search_space(runtime_evidence, bottleneck_signature)
+    apipe_problem_formulation = _build_apipe_problem_formulation(norm, runtime_evidence)
+    apipe_heuristic_plan = _build_apipe_heuristic_plan(norm, runtime_evidence, stage_evidence)
     local_memory_search_space = _build_local_memory_search_space(norm, stage_evidence)
     single_node_deep_stats = _build_single_node_deep_stats(
         norm,
@@ -1281,6 +1876,16 @@ def _build_context_from_trace(
         runtime_evidence,
         stage_cost_model,
         boundary_semantics,
+    )
+    runtime_branch_plan = _build_runtime_branch_plan(
+        norm,
+        runtime_evidence,
+        stage_evidence,
+        nonuniform_vpp_shape,
+        pipe_search_space,
+        apipe_heuristic_plan,
+        local_memory_search_space,
+        single_node_deep_stats,
     )
     search_space_blueprint = _search_space_blueprint(norm, runtime_evidence, backend_context, bottleneck_signature)
     perfetto_trace = _build_perfetto_trace(norm, stage_evidence, subgraph_evidence, runtime_evidence)
@@ -1297,8 +1902,11 @@ def _build_context_from_trace(
             "boundary_semantics": boundary_semantics,
             "nonuniform_vpp_shape": nonuniform_vpp_shape,
             "pipe_search_space": pipe_search_space,
+            "apipe_problem_formulation": apipe_problem_formulation,
+            "apipe_heuristic_plan": apipe_heuristic_plan,
             "local_memory_search_space": local_memory_search_space,
             "single_node_deep_stats": single_node_deep_stats,
+            "runtime_branch_plan": runtime_branch_plan,
             "search_space_blueprint": search_space_blueprint,
             "visualization_artifacts": {
                 "perfetto_trace": perfetto_trace,
@@ -1437,8 +2045,11 @@ def build_trial_artifact(
         "boundary_semantics": list(evidence.get("boundary_semantics") or []),
         "nonuniform_vpp_shape": dict(evidence.get("nonuniform_vpp_shape") or {}),
         "pipe_search_space": dict(evidence.get("pipe_search_space") or {}),
+        "apipe_problem_formulation": dict(evidence.get("apipe_problem_formulation") or {}),
+        "apipe_heuristic_plan": dict(evidence.get("apipe_heuristic_plan") or {}),
         "local_memory_search_space": dict(evidence.get("local_memory_search_space") or {}),
         "single_node_deep_stats": dict(evidence.get("single_node_deep_stats") or {}),
+        "runtime_branch_plan": dict(evidence.get("runtime_branch_plan") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
         "search_space_blueprint": dict(evidence.get("search_space_blueprint") or {}),
         "decomposition": {

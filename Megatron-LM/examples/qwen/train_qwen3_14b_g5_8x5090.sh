@@ -82,6 +82,21 @@ ENABLE_SP=${ENABLE_SP:-}
 LOAD_CHECKPOINT=${LOAD_CHECKPOINT:-0}
 USE_BF16=${USE_BF16:-1}
 USE_FP16=${USE_FP16:-0}
+ENABLE_DISTRIBUTED_OPTIMIZER=${ENABLE_DISTRIBUTED_OPTIMIZER:-1}
+ENABLE_OPTIMIZER_CPU_OFFLOAD=${ENABLE_OPTIMIZER_CPU_OFFLOAD:-1}
+OPTIMIZER_OFFLOAD_FRACTION=${OPTIMIZER_OFFLOAD_FRACTION:-1.0}
+USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD=${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD:-1}
+ENABLE_PRECISION_AWARE_OPTIMIZER=${ENABLE_PRECISION_AWARE_OPTIMIZER:-1}
+RECOMPUTE_GRANULARITY=${RECOMPUTE_GRANULARITY:-selective}
+ENABLE_RECOMPUTE_ACTIVATIONS=${ENABLE_RECOMPUTE_ACTIVATIONS:-1}
+RECOMPUTE_MODULES=${RECOMPUTE_MODULES:-core_attn}
+ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING=${ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING:-0}
+OFFLOAD_MODULES=${OFFLOAD_MODULES:-}
+USE_TORCH_FSDP2=${USE_TORCH_FSDP2:-0}
+TORCH_FSDP2_RESHARD_AFTER_FORWARD=${TORCH_FSDP2_RESHARD_AFTER_FORWARD:-1}
+USE_MEGATRON_FSDP=${USE_MEGATRON_FSDP:-0}
+MEGATRON_FSDP_SHARDING_STRATEGY=${MEGATRON_FSDP_SHARDING_STRATEGY:-optim_grads_params}
+CKPT_FORMAT=${CKPT_FORMAT:-torch_dist}
 
 TP_SIZE=${TP_SIZE:-}
 PP_SIZE=${PP_SIZE:-}
@@ -97,7 +112,25 @@ NUM_LAYERS=${NUM_LAYERS:-}
 PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-}
 SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-}
 SCHEDULE_TEMPLATE=${SCHEDULE_TEMPLATE:-fixed_1f1b}
+DISPATCH_ORDER=${DISPATCH_ORDER:-default}
+SCHEDULE_WARMUP_POLICY=${SCHEDULE_WARMUP_POLICY:-default}
+SCHEDULE_COOLDOWN_POLICY=${SCHEDULE_COOLDOWN_POLICY:-default}
+SCHEDULE_WARMUP_CHECKPOINT_POLICY=${SCHEDULE_WARMUP_CHECKPOINT_POLICY:-default}
+SCHEDULE_STEADY_CHECKPOINT_POLICY=${SCHEDULE_STEADY_CHECKPOINT_POLICY:-default}
+SCHEDULE_WARMUP_P2P_POLICY=${SCHEDULE_WARMUP_P2P_POLICY:-default}
+SCHEDULE_COOLDOWN_P2P_POLICY=${SCHEDULE_COOLDOWN_P2P_POLICY:-default}
+SCHEDULE_WARMUP_COMBINED_POLICY=${SCHEDULE_WARMUP_COMBINED_POLICY:-default}
+SCHEDULE_STEADY_COMBINED_POLICY=${SCHEDULE_STEADY_COMBINED_POLICY:-default}
+SCHEDULE_COOLDOWN_COMBINED_POLICY=${SCHEDULE_COOLDOWN_COMBINED_POLICY:-default}
+SCHEDULE_FLUSH_ORDER_POLICY=${SCHEDULE_FLUSH_ORDER_POLICY:-default}
+SCHEDULE_FLUSH_MICROBATCHES=${SCHEDULE_FLUSH_MICROBATCHES:-}
 NUM_LAYERS_PER_VIRTUAL_STAGE=${NUM_LAYERS_PER_VIRTUAL_STAGE:-}
+LOCAL_VPP_LAYOUT=${LOCAL_VPP_LAYOUT:-Etttt|ttttt|ttttt|tttttt|tttttt|ttttt|ttttt|ttttL}
+LOCAL_VPP_SCHEDULE_GROUP_SIZE=${LOCAL_VPP_SCHEDULE_GROUP_SIZE:-4}
+VPP_STABLE_LAYOUT=${VPP_STABLE_LAYOUT:-Etttt|ttttt|ttttt|tttttt|tttttt|ttttt|ttttt|ttttL}
+VPP_NEIGHBOR_LAYOUT=${VPP_NEIGHBOR_LAYOUT:-Etttt|ttttt|ttttt|tttttt|ttttt|tttttt|ttttt|ttttL}
+MICRO_SCHEDULE_LAYOUT=${MICRO_SCHEDULE_LAYOUT:-$LOCAL_VPP_LAYOUT}
+MICRO_SCHEDULE_GROUP_SIZE=${MICRO_SCHEDULE_GROUP_SIZE:-4}
 
 MOE_NUM_EXPERTS=${MOE_NUM_EXPERTS:-4}
 MOE_LAYER_FREQ=${MOE_LAYER_FREQ:-2}
@@ -194,6 +227,107 @@ elif [[ "$MODEL_TRACK" == "moe" ]]; then
   MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-4096}
 fi
 
+if [[ "$PRESET" == "pp_local_vpp" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: pp_local_vpp currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$LOCAL_VPP_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-$LOCAL_VPP_SCHEDULE_GROUP_SIZE}
+fi
+
+if [[ "$PRESET" == "vpp_stable" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: vpp_stable currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$VPP_STABLE_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-4}
+fi
+
+if [[ "$PRESET" == "vpp_neighbor" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: vpp_neighbor currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$VPP_NEIGHBOR_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-4}
+fi
+
+if [[ "$PRESET" == "vpp_neighbor_g8" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: vpp_neighbor_g8 currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$VPP_NEIGHBOR_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-8}
+  DISPATCH_ORDER=${DISPATCH_ORDER:-tail_boundary_rewrite}
+  SCHEDULE_WARMUP_POLICY=${SCHEDULE_WARMUP_POLICY:-balanced_fill}
+  SCHEDULE_COOLDOWN_POLICY=${SCHEDULE_COOLDOWN_POLICY:-opt_prioritized}
+  SCHEDULE_FLUSH_ORDER_POLICY=${SCHEDULE_FLUSH_ORDER_POLICY:-reverse_last_group}
+fi
+
+if [[ "$PRESET" == "pp_micro_schedule" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: pp_micro_schedule currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$MICRO_SCHEDULE_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-$MICRO_SCHEDULE_GROUP_SIZE}
+fi
+
+if (( USE_TORCH_FSDP2 > 0 && USE_MEGATRON_FSDP > 0 )); then
+  echo "Invalid preset: USE_TORCH_FSDP2 and USE_MEGATRON_FSDP cannot both be enabled"
+  exit 1
+fi
+
+if (( USE_TORCH_FSDP2 > 0 || USE_MEGATRON_FSDP > 0 )); then
+  if [[ "${CUDA_DEVICE_MAX_CONNECTIONS:-}" == "1" ]]; then
+    echo "FSDP mode requires CUDA_DEVICE_MAX_CONNECTIONS != 1; unsetting it for this launch"
+    unset CUDA_DEVICE_MAX_CONNECTIONS
+  fi
+fi
+
+if (( USE_TORCH_FSDP2 > 0 )); then
+  if (( PP_SIZE != 1 )); then
+    echo "Invalid preset: Torch FSDP2 does not support PP in this Megatron runtime"
+    exit 1
+  fi
+  ENABLE_DISTRIBUTED_OPTIMIZER=0
+  USE_FP16=0
+  CKPT_FORMAT=${CKPT_FORMAT:-torch_dist}
+fi
+
+if (( USE_MEGATRON_FSDP > 0 )); then
+  ENABLE_DISTRIBUTED_OPTIMIZER=1
+  CKPT_FORMAT=${CKPT_FORMAT:-fsdp_dtensor}
+fi
+
 if [[ "$USE_BF16" == "1" ]] && [[ "$USE_FP16" == "1" ]]; then
   echo "Invalid precision preset: USE_BF16 and USE_FP16 cannot both be enabled"
   exit 1
@@ -209,6 +343,16 @@ if (( PRODUCT <= 0 || WORLD_SIZE % PRODUCT != 0 )); then
   echo "Invalid parallel product: WORLD_SIZE=${WORLD_SIZE}, TP=${TP_SIZE}, PP=${PP_SIZE}, CP=${CP_SIZE}, EP=${EP_SIZE}, ETP=${EXPERT_TP_SIZE}"
   exit 1
 fi
+DATA_PARALLEL_SIZE=$((WORLD_SIZE / PRODUCT))
+if (( DATA_PARALLEL_SIZE <= 0 )); then
+  echo "Invalid derived data parallel size: ${DATA_PARALLEL_SIZE}"
+  exit 1
+fi
+if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DATA_PARALLEL_SIZE) != 0 )); then
+  echo "Invalid batch configuration: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by MICRO_BATCH_SIZE*DATA_PARALLEL_SIZE=$((MICRO_BATCH_SIZE * DATA_PARALLEL_SIZE))"
+  exit 1
+fi
+NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DATA_PARALLEL_SIZE)))
 
 if (( VPP_SIZE > 1 )) && [[ -z "$PIPELINE_LAYOUT" ]]; then
   if (( PP_SIZE <= 1 )); then
@@ -223,6 +367,38 @@ if (( VPP_SIZE > 1 )) && [[ -z "$PIPELINE_LAYOUT" ]]; then
   if [[ -z "$NUM_LAYERS_PER_VIRTUAL_STAGE" ]]; then
     NUM_LAYERS_PER_VIRTUAL_STAGE=$((NUM_LAYERS / TOTAL_VIRTUAL))
   fi
+fi
+
+if (( PP_SIZE > 1 && VPP_SIZE > 1 )) && [[ -n "$SCHEDULE_GROUP_SIZE" ]]; then
+  if (( SCHEDULE_GROUP_SIZE < PP_SIZE || SCHEDULE_GROUP_SIZE > NUM_MICROBATCHES )); then
+    echo "Invalid preset: SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE} must be in [PP=${PP_SIZE}, M=${NUM_MICROBATCHES}] for interleaved PP"
+    exit 1
+  fi
+fi
+
+if [[ -n "$SCHEDULE_FLUSH_MICROBATCHES" ]]; then
+  IFS=',' read -r -a FLUSH_MB_ARRAY <<< "$SCHEDULE_FLUSH_MICROBATCHES"
+  declare -A FLUSH_MB_SEEN=()
+  for raw_id in "${FLUSH_MB_ARRAY[@]}"; do
+    microbatch_id="$(echo "$raw_id" | xargs)"
+    if [[ -z "$microbatch_id" ]]; then
+      continue
+    fi
+    if ! [[ "$microbatch_id" =~ ^[0-9]+$ ]]; then
+      echo "Invalid preset: SCHEDULE_FLUSH_MICROBATCHES contains non-integer token '${microbatch_id}'"
+      exit 1
+    fi
+    if (( microbatch_id < 0 || microbatch_id >= NUM_MICROBATCHES )); then
+      echo "Invalid preset: SCHEDULE_FLUSH_MICROBATCHES id ${microbatch_id} must be in [0, ${NUM_MICROBATCHES}-1]"
+      exit 1
+    fi
+    if [[ -n "${FLUSH_MB_SEEN[$microbatch_id]:-}" ]]; then
+      echo "Invalid preset: SCHEDULE_FLUSH_MICROBATCHES contains duplicate id ${microbatch_id}"
+      exit 1
+    fi
+    FLUSH_MB_SEEN[$microbatch_id]=1
+  done
+  unset FLUSH_MB_SEEN
 fi
 
 if [[ "$RUN_TARGET" == "single_g4" ]] && (( NUM_NODES != 1 )); then
@@ -269,6 +445,17 @@ fi
 if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]] && [[ "$ENABLE_SP" == "1" ]]; then
   echo "Invalid preset: sequence parallel requires transformer_engine in the current runtime path"
   exit 1
+fi
+
+if (( ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING > 0 )); then
+  if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]]; then
+    echo "Invalid preset: fine-grained activation offloading requires TRANSFORMER_IMPL=transformer_engine"
+    exit 1
+  fi
+  if [[ -z "$OFFLOAD_MODULES" ]]; then
+    echo "Invalid preset: OFFLOAD_MODULES must be set when fine-grained activation offloading is enabled"
+    exit 1
+  fi
 fi
 
 DISTRIBUTED_ARGS=(
@@ -349,12 +536,28 @@ TRAINING_ARGS=(
   --adam-beta2 0.95
   --adam-eps 1.0e-8
   --calculate-per-token-loss
-  --use-distributed-optimizer
-  --optimizer-cpu-offload
-  --optimizer-offload-fraction 1.0
-  --use-precision-aware-optimizer
-  --use-torch-optimizer-for-cpu-offload
-  )
+)
+if (( ENABLE_DISTRIBUTED_OPTIMIZER > 0 )); then
+  TRAINING_ARGS+=(--use-distributed-optimizer)
+fi
+if (( ENABLE_OPTIMIZER_CPU_OFFLOAD > 0 )); then
+  TRAINING_ARGS+=(--optimizer-cpu-offload --optimizer-offload-fraction "$OPTIMIZER_OFFLOAD_FRACTION")
+  if (( USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD > 0 )); then
+    TRAINING_ARGS+=(--use-torch-optimizer-for-cpu-offload)
+  fi
+fi
+if (( ENABLE_PRECISION_AWARE_OPTIMIZER > 0 )); then
+  TRAINING_ARGS+=(--use-precision-aware-optimizer)
+fi
+if (( USE_TORCH_FSDP2 > 0 )); then
+  TRAINING_ARGS+=(--use-torch-fsdp2)
+  if (( TORCH_FSDP2_RESHARD_AFTER_FORWARD <= 0 )); then
+    TRAINING_ARGS+=(--torch-fsdp2-no-reshard-after-forward)
+  fi
+fi
+if (( USE_MEGATRON_FSDP > 0 )); then
+  TRAINING_ARGS+=(--use-megatron-fsdp --data-parallel-sharding-strategy "$MEGATRON_FSDP_SHARDING_STRATEGY")
+fi
 if [[ "$USE_BF16" == "1" ]]; then
   TRAINING_ARGS+=(--bf16)
 elif [[ "$USE_FP16" == "1" ]]; then
@@ -362,7 +565,34 @@ elif [[ "$USE_FP16" == "1" ]]; then
 fi
 
 if [[ "$MODEL_TRACK" == "dense" ]]; then
-  TRAINING_ARGS+=(--recompute-granularity selective --recompute-activations --recompute-modules core_attn)
+  if [[ -n "$RECOMPUTE_GRANULARITY" ]]; then
+    TRAINING_ARGS+=(--recompute-granularity "$RECOMPUTE_GRANULARITY")
+  fi
+  if (( ENABLE_RECOMPUTE_ACTIVATIONS > 0 )); then
+    TRAINING_ARGS+=(--recompute-activations)
+  fi
+  if [[ -n "$RECOMPUTE_MODULES" ]]; then
+    RECOMPUTE_MODULE_ARRAY=()
+    while IFS= read -r module_name; do
+      if [[ -n "$module_name" ]]; then
+        RECOMPUTE_MODULE_ARRAY+=("$module_name")
+      fi
+    done < <(printf '%s\n' "$RECOMPUTE_MODULES" | tr ', ' '\n')
+    if (( ${#RECOMPUTE_MODULE_ARRAY[@]} > 0 )); then
+      TRAINING_ARGS+=(--recompute-modules "${RECOMPUTE_MODULE_ARRAY[@]}")
+    fi
+  fi
+  if (( ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING > 0 )); then
+    OFFLOAD_MODULE_ARRAY=()
+    while IFS= read -r module_name; do
+      if [[ -n "$module_name" ]]; then
+        OFFLOAD_MODULE_ARRAY+=("$module_name")
+      fi
+    done < <(printf '%s\n' "$OFFLOAD_MODULES" | tr ', ' '\n')
+    if (( ${#OFFLOAD_MODULE_ARRAY[@]} > 0 )); then
+      TRAINING_ARGS+=(--fine-grained-activation-offloading --offload-modules "${OFFLOAD_MODULE_ARRAY[@]}")
+    fi
+  fi
 fi
 
 if [[ "$TRANSFORMER_IMPL" != "transformer_engine" ]]; then
@@ -418,7 +648,7 @@ LOGGING_ARGS=(
   --log-throughput
   --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
   --tensorboard-log-interval "$TENSORBOARD_LOG_INTERVAL"
-  --ckpt-format torch_dist
+  --ckpt-format "$CKPT_FORMAT"
   --distributed-timeout-minutes 60
 )
 if (( LOAD_CHECKPOINT > 0 )); then
@@ -491,9 +721,25 @@ echo "  RUN_TARGET=${RUN_TARGET}"
 echo "  MODEL_TRACK=${MODEL_TRACK}"
 echo "  PRECISION=${PRECISION_NAME}"
 echo "  WORLD_SIZE=${WORLD_SIZE} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} CP=${CP_SIZE} EP=${EP_SIZE} ETP=${EXPERT_TP_SIZE}"
+echo "  TORCH_FSDP2=${USE_TORCH_FSDP2} TORCH_FSDP2_RESHARD_AFTER_FORWARD=${TORCH_FSDP2_RESHARD_AFTER_FORWARD}"
+echo "  MEGATRON_FSDP=${USE_MEGATRON_FSDP} MEGATRON_FSDP_SHARDING_STRATEGY=${MEGATRON_FSDP_SHARDING_STRATEGY}"
+echo "  RECOMPUTE_GRANULARITY=${RECOMPUTE_GRANULARITY:-<none>} ENABLE_RECOMPUTE_ACTIVATIONS=${ENABLE_RECOMPUTE_ACTIVATIONS} RECOMPUTE_MODULES=${RECOMPUTE_MODULES:-<none>}"
+echo "  ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING=${ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING} OFFLOAD_MODULES=${OFFLOAD_MODULES:-<none>}"
 echo "  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-<none>}"
 echo "  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-<none>}"
 echo "  SCHEDULE_TEMPLATE=${SCHEDULE_TEMPLATE}"
+echo "  DISPATCH_ORDER=${DISPATCH_ORDER}"
+echo "  SCHEDULE_WARMUP_POLICY=${SCHEDULE_WARMUP_POLICY}"
+echo "  SCHEDULE_COOLDOWN_POLICY=${SCHEDULE_COOLDOWN_POLICY}"
+echo "  SCHEDULE_WARMUP_CHECKPOINT_POLICY=${SCHEDULE_WARMUP_CHECKPOINT_POLICY}"
+echo "  SCHEDULE_STEADY_CHECKPOINT_POLICY=${SCHEDULE_STEADY_CHECKPOINT_POLICY}"
+echo "  SCHEDULE_WARMUP_P2P_POLICY=${SCHEDULE_WARMUP_P2P_POLICY}"
+echo "  SCHEDULE_COOLDOWN_P2P_POLICY=${SCHEDULE_COOLDOWN_P2P_POLICY}"
+echo "  SCHEDULE_WARMUP_COMBINED_POLICY=${SCHEDULE_WARMUP_COMBINED_POLICY}"
+echo "  SCHEDULE_STEADY_COMBINED_POLICY=${SCHEDULE_STEADY_COMBINED_POLICY}"
+echo "  SCHEDULE_COOLDOWN_COMBINED_POLICY=${SCHEDULE_COOLDOWN_COMBINED_POLICY}"
+echo "  SCHEDULE_FLUSH_ORDER_POLICY=${SCHEDULE_FLUSH_ORDER_POLICY}"
+echo "  SCHEDULE_FLUSH_MICROBATCHES=${SCHEDULE_FLUSH_MICROBATCHES:-<none>}"
 echo "  ENABLE_PLANE_MAP=${ENABLE_PLANE_MAP} ATTN_TP=${ATTENTION_TP_SIZE} ATTN_CP=${ATTENTION_CP_SIZE} MOE_EP=${MOE_EP_SIZE} MOE_ETP=${MOE_EXPERT_TP_SIZE}"
 echo "  OBSERVABILITY_PRESET=${OBSERVABILITY_PRESET} PROFILE=${ENABLE_PROFILE} PYTORCH_PROFILER=${ENABLE_PYTORCH_PROFILER} STRAGGLER=${ENABLE_STRAGGLER_LOG} MEMORY_HISTORY=${ENABLE_MEMORY_HISTORY} NSYS=${ENABLE_NSYS}"
 echo "  GPU_PEAK_TFLOPS=${GPU_PEAK_TFLOPS:-<none>}"
@@ -504,6 +750,19 @@ echo "  MEMORY_SNAPSHOT_PATH=${MEMORY_SNAPSHOT_PATH}"
 echo "  NSYS_OUTPUT=${NSYS_OUTPUT}"
 
 set -x
+export SCHEDULE_TEMPLATE
+export DISPATCH_ORDER
+export SCHEDULE_WARMUP_POLICY
+export SCHEDULE_COOLDOWN_POLICY
+export SCHEDULE_WARMUP_CHECKPOINT_POLICY
+export SCHEDULE_STEADY_CHECKPOINT_POLICY
+export SCHEDULE_WARMUP_P2P_POLICY
+export SCHEDULE_COOLDOWN_P2P_POLICY
+export SCHEDULE_WARMUP_COMBINED_POLICY
+export SCHEDULE_STEADY_COMBINED_POLICY
+export SCHEDULE_COOLDOWN_COMBINED_POLICY
+export SCHEDULE_FLUSH_ORDER_POLICY
+export SCHEDULE_FLUSH_MICROBATCHES
 TORCHRUN_CMD=(
   torchrun "${DISTRIBUTED_ARGS[@]}"
   "$PRETRAIN_SCRIPT_PATH"

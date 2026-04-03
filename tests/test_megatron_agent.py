@@ -954,6 +954,236 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(context["workload_context"]["length_bucket"], "short")
         self.assertEqual(len(context["evidence_record"]["stage_evidence"]), 2)
 
+    def test_context_record_includes_apipe_problem_formulation_and_plan(self) -> None:
+        program = default_dense_program("dual_g5_g5")
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "steady_state_step_time_ms_p95": 8420.0,
+            "bubble_ratio": 0.11,
+            "pipeline_wait_ratio": 0.14,
+            "optimizer_exposed_ratio": 0.24,
+            "stage_tail_ratio": 0.18,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1600.0, "comm_ms": 220.0, "bubble_ms": 150.0, "window_ms": 1970.0, "peak_reserved_gib": 22.0, "peak_active_gib": 19.0},
+                "1": {"compute_ms": 1300.0, "comm_ms": 120.0, "bubble_ms": 70.0, "window_ms": 1490.0, "peak_reserved_gib": 18.0, "peak_active_gib": 16.0},
+                "2": {"compute_ms": 1320.0, "comm_ms": 125.0, "bubble_ms": 65.0, "window_ms": 1510.0, "peak_reserved_gib": 18.5, "peak_active_gib": 16.2},
+                "3": {"compute_ms": 1700.0, "comm_ms": 260.0, "bubble_ms": 160.0, "window_ms": 2120.0, "peak_reserved_gib": 24.0, "peak_active_gib": 21.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        formulation = context["evidence_record"]["apipe_problem_formulation"]
+        plan = context["evidence_record"]["apipe_heuristic_plan"]
+
+        self.assertEqual(formulation["status"], "v1_partial_runtime_support")
+        action_names = {item["name"] for item in formulation["action_space"]}
+        self.assertIn("move_boundary", action_names)
+        self.assertIn("set_local_vpp", action_names)
+        self.assertIn("reorder_flush_microbatches", action_names)
+        self.assertIn("place_optimizer_slice", action_names)
+        self.assertEqual(plan["runtime_controls"]["flush_order_policy"], "reverse_last_group")
+        planned_actions = {item["name"] for item in plan["actions"]}
+        self.assertIn("move_boundary", planned_actions)
+        self.assertIn("reorder_flush_microbatches", planned_actions)
+
+    def test_context_record_includes_runtime_branch_plan(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.15,
+            "optimizer_exposed_ratio": 0.22,
+            "peak_memory_ratio": 0.89,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+                "1": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "2": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "3": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        branch_plan = context["evidence_record"]["runtime_branch_plan"]
+        activated_ids = {item["branch_id"] for item in branch_plan["activated_branches"]}
+
+        self.assertEqual(branch_plan["status"], "v1_executable_branch_pack")
+        self.assertIn("branch_hotspot_stage_local_vpp", activated_ids)
+        self.assertIn("branch_peak_window_memory_relief", activated_ids)
+        self.assertIn("branch_local_pipe_reorder", activated_ids)
+        self.assertGreaterEqual(len(branch_plan["trigger_rules"]), 4)
+
+    def test_runtime_branch_candidates_follow_active_branches(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.15,
+            "optimizer_exposed_ratio": 0.22,
+            "peak_memory_ratio": 0.89,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+                "1": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "2": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "3": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        candidates = agent_loop._build_runtime_branch_candidates(program, context)
+        branch_ids = {str(candidate.metadata.get("runtime_branch_id") or "") for candidate in candidates}
+
+        self.assertIn("branch_peak_window_memory_relief", branch_ids)
+        self.assertIn("branch_local_pipe_reorder", branch_ids)
+        self.assertTrue(any(str(candidate.metadata.get("program_kind") or "").startswith("candidate_branch_") for candidate in candidates))
+
+    def test_compile_program_exports_pipe_runtime_envs(self) -> None:
+        program = default_dense_program("dual_g5_g5").normalized()
+        program.schedule.template = "interleaved_grouped_g4"
+        program.schedule.skeleton = "stage_aware_grouped"
+        program.schedule.dispatch_order = "tail_boundary_rewrite"
+        program.schedule.microbatch_group_size_per_vp_stage = 8
+        program.strategy_ir.pipe.warmup_policy = "balanced_fill"
+        program.strategy_ir.pipe.cooldown_policy = "opt_prioritized"
+        program.metadata["flush_order_policy"] = "reverse_last_group"
+        program.metadata["flush_microbatches"] = [8, 9, 10, 11]
+
+        compiled = compile_program(program)
+        self.assertEqual(compiled.launcher_env["SCHEDULE_TEMPLATE"], "interleaved_grouped_g4")
+        self.assertEqual(compiled.launcher_env["DISPATCH_ORDER"], "tail_boundary_rewrite")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_WARMUP_POLICY"], "balanced_fill")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_POLICY"], "opt_prioritized")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_FLUSH_ORDER_POLICY"], "reverse_last_group")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_FLUSH_MICROBATCHES"], "8,9,10,11")
+
+    def test_compile_program_exports_runtime_memory_envs(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.metadata["runtime_recompute_granularity"] = "selective"
+        program.metadata["runtime_enable_recompute_activations"] = True
+        program.metadata["runtime_recompute_modules"] = ["core_attn", "mlp"]
+        program.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+        program.metadata["runtime_offload_modules"] = ["core_attn", "attn_proj"]
+        program.metadata["schedule_warmup_checkpoint_policy"] = "full"
+        program.metadata["schedule_steady_checkpoint_policy"] = "default"
+        program.metadata["schedule_cooldown_p2p_policy"] = "serial"
+        program.metadata["schedule_warmup_combined_policy"] = "serial"
+        program.metadata["schedule_cooldown_combined_policy"] = "serial"
+
+        compiled = compile_program(program)
+        self.assertEqual(compiled.launcher_env["RECOMPUTE_GRANULARITY"], "selective")
+        self.assertEqual(compiled.launcher_env["ENABLE_RECOMPUTE_ACTIVATIONS"], "1")
+        self.assertEqual(compiled.launcher_env["RECOMPUTE_MODULES"], "core_attn,mlp")
+        self.assertEqual(
+            compiled.launcher_env["ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING"],
+            "1",
+        )
+        self.assertEqual(compiled.launcher_env["OFFLOAD_MODULES"], "core_attn,attn_proj")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_WARMUP_CHECKPOINT_POLICY"], "full")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_STEADY_CHECKPOINT_POLICY"], "default")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_P2P_POLICY"], "serial")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_WARMUP_COMBINED_POLICY"], "serial")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_COMBINED_POLICY"], "serial")
+
+    def test_context_record_includes_runtime_memory_policy(self) -> None:
+        program = default_dense_program("single_g5")
+        program.constraints.memory_budget_gb = 24.0
+        runtime_summary = {
+            "stage_window_summary": {
+                "0": {
+                    "compute_ms": 1200.0,
+                    "forward_ms": 700.0,
+                    "completion_ms": 1800.0,
+                    "window_ms": 1800.0,
+                    "peak_reserved_gib": 23.1,
+                },
+                "1": {
+                    "compute_ms": 1100.0,
+                    "forward_ms": 760.0,
+                    "completion_ms": 1500.0,
+                    "window_ms": 1500.0,
+                    "peak_reserved_gib": 18.4,
+                },
+            },
+        }
+
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        local_memory = context["evidence_record"]["local_memory_search_space"]
+        runtime_policy = local_memory["runtime_policy"]
+
+        self.assertEqual(
+            runtime_policy["status"], "executable_now_with_module_level_approximation"
+        )
+        self.assertEqual(runtime_policy["recompute_modules"], ["core_attn", "mlp"])
+        self.assertEqual(runtime_policy["offload_modules"], ["attn_proj", "core_attn"])
+        self.assertEqual(runtime_policy["warmup_checkpoint_policy"], "full")
+        self.assertEqual(runtime_policy["warmup_combined_policy"], "serial")
+        self.assertEqual(runtime_policy["steady_checkpoint_policy"], "default")
+
+    def test_schedule_phase_helpers_support_phase_local_policies(self) -> None:
+        from megatron.core.pipeline_parallel.schedules import (
+            _phase_uses_combined_overlap,
+            _phase_uses_p2p_overlap,
+            _resolve_execution_phase_for_virtual_microbatches,
+            _resolve_phase_checkpoint_policy,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCHEDULE_WARMUP_CHECKPOINT_POLICY": "full",
+                "SCHEDULE_STEADY_CHECKPOINT_POLICY": "off",
+                "SCHEDULE_COOLDOWN_P2P_POLICY": "serial",
+                "SCHEDULE_WARMUP_COMBINED_POLICY": "serial",
+                "SCHEDULE_STEADY_COMBINED_POLICY": "combined",
+            },
+            clear=False,
+        ):
+            self.assertTrue(_resolve_phase_checkpoint_policy("warmup", None))
+            self.assertFalse(_resolve_phase_checkpoint_policy("steady", True))
+            self.assertFalse(_phase_uses_p2p_overlap("cooldown", True))
+            self.assertTrue(_phase_uses_p2p_overlap("warmup", True))
+            self.assertEqual(
+                _resolve_execution_phase_for_virtual_microbatches(
+                    f_virtual_microbatch_id=3, b_virtual_microbatch_id=None
+                ),
+                "warmup",
+            )
+            self.assertEqual(
+                _resolve_execution_phase_for_virtual_microbatches(
+                    f_virtual_microbatch_id=3, b_virtual_microbatch_id=1
+                ),
+                "steady",
+            )
+            self.assertEqual(
+                _resolve_execution_phase_for_virtual_microbatches(
+                    f_virtual_microbatch_id=None, b_virtual_microbatch_id=1
+                ),
+                "cooldown",
+            )
+            self.assertFalse(_phase_uses_combined_overlap("warmup", True))
+            self.assertTrue(_phase_uses_combined_overlap("steady", True))
+
+    def test_schedule_table_supports_flush_reordering_envs(self) -> None:
+        from megatron.core.pipeline_parallel.schedules import get_schedule_table
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCHEDULE_TEMPLATE": "pp4_middle_relief",
+                "DISPATCH_ORDER": "tail_boundary_rewrite",
+                "SCHEDULE_WARMUP_POLICY": "balanced_fill",
+                "SCHEDULE_COOLDOWN_POLICY": "opt_prioritized",
+                "SCHEDULE_FLUSH_ORDER_POLICY": "reverse_last_group",
+            },
+            clear=False,
+        ):
+            schedule_table = get_schedule_table(16, 2, 8)
+
+        self.assertEqual([microbatch_id for microbatch_id, _ in schedule_table[-16:-8]], list(range(15, 7, -1)))
+        self.assertEqual([microbatch_id for microbatch_id, _ in schedule_table[-8:]], list(range(15, 7, -1)))
+
     def test_stage_memory_gate_rejects_hotspot_candidate(self) -> None:
         program = default_dense_program("single_g5")
         program.constraints.memory_budget_gb = 4.0
