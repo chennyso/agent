@@ -155,6 +155,74 @@ export GLOO_SOCKET_IFNAME=ens8f0
 bash examples/hybrid_parallel/launch_torchtitan_hybrid_node0.sh qwen3_14b_single_g4_fsdp8_conditioned
 ```
 
+Single-node 14B validation on `5090D` / `g5`:
+
+- New helper launcher:
+  - `examples/hybrid_parallel/launch_torchtitan_qwen3_14b_single_5090d.sh`
+- Supported presets:
+  - `throughput`
+    - maps to `qwen3_14b_single_5090d_tp4_fsdp2_throughput`
+    - `PP=1, TP=4, FSDP2(shard=2)` throughput baseline
+    - best when you want a shard-heavy control line and pipeline bubble is not the main problem
+  - `vpp`
+    - maps to `qwen3_14b_single_5090d_vpp_fsdp2`
+    - `PP=2, VPP=2, TP=2, FSDP2(shard=2)` interleaved research preset
+    - useful when you explicitly want to study `pipeline/VPP <-> FSDP2` interaction
+  - `vpp_safe`
+    - maps to `qwen3_14b_single_5090d_vpp_fsdp2_safe`
+    - safer bring-up defaults for seq length and local batch
+    - good first step before testing the more aggressive `vpp` preset
+  - `vpp_budgeted`
+    - maps to `qwen3_14b_single_5090d_vpp_fsdp2_budgeted`
+    - keeps `PP=2, VPP=2, TP=2, FSDP2(shard=2)` but adds per-stage HBM budget, prefetch window, and watermark knobs
+    - best preset for studying communication/materialization/offload coordination
+
+Example:
+
+```bash
+export NNODES=1
+export NODE_RANK=0
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens9f0
+export GLOO_SOCKET_IFNAME=ens9f0
+bash examples/hybrid_parallel/launch_torchtitan_qwen3_14b_single_5090d.sh throughput
+```
+
+```bash
+export NNODES=1
+export NODE_RANK=0
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens9f0
+export GLOO_SOCKET_IFNAME=ens9f0
+HYBRID_SEQ_LEN=1024 \
+HYBRID_LOCAL_BATCH_SIZE=2 \
+bash examples/hybrid_parallel/launch_torchtitan_qwen3_14b_single_5090d.sh vpp_safe
+```
+
+```bash
+export NNODES=1
+export NODE_RANK=0
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export NCCL_SOCKET_IFNAME=ens9f0
+export GLOO_SOCKET_IFNAME=ens9f0
+HYBRID_SEQ_LEN=1024 \
+HYBRID_GLOBAL_BATCH_SIZE=32 \
+HYBRID_STAGE_HBM_BUDGET_GIB=28.5,30,30,28.5 \
+HYBRID_FSDP_PREFETCH_WINDOW=1 \
+HYBRID_FSDP_MATERIALIZATION_WATERMARK_GIB=29.0 \
+bash examples/hybrid_parallel/launch_torchtitan_qwen3_14b_single_5090d.sh vpp_budgeted
+```
+
+Strategy notes for single-node `5090D`:
+
+- If your main bottleneck is `all-gather` or parameter materialization pressure, start from `throughput`.
+- If your main question is `pipeline/VPP` behavior under FSDP2, start from `vpp_safe`, then move to `vpp`.
+- If your main question is communication vs prefetch/materialization coordination, use `vpp_budgeted`.
+- For the current Qwen3-14B single-node runtime-optimization line, Megatron PP/VPP is still the stronger mainline for peak throughput; TorchTitan/FSDP2 is the better comparison axis for shard policy, prefetch, reshard, and budgeted-materialization studies.
+
 Offline TorchTitan packaging on `g4` and sync to `g5`:
 
 ```bash
