@@ -709,8 +709,8 @@ def _build_boundary_semantics(
         left_node = stage_to_node[left_stage] if left_stage < len(stage_to_node) else "unknown"
         right_node = stage_to_node[right_stage] if right_stage < len(stage_to_node) else left_node
         cross_node = str(left_node) != str(right_node)
-        left_wait = float(left.get("send_recv_ms") or 0.0) + float(left.get("idle_ms") or 0.0) * 0.35
-        right_wait = float(right.get("send_recv_ms") or 0.0) + float(right.get("idle_ms") or 0.0) * 0.35
+        left_wait = float(left.get("send_recv_ms") or left.get("comm_ms") or 0.0) + float(left.get("idle_ms") or left.get("bubble_ms") or 0.0) * 0.35
+        right_wait = float(right.get("send_recv_ms") or right.get("comm_ms") or 0.0) + float(right.get("idle_ms") or right.get("bubble_ms") or 0.0) * 0.35
         boundary_wait_ms = 0.5 * (left_wait + right_wait)
         left_mem_ratio = (float(left.get("peak_reserved_gib") or 0.0) / budget_gib) if budget_gib > 0.0 else float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
         right_mem_ratio = (float(right.get("peak_reserved_gib") or 0.0) / budget_gib) if budget_gib > 0.0 else float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
@@ -1069,7 +1069,9 @@ def _build_apipe_heuristic_plan(
             )
 
     flush_order_policy = "default"
-    if optimizer_exposed_ratio >= 0.18 or bubble_ratio >= 0.10:
+    if optimizer_exposed_ratio >= 0.18 and stage_tail_ratio >= 0.10:
+        flush_order_policy = "optimizer_tail_hide"
+    elif optimizer_exposed_ratio >= 0.18 or bubble_ratio >= 0.10:
         flush_order_policy = "reverse_last_group"
         actions.append(
             {
@@ -1097,7 +1099,9 @@ def _build_apipe_heuristic_plan(
             group_size = max(pp_degree, 2)
 
     dispatch_order = "default"
-    if flush_order_policy != "default":
+    if flush_order_policy == "optimizer_tail_hide":
+        dispatch_order = "optimizer_tail_guarded"
+    elif flush_order_policy != "default":
         dispatch_order = "tail_boundary_rewrite"
     elif int(getattr(norm.parallel, "vpp_degree", 1) or 1) > 1 and pipeline_wait_ratio >= 0.08:
         dispatch_order = "structure_aware_critical_first"
@@ -1126,7 +1130,11 @@ def _build_apipe_heuristic_plan(
             "dispatch_order": dispatch_order,
             "steady_state_group_size": group_size,
             "warmup_policy": "balanced_fill" if bubble_ratio >= 0.08 else "fast_fill",
-            "cooldown_policy": "opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min",
+            "cooldown_policy": (
+                "optimizer_tail_hide"
+                if optimizer_exposed_ratio >= 0.18 and stage_tail_ratio >= 0.10
+                else ("opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min")
+            ),
             "flush_order_policy": flush_order_policy,
         },
     }
@@ -1872,6 +1880,7 @@ def _build_morphable_pipeline_plan(
     stage_families: List[Dict[str, Any]] = []
     runtime_recompute_modules: List[str] = []
     runtime_offload_modules: List[str] = []
+    stage_count = max(len(stage_evidence or []), len(family_space or []), int(norm.parallel.pp_degree), 1)
     for family in family_space:
         stage_id = int(family.get("stage_id") or 0)
         metrics = stage_metrics.get(stage_id, {})
@@ -1889,6 +1898,7 @@ def _build_morphable_pipeline_plan(
         offload_modules: List[str] = []
         chunk_priority_hints: List[int] = []
         semantic_role = str(family.get("semantic_role") or "decoder")
+        is_tail_stage = bool(stage_id == stage_count - 1)
         criticality_bonus = 1.0 if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} else 0.0
         throughput_gain_score = (
             0.55 * pipeline_wait_ratio * max(completion_ms, 1.0)
@@ -1906,6 +1916,16 @@ def _build_morphable_pipeline_plan(
             warmup_policy = "balanced_fill"
             cooldown_policy = "opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min"
             chunk_priority_hints = [4, 2] if int(norm.parallel.vpp_degree) > 1 else [4]
+        if is_tail_stage and optimizer_exposed_ratio >= 0.18:
+            family_name = "optimizer_guarded_tail"
+            dispatch_order = "optimizer_tail_guarded"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "optimizer_tail_hide"
+            combined_policy = "serial"
+            p2p_policy = "serial" if optimizer_exposed_ratio >= 0.22 else p2p_policy
+            checkpoint_policy = "guarded_selective" if local_memory_ratio >= 0.80 else checkpoint_policy
+            recompute_modules = list(dict.fromkeys(recompute_modules + ["core_attn"]))
+            chunk_priority_hints = [4, 1] if int(norm.parallel.vpp_degree) > 1 else [4]
         if local_memory_ratio >= 0.84:
             family_name = "memory_guarded"
             dispatch_order = "middle_stage_relief"
@@ -1916,6 +1936,11 @@ def _build_morphable_pipeline_plan(
             recompute_modules = ["core_attn", "mlp"]
             offload_modules = ["core_attn", "attn_proj"] if local_memory_ratio >= 0.90 else []
             chunk_priority_hints = [3, 1] if int(norm.parallel.vpp_degree) > 1 else [3]
+            if is_tail_stage:
+                family_name = "tail_memory_guarded"
+                dispatch_order = "tail_boundary_rewrite"
+                cooldown_policy = "tail_checkpoint_guard"
+                checkpoint_policy = "guarded_selective"
         elif comm_ms >= 0.12 * max(completion_ms, 1.0) or comm_exposure_ratio >= 0.12:
             family_name = "comm_guarded"
             dispatch_order = "balanced_round_robin"

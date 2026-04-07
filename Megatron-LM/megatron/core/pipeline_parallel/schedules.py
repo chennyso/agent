@@ -1085,6 +1085,7 @@ def _resolve_model_chunk_order(
         "stage_local_nonuniform_vpp",
         "boundary_localized",
         "boundary_comm_aware",
+        "optimizer_tail_guarded",
     } and num_model_chunks > 2:
         order = _center_out_order(num_model_chunks)
 
@@ -1101,6 +1102,8 @@ def _resolve_model_chunk_order(
             "drain_with_w",
             "staggered_wgrad",
             "late_wait",
+            "optimizer_tail_hide",
+            "tail_checkpoint_guard",
         } or dispatch_order in {"tail_boundary_rewrite", "zero_bubble_proxy"}:
             order = list(reversed(order))
 
@@ -1146,7 +1149,7 @@ def _resolve_microbatch_order(
         explicit = _parse_explicit_flush_microbatch_ids(explicit_flush_ids, microbatch_ids)
         if explicit:
             return explicit
-        if flush_order_policy in {"reverse_last_group", "tail_min", "opt_prioritized"}:
+        if flush_order_policy in {"reverse_last_group", "tail_min", "opt_prioritized", "optimizer_tail_hide", "tail_checkpoint_guard"}:
             return list(reversed(microbatch_ids))
         if cooldown_policy in {
             "tail_min",
@@ -1155,6 +1158,8 @@ def _resolve_microbatch_order(
             "drain_with_w",
             "staggered_wgrad",
             "late_wait",
+            "optimizer_tail_hide",
+            "tail_checkpoint_guard",
         } or dispatch_order in {"tail_boundary_rewrite", "zero_bubble_proxy"}:
             return list(reversed(microbatch_ids))
 
@@ -1188,7 +1193,7 @@ def _resolve_phase_checkpoint_policy(phase: str, default_value):
         return default_value
     if raw in {"full", "all", "force_full"}:
         return True
-    if raw in {"partial", "off", "none", "disable", "false", "prefer_partial", "selective"}:
+    if raw in {"partial", "off", "none", "disable", "false", "prefer_partial", "selective", "tail_selective", "guarded_selective", "hotspot_selective"}:
         return False
     return default_value
 

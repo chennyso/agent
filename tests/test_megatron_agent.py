@@ -655,7 +655,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             run_root = tmp / "runs"
             program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
 
-            def _fake_run(cmd, capture_output, text, cwd, env=None):
+            def _fake_run(cmd, capture_output=None, text=None, cwd=None, env=None, **_kwargs):
                 torchrun_dir = run_root / "trial_000" / "torchrun_logs" / "test_run_id" / "attempt_0" / "0"
                 torchrun_dir.mkdir(parents=True, exist_ok=True)
                 (torchrun_dir / "stderr.log").write_text(
@@ -693,6 +693,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                                 "",
                                 "--run-root",
                                 str(run_root),
+                                "--no-stream-trial-logs",
                             ],
                         ):
                             with self.assertRaises(SystemExit) as exc_info:
@@ -2055,6 +2056,81 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 if str(proposal.program.metadata.get("program_kind")) == "candidate_stage_local_memory_policy"
             )
             self.assertGreater(len(list(candidate.metadata.get("stage_local_memory_policy") or [])), 0)
+
+    def test_build_optimizer_aware_pipeline_candidate_emits_tail_guarded_execution_semantics(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "optimizer_exposed_ratio": 0.26,
+                "optimizer_ratio": 0.61,
+                "peak_reserved_ratio": 0.85,
+                "stage_tail_ratio": 0.14,
+                "tail_step_jitter_ratio": 0.16,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 22.0},
+                    "1": {"peak_reserved_gib": 28.5},
+                },
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_optimizer_aware_pipeline_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_optimizer_aware_pipeline")
+        self.assertEqual(str(candidate.schedule.dispatch_order or ""), "optimizer_tail_guarded")
+        self.assertEqual(str(candidate.metadata.get("flush_order_policy") or ""), "optimizer_tail_hide")
+        self.assertTrue(bool(candidate.metadata.get("runtime_recompute_modules")))
+        stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
+        self.assertTrue(any(str(item.get("family") or "") == "optimizer_guarded_tail" for item in stage_families))
+
+    def test_build_tail_aware_execution_candidate_emits_heterogeneous_tail_controls(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "bubble_ratio": 0.14,
+                "peak_reserved_ratio": 0.83,
+                "optimizer_exposed_ratio": 0.19,
+                "stage_tail_ratio": 0.16,
+                "tail_step_jitter_ratio": 0.18,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 23.0},
+                    "1": {"peak_reserved_gib": 25.0},
+                },
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_tail_aware_execution_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_tail_aware_execution")
+        self.assertEqual(str(candidate.metadata.get("runtime_checkpoint_boundary_mode") or ""), "tail_stage_guarded")
+        self.assertTrue(bool(candidate.metadata.get("stage_local_vpp_vector")))
+        stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
+        self.assertTrue(any(str(item.get("family") or "") == "tail_guarded" for item in stage_families))
+
+    def test_build_checkpoint_boundary_refinement_candidate_marks_joint_checkpoint_control(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "peak_reserved_ratio": 0.91,
+                "stage_tail_ratio": 0.12,
+                "tail_step_jitter_ratio": 0.15,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 26.0},
+                    "1": {"peak_reserved_gib": 29.4},
+                },
+            },
+            "failure_modes": [{"label": "memory_hotspot"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_checkpoint_boundary_refinement_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_checkpoint_boundary_refinement")
+        self.assertEqual(str(candidate.metadata.get("runtime_checkpoint_boundary_mode") or ""), "hotspot_tail_staggered")
+        self.assertEqual(str(candidate.metadata.get("schedule_steady_checkpoint_policy") or ""), "guarded_selective")
+        self.assertTrue(bool(candidate.metadata.get("stage_local_memory_policy")))
+        stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
+        self.assertTrue(any(str(item.get("family") or "") == "checkpoint_guarded" for item in stage_families))
 
     def test_synthesize_proposals_emits_morphable_pipeline_candidate(self) -> None:
         baseline = default_dense_program("single_g5")

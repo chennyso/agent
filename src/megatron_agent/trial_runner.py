@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -43,6 +44,14 @@ DEFAULT_G5_DATA_PATH = DEFAULT_DATA_PATH
 ProgramLike = Union[MegatronProgram, MegatronStrategy]
 
 
+@dataclass
+class _GpuSnapshot:
+    index: int
+    memory_total_mib: int
+    memory_free_mib: int
+    memory_used_mib: int
+
+
 def _load_args_from_file(path: Optional[str]) -> List[str]:
     if not path:
         return []
@@ -56,6 +65,28 @@ def _load_args_from_file(path: Optional[str]) -> List[str]:
             continue
         args.extend(shlex.split(raw))
     return args
+
+
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None:
+            return default
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _parse_cuda_visible_devices(raw: Optional[str], nproc: int) -> List[int]:
+    if raw:
+        devices = [_safe_int(token) for token in str(raw).split(",")]
+        parsed = [int(token) for token in devices if token is not None]
+        return parsed[: max(int(nproc), 0)] if parsed else list(range(int(nproc)))
+    env_value = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env_value:
+        devices = [_safe_int(token) for token in str(env_value).split(",")]
+        parsed = [int(token) for token in devices if token is not None]
+        return parsed[: max(int(nproc), 0)] if parsed else list(range(int(nproc)))
+    return list(range(max(int(nproc), 0)))
 
 
 def _resolve_megatron_entry(root: Optional[str], entry: str) -> Path:
@@ -264,6 +295,63 @@ def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
         "stderr_log": str(trial_dir / "stderr.log"),
         "launch_plan_log": str(trial_dir / "launch_plan.json"),
     }
+
+
+def _query_gpu_snapshots() -> List[_GpuSnapshot]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,memory.total,memory.free,memory.used",
+        "--format=csv,noheader,nounits",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return []
+    snapshots: List[_GpuSnapshot] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        index = _safe_int(parts[0])
+        total = _safe_int(parts[1])
+        free = _safe_int(parts[2])
+        used = _safe_int(parts[3])
+        if None in {index, total, free, used}:
+            continue
+        snapshots.append(
+            _GpuSnapshot(
+                index=int(index),
+                memory_total_mib=int(total),
+                memory_free_mib=int(free),
+                memory_used_mib=int(used),
+            )
+        )
+    return snapshots
+
+
+def _preflight_gpu_guard(args: argparse.Namespace) -> Optional[str]:
+    if bool(getattr(args, "allow_busy_gpus", False)):
+        return None
+    snapshots = _query_gpu_snapshots()
+    if not snapshots:
+        return None
+    selected = set(_parse_cuda_visible_devices(getattr(args, "cuda_visible_devices", None), int(args.nproc)))
+    issues: List[str] = []
+    min_free_mib = int(getattr(args, "min_free_gpu_memory_mib", 28672) or 0)
+    busy_used_mib = int(getattr(args, "busy_gpu_memory_threshold_mib", 2048) or 0)
+    for snap in snapshots:
+        if snap.index not in selected:
+            continue
+        if snap.memory_free_mib < min_free_mib or snap.memory_used_mib > busy_used_mib:
+            issues.append(
+                f"gpu{snap.index}: free={snap.memory_free_mib}MiB used={snap.memory_used_mib}MiB total={snap.memory_total_mib}MiB"
+            )
+    if not issues:
+        return None
+    return (
+        "GPU preflight rejected busy devices. "
+        f"Selected GPUs={sorted(selected)} require free>={min_free_mib}MiB and used<={busy_used_mib}MiB. "
+        "Observed: " + "; ".join(issues)
+    )
 
 
 def _consume_stream(
@@ -985,6 +1073,11 @@ def _launcher_env_overrides(
             "MODEL_NAME": str(program.model.model_name),
         }
     )
+    if str(env.get("PYTORCH_CUDA_ALLOC_CONF") or "").strip() == "":
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    cuda_visible_devices = str(getattr(args, "cuda_visible_devices", "") or "").strip()
+    if cuda_visible_devices:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     if args.preset:
         env["PRESET"] = str(args.preset)
     return env
@@ -1167,6 +1260,9 @@ def run_trial(
             metrics["returncode"] = 0
             metrics["oom"] = False
             return metrics
+        preflight_error = _preflight_gpu_guard(args)
+        if preflight_error:
+            raise RuntimeError(preflight_error)
         _prepare_trial_artifact_dirs(output_dirs, observability)
         stream_output = bool(getattr(args, "stream_trial_logs", True))
         print(
@@ -1296,6 +1392,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-tp-comm-overlap", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     add_observability_args(parser)
+    parser.add_argument("--cuda-visible-devices", type=str, default=None)
+    parser.add_argument("--allow-busy-gpus", action="store_true")
+    parser.add_argument("--min-free-gpu-memory-mib", type=int, default=28672)
+    parser.add_argument("--busy-gpu-memory-threshold-mib", type=int, default=2048)
     parser.add_argument("--transformer-impl", type=str, default="auto")
     parser.add_argument("--attention-backend", type=str, default="auto")
     parser.add_argument("--train-iters", type=int, default=10)

@@ -799,6 +799,33 @@ def _local_parallel_by_stage(program: MegatronProgram) -> Dict[int, Any]:
     return mapped
 
 
+def _stage_family_hint_map(program: MegatronProgram) -> Dict[int, Dict[str, Any]]:
+    norm = program.normalized()
+    hint_map: Dict[int, Dict[str, Any]] = {}
+    for item in list((norm.metadata or {}).get("morphable_stage_families") or []):
+        stage_index = _safe_int((item or {}).get("stage_index"))
+        if stage_index is None:
+            continue
+        hint_map[int(stage_index)] = dict(item or {})
+    for subgraph in (norm.strategy_ir.apipe or []):
+        stage_index = int(subgraph.stage_index)
+        hint_map.setdefault(
+            stage_index,
+            {
+                "stage_index": stage_index,
+                "family": "balanced_interleave",
+            },
+        )
+    return hint_map
+
+
+def _sorted_stage_family_hints(hint_map: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        dict(hint_map[stage_index])
+        for stage_index in sorted(hint_map)
+    ]
+
+
 def _nonuniform_vpp_vector_from_evidence(
     context_record: Dict[str, Any],
     *,
@@ -1762,7 +1789,7 @@ def _build_verified_strategy_template_library(
             "description": "high-memory stages use selective recompute or offload while preserving critical-path stages",
             "trigger_conditions": ["memory_hotspot", "memory_skew", "memory_constrained"],
             "supported_batch_profiles": ["memory_constrained", "long_context", "moe_heavy"],
-            "preferred_kinds": ["candidate_stage_local_memory_policy", "candidate_morphable_pipeline", "candidate_memory_relief"],
+            "preferred_kinds": ["candidate_offload_first_refinement", "candidate_stage_local_memory_policy", "candidate_morphable_pipeline", "candidate_memory_relief"],
         },
         {
             "template_id": "D_long_context_conservative",
@@ -1781,6 +1808,33 @@ def _build_verified_strategy_template_library(
             "trigger_conditions": ["tail_heavy", "memory_hotspot", "comm_exposed"],
             "supported_batch_profiles": ["normal", "memory_constrained", "long_context"],
             "preferred_kinds": ["candidate_boundary_semantic_memory", "candidate_boundary_semantic_tail", "candidate_morphable_pipeline"],
+        },
+        {
+            "template_id": "F_optimizer_exposure_relief",
+            "label": "Optimizer-aware relief",
+            "category": "execution",
+            "description": "reduce optimizer exposure on the critical path with tail-guarded overlap and flush control",
+            "trigger_conditions": ["optimizer_exposed", "tail_heavy", "pipeline_wait"],
+            "supported_batch_profiles": ["normal", "memory_constrained"],
+            "preferred_kinds": ["candidate_optimizer_aware_pipeline", "candidate_tail_aware_execution", "candidate_morphable_pipeline"],
+        },
+        {
+            "template_id": "G_tail_stage_heterogeneous",
+            "label": "Tail-stage heterogeneous execution",
+            "category": "tail",
+            "description": "tail stages use more conservative VPP, checkpoint, and cooldown policies than middle stages",
+            "trigger_conditions": ["tail_heavy", "tail_jitter", "pipeline_wait"],
+            "supported_batch_profiles": ["normal", "memory_constrained", "long_context"],
+            "preferred_kinds": ["candidate_tail_aware_execution", "candidate_nonuniform_vpp_shape", "candidate_runtime_guided_partition"],
+        },
+        {
+            "template_id": "H_checkpoint_boundary_joint",
+            "label": "Checkpoint-boundary joint refinement",
+            "category": "checkpoint",
+            "description": "checkpoint and recompute boundaries are refined jointly with PP/VPP to expand the feasible region",
+            "trigger_conditions": ["memory_hotspot", "tail_heavy", "optimizer_exposed"],
+            "supported_batch_profiles": ["memory_constrained", "long_context"],
+            "preferred_kinds": ["candidate_checkpoint_boundary_refinement", "candidate_offload_first_refinement", "candidate_stage_local_memory_policy"],
         },
     ]
     for definition in definitions:
@@ -1838,6 +1892,7 @@ def _select_verified_strategy_template(
     peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
     stage_tail_ratio = float(runtime.get("stage_tail_ratio") or 0.0)
     comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
     scores: List[Dict[str, Any]] = []
     for item in template_library:
         score = 0.0
@@ -1850,6 +1905,10 @@ def _select_verified_strategy_template(
             if str(item.get("category") or "") in {"memory", "boundary"}:
                 score += 2.5
                 reasons.append("memory pressure favors memory or boundary guarded templates")
+        if ("memory_hotspot" in active_labels or peak_reserved_ratio >= 0.86) and stage_tail_ratio >= 0.10:
+            if str(item.get("template_id") or "") == "C_memory_guarded_offload":
+                score += 3.0
+                reasons.append("tail-heavy memory pressure favors offload-first local refinement before global rewrites")
         if "communication_drag" in active_labels or comm_exposure_ratio >= 0.12:
             if str(item.get("category") or "") in {"partition", "boundary"}:
                 score += 2.0
@@ -1858,14 +1917,18 @@ def _select_verified_strategy_template(
             if str(item.get("template_id") or "") == "D_long_context_conservative":
                 score += 4.0
                 reasons.append("long-context batches should use conservative VPP or CP relief")
+        if optimizer_exposed_ratio >= 0.18:
+            if str(item.get("category") or "") in {"execution", "tail", "checkpoint"}:
+                score += 2.5
+                reasons.append("optimizer exposure favors execution-semantic relief over pure bubble tuning")
         if bubble_ratio >= 0.10:
             if str(item.get("category") or "") in {"vpp", "partition"}:
                 score += 1.5
                 reasons.append("bubble pressure favors VPP or partition refinement")
         if stage_tail_ratio >= 0.12:
-            if str(item.get("category") or "") == "boundary":
+            if str(item.get("category") or "") in {"boundary", "tail", "execution", "checkpoint"}:
                 score += 1.5
-                reasons.append("tail-heavy execution favors conservative edge-stage handling")
+                reasons.append("tail-heavy execution favors conservative edge-stage handling and checkpoint control")
         scores.append(
             {
                 "template_id": str(item.get("template_id") or ""),
@@ -2017,6 +2080,7 @@ def _resolve_replan_decision(
     memory_worsened = float(runtime.get("peak_reserved_ratio") or 0.0) > float(previous_runtime.get("peak_reserved_ratio") or 0.0) + 0.08
     bubble_worsened = float(runtime.get("bubble_ratio") or 0.0) > max(float(previous_runtime.get("bubble_ratio") or 0.0), 0.08)
     stage_imbalance = any(str(item.get("label")) == "compute_imbalance" for item in (context_record.get("failure_modes") or []))
+    memory_hotspot = any(str(item.get("label")) == "memory_hotspot" for item in (context_record.get("failure_modes") or []))
     tail_heavy = any(str(item.get("label")) == "tail_heavy" for item in (context_record.get("derived_bottlenecks") or []))
     comm_exposed = any(str(item.get("label")) in {"comm_exposed", "topology_mismatch"} for item in (context_record.get("derived_bottlenecks") or []))
 
@@ -2029,7 +2093,7 @@ def _resolve_replan_decision(
         trigger = "workload_drift" if seq_changed else "bubble_spike"
         rationale = "prefer low-cost pipe adaptation before touching local or global structure"
         expected_switch_cost = 0.06
-    if memory_worsened or any(str(item.get("label")) == "memory_hotspot" for item in (context_record.get("failure_modes") or [])):
+    if memory_worsened or memory_hotspot:
         scope = "local_parallel"
         trigger = "memory_pressure"
         rationale = "promote CP/FSDP relief on hotspot subgraphs before changing PP skeleton"
@@ -2039,7 +2103,12 @@ def _resolve_replan_decision(
         trigger = "topology_shift" if cross_node_worsened else "stage_imbalance"
         rationale = "communication drift or persistent imbalance requires broader repartitioning"
         expected_switch_cost = 0.28 if cross_node_worsened else 0.14
-    if tail_heavy:
+    if tail_heavy and memory_hotspot:
+        scope = "local_parallel"
+        trigger = "tail_memory_hotspot"
+        rationale = "tail-heavy execution under memory pressure should first try offload/checkpoint refinement before global PP rewrites"
+        expected_switch_cost = 0.12
+    elif tail_heavy:
         scope = "skeleton"
         trigger = "tail_drift"
         rationale = "tail-heavy execution suggests PP boundaries or virtual chunks should be rebalanced before smaller tweaks"
@@ -2148,6 +2217,10 @@ def _build_summary_payload(
     external_inputs: Optional[Dict[str, Any]] = None,
     strategy_template_library: Optional[List[Dict[str, Any]]] = None,
     template_selection_decision: Optional[Dict[str, Any]] = None,
+    second_stage_runtime_summary: Optional[Dict[str, Any]] = None,
+    second_stage_context_record: Optional[Dict[str, Any]] = None,
+    second_stage_replan_decision: Optional[Dict[str, Any]] = None,
+    second_stage_bottleneck_signature: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     candidate_entries = _candidate_entries(candidate_manifest)
     compile_success_rate = None
@@ -2190,6 +2263,10 @@ def _build_summary_payload(
         "external_inputs": dict(external_inputs or {}),
         "strategy_template_library": list(strategy_template_library or []),
         "template_selection_decision": dict(template_selection_decision or {}),
+        "second_stage_runtime_summary": dict(second_stage_runtime_summary or {}),
+        "second_stage_context_record": dict(second_stage_context_record or {}),
+        "second_stage_replan_decision": dict(second_stage_replan_decision or {}),
+        "second_stage_bottleneck_signature": dict(second_stage_bottleneck_signature or {}),
         "recommended_execution_order": [entry["config_name"] for entry in candidate_manifest],
         "program_bank": program_bank.to_dict(),
         "candidate_generation_count": len(candidate_entries),
@@ -2946,7 +3023,7 @@ def _build_pp_scaleout_candidate(program: MegatronProgram) -> Optional[MegatronP
     if candidate is None:
         return None
     candidate.metadata["program_kind"] = "candidate_pp_scaleout"
-    candidate.metadata["priority_rank"] = 30
+    candidate.metadata["priority_rank"] = 24
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3289,7 +3366,7 @@ def _build_dual_node_pp8_scaleout_candidate(
         return None
     candidate.metadata["program_kind"] = "candidate_dual_node_pp8_scaleout"
     candidate.metadata["bubble_ratio"] = round(float(bubble_ratio), 4)
-    candidate.metadata["priority_rank"] = 22 if bubble_ratio >= 0.08 else 34
+    candidate.metadata["priority_rank"] = 22 if bubble_ratio >= 0.08 else 24
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3441,7 +3518,7 @@ def _build_stage_local_vpp_shape_candidate(
             )
 
     candidate.metadata["program_kind"] = "candidate_nonuniform_vpp_shape"
-    candidate.metadata["priority_rank"] = 44
+    candidate.metadata["priority_rank"] = 21
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3536,6 +3613,389 @@ def _build_stage_local_memory_policy_candidate(
     )
     candidate.metadata["program_kind"] = "candidate_stage_local_memory_policy"
     candidate.metadata["priority_rank"] = 42
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_offload_first_refinement_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failures = list((context_record or {}).get("failure_modes") or [])
+    failure_labels = {str(item.get("label") or "") for item in failures}
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    optimizer_ratio = float(runtime.get("optimizer_ratio") or 0.0)
+    tail_jitter_ratio = float(runtime.get("tail_step_jitter_ratio") or 0.0)
+    if (
+        "memory_hotspot" not in failure_labels
+        and peak_reserved_ratio < 0.84
+        and optimizer_ratio < 0.40
+    ):
+        return None
+
+    candidate = _clone_program(program)
+    stage_ids: List[int] = []
+    if candidate.strategy_ir.apipe:
+        stage_ids.append(int(candidate.strategy_ir.apipe[0].stage_index))
+        if len(candidate.strategy_ir.apipe) > 1:
+            stage_ids.append(int(candidate.strategy_ir.apipe[-1].stage_index))
+    stage_ids = sorted(set(stage_ids))
+    if not stage_ids:
+        stage_ids = [0]
+
+    local_by_subgraph = {str(item.subgraph): item for item in (candidate.strategy_ir.local_parallel or [])}
+    selected_policies: List[Dict[str, Any]] = []
+    runtime_offload_modules: List[str] = []
+    runtime_recompute_modules: List[str] = []
+    touched = False
+    for subgraph in (candidate.strategy_ir.apipe or []):
+        stage_id = int(subgraph.stage_index)
+        if stage_id not in stage_ids:
+            continue
+        local = local_by_subgraph.get(str(subgraph.name))
+        if local is None:
+            continue
+        local.fsdp_scope = "selective"
+        local.offload_policy = "selective_overlap_aware"
+        local.reshard_policy = "intra_node"
+        if int(local.vpp_degree) > 1:
+            local.vpp_degree = 1
+        touched = True
+        stage_offload_modules = ["core_attn", "attn_proj"]
+        if stage_id == stage_ids[-1] or tail_jitter_ratio >= 0.20:
+            stage_offload_modules.append("mlp")
+        stage_recompute_modules = ["core_attn"]
+        if peak_reserved_ratio >= 0.88:
+            stage_recompute_modules.append("mlp")
+        for module in stage_offload_modules:
+            if module not in runtime_offload_modules:
+                runtime_offload_modules.append(module)
+        for module in stage_recompute_modules:
+            if module not in runtime_recompute_modules:
+                runtime_recompute_modules.append(module)
+        selected_policies.append(
+            {
+                "stage_id": stage_id,
+                "subgraph": str(subgraph.name),
+                "checkpoint_policy": "selective",
+                "remat_policy": "selective",
+                "prefetch_policy": "guarded",
+                "runtime_recompute_modules": list(stage_recompute_modules),
+                "runtime_offload_modules": list(stage_offload_modules),
+                "reason": "offload-first refinement protects hotspot and tail-sensitive stages before broader PP/VPP rewrites",
+            }
+        )
+
+    if not touched:
+        return None
+
+    if int(candidate.parallel.vpp_degree) > 1 and peak_reserved_ratio >= 0.86:
+        candidate.parallel.vpp_degree = 1
+        candidate.layout.vpp_degree = 1
+        candidate.layout.pipeline_layout = None
+        candidate.schedule.template = "fixed_1f1b"
+        candidate.schedule.skeleton = "fixed_1f1b"
+        candidate.schedule.microbatch_group_size_per_vp_stage = None
+
+    candidate.metadata["stage_local_memory_policy"] = selected_policies
+    candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+    candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
+    candidate.metadata["runtime_recompute_granularity"] = "selective"
+    candidate.metadata["runtime_enable_recompute_activations"] = True
+    candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+    candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
+    candidate.metadata["schedule_steady_checkpoint_policy"] = "selective"
+    candidate.metadata["schedule_warmup_combined_policy"] = "serial"
+    candidate.metadata["schedule_steady_combined_policy"] = "serial"
+    candidate.metadata["schedule_cooldown_p2p_policy"] = "serial"
+    candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
+    candidate.metadata["runtime_memory_policy_mode"] = "offload_first_hotspot_relief"
+    candidate.metadata["runtime_memory_expected_effect"] = (
+        "reduce edge-stage activation pressure and optimizer exposure before global PP/VPP reshaping"
+    )
+    candidate.metadata["runtime_checkpoint_boundary_mode"] = "edge_guarded_selective"
+    candidate.metadata["program_kind"] = "candidate_offload_first_refinement"
+    candidate.metadata["priority_rank"] = 14
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_optimizer_aware_pipeline_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+    optimizer_ratio = float(runtime.get("optimizer_ratio") or 0.0)
+    tail_ratio = max(
+        float(runtime.get("stage_tail_ratio") or 0.0),
+        float(runtime.get("tail_step_jitter_ratio") or 0.0),
+    )
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    if optimizer_exposed_ratio < 0.18 and optimizer_ratio < 0.45:
+        return None
+
+    candidate = _clone_program(program)
+    candidate.schedule.dispatch_order = "optimizer_tail_guarded"
+    candidate.strategy_ir.pipe.warmup_policy = "balanced_fill"
+    candidate.strategy_ir.pipe.cooldown_policy = "optimizer_tail_hide"
+    candidate.metadata["flush_order_policy"] = "optimizer_tail_hide"
+    candidate.metadata["schedule_cooldown_p2p_policy"] = "serial"
+    candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
+    if optimizer_exposed_ratio >= 0.24:
+        candidate.metadata["schedule_steady_combined_policy"] = "serial"
+
+    runtime_recompute_modules: List[str] = []
+    if peak_reserved_ratio >= 0.84 or tail_ratio >= 0.10:
+        runtime_recompute_modules.append("core_attn")
+        if peak_reserved_ratio >= 0.88:
+            runtime_recompute_modules.append("mlp")
+        candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
+        candidate.metadata["schedule_steady_checkpoint_policy"] = "guarded_selective"
+        candidate.metadata["runtime_enable_recompute_activations"] = True
+        candidate.metadata["runtime_recompute_granularity"] = "selective"
+        candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+        candidate.metadata["runtime_checkpoint_boundary_mode"] = "optimizer_tail_guarded"
+
+    hint_map = _stage_family_hint_map(candidate)
+    tail_stage = max(hint_map) if hint_map else 0
+    tail_hint = hint_map.setdefault(tail_stage, {"stage_index": tail_stage, "family": "balanced_interleave"})
+    tail_hint.update(
+        {
+            "family": "optimizer_guarded_tail",
+            "dispatch_order": "optimizer_tail_guarded",
+            "warmup_policy": "balanced_fill",
+            "cooldown_policy": "optimizer_tail_hide",
+            "checkpoint_policy": "guarded_selective" if runtime_recompute_modules else "tail_selective",
+            "p2p_policy": "serial" if optimizer_exposed_ratio >= 0.22 else "",
+            "combined_policy": "serial",
+            "chunk_priority_hints": [4, 2] if int(candidate.parallel.vpp_degree) > 1 else [4],
+        }
+    )
+    candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
+    candidate.metadata["runtime_optimizer_policy_mode"] = "tail_hidden_overlap"
+    candidate.metadata["runtime_optimizer_expected_effect"] = (
+        "reduce optimizer exposure on the tail-stage critical path before larger PP/VPP repartitioning"
+    )
+    candidate.metadata["runtime_optimizer_target_exposed_ratio"] = round(
+        max(optimizer_exposed_ratio - 0.08, optimizer_exposed_ratio * 0.70),
+        4,
+    )
+    candidate.metadata["program_kind"] = "candidate_optimizer_aware_pipeline"
+    candidate.metadata["priority_rank"] = 12
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_tail_aware_execution_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    if int(program.parallel.pp_degree) <= 1:
+        return None
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failure_labels = {
+        str(item.get("label") or "")
+        for item in list((context_record or {}).get("failure_modes") or [])
+    }
+    derived_labels = {
+        str(item.get("label") or "")
+        for item in list((context_record or {}).get("derived_bottlenecks") or [])
+    }
+    bubble_ratio = float(runtime.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+    tail_ratio = max(
+        float(runtime.get("stage_tail_ratio") or 0.0),
+        float(runtime.get("tail_step_jitter_ratio") or 0.0),
+    )
+    if "tail_heavy" not in failure_labels and "tail_heavy" not in derived_labels and tail_ratio < 0.12:
+        return None
+
+    candidate = _clone_program(program)
+    stage_count = int(candidate.partition.num_stages)
+    local_by_stage = _local_parallel_by_stage(candidate)
+    base_vector = [
+        int(((local_by_stage.get(stage_id)).vpp_degree if stage_id in local_by_stage else int(candidate.parallel.vpp_degree)))
+        for stage_id in range(stage_count)
+    ]
+    target_vector = list(base_vector)
+    if stage_count >= 1:
+        target_vector[-1] = 1
+    if stage_count >= 2 and bubble_ratio >= 0.10 and peak_reserved_ratio < 0.86:
+        middle_stage_ids = list(range(1, max(stage_count - 1, 1)))
+        if not middle_stage_ids:
+            middle_stage_ids = [0]
+        for stage_id in middle_stage_ids:
+            target_vector[stage_id] = max(int(target_vector[stage_id]), 2)
+
+    if target_vector != base_vector and any(int(value) > 1 for value in target_vector):
+        candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in target_vector]
+        candidate.metadata["preserve_stage_local_vpp"] = True
+        target_global_vpp = min(max(max(int(value) for value in target_vector), int(candidate.parallel.vpp_degree)), 2)
+        candidate.parallel.vpp_degree = int(target_global_vpp)
+        candidate.layout.vpp_degree = int(target_global_vpp)
+        if int(target_global_vpp) > 1:
+            stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+            counts = _stage_local_virtual_counts(
+                stage_layers,
+                target_vector,
+                global_vpp=int(target_global_vpp),
+                focus="tail-aware",
+            )
+            candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+            candidate.schedule.skeleton = "stage_aware_grouped"
+            if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
+                candidate.schedule.template = "interleaved_grouped_g2"
+            candidate.schedule.microbatch_group_size_per_vp_stage = max(
+                int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+                2,
+            )
+    candidate.schedule.dispatch_order = "tail_boundary_rewrite"
+    candidate.strategy_ir.pipe.warmup_policy = "balanced_fill"
+    candidate.strategy_ir.pipe.cooldown_policy = "tail_checkpoint_guard"
+    candidate.metadata["flush_order_policy"] = "tail_checkpoint_guard"
+
+    runtime_recompute_modules = ["core_attn"]
+    if peak_reserved_ratio >= 0.88:
+        runtime_recompute_modules.append("mlp")
+    candidate.metadata["runtime_enable_recompute_activations"] = True
+    candidate.metadata["runtime_recompute_granularity"] = "selective"
+    candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+    candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
+    candidate.metadata["schedule_steady_checkpoint_policy"] = "tail_selective"
+    if peak_reserved_ratio >= 0.84 or optimizer_exposed_ratio >= 0.18:
+        candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
+    candidate.metadata["runtime_checkpoint_boundary_mode"] = "tail_stage_guarded"
+    candidate.metadata["runtime_memory_policy_mode"] = "tail_guarded_selective_recompute"
+
+    hint_map = _stage_family_hint_map(candidate)
+    tail_stage = max(hint_map) if hint_map else 0
+    tail_hint = hint_map.setdefault(tail_stage, {"stage_index": tail_stage, "family": "balanced_interleave"})
+    tail_hint.update(
+        {
+            "family": "tail_guarded",
+            "dispatch_order": "tail_boundary_rewrite",
+            "warmup_policy": "balanced_fill",
+            "cooldown_policy": "tail_checkpoint_guard",
+            "checkpoint_policy": "tail_selective",
+            "combined_policy": "serial" if peak_reserved_ratio >= 0.84 or optimizer_exposed_ratio >= 0.18 else "",
+            "chunk_priority_hints": [1],
+        }
+    )
+    for stage_id in range(1, max(stage_count - 1, 1)):
+        if stage_id >= tail_stage:
+            continue
+        if stage_id < len(target_vector) and int(target_vector[stage_id]) > 1:
+            hint_map.setdefault(stage_id, {"stage_index": stage_id, "family": "balanced_interleave"}).update(
+                {
+                    "family": "heterogeneous_middle_relief",
+                    "dispatch_order": "middle_stage_relief",
+                    "warmup_policy": "balanced_fill",
+                    "cooldown_policy": "tail_min",
+                    "chunk_priority_hints": [3, 1],
+                }
+            )
+    candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
+    candidate.metadata["program_kind"] = "candidate_tail_aware_execution"
+    candidate.metadata["priority_rank"] = 11
+    return _sync_batch_plan_metadata(candidate)
+
+
+def _build_checkpoint_boundary_refinement_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failure_labels = {
+        str(item.get("label") or "")
+        for item in list((context_record or {}).get("failure_modes") or [])
+    }
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    tail_ratio = max(
+        float(runtime.get("stage_tail_ratio") or 0.0),
+        float(runtime.get("tail_step_jitter_ratio") or 0.0),
+    )
+    if "memory_hotspot" not in failure_labels and peak_reserved_ratio < 0.84 and tail_ratio < 0.10:
+        return None
+
+    candidate = _clone_program(program)
+    stage_windows = {
+        int(stage_id): dict(values or {})
+        for stage_id, values in dict(runtime.get("stage_window_summary") or {}).items()
+        if _safe_int(stage_id) is not None
+    }
+    hot_stage_ids = sorted(
+        stage_windows,
+        key=lambda stage_id: float((stage_windows.get(stage_id) or {}).get("peak_reserved_gib") or 0.0),
+        reverse=True,
+    )[:2]
+    if candidate.strategy_ir.apipe:
+        tail_stage = int(candidate.strategy_ir.apipe[-1].stage_index)
+        if tail_stage not in hot_stage_ids:
+            hot_stage_ids.append(tail_stage)
+    hot_stage_ids = sorted(set(int(stage_id) for stage_id in hot_stage_ids))
+    if not hot_stage_ids:
+        hot_stage_ids = [0]
+
+    selected_policies: List[Dict[str, Any]] = []
+    runtime_recompute_modules: List[str] = []
+    runtime_offload_modules: List[str] = []
+    hint_map = _stage_family_hint_map(candidate)
+    for stage_id in hot_stage_ids:
+        local_ratio = 0.0
+        stage_window = dict(stage_windows.get(int(stage_id)) or {})
+        peak_reserved_gib = float(stage_window.get("peak_reserved_gib") or 0.0)
+        if float(candidate.constraints.memory_budget_gb or candidate.cluster.device_memory_gb or 0.0) > 0.0:
+            local_ratio = peak_reserved_gib / float(candidate.constraints.memory_budget_gb or candidate.cluster.device_memory_gb or 1.0)
+        recompute_modules = ["core_attn"]
+        if peak_reserved_ratio >= 0.88 or local_ratio >= 0.88:
+            recompute_modules.append("mlp")
+        offload_modules = ["core_attn"] if peak_reserved_ratio >= 0.90 or local_ratio >= 0.90 else []
+        for module in recompute_modules:
+            if module not in runtime_recompute_modules:
+                runtime_recompute_modules.append(module)
+        for module in offload_modules:
+            if module not in runtime_offload_modules:
+                runtime_offload_modules.append(module)
+        selected_policies.append(
+            {
+                "stage_id": int(stage_id),
+                "checkpoint_policy": "guarded_selective",
+                "remat_policy": "selective",
+                "prefetch_policy": "guarded",
+                "runtime_recompute_modules": list(recompute_modules),
+                "runtime_offload_modules": list(offload_modules),
+                "reason": "checkpoint boundaries should be tightened around hotspot and tail-sensitive stages before widening VPP",
+            }
+        )
+        hint_map.setdefault(int(stage_id), {"stage_index": int(stage_id), "family": "balanced_interleave"}).update(
+            {
+                "family": "checkpoint_guarded",
+                "dispatch_order": "tail_boundary_rewrite" if int(stage_id) == max(hot_stage_ids) else "middle_stage_relief",
+                "warmup_policy": "balanced_fill",
+                "cooldown_policy": "tail_checkpoint_guard" if int(stage_id) == max(hot_stage_ids) else "tail_min",
+                "checkpoint_policy": "guarded_selective",
+                "combined_policy": "serial",
+            }
+        )
+
+    candidate.metadata["stage_local_memory_policy"] = selected_policies
+    candidate.metadata["runtime_enable_recompute_activations"] = True
+    candidate.metadata["runtime_recompute_granularity"] = "selective"
+    candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+    if runtime_offload_modules:
+        candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+        candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
+    candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
+    candidate.metadata["schedule_steady_checkpoint_policy"] = "guarded_selective"
+    candidate.metadata["schedule_warmup_combined_policy"] = "serial"
+    candidate.metadata["schedule_steady_combined_policy"] = "serial"
+    candidate.metadata["runtime_memory_policy_mode"] = "checkpoint_boundary_joint_refinement"
+    candidate.metadata["runtime_checkpoint_boundary_mode"] = "hotspot_tail_staggered"
+    candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
+    candidate.metadata["program_kind"] = "candidate_checkpoint_boundary_refinement"
+    candidate.metadata["priority_rank"] = 13
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3773,7 +4233,7 @@ def _build_boundary_semantic_schedule_candidates(
             candidate.strategy_ir.pipe.warmup_policy = "comm_shy"
             candidate.strategy_ir.pipe.cooldown_policy = "late_wait"
             candidate.metadata["program_kind"] = "candidate_boundary_semantic_comm"
-            candidate.metadata["priority_rank"] = 44
+            candidate.metadata["priority_rank"] = 23
         elif semantic == "tail-aware":
             if int(candidate.parallel.vpp_degree) == 1:
                 counts = _pp_vpp_layout_counts(
@@ -3792,7 +4252,7 @@ def _build_boundary_semantic_schedule_candidates(
             candidate.metadata["schedule_cooldown_p2p_policy"] = "serial"
             candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
             candidate.metadata["program_kind"] = "candidate_boundary_semantic_tail"
-            candidate.metadata["priority_rank"] = 45
+            candidate.metadata["priority_rank"] = 24
         elif semantic == "memory-aware":
             left_stage = int(boundary.get("left_stage") or 0)
             right_stage = int(boundary.get("right_stage") or 0)
@@ -3817,7 +4277,7 @@ def _build_boundary_semantic_schedule_candidates(
             candidate.strategy_ir.pipe.warmup_policy = "default"
             candidate.strategy_ir.pipe.cooldown_policy = "default"
             candidate.metadata["program_kind"] = "candidate_boundary_semantic_memory"
-            candidate.metadata["priority_rank"] = 41
+            candidate.metadata["priority_rank"] = 21
         else:
             continue
         candidates.append(_sync_batch_plan_metadata(candidate))
@@ -4039,7 +4499,7 @@ def _build_runtime_branch_candidates(
         priority_rank = int((branch or {}).get("priority_rank") or 40)
         candidate: Optional[MegatronProgram] = None
         if builder == "stage_local_vpp_shape":
-            candidate = _build_stage_local_vpp_shape_candidate(baseline, context_record)
+            continue
         elif builder == "stage_local_memory_policy":
             candidate = _build_stage_local_memory_policy_candidate(baseline, context_record)
             if candidate is not None and branch_id == "branch_moe_skew_memory_policy":
@@ -4244,13 +4704,21 @@ def _build_local_parallel_candidates(
                 candidates.append(_annotate_local_parallel(hybrid_candidate, context_record))
 
     if rewrite.allow_asymmetric_vpp or rewrite.allow_stage_aware_schedule:
-        for seed in seeds:
-            stage_local_vpp = _build_stage_local_vpp_shape_candidate(seed, context_record)
-            if stage_local_vpp is not None:
-                candidates.append(_annotate_local_parallel(stage_local_vpp, context_record))
+        stage_local_vpp = _build_stage_local_vpp_shape_candidate(baseline, context_record)
+        if stage_local_vpp is not None:
+            candidates.append(_annotate_local_parallel(stage_local_vpp, context_record))
+        tail_aware = _build_tail_aware_execution_candidate(baseline, context_record)
+        if tail_aware is not None:
+            candidates.append(_annotate_local_parallel(tail_aware, context_record))
 
     if rewrite.prefer_memory_relief or "memory_hotspot" in failure_labels or "memory_skew" in failure_labels:
         for seed in seeds:
+            checkpoint_refinement = _build_checkpoint_boundary_refinement_candidate(seed, context_record)
+            if checkpoint_refinement is not None:
+                candidates.append(_annotate_local_parallel(checkpoint_refinement, context_record))
+            offload_first = _build_offload_first_refinement_candidate(seed, context_record)
+            if offload_first is not None:
+                candidates.append(_annotate_local_parallel(offload_first, context_record))
             local_memory_policy = _build_stage_local_memory_policy_candidate(seed, context_record)
             if local_memory_policy is not None:
                 candidates.append(_annotate_local_parallel(local_memory_policy, context_record))
@@ -4275,6 +4743,9 @@ def _build_schedule_candidates(
     runtime_guided = _build_runtime_guided_schedule(baseline, runtime_summary)
     if runtime_guided is not None:
         candidates.append(_annotate_local_parallel(runtime_guided, context_record))
+    optimizer_aware = _build_optimizer_aware_pipeline_candidate(baseline, context_record)
+    if optimizer_aware is not None:
+        candidates.append(_annotate_local_parallel(optimizer_aware, context_record))
     if rewrite.allow_torchtitan_schedule_sandbox:
         zero_bubble = _build_torchtitan_zero_bubble_schedule_candidate(baseline, runtime_summary, context_record)
         if zero_bubble is not None:
@@ -4300,15 +4771,14 @@ def _build_schedule_candidates(
             scaled = _build_pp_vpp_scaleout_candidate(skeleton, runtime_summary)
             if scaled is not None:
                 candidates.append(_annotate_local_parallel(scaled, context_record))
-    for seed in [baseline] + list(skeletons):
-        for boundary_candidate in _build_boundary_semantic_schedule_candidates(seed, context_record):
-            if str(boundary_candidate.schedule.template or "") not in allowed_templates:
-                continue
-            candidates.append(_annotate_local_parallel(boundary_candidate, context_record))
-        for pipe_candidate in _build_pipe_search_space_candidates(seed, runtime_summary, context_record):
-            if str(pipe_candidate.schedule.template or "") not in allowed_templates:
-                continue
-            candidates.append(_annotate_local_parallel(pipe_candidate, context_record))
+    for boundary_candidate in _build_boundary_semantic_schedule_candidates(baseline, context_record):
+        if str(boundary_candidate.schedule.template or "") not in allowed_templates:
+            continue
+        candidates.append(_annotate_local_parallel(boundary_candidate, context_record))
+    for pipe_candidate in _build_pipe_search_space_candidates(baseline, runtime_summary, context_record):
+        if str(pipe_candidate.schedule.template or "") not in allowed_templates:
+            continue
+        candidates.append(_annotate_local_parallel(pipe_candidate, context_record))
     return candidates
 
 
@@ -4359,8 +4829,8 @@ def _build_agent_proposals(
         )
     elif str(replan_decision.get("scope")) == "local_parallel":
         ordered_pool = (
-            [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says local policy relief is worth trying before broader search")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
-            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
+            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says local policy relief is worth trying before broader search")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
             + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"]
             + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in schedules]
             + [(program, "skeleton", hinted_rationales.get("skeleton", "persistent local failures justify skeleton repartitioning")) for program in skeletons]
@@ -4466,6 +4936,54 @@ def _synthesize_programs(
     return [proposal.program for proposal in proposals], rejected
 
 
+def _real_trial_runtime_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    trace_summary = dict(metrics.get("trace_summary") or {})
+    if trace_summary:
+        return trace_summary
+    summary: Dict[str, Any] = {}
+    for key in (
+        "steady_state_step_time_ms_p50",
+        "steady_state_step_time_ms_p95",
+        "bubble_ratio",
+        "comm_exposure_ratio",
+        "peak_reserved_ratio",
+        "peak_reserved_gib",
+        "optimizer_ratio",
+        "optimizer_exposed_ratio",
+        "stage_tail_ratio",
+        "mem_skew_ratio",
+        "stall_ratio",
+        "tail_step_jitter_ratio",
+    ):
+        if key in metrics:
+            summary[key] = metrics.get(key)
+    return summary
+
+
+def _second_stage_runtime_inputs(
+    baseline: MegatronProgram,
+    baseline_metrics: Dict[str, Any],
+    fallback_context: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    trial_runtime_summary = _real_trial_runtime_summary(baseline_metrics)
+    trial_context = dict(baseline_metrics.get("context_record") or {})
+    if not trial_context:
+        baseline_observation = _make_agent_observation(
+            baseline,
+            metrics=baseline_metrics,
+            trace_summary=trial_runtime_summary,
+        )
+        trial_context = baseline_observation.to_dict()
+    previous_context = fallback_context or {}
+    second_stage_replan = _resolve_replan_decision(
+        baseline,
+        trial_context,
+        previous_context=previous_context,
+    ).to_dict()
+    second_stage_bottleneck = classify_bottleneck(baseline, trial_runtime_summary)
+    return trial_runtime_summary, trial_context, second_stage_replan, second_stage_bottleneck
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Megatron program synthesis bring-up runner.")
     parser.add_argument("--workdir", type=str, default="./runs_megatron_programs")
@@ -4516,6 +5034,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--enable-tp-comm-overlap", action="store_true")
     add_observability_args(parser)
+    parser.add_argument("--cuda-visible-devices", type=str, default=None)
+    parser.add_argument("--allow-busy-gpus", action="store_true")
+    parser.add_argument("--min-free-gpu-memory-mib", type=int, default=28672)
+    parser.add_argument("--busy-gpu-memory-threshold-mib", type=int, default=2048)
     parser.add_argument("--run-root", type=str, default="./runs_megatron")
     parser.add_argument("--preset", type=str, default=None)
     parser.add_argument("--hidden-size", type=int, default=5120)
@@ -4609,6 +5131,11 @@ def main() -> None:
             selected_candidates = [program for program in candidates if str(program.metadata.get("program_kind") or "") == selected_kind]
             if selected_candidates:
                 candidates = selected_candidates[:1]
+                proposal_pool = [
+                    proposal
+                    for proposal in proposal_pool
+                    if str(proposal.program.metadata.get("program_kind") or "") == selected_kind
+                ]
     experiment_specs = _build_experiment_specs(baseline, evidence_programs, candidates)
     initial_bank = build_program_bank(
         [baseline] + evidence_programs + candidates,
@@ -4672,6 +5199,10 @@ def main() -> None:
     baseline_metrics: Optional[Dict[str, Any]] = None
     best_program: Optional[MegatronProgram] = None
     best_metrics: Optional[Dict[str, Any]] = None
+    second_stage_runtime_summary: Optional[Dict[str, Any]] = None
+    second_stage_context_record: Optional[Dict[str, Any]] = None
+    second_stage_replan_decision: Optional[Dict[str, Any]] = None
+    second_stage_bottleneck_signature: Optional[Dict[str, Any]] = None
 
     if not args.export_only:
         _progress("starting baseline trial")
@@ -4704,6 +5235,67 @@ def main() -> None:
             f"step_time_ms_p50={baseline_metrics.get('step_time_ms_p50')} "
             f"throughput={baseline_metrics.get('throughput_tokens_per_s') or baseline_metrics.get('throughput_effective_tokens_per_s')}"
         )
+
+        if int(baseline_metrics.get("returncode") or 0) == 0:
+            (
+                second_stage_runtime_summary,
+                second_stage_context_record,
+                second_stage_replan_decision,
+                second_stage_bottleneck_signature,
+            ) = _second_stage_runtime_inputs(
+                baseline,
+                baseline_metrics,
+                context_record,
+            )
+            second_stage_proposals, second_stage_rejected = _synthesize_proposals(
+                baseline,
+                rewrite=rewrite,
+                runtime_summary=second_stage_runtime_summary,
+                context_record=second_stage_context_record,
+                replan_decision=second_stage_replan_decision,
+                candidate_limit=int(args.candidate_limit),
+                llm_config=llm_config,
+            )
+            if second_stage_proposals:
+                proposal_pool = second_stage_proposals
+                rejected_candidates = second_stage_rejected
+                strategy_template_library = _build_verified_strategy_template_library(
+                    baseline,
+                    proposal_pool,
+                    second_stage_context_record,
+                )
+                template_selection_decision = _select_verified_strategy_template(
+                    strategy_template_library,
+                    second_stage_context_record,
+                )
+                candidates = [proposal.program for proposal in proposal_pool]
+                if bool(args.selector_only):
+                    selected_kind = str(template_selection_decision.get("selected_program_kind") or "")
+                    if selected_kind:
+                        selected_candidates = [
+                            program
+                            for program in candidates
+                            if str(program.metadata.get("program_kind") or "") == selected_kind
+                        ]
+                        if selected_candidates:
+                            candidates = selected_candidates[:1]
+                            proposal_pool = [
+                                proposal
+                                for proposal in proposal_pool
+                                if str(proposal.program.metadata.get("program_kind") or "") == selected_kind
+                            ]
+                experiment_specs = _build_experiment_specs(baseline, evidence_programs, candidates)
+                candidate_manifest = _export_programs(
+                    baseline,
+                    candidates,
+                    programs_dir,
+                    context_record=second_stage_context_record,
+                    previous_program=baseline,
+                )
+                _progress(
+                    "second-stage replan refreshed candidates "
+                    f"count={len(candidates)} selected_template={template_selection_decision.get('selected_template_id')}"
+                )
 
         trial_queue: List[Tuple[str, MegatronProgram, Optional[ExperimentSpec]]] = []
         for program in evidence_programs:
@@ -4820,6 +5412,10 @@ def main() -> None:
         external_inputs=external_inputs,
         strategy_template_library=strategy_template_library,
         template_selection_decision=template_selection_decision,
+        second_stage_runtime_summary=second_stage_runtime_summary,
+        second_stage_context_record=second_stage_context_record,
+        second_stage_replan_decision=second_stage_replan_decision,
+        second_stage_bottleneck_signature=second_stage_bottleneck_signature,
     )
     summary_path = workdir / "summary_megatron.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
