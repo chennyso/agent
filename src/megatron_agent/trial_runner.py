@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -121,6 +122,9 @@ def add_observability_args(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument("--enable-nsys", action="store_true")
     parser.add_argument("--nsys-output", type=str, default=None)
     parser.add_argument("--nsys-trace", type=str, default="cuda,nvtx")
+    parser.add_argument("--stream-trial-logs", dest="stream_trial_logs", action="store_true")
+    parser.add_argument("--no-stream-trial-logs", dest="stream_trial_logs", action="store_false")
+    parser.set_defaults(stream_trial_logs=True)
     return parser
 
 
@@ -260,6 +264,76 @@ def _trial_log_paths(output_dirs: Dict[str, str]) -> Dict[str, str]:
         "stderr_log": str(trial_dir / "stderr.log"),
         "launch_plan_log": str(trial_dir / "launch_plan.json"),
     }
+
+
+def _consume_stream(
+    pipe: Any,
+    sink_path: str,
+    console: Any,
+    chunks: List[str],
+) -> None:
+    with Path(sink_path).open("w", encoding="utf-8") as sink:
+        while True:
+            line = pipe.readline()
+            if not line:
+                break
+            chunks.append(line)
+            sink.write(line)
+            sink.flush()
+            console.write(line)
+            console.flush()
+    pipe.close()
+
+
+def _run_command_with_logging(
+    cmd: List[str],
+    cwd: Optional[str],
+    env: Dict[str, str],
+    stdout_log: str,
+    stderr_log: str,
+    stream_output: bool,
+) -> subprocess.CompletedProcess[str]:
+    if not stream_output:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+        )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        cwd=cwd,
+        env=env,
+    )
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    stdout_thread = threading.Thread(
+        target=_consume_stream,
+        args=(proc.stdout, stdout_log, sys.stdout, stdout_chunks),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_consume_stream,
+        args=(proc.stderr, stderr_log, sys.stderr, stderr_chunks),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    returncode = proc.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=returncode,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
+    )
 
 
 def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, Any]) -> Dict[str, str]:
@@ -1094,25 +1168,34 @@ def run_trial(
             metrics["oom"] = False
             return metrics
         _prepare_trial_artifact_dirs(output_dirs, observability)
+        stream_output = bool(getattr(args, "stream_trial_logs", True))
+        print(
+            f"[megatron_agent] trial {int(trial_id):03d} launching ({runner_mode}) "
+            f"stream_logs={'on' if stream_output else 'off'} "
+            f"stdout={log_paths['stdout_log']}",
+            flush=True,
+        )
         if launcher_script:
             if not launcher_script.exists():
                 raise FileNotFoundError(f"Launcher script not found: {launcher_script}")
             cmd = list(launcher_command)
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+            proc = _run_command_with_logging(
+                cmd=cmd,
                 cwd=cwd,
                 env=_build_launcher_env(args, program, compiled, trial_id),
+                stdout_log=log_paths["stdout_log"],
+                stderr_log=log_paths["stderr_log"],
+                stream_output=stream_output,
             )
         else:
             cmd = list(executed_command)
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+            proc = _run_command_with_logging(
+                cmd=cmd,
                 cwd=cwd,
                 env=_build_launcher_env(args, program, compiled, trial_id),
+                stdout_log=log_paths["stdout_log"],
+                stderr_log=log_paths["stderr_log"],
+                stream_output=stream_output,
             )
     except Exception as exc:
         metrics["returncode"] = 1
@@ -1127,6 +1210,11 @@ def run_trial(
     metrics["returncode"] = proc.returncode
     metrics["stdout_tail"] = stdout_text[-2000:]
     metrics["stderr_tail"] = stderr_text[-2000:]
+    print(
+        f"[megatron_agent] trial {int(trial_id):03d} finished "
+        f"returncode={int(proc.returncode)}",
+        flush=True,
+    )
 
     if proc.returncode != 0:
         failure_details = _extract_failure_details(stdout_text, stderr_text, output_dirs["torchrun_log_dir"])

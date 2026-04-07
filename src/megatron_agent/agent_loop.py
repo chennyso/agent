@@ -58,6 +58,10 @@ from megatron_agent.trial_runner import (
 )
 
 
+def _progress(message: str) -> None:
+    print(f"[megatron_agent] {message}", flush=True)
+
+
 def _llm_supervisor_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(llm_config, dict):
         return False
@@ -4637,6 +4641,12 @@ def main() -> None:
         context_record=context_record,
         previous_program=baseline,
     )
+    _progress(
+        "prepared "
+        f"{1 + len(candidates)} executable programs "
+        f"(baseline + {len(candidates)} candidates); "
+        f"rejected={len(rejected_candidates)}"
+    )
     evidence_manifest = []
     for index, program in enumerate(evidence_programs):
         program_kind = str(program.metadata.get("program_kind") or f"evidence_{index:02d}")
@@ -4664,6 +4674,7 @@ def main() -> None:
     best_metrics: Optional[Dict[str, Any]] = None
 
     if not args.export_only:
+        _progress("starting baseline trial")
         baseline_metrics = run_trial(args, baseline, trial_id=0)
         baseline_metrics["config_name"] = "baseline"
         baseline_metrics["trace_summary"] = reduce_trial_trace(baseline, metrics=baseline_metrics, runtime_summary=runtime_signature)
@@ -4687,6 +4698,12 @@ def main() -> None:
         paper_artifacts.append(dict(baseline_metrics.get("trial_artifact") or {}))
         if bool((baseline_metrics.get("family") or {}).get("is_family_outside")):
             family_outside_trials.append(baseline_metrics)
+        _progress(
+            "baseline trial finished "
+            f"returncode={int(baseline_metrics.get('returncode') or 0)} "
+            f"step_time_ms_p50={baseline_metrics.get('step_time_ms_p50')} "
+            f"throughput={baseline_metrics.get('throughput_tokens_per_s') or baseline_metrics.get('throughput_effective_tokens_per_s')}"
+        )
 
         trial_queue: List[Tuple[str, MegatronProgram, Optional[ExperimentSpec]]] = []
         for program in evidence_programs:
@@ -4708,7 +4725,9 @@ def main() -> None:
                 )
             )
 
+        _progress(f"starting candidate trials: total={len(trial_queue)}")
         for index, (config_name, candidate, experiment_spec) in enumerate(trial_queue, start=1):
+            _progress(f"trial {index}/{len(trial_queue)} starting: {config_name}")
             metrics = run_trial(args, candidate, trial_id=index)
             metrics["config_name"] = config_name
             metrics["trace_summary"] = reduce_trial_trace(candidate, metrics=metrics)
@@ -4729,12 +4748,22 @@ def main() -> None:
             paper_artifacts.append(dict(metrics.get("trial_artifact") or {}))
             if bool((metrics.get("family") or {}).get("is_family_outside")):
                 family_outside_trials.append(metrics)
+            _progress(
+                f"trial {index}/{len(trial_queue)} finished: {config_name} "
+                f"returncode={int(metrics.get('returncode') or 0)} "
+                f"step_time_ms_p50={metrics.get('step_time_ms_p50')} "
+                f"throughput={metrics.get('throughput_tokens_per_s') or metrics.get('throughput_effective_tokens_per_s')}"
+            )
 
         ranked_trials = _rank_trials(tested)
         best_metrics = ranked_trials[0] if ranked_trials else baseline_metrics
         selected_hash = str(best_metrics.get("program_hash") or baseline.semantic_hash()) if best_metrics is not None else baseline.semantic_hash()
         all_programs = [baseline] + evidence_programs + candidates
         best_program = next((program for program in all_programs if program.semantic_hash() == selected_hash), baseline)
+        _progress(
+            "trial ranking complete "
+            f"best={str((best_program.metadata if best_program else {}).get('program_kind') or 'baseline')}"
+        )
     else:
         ranked_trials = []
         paper_artifacts = [
