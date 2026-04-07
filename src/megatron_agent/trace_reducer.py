@@ -1567,6 +1567,65 @@ def _normalized_stage_metric(item: Dict[str, Any], key: str) -> float:
     return float(item.get(key) or item.get("window_ms") or 0.0) if key == "completion_ms" else float(item.get(key) or 0.0)
 
 
+def _morphable_objective_terms(
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+) -> Dict[str, float]:
+    step_time_ms = float(
+        runtime_evidence.get("steady_state_step_time_ms_p50")
+        or runtime_evidence.get("step_time_ms")
+        or 0.0
+    )
+    compute_ms = sum(float(item.get("compute_ms") or 0.0) for item in (stage_evidence or []))
+    bubble_idle_ms = max(0.0, float(runtime_evidence.get("bubble_ratio") or 0.0) * max(step_time_ms, 0.0))
+    exposed_communication_ms = max(
+        0.0,
+        float(runtime_evidence.get("comm_exposure_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    recompute_overhead_ms = max(
+        0.0,
+        float(runtime_evidence.get("recompute_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    offload_overhead_ms = max(
+        0.0,
+        float(runtime_evidence.get("offload_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    synchronization_penalty_ms = max(
+        0.0,
+        float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    return {
+        "step_time_ms": round(step_time_ms, 4),
+        "compute_time_ms": round(compute_ms, 4),
+        "bubble_idle_ms": round(bubble_idle_ms, 4),
+        "exposed_communication_ms": round(exposed_communication_ms, 4),
+        "recompute_overhead_ms": round(recompute_overhead_ms, 4),
+        "offload_overhead_ms": round(offload_overhead_ms, 4),
+        "synchronization_penalty_ms": round(synchronization_penalty_ms, 4),
+    }
+
+
+def _morphable_budget_summary(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+) -> Dict[str, float]:
+    norm = program.normalized()
+    budget_gib = float(norm.constraints.memory_budget_gb or norm.cluster.device_memory_gb or 0.0)
+    peak_reserved_gib = float(runtime_evidence.get("peak_reserved_gib") or 0.0)
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    if budget_gib <= 0.0 and peak_reserved_ratio > 0.0:
+        budget_gib = peak_reserved_gib / max(peak_reserved_ratio, 1e-6)
+    headroom_gib = max(0.0, budget_gib - peak_reserved_gib) if budget_gib > 0.0 else 0.0
+    margin_ratio = (headroom_gib / budget_gib) if budget_gib > 0.0 else 0.0
+    return {
+        "memory_budget_gb": round(budget_gib, 4),
+        "peak_reserved_gib": round(peak_reserved_gib, 4),
+        "peak_reserved_ratio": round(peak_reserved_ratio, 4),
+        "memory_headroom_gib": round(headroom_gib, 4),
+        "memory_margin_ratio": round(margin_ratio, 4),
+    }
+
+
 def _build_morphable_pipeline_problem(
     program: MegatronProgram,
     runtime_evidence: Dict[str, Any],
@@ -1735,10 +1794,23 @@ def _build_morphable_pipeline_problem(
             }
         )
 
+    budget_summary = _morphable_budget_summary(program, runtime_evidence)
+    objective_terms = _morphable_objective_terms(runtime_evidence, stage_evidence)
     return {
         "status": "executable_v1",
         "shape_objective": morphable.shape_objective,
         "search_levels": list(morphable.search_levels),
+        "objective": {
+            "type": "minimize_step_time_under_memory_budget",
+            "primary_goal": "maximize_throughput",
+            "hard_constraints": [
+                "peak_memory_lte_budget",
+                "dependency_legal",
+                "communication_timing_executable",
+            ],
+            "terms": objective_terms,
+        },
+        "memory_budget": budget_summary,
         "structure_aware_partition_ir": {
             "units": units,
             "adjacent_dependencies": [item.to_dict() for item in morphable.structure_edges],
@@ -1782,6 +1854,10 @@ def _build_morphable_pipeline_plan(
     pipeline_wait_ratio = float(runtime_evidence.get("pipeline_wait_ratio") or 0.0)
     optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
     comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    budget_summary = dict(morphable_problem.get("memory_budget") or {})
+    memory_budget_gb = float(budget_summary.get("memory_budget_gb") or 0.0)
+    peak_reserved_gib = float(budget_summary.get("peak_reserved_gib") or 0.0)
+    memory_margin_ratio = float(budget_summary.get("memory_margin_ratio") or 0.0)
     regroup_actions: List[Dict[str, Any]] = []
     for candidate in regroup_space:
         if float(candidate.get("imbalance_ratio") or 0.0) >= 0.10 or float(candidate.get("boundary_wait_ms") or 0.0) >= 40.0:
@@ -1794,6 +1870,8 @@ def _build_morphable_pipeline_plan(
                 }
             )
     stage_families: List[Dict[str, Any]] = []
+    runtime_recompute_modules: List[str] = []
+    runtime_offload_modules: List[str] = []
     for family in family_space:
         stage_id = int(family.get("stage_id") or 0)
         metrics = stage_metrics.get(stage_id, {})
@@ -1811,6 +1889,17 @@ def _build_morphable_pipeline_plan(
         offload_modules: List[str] = []
         chunk_priority_hints: List[int] = []
         semantic_role = str(family.get("semantic_role") or "decoder")
+        criticality_bonus = 1.0 if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} else 0.0
+        throughput_gain_score = (
+            0.55 * pipeline_wait_ratio * max(completion_ms, 1.0)
+            + 0.35 * optimizer_exposed_ratio * max(completion_ms, 1.0)
+            + 14.0 * criticality_bonus
+        )
+        memory_relief_need = max(0.0, (local_memory_ratio - 0.82) * max(completion_ms, 1.0))
+        communication_drag = max(
+            0.0,
+            comm_ms + float(comm_exposure_ratio) * 0.5 * max(completion_ms, 1.0),
+        )
         if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} or completion_ms > 0.0 and pipeline_wait_ratio >= 0.08:
             family_name = "critical_path_first"
             dispatch_order = "structure_aware_critical_first"
@@ -1825,7 +1914,7 @@ def _build_morphable_pipeline_plan(
             checkpoint_policy = "selective"
             combined_policy = "serial"
             recompute_modules = ["core_attn", "mlp"]
-            offload_modules = ["core_attn"] if local_memory_ratio >= 0.90 else []
+            offload_modules = ["core_attn", "attn_proj"] if local_memory_ratio >= 0.90 else []
             chunk_priority_hints = [3, 1] if int(norm.parallel.vpp_degree) > 1 else [3]
         elif comm_ms >= 0.12 * max(completion_ms, 1.0) or comm_exposure_ratio >= 0.12:
             family_name = "comm_guarded"
@@ -1836,6 +1925,21 @@ def _build_morphable_pipeline_plan(
             combined_policy = "serial"
             recompute_modules = ["core_attn"]
             chunk_priority_hints = [2, 2] if int(norm.parallel.vpp_degree) > 1 else [2]
+        net_throughput_score = throughput_gain_score - 0.80 * communication_drag - 0.60 * memory_relief_need
+        if memory_margin_ratio <= 0.08 and family_name == "critical_path_first":
+            family_name = "memory_guarded"
+            dispatch_order = "middle_stage_relief"
+            checkpoint_policy = "selective"
+            combined_policy = "serial"
+            recompute_modules = ["core_attn", "mlp"]
+            offload_modules = ["core_attn", "attn_proj"] if local_memory_ratio >= 0.88 else ["core_attn"]
+            chunk_priority_hints = [3, 1] if int(norm.parallel.vpp_degree) > 1 else [3]
+        for module in recompute_modules:
+            if module not in runtime_recompute_modules:
+                runtime_recompute_modules.append(module)
+        for module in offload_modules:
+            if module not in runtime_offload_modules:
+                runtime_offload_modules.append(module)
         stage_families.append(
             {
                 "stage_index": stage_id,
@@ -1851,6 +1955,10 @@ def _build_morphable_pipeline_plan(
                 "recompute_modules": recompute_modules,
                 "offload_modules": offload_modules,
                 "chunk_priority_hints": chunk_priority_hints,
+                "throughput_gain_score": round(throughput_gain_score, 4),
+                "communication_drag_score": round(communication_drag, 4),
+                "memory_relief_need_score": round(memory_relief_need, 4),
+                "net_throughput_score": round(net_throughput_score, 4),
             }
         )
     chunk_shape_vector = [max(int(norm.parallel.vpp_degree), 1) for _ in range(max(int(norm.parallel.pp_degree), 1))]
@@ -1858,17 +1966,28 @@ def _build_morphable_pipeline_plan(
     for item in selective_vpp_space:
         stage_id = int(item.get("stage_id") or 0)
         recommended = max(int(item.get("recommended_vpp_chunks") or 1), 1)
+        bubble_gain_score = float(item.get("bubble_gain_score") or 0.0)
+        communication_penalty_score = float(item.get("communication_penalty_score") or 0.0)
+        liveness_penalty_score = float(item.get("liveness_penalty_score") or 0.0)
+        net_vpp_gain = bubble_gain_score - communication_penalty_score - liveness_penalty_score
+        memory_safe_to_virtualize = memory_margin_ratio >= 0.10 or liveness_penalty_score <= bubble_gain_score * 0.55
+        should_virtualize = bool(item.get("should_virtualize")) and net_vpp_gain > 0.0 and memory_safe_to_virtualize
+        if memory_margin_ratio <= 0.05:
+            recommended = 1
+            should_virtualize = False
         if stage_id < len(chunk_shape_vector):
-            chunk_shape_vector[stage_id] = max(chunk_shape_vector[stage_id], recommended)
+            chunk_shape_vector[stage_id] = max(chunk_shape_vector[stage_id], recommended if should_virtualize else 1)
         selective_vpp_decisions.append(
             {
                 "stage_id": stage_id,
                 "unit_name": str(item.get("unit_name") or ""),
-                "should_virtualize": bool(item.get("should_virtualize")),
+                "should_virtualize": should_virtualize,
                 "recommended_vpp_chunks": recommended,
-                "bubble_gain_score": float(item.get("bubble_gain_score") or 0.0),
-                "communication_penalty_score": float(item.get("communication_penalty_score") or 0.0),
-                "liveness_penalty_score": float(item.get("liveness_penalty_score") or 0.0),
+                "bubble_gain_score": bubble_gain_score,
+                "communication_penalty_score": communication_penalty_score,
+                "liveness_penalty_score": liveness_penalty_score,
+                "net_vpp_gain_score": round(net_vpp_gain, 4),
+                "memory_safe": memory_safe_to_virtualize,
             }
         )
     for item in chunk_space:
@@ -1876,14 +1995,50 @@ def _build_morphable_pipeline_plan(
         recommended = max(int(item.get("recommended_chunks") or 1), 1)
         if stage_id < len(chunk_shape_vector):
             chunk_shape_vector[stage_id] = max(chunk_shape_vector[stage_id], recommended)
+    runtime_memory_policy = {
+        "status": "budgeted_joint_runtime_policy",
+        "memory_budget_gb": round(memory_budget_gb, 4),
+        "peak_reserved_gib": round(peak_reserved_gib, 4),
+        "memory_margin_ratio": round(memory_margin_ratio, 4),
+        "enable_recompute_activations": bool(runtime_recompute_modules),
+        "recompute_granularity": "selective" if runtime_recompute_modules else None,
+        "recompute_modules": runtime_recompute_modules,
+        "fine_grained_activation_offloading": bool(runtime_offload_modules),
+        "offload_modules": runtime_offload_modules,
+        "warmup_checkpoint_policy": "full" if runtime_recompute_modules else "default",
+        "steady_checkpoint_policy": "default",
+        "warmup_combined_policy": "serial" if runtime_recompute_modules else "default",
+        "steady_combined_policy": "combined" if comm_exposure_ratio < 0.12 else "serial",
+        "cooldown_p2p_policy": "serial" if comm_exposure_ratio >= 0.10 else "default",
+        "cooldown_combined_policy": "serial" if runtime_offload_modules or comm_exposure_ratio >= 0.10 else "default",
+        "policy_mode": "selective_overlap_aware" if (runtime_recompute_modules or runtime_offload_modules) else "budgeted_joint_runtime_policy",
+        "offload_policy": "selective_overlap_aware" if runtime_offload_modules else "none",
+        "expected_effect": "preserve throughput under memory budget by trading selective recompute/offload against exposed communication",
+    }
+    objective_terms = dict((morphable_problem.get("objective") or {}).get("terms") or {})
+    baseline_step_ms = float(objective_terms.get("step_time_ms") or runtime_evidence.get("steady_state_step_time_ms_p50") or 0.0)
+    estimated_step_delta_ms = (
+        -0.18 * sum(float(item.get("net_vpp_gain_score") or 0.0) for item in selective_vpp_decisions if item.get("should_virtualize"))
+        -0.06 * sum(float(item.get("net_throughput_score") or 0.0) for item in stage_families)
+        + (120.0 if runtime_offload_modules and comm_exposure_ratio >= 0.12 else 0.0)
+    )
+    estimated_step_time_ms = max(baseline_step_ms + estimated_step_delta_ms, baseline_step_ms * 0.55 if baseline_step_ms > 0 else 0.0)
     return {
         "status": "executable_v1",
         "search_levels": list(morphable_problem.get("search_levels") or []),
+        "objective": {
+            "type": "minimize_step_time_under_memory_budget",
+            "primary_goal": "maximize_throughput",
+            "memory_budget_gb": round(memory_budget_gb, 4),
+            "estimated_step_time_ms": round(estimated_step_time_ms, 4),
+            "estimated_step_delta_ms": round(estimated_step_delta_ms, 4),
+        },
         "regroup_actions": regroup_actions,
         "chunk_shape_vector": chunk_shape_vector,
         "selective_vpp_decisions": selective_vpp_decisions,
         "stage_families": stage_families,
         "local_family_assignment": stage_families,
+        "runtime_memory_policy": runtime_memory_policy,
         "shape_signature": str(morphable_problem.get("shape_signature") or ""),
         "dominant_family": str(stage_families[0]["family"]) if stage_families else "balanced_interleave",
     }

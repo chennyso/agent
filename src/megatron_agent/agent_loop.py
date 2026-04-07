@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from megatron_agent.config import (
     AgentObservation,
@@ -53,6 +56,401 @@ from megatron_agent.trial_runner import (
     add_observability_args,
     run_trial,
 )
+
+
+def _llm_supervisor_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(llm_config, dict):
+        return False
+    if not bool(llm_config.get("enabled")):
+        return False
+    return bool(str(llm_config.get("endpoint") or "").strip() and str(llm_config.get("model") or "").strip())
+
+
+def _agent_topology_summary(llm_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    llm_enabled = _llm_supervisor_enabled(llm_config)
+    return {
+        "planner_mode": "llm_http" if llm_enabled else "heuristic_only",
+        "logical_roles": ["planner", "verifier", "executor"],
+        "logical_agent_count": 3,
+        "llm_planner_agents": 1 if llm_enabled else 0,
+        "heuristic_planner_agents": 0 if llm_enabled else 1,
+        "verifier_agents": 1,
+        "executor_agents": 1,
+        "llm_endpoint": str((llm_config or {}).get("endpoint") or "") if llm_enabled else None,
+        "llm_model": str((llm_config or {}).get("model") or "") if llm_enabled else None,
+    }
+
+
+def _load_json_file(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_external_agent_inputs(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "model_structure_summary": _load_json_file(getattr(args, "model_structure_summary", None)),
+        "hardware_topology_summary": _load_json_file(getattr(args, "hardware_topology_summary", None)),
+        "profile_summary": _load_json_file(getattr(args, "profile_summary", None)),
+        "baseline_catalog": _load_json_file(getattr(args, "baseline_catalog", None)),
+    }
+
+
+def _structure_summary_digest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    layers = list(payload.get("layers") or payload.get("layer_types") or [])
+    type_counter: Dict[str, int] = {}
+    for item in layers:
+        if isinstance(item, dict):
+            token = str(item.get("type") or item.get("module_type") or "unknown").strip().lower()
+        else:
+            token = str(item or "unknown").strip().lower()
+        if not token:
+            token = "unknown"
+        type_counter[token] = int(type_counter.get(token, 0)) + 1
+    total_layers = int(payload.get("num_layers") or len(layers) or 0)
+    if total_layers <= 0:
+        total_layers = sum(type_counter.values())
+    attention_layers = sum(value for key, value in type_counter.items() if "attn" in key or "attention" in key)
+    mlp_layers = sum(value for key, value in type_counter.items() if "mlp" in key or "ffn" in key)
+    moe_layers = sum(value for key, value in type_counter.items() if "moe" in key or "expert" in key)
+    vocab_layers = sum(value for key, value in type_counter.items() if key in {"embedding", "lm_head", "vocab", "loss"})
+    return {
+        "total_layers": int(total_layers),
+        "attention_layers": int(attention_layers),
+        "mlp_layers": int(mlp_layers),
+        "moe_layers": int(moe_layers),
+        "vocab_related_layers": int(vocab_layers),
+        "layer_type_histogram": dict(type_counter),
+        "has_moe": bool(moe_layers > 0),
+        "edge_heavy_vocab": bool(vocab_layers > 0),
+    }
+
+
+def _topology_summary_digest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    links = list(payload.get("links") or payload.get("edges") or [])
+    nvlink_links = 0
+    pcie_links = 0
+    ib_links = 0
+    bandwidth_values: List[float] = []
+    for item in links:
+        token = str((item or {}).get("type") or (item or {}).get("fabric") or "").strip().lower()
+        bandwidth = _safe_float((item or {}).get("bandwidth_gbps") or (item or {}).get("bandwidth"))
+        if bandwidth is not None and bandwidth > 0.0:
+            bandwidth_values.append(float(bandwidth))
+        if "nvlink" in token:
+            nvlink_links += 1
+        elif "pcie" in token:
+            pcie_links += 1
+        elif "ib" in token or "infiniband" in token:
+            ib_links += 1
+    dominant = "unknown"
+    dominant_count = max(nvlink_links, pcie_links, ib_links)
+    if dominant_count > 0:
+        dominant = (
+            "nvlink"
+            if nvlink_links == dominant_count
+            else "pcie" if pcie_links == dominant_count else "infiniband"
+        )
+    return {
+        "node_count": int(payload.get("node_count") or payload.get("num_nodes") or 0),
+        "gpu_count": int(payload.get("gpu_count") or payload.get("world_size") or 0),
+        "nvlink_links": int(nvlink_links),
+        "pcie_links": int(pcie_links),
+        "infiniband_links": int(ib_links),
+        "dominant_fabric": dominant,
+        "mean_bandwidth_gbps": round(sum(bandwidth_values) / float(len(bandwidth_values)), 4) if bandwidth_values else 0.0,
+    }
+
+
+def _profile_summary_digest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    layers = list(payload.get("layers") or payload.get("layer_profiles") or [])
+    forward_values: List[float] = []
+    backward_values: List[float] = []
+    activation_values: List[float] = []
+    comm_values: List[float] = []
+    for item in layers:
+        forward = _safe_float((item or {}).get("forward_ms"))
+        backward = _safe_float((item or {}).get("backward_ms"))
+        activation = _safe_float((item or {}).get("activation_mb") or (item or {}).get("activation_mib"))
+        comm = _safe_float((item or {}).get("communication_ms") or (item or {}).get("comm_ms"))
+        if forward is not None and forward > 0.0:
+            forward_values.append(float(forward))
+        if backward is not None and backward > 0.0:
+            backward_values.append(float(backward))
+        if activation is not None and activation > 0.0:
+            activation_values.append(float(activation))
+        if comm is not None and comm > 0.0:
+            comm_values.append(float(comm))
+    return {
+        "layer_profile_count": len(layers),
+        "mean_forward_ms": round(sum(forward_values) / float(len(forward_values)), 4) if forward_values else 0.0,
+        "mean_backward_ms": round(sum(backward_values) / float(len(backward_values)), 4) if backward_values else 0.0,
+        "peak_activation_mb": round(max(activation_values), 4) if activation_values else 0.0,
+        "mean_comm_ms": round(sum(comm_values) / float(len(comm_values)), 4) if comm_values else 0.0,
+        "peak_memory_gib": round(float(_safe_float(payload.get("peak_memory_gib")) or 0.0), 4),
+    }
+
+
+def _baseline_catalog_digest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    baselines = list(payload.get("baselines") or payload.get("entries") or [])
+    ranked: List[Dict[str, Any]] = []
+    for item in baselines:
+        step = _safe_float((item or {}).get("step_time_ms"))
+        throughput = _safe_float((item or {}).get("throughput"))
+        ranked.append(
+            {
+                "name": str((item or {}).get("name") or (item or {}).get("template") or "baseline"),
+                "pp": int((item or {}).get("pp") or 1),
+                "vpp": int((item or {}).get("vpp") or 1),
+                "family": str((item or {}).get("family") or ""),
+                "step_time_ms": float(step or 0.0),
+                "throughput": float(throughput or 0.0),
+            }
+        )
+    ranked.sort(key=lambda item: (item["step_time_ms"] <= 0.0, item["step_time_ms"] if item["step_time_ms"] > 0.0 else -item["throughput"]))
+    return {
+        "baseline_count": len(ranked),
+        "best_baseline": ranked[0] if ranked else None,
+        "ranked_baselines": ranked[:8],
+    }
+
+
+def _augment_context_with_external_inputs(
+    context_record: Dict[str, Any],
+    external_inputs: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not external_inputs:
+        return context_record
+    merged = json.loads(json.dumps(context_record or {}, ensure_ascii=False))
+    model_payload = dict(external_inputs.get("model_structure_summary") or {})
+    topology_payload = dict(external_inputs.get("hardware_topology_summary") or {})
+    profile_payload = dict(external_inputs.get("profile_summary") or {})
+    baseline_payload = dict(external_inputs.get("baseline_catalog") or {})
+
+    if model_payload:
+        merged.setdefault("model_context", {})["external_structure_summary"] = model_payload
+        merged["model_context"]["structure_digest"] = _structure_summary_digest(model_payload)
+    if topology_payload:
+        merged.setdefault("hardware_context", {})["external_topology_summary"] = topology_payload
+        merged["hardware_context"]["topology_digest"] = _topology_summary_digest(topology_payload)
+    if profile_payload:
+        merged.setdefault("evidence_record", {})["external_profile_summary"] = profile_payload
+        merged["evidence_record"]["profile_digest"] = _profile_summary_digest(profile_payload)
+    if baseline_payload:
+        merged.setdefault("evidence_record", {})["external_baseline_catalog"] = baseline_payload
+        merged["evidence_record"]["baseline_catalog_digest"] = _baseline_catalog_digest(baseline_payload)
+    return merged
+
+
+def _batch_profile(context_record: Dict[str, Any]) -> str:
+    workload = dict((context_record or {}).get("workload_context") or {})
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    model_context = dict((context_record or {}).get("model_context") or {})
+    seq_len = int(workload.get("seq_len") or 1024)
+    length_bucket = str(workload.get("length_bucket") or "default")
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    if str(model_context.get("track") or "") == "moe":
+        return "moe_heavy"
+    if seq_len >= 4096 or "long" in length_bucket:
+        return "long_context"
+    if peak_reserved_ratio >= 0.88:
+        return "memory_constrained"
+    return "normal"
+
+
+def _call_llm_chat_completion(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    system_prompt: str,
+    temperature: float,
+) -> str:
+    payload = {
+        "model": str(model),
+        "messages": [
+            {"role": "system", "content": str(system_prompt)},
+            {"role": "user", "content": str(prompt)},
+        ],
+        "temperature": float(temperature),
+        "stream": False,
+    }
+    resp = requests.post(
+        str(endpoint),
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = list(data.get("choices") or [])
+    if not choices:
+        raise RuntimeError(f"unexpected LLM response: {data}")
+    return str((((choices[0] or {}).get("message") or {}).get("content")) or "").strip()
+
+
+def _robust_parse_llm_json(text: str) -> Dict[str, Any]:
+    cleaned = re.sub(r"```json\s*", "", str(text), flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    return json.loads(cleaned)
+
+
+def _proposal_prompt_entry(proposal: AgentProposal) -> Dict[str, Any]:
+    program = proposal.program.normalized()
+    return {
+        "proposal_id": str(proposal.proposal_id),
+        "scope": str(proposal.scope),
+        "program_kind": str(program.metadata.get("program_kind") or "candidate"),
+        "template": str(program.schedule.template or "fixed_1f1b"),
+        "dispatch_order": str(program.schedule.dispatch_order or "default"),
+        "pp": int(program.parallel.pp_degree),
+        "vpp": int(program.parallel.vpp_degree),
+        "tp": int(program.parallel.tp_degree),
+        "cp": int(program.parallel.cp_degree),
+        "ep": int(program.parallel.ep_degree),
+        "priority_rank": int(proposal.priority_rank),
+        "rationale": str(proposal.rationale or ""),
+        "memory_policy": str(program.metadata.get("runtime_memory_policy_mode") or "none"),
+        "estimated_step_delta_ms": float(program.metadata.get("morphable_estimated_step_delta_ms") or 0.0),
+    }
+
+
+def _build_llm_supervisor_prompt(
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    candidate_limit: int,
+) -> str:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    bottlenecks = list((context_record or {}).get("derived_bottlenecks") or [])
+    payload = {
+        "objective": "maximize throughput under memory budget",
+        "hard_constraints": [
+            "peak memory must remain within budget",
+            "dependency legality must hold",
+            "communication schedule must remain executable",
+        ],
+        "replan_decision": {
+            "trigger": str(replan_decision.get("trigger") or "steady"),
+            "scope": str(replan_decision.get("scope") or "none"),
+            "rationale": str(replan_decision.get("rationale") or ""),
+        },
+        "runtime_evidence": {
+            "bubble_ratio": float(runtime.get("bubble_ratio") or 0.0),
+            "pipeline_wait_ratio": float(runtime.get("pipeline_wait_ratio") or 0.0),
+            "optimizer_exposed_ratio": float(runtime.get("optimizer_exposed_ratio") or 0.0),
+            "cross_node_exposed_ratio": float(runtime.get("cross_node_exposed_ratio") or 0.0),
+            "peak_reserved_ratio": float(runtime.get("peak_reserved_ratio") or 0.0),
+            "memory_budget_gb": float(runtime.get("memory_budget_gb") or runtime.get("memory_limit_gb") or 0.0),
+        },
+        "derived_bottlenecks": [
+            {
+                "label": str(item.get("label") or ""),
+                "severity_label": str(item.get("severity") or ""),
+                "severity_score": float(_safe_float(item.get("severity_score")) or 0.0),
+            }
+            for item in bottlenecks[:8]
+        ],
+        "candidate_limit": int(candidate_limit),
+        "proposals": [_proposal_prompt_entry(item) for item in proposals[:12]],
+        "output_schema": {
+            "selected_proposal_ids": ["proposal_id_1", "proposal_id_2"],
+            "rationales": {"proposal_id_1": "short reason"},
+            "agent_topology": {
+                "llm_planner_agents": 1,
+                "verifier_agents": 1,
+                "executor_agents": 1,
+            },
+            "notes": ["optional note"],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _apply_llm_supervisor(
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    candidate_limit: int,
+    llm_config: Optional[Dict[str, Any]],
+) -> List[AgentProposal]:
+    if not proposals or not _llm_supervisor_enabled(llm_config):
+        return proposals
+    system_prompt = (
+        "You are the planner in a Megatron pipeline optimization agent. "
+        "Select and rank candidate programs that best improve throughput under a hard memory budget. "
+        "You may reorder proposals and provide concise rationales, but you must not invent new candidates. "
+        "Return JSON only."
+    )
+    prompt = _build_llm_supervisor_prompt(
+        proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+    )
+    if bool((llm_config or {}).get("log_llm")):
+        print("[megatron_agent] llm supervisor prompt >>>")
+        print(prompt)
+    try:
+        reply = _call_llm_chat_completion(
+            endpoint=str((llm_config or {}).get("endpoint") or ""),
+            model=str((llm_config or {}).get("model") or ""),
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=float((llm_config or {}).get("temperature") or 0.0),
+        )
+        if bool((llm_config or {}).get("log_llm")):
+            print("[megatron_agent] llm supervisor reply <<<")
+            print(reply)
+        plan = _robust_parse_llm_json(reply)
+    except Exception:
+        return proposals
+
+    selected_ids = [str(item) for item in (plan.get("selected_proposal_ids") or []) if str(item).strip()]
+    rationales = {
+        str(key): str(value)
+        for key, value in dict(plan.get("rationales") or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    topology = dict(plan.get("agent_topology") or {})
+    ordered: List[AgentProposal] = []
+    seen: set[str] = set()
+    proposal_by_id = {str(item.proposal_id): item for item in proposals}
+    for proposal_id in selected_ids:
+        proposal = proposal_by_id.get(str(proposal_id))
+        if proposal is None:
+            continue
+        seen.add(str(proposal_id))
+        updated = proposal.normalized()
+        updated.source = "llm_supervisor"
+        updated.rationale = rationales.get(str(proposal_id), updated.rationale)
+        updated.program.metadata["planner_backend"] = "llm_http"
+        updated.program.metadata["planner_model"] = str((llm_config or {}).get("model") or "")
+        updated.program.metadata["agent_topology"] = _agent_topology_summary(llm_config)
+        if topology:
+            updated.program.metadata["llm_declared_topology"] = topology
+        ordered.append(updated.normalized())
+    for proposal in proposals:
+        if str(proposal.proposal_id) in seen:
+            continue
+        updated = proposal.normalized()
+        if str(updated.source or "") == "heuristic_supervisor":
+            updated.program.metadata["agent_topology"] = _agent_topology_summary(llm_config)
+        ordered.append(updated.normalized())
+    return ordered or proposals
 
 
 def _clone_program(program: MegatronProgram) -> MegatronProgram:
@@ -1282,6 +1680,209 @@ def _candidate_entries(candidate_manifest: List[Dict[str, Any]]) -> List[Dict[st
     return [entry for entry in candidate_manifest if not bool(entry.get("is_baseline"))]
 
 
+def _select_first_program(
+    proposals: List[AgentProposal],
+    preferred_kinds: List[str],
+) -> Optional[Tuple[AgentProposal, MegatronProgram]]:
+    for kind in preferred_kinds:
+        for proposal in proposals:
+            program = proposal.program.normalized()
+            if str(program.metadata.get("program_kind") or "") == str(kind):
+                return proposal, program
+    return None
+
+
+def _strategy_template_record(
+    *,
+    template_id: str,
+    label: str,
+    description: str,
+    category: str,
+    trigger_conditions: List[str],
+    supported_batch_profiles: List[str],
+    proposal: AgentProposal,
+    program: MegatronProgram,
+) -> Dict[str, Any]:
+    verifier_report = dict(proposal.verifier_report or {})
+    return {
+        "template_id": str(template_id),
+        "label": str(label),
+        "category": str(category),
+        "description": str(description),
+        "trigger_conditions": [str(item) for item in (trigger_conditions or [])],
+        "supported_batch_profiles": [str(item) for item in (supported_batch_profiles or [])],
+        "program_kind": str(program.metadata.get("program_kind") or ""),
+        "program_hash": program.semantic_hash(),
+        "schedule_template": str(program.schedule.template or "fixed_1f1b"),
+        "dispatch_order": str(program.schedule.dispatch_order or "default"),
+        "pp_degree": int(program.parallel.pp_degree),
+        "vpp_degree": int(program.parallel.vpp_degree),
+        "cp_degree": int(program.parallel.cp_degree),
+        "memory_policy_mode": str(program.metadata.get("runtime_memory_policy_mode") or "none"),
+        "planner_backend": str(program.metadata.get("planner_backend") or "heuristic"),
+        "verifier_legal": bool(verifier_report.get("is_legal", False)),
+        "verifier_report": verifier_report,
+        "rationale": str(proposal.rationale or ""),
+    }
+
+
+def _build_verified_strategy_template_library(
+    baseline: MegatronProgram,
+    proposals: List[AgentProposal],
+    context_record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    library: List[Dict[str, Any]] = []
+    definitions = [
+        {
+            "template_id": "A_pp_comm_balanced",
+            "label": "PP communication-balanced",
+            "category": "partition",
+            "description": "ordinary PP with stage cuts biased toward communication-balanced boundaries",
+            "trigger_conditions": ["communication_drag", "comm_exposed", "topology_mismatch", "compute_imbalance"],
+            "supported_batch_profiles": ["normal", "memory_constrained"],
+            "preferred_kinds": ["candidate_runtime_guided_partition", "candidate_nonuniform_partition", "candidate_stage_aware_schedule"],
+        },
+        {
+            "template_id": "B_middle_stage_vpp",
+            "label": "Middle-stage selective VPP",
+            "category": "vpp",
+            "description": "edge stages stay conservative while middle stages use finer virtual pipeline chunks",
+            "trigger_conditions": ["schedule_coupling", "bubble", "pipeline_wait"],
+            "supported_batch_profiles": ["normal"],
+            "preferred_kinds": ["candidate_nonuniform_vpp_shape", "candidate_morphable_pipeline", "candidate_stage_aware_schedule"],
+        },
+        {
+            "template_id": "C_memory_guarded_offload",
+            "label": "Selective memory relief",
+            "category": "memory",
+            "description": "high-memory stages use selective recompute or offload while preserving critical-path stages",
+            "trigger_conditions": ["memory_hotspot", "memory_skew", "memory_constrained"],
+            "supported_batch_profiles": ["memory_constrained", "long_context", "moe_heavy"],
+            "preferred_kinds": ["candidate_stage_local_memory_policy", "candidate_morphable_pipeline", "candidate_memory_relief"],
+        },
+        {
+            "template_id": "D_long_context_conservative",
+            "label": "Long-context conservative VPP",
+            "category": "batch_routing",
+            "description": "long-sequence batches prefer coarser chunking and conservative overlap with CP relief",
+            "trigger_conditions": ["long_context", "communication_drag"],
+            "supported_batch_profiles": ["long_context"],
+            "preferred_kinds": ["candidate_long_context_cp_relief", "candidate_stage_local_memory_policy", "candidate_stage_aware_schedule"],
+        },
+        {
+            "template_id": "E_vocab_edge_conservative",
+            "label": "Vocab-edge conservative partition",
+            "category": "boundary",
+            "description": "embedding and lm_head edge stages avoid over-fragmentation and expensive boundary activations",
+            "trigger_conditions": ["tail_heavy", "memory_hotspot", "comm_exposed"],
+            "supported_batch_profiles": ["normal", "memory_constrained", "long_context"],
+            "preferred_kinds": ["candidate_boundary_semantic_memory", "candidate_boundary_semantic_tail", "candidate_morphable_pipeline"],
+        },
+    ]
+    for definition in definitions:
+        selected = _select_first_program(proposals, list(definition.get("preferred_kinds") or []))
+        if selected is None:
+            continue
+        proposal, program = selected
+        library.append(
+            _strategy_template_record(
+                template_id=str(definition["template_id"]),
+                label=str(definition["label"]),
+                description=str(definition["description"]),
+                category=str(definition["category"]),
+                trigger_conditions=list(definition.get("trigger_conditions") or []),
+                supported_batch_profiles=list(definition.get("supported_batch_profiles") or []),
+                proposal=proposal,
+                program=program,
+            )
+        )
+    if not library:
+        baseline_program = baseline.normalized()
+        pseudo_proposal = AgentProposal(
+            proposal_id="baseline_template",
+            scope="pipe",
+            program=baseline_program,
+            rationale="fallback baseline template when no verified alternatives are available",
+            priority_rank=999,
+            source="fallback",
+            verifier_report={"is_legal": True, "legality": {"fallback": True}},
+        ).normalized()
+        library.append(
+            _strategy_template_record(
+                template_id="baseline_safe",
+                label="Baseline safe template",
+                description="fallback template that preserves the baseline configuration",
+                category="fallback",
+                trigger_conditions=["fallback"],
+                supported_batch_profiles=["normal", "memory_constrained", "long_context", "moe_heavy"],
+                proposal=pseudo_proposal,
+                program=baseline_program,
+            )
+        )
+    return library
+
+
+def _select_verified_strategy_template(
+    template_library: List[Dict[str, Any]],
+    context_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failures = list((context_record or {}).get("failure_modes") or [])
+    batch_profile = _batch_profile(context_record)
+    active_labels = {str(item.get("label") or "") for item in failures}
+    bubble_ratio = float(runtime.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    stage_tail_ratio = float(runtime.get("stage_tail_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    scores: List[Dict[str, Any]] = []
+    for item in template_library:
+        score = 0.0
+        reasons: List[str] = []
+        supported_profiles = set(str(value) for value in (item.get("supported_batch_profiles") or []))
+        if batch_profile in supported_profiles:
+            score += 3.0
+            reasons.append(f"batch profile {batch_profile} matches template support")
+        if "memory_hotspot" in active_labels or peak_reserved_ratio >= 0.88:
+            if str(item.get("category") or "") in {"memory", "boundary"}:
+                score += 2.5
+                reasons.append("memory pressure favors memory or boundary guarded templates")
+        if "communication_drag" in active_labels or comm_exposure_ratio >= 0.12:
+            if str(item.get("category") or "") in {"partition", "boundary"}:
+                score += 2.0
+                reasons.append("communication exposure favors communication-aware templates")
+        if batch_profile == "long_context":
+            if str(item.get("template_id") or "") == "D_long_context_conservative":
+                score += 4.0
+                reasons.append("long-context batches should use conservative VPP or CP relief")
+        if bubble_ratio >= 0.10:
+            if str(item.get("category") or "") in {"vpp", "partition"}:
+                score += 1.5
+                reasons.append("bubble pressure favors VPP or partition refinement")
+        if stage_tail_ratio >= 0.12:
+            if str(item.get("category") or "") == "boundary":
+                score += 1.5
+                reasons.append("tail-heavy execution favors conservative edge-stage handling")
+        scores.append(
+            {
+                "template_id": str(item.get("template_id") or ""),
+                "program_kind": str(item.get("program_kind") or ""),
+                "score": round(float(score), 4),
+                "reasons": reasons,
+            }
+        )
+    ranked = sorted(scores, key=lambda entry: (float(entry["score"]), str(entry["template_id"])), reverse=True)
+    selected = ranked[0] if ranked else {}
+    return {
+        "batch_profile": batch_profile,
+        "active_failure_labels": sorted(active_labels),
+        "ranked_templates": ranked,
+        "selected_template_id": str(selected.get("template_id") or ""),
+        "selected_program_kind": str(selected.get("program_kind") or ""),
+        "selector_mode": "verified_template_switch_only",
+        "notes": "selector only switches among verifier-approved templates and does not rewrite the runtime graph online",
+    }
+
+
 def _proposal_scope_fallback(scope: str) -> str:
     current = str(scope or "none")
     if current == "pipe":
@@ -1539,6 +2140,10 @@ def _build_summary_payload(
     experiment_specs: Optional[List[ExperimentSpec]] = None,
     paper_artifacts: Optional[List[Dict[str, Any]]] = None,
     agent_proposals: Optional[List[Dict[str, Any]]] = None,
+    agent_topology: Optional[Dict[str, Any]] = None,
+    external_inputs: Optional[Dict[str, Any]] = None,
+    strategy_template_library: Optional[List[Dict[str, Any]]] = None,
+    template_selection_decision: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     candidate_entries = _candidate_entries(candidate_manifest)
     compile_success_rate = None
@@ -1577,6 +2182,10 @@ def _build_summary_payload(
         "experiment_specs": [item.to_dict() for item in (experiment_specs or [])],
         "paper_artifacts": list(paper_artifacts or []),
         "agent_proposals": list(agent_proposals or []),
+        "agent_topology": dict(agent_topology or {}),
+        "external_inputs": dict(external_inputs or {}),
+        "strategy_template_library": list(strategy_template_library or []),
+        "template_selection_decision": dict(template_selection_decision or {}),
         "recommended_execution_order": [entry["config_name"] for entry in candidate_manifest],
         "program_bank": program_bank.to_dict(),
         "candidate_generation_count": len(candidate_entries),
@@ -2933,6 +3542,8 @@ def _build_morphable_pipeline_candidate(
     evidence = dict((context_record or {}).get("evidence_record") or {})
     plan = dict(evidence.get("morphable_pipeline_plan") or {})
     families = list(plan.get("stage_families") or [])
+    runtime_memory_policy = dict(plan.get("runtime_memory_policy") or {})
+    objective = dict(plan.get("objective") or {})
     chunk_shape_vector = [max(int(item), 1) for item in list(plan.get("chunk_shape_vector") or []) if _safe_int(item) is not None]
     regroup_actions = list(plan.get("regroup_actions") or [])
     if not families and not chunk_shape_vector and not regroup_actions:
@@ -2977,6 +3588,10 @@ def _build_morphable_pipeline_candidate(
     candidate.metadata["morphable_chunk_shape_vector"] = [int(value) for value in chunk_shape_vector]
     candidate.metadata["morphable_regroup_actions"] = list(regroup_actions)
     candidate.metadata["morphable_shape_signature"] = str(plan.get("shape_signature") or "")
+    if objective:
+        candidate.metadata["morphable_objective_type"] = str(objective.get("type") or "")
+        candidate.metadata["morphable_estimated_step_time_ms"] = float(objective.get("estimated_step_time_ms") or 0.0)
+        candidate.metadata["morphable_estimated_step_delta_ms"] = float(objective.get("estimated_step_delta_ms") or 0.0)
     target_global_vpp = max([max(int(candidate.parallel.vpp_degree), 1)] + [int(value) for value in chunk_shape_vector])
     candidate.parallel.vpp_degree = int(target_global_vpp)
     candidate.layout.vpp_degree = int(target_global_vpp)
@@ -3062,6 +3677,59 @@ def _build_morphable_pipeline_candidate(
             candidate.metadata["schedule_warmup_combined_policy"] = policy
             candidate.metadata["schedule_steady_combined_policy"] = policy
             candidate.metadata["schedule_cooldown_combined_policy"] = policy
+    if runtime_memory_policy:
+        recompute_modules = [
+            str(item).strip()
+            for item in list(runtime_memory_policy.get("recompute_modules") or [])
+            if str(item).strip()
+        ]
+        offload_modules = [
+            str(item).strip()
+            for item in list(runtime_memory_policy.get("offload_modules") or [])
+            if str(item).strip()
+        ]
+        if recompute_modules:
+            candidate.metadata["runtime_recompute_granularity"] = str(
+                runtime_memory_policy.get("recompute_granularity") or "selective"
+            )
+            candidate.metadata["runtime_enable_recompute_activations"] = bool(
+                runtime_memory_policy.get("enable_recompute_activations", True)
+            )
+            candidate.metadata["runtime_recompute_modules"] = recompute_modules
+            candidate.metadata["schedule_warmup_checkpoint_policy"] = str(
+                runtime_memory_policy.get("warmup_checkpoint_policy") or "full"
+            )
+            candidate.metadata["schedule_steady_checkpoint_policy"] = str(
+                runtime_memory_policy.get("steady_checkpoint_policy") or "default"
+            )
+            candidate.metadata["schedule_warmup_combined_policy"] = str(
+                runtime_memory_policy.get("warmup_combined_policy") or "serial"
+            )
+        if offload_modules:
+            candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = bool(
+                runtime_memory_policy.get("fine_grained_activation_offloading", True)
+            )
+            candidate.metadata["runtime_offload_modules"] = offload_modules
+        if str(runtime_memory_policy.get("cooldown_p2p_policy") or "").strip():
+            candidate.metadata["schedule_cooldown_p2p_policy"] = str(
+                runtime_memory_policy.get("cooldown_p2p_policy") or "serial"
+            )
+        if str(runtime_memory_policy.get("cooldown_combined_policy") or "").strip():
+            candidate.metadata["schedule_cooldown_combined_policy"] = str(
+                runtime_memory_policy.get("cooldown_combined_policy") or "serial"
+            )
+        if str(runtime_memory_policy.get("steady_combined_policy") or "").strip():
+            candidate.metadata["schedule_steady_combined_policy"] = str(
+                runtime_memory_policy.get("steady_combined_policy") or "combined"
+            )
+        candidate.metadata["runtime_memory_policy_mode"] = str(
+            runtime_memory_policy.get("policy_mode")
+            or runtime_memory_policy.get("offload_policy")
+            or "budgeted_joint_runtime_policy"
+        )
+        candidate.metadata["runtime_memory_expected_effect"] = str(
+            runtime_memory_policy.get("expected_effect") or ""
+        )
 
     candidate.metadata["program_kind"] = "candidate_morphable_pipeline"
     candidate.metadata["priority_rank"] = 16
@@ -3745,6 +4413,7 @@ def _synthesize_proposals(
     context_record: Optional[Dict[str, Any]] = None,
     replan_decision: Optional[Dict[str, Any]] = None,
     candidate_limit: int = 4,
+    llm_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[AgentProposal], List[Dict[str, Any]]]:
     runtime_summary = runtime_summary or {}
     context_record = context_record or build_context_record(baseline, runtime_summary=runtime_summary)
@@ -3755,6 +4424,13 @@ def _synthesize_proposals(
         runtime_summary=runtime_summary,
         context_record=context_record,
         replan_decision=replan_decision,
+    )
+    proposals = _apply_llm_supervisor(
+        proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        llm_config=llm_config,
     )
     return _verify_agent_proposals(
         baseline,
@@ -3772,6 +4448,7 @@ def _synthesize_programs(
     context_record: Optional[Dict[str, Any]] = None,
     replan_decision: Optional[Dict[str, Any]] = None,
     candidate_limit: int = 4,
+    llm_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[MegatronProgram], List[Dict[str, Any]]]:
     proposals, rejected = _synthesize_proposals(
         baseline,
@@ -3780,6 +4457,7 @@ def _synthesize_programs(
         context_record=context_record,
         replan_decision=replan_decision,
         candidate_limit=candidate_limit,
+        llm_config=llm_config,
     )
     return [proposal.program for proposal in proposals], rejected
 
@@ -3791,6 +4469,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--programs-dir", type=str, default=None)
     parser.add_argument("--runtime-summary", type=str, default=None)
     parser.add_argument("--candidate-limit", type=int, default=4)
+    parser.add_argument("--enable-llm-supervisor", action="store_true")
+    parser.add_argument("--llm-endpoint", type=str, default="http://10.100.1.93:12365/v1/chat/completions")
+    parser.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
+    parser.add_argument("--llm-temperature", type=float, default=0.2)
+    parser.add_argument("--log-llm", action="store_true")
+    parser.add_argument("--model-structure-summary", type=str, default=None)
+    parser.add_argument("--hardware-topology-summary", type=str, default=None)
+    parser.add_argument("--profile-summary", type=str, default=None)
+    parser.add_argument("--baseline-catalog", type=str, default=None)
+    parser.add_argument("--selector-only", action="store_true")
     parser.add_argument("--run-target", type=str, choices=["single_g4", "single_g5", "dual_g4_g5", "dual_g5_g5"], default="single_g5")
     parser.add_argument("--model-track", type=str, choices=["dense", "moe"], default="dense")
     parser.add_argument("--nproc", type=int, default=8)
@@ -3869,10 +4557,18 @@ def main() -> None:
     programs_dir = Path(args.programs_dir) if args.programs_dir else workdir / "programs"
 
     runtime_summary = _load_runtime_summary(args.runtime_summary)
+    llm_config = {
+        "enabled": bool(args.enable_llm_supervisor),
+        "endpoint": str(args.llm_endpoint),
+        "model": str(args.llm_model),
+        "temperature": float(args.llm_temperature),
+        "log_llm": bool(args.log_llm),
+    }
+    external_inputs = _load_external_agent_inputs(args)
     baseline = _build_baseline_program(args)
     runtime_signature = reduce_trial_trace(baseline, runtime_summary=runtime_summary)
     observation = _make_agent_observation(baseline, runtime_summary=runtime_summary)
-    context_record = observation.to_dict()
+    context_record = _augment_context_with_external_inputs(observation.to_dict(), external_inputs)
     previous_context = dict(runtime_summary.get("previous_context_record") or {}) if isinstance(runtime_summary, dict) else {}
     replan_decision_obj = _resolve_replan_decision(baseline, context_record, previous_context=previous_context or None)
     replan_decision = replan_decision_obj.to_dict()
@@ -3891,8 +4587,24 @@ def main() -> None:
         context_record=context_record,
         replan_decision=replan_decision,
         candidate_limit=int(args.candidate_limit),
+        llm_config=llm_config,
+    )
+    strategy_template_library = _build_verified_strategy_template_library(
+        baseline,
+        proposal_pool,
+        context_record,
+    )
+    template_selection_decision = _select_verified_strategy_template(
+        strategy_template_library,
+        context_record,
     )
     candidates = [proposal.program for proposal in proposal_pool]
+    if bool(args.selector_only):
+        selected_kind = str(template_selection_decision.get("selected_program_kind") or "")
+        if selected_kind:
+            selected_candidates = [program for program in candidates if str(program.metadata.get("program_kind") or "") == selected_kind]
+            if selected_candidates:
+                candidates = selected_candidates[:1]
     experiment_specs = _build_experiment_specs(baseline, evidence_programs, candidates)
     initial_bank = build_program_bank(
         [baseline] + evidence_programs + candidates,
@@ -4075,6 +4787,10 @@ def main() -> None:
         experiment_specs=experiment_specs,
         paper_artifacts=paper_artifacts,
         agent_proposals=[proposal.to_dict() for proposal in proposal_pool],
+        agent_topology=_agent_topology_summary(llm_config),
+        external_inputs=external_inputs,
+        strategy_template_library=strategy_template_library,
+        template_selection_decision=template_selection_decision,
     )
     summary_path = workdir / "summary_megatron.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")

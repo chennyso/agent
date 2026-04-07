@@ -1111,6 +1111,15 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         env["ENABLE_MORPHABLE_PIPELINE"] = "1"
         if morphable_shape_signature:
             env["MORPHABLE_PIPE_SHAPE_SIGNATURE"] = morphable_shape_signature
+        morphable_objective_type = str((norm.metadata or {}).get("morphable_objective_type") or "").strip()
+        if morphable_objective_type:
+            env["MORPHABLE_PIPE_OBJECTIVE"] = morphable_objective_type
+        estimated_step_time_ms = float((norm.metadata or {}).get("morphable_estimated_step_time_ms") or 0.0)
+        if estimated_step_time_ms > 0.0:
+            env["MORPHABLE_PIPE_ESTIMATED_STEP_TIME_MS"] = f"{estimated_step_time_ms:.4f}"
+        estimated_step_delta_ms = float((norm.metadata or {}).get("morphable_estimated_step_delta_ms") or 0.0)
+        if estimated_step_delta_ms != 0.0:
+            env["MORPHABLE_PIPE_ESTIMATED_STEP_DELTA_MS"] = f"{estimated_step_delta_ms:.4f}"
         if norm.strategy_ir.morphable_pipe.search_levels:
             env["MORPHABLE_PIPE_SEARCH_LEVELS"] = ",".join(
                 str(item) for item in norm.strategy_ir.morphable_pipe.search_levels

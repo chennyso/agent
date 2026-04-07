@@ -1040,6 +1040,11 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
         self.assertEqual(problem["status"], "executable_v1")
         self.assertEqual(plan["status"], "executable_v1")
+        self.assertEqual(problem["shape_objective"], "memory_constrained_throughput_maximization")
+        self.assertEqual(problem["objective"]["type"], "minimize_step_time_under_memory_budget")
+        self.assertIn("memory_budget", problem)
+        self.assertIn("runtime_memory_policy", plan)
+        self.assertEqual(plan["objective"]["type"], "minimize_step_time_under_memory_budget")
         self.assertGreater(len(list((problem.get("three_semantic_execution_graph") or {}).get("units") or [])), 0)
         self.assertIn("structure_aware_partition_ir", problem)
         self.assertIn("selective_vpp_generator", problem)
@@ -1103,9 +1108,26 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         candidates = agent_loop._build_runtime_branch_candidates(program, context)
         branch_ids = {str(candidate.metadata.get("runtime_branch_id") or "") for candidate in candidates}
         kinds = {str(candidate.metadata.get("program_kind") or "") for candidate in candidates}
+        morphable = next(
+            (
+                candidate
+                for candidate in candidates
+                if str(candidate.metadata.get("program_kind") or "") == "candidate_branch_morphable_pipeline_shape"
+            ),
+            None,
+        )
 
         self.assertIn("branch_morphable_pipeline_shape", branch_ids)
         self.assertIn("candidate_branch_morphable_pipeline_shape", kinds)
+        self.assertIsNotNone(morphable)
+        self.assertIn(
+            str((morphable.metadata or {}).get("runtime_memory_policy_mode") or ""),
+            {"budgeted_joint_runtime_policy", "selective_overlap_aware"},
+        )
+        self.assertTrue(
+            bool((morphable.metadata or {}).get("runtime_recompute_modules"))
+            or float((morphable.metadata or {}).get("morphable_estimated_step_time_ms") or 0.0) > 0.0
+        )
 
     def test_apipe_plan_uses_structure_aware_dispatch_for_vpp_wait(self) -> None:
         program = default_dense_program("single_g5")
@@ -1187,6 +1209,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         program.parallel.pp_degree = 4
         program.parallel.vpp_degree = 2
         program.layout.vpp_degree = 2
+        program.metadata["morphable_objective_type"] = "minimize_step_time_under_memory_budget"
+        program.metadata["morphable_estimated_step_time_ms"] = 8021.25
+        program.metadata["morphable_estimated_step_delta_ms"] = -144.5
         program.metadata["morphable_shape_signature"] = "shape:test"
         program.metadata["morphable_chunk_shape_vector"] = [2, 1, 1, 2]
         program.metadata["morphable_stage_families"] = [
@@ -1216,6 +1241,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
         compiled = compile_program(program)
         self.assertEqual(compiled.launcher_env["ENABLE_MORPHABLE_PIPELINE"], "1")
+        self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_OBJECTIVE"], "minimize_step_time_under_memory_budget")
+        self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_ESTIMATED_STEP_TIME_MS"], "8021.2500")
+        self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_ESTIMATED_STEP_DELTA_MS"], "-144.5000")
         self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_SHAPE_SIGNATURE"], "shape:test")
         self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_CHUNK_SHAPE_VECTOR"], "2,1,1,2")
         self.assertIn("0,family=critical_path_first", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
@@ -1709,6 +1737,127 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("candidate_runtime_guided_partition", scores)
         self.assertGreater(scores["candidate_runtime_guided_partition"], scores["candidate_nonuniform_partition"])
         self.assertEqual(str(proposals[0].program.metadata.get("program_kind")), "candidate_runtime_guided_partition")
+
+    @mock.patch(
+        "megatron_agent.agent_loop._call_llm_chat_completion",
+        return_value=json.dumps(
+            {
+                "selected_proposal_ids": ["candidate_runtime_guided_partition"],
+                "rationales": {"candidate_runtime_guided_partition": "tail-heavy partition should be fixed before broader search"},
+                "agent_topology": {"llm_planner_agents": 1, "verifier_agents": 1, "executor_agents": 1},
+                "notes": ["prefer throughput under memory budget"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    def test_llm_supervisor_reorders_and_tags_megatron_proposals(self, _mock_llm: mock.Mock) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.06,
+            "stage_load_variance": 0.05,
+            "cross_node_exposed_ratio": 0.02,
+            "peak_memory_ratio": 0.76,
+            "steady_state_step_time_ms_p50": 1100.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1080.0, "comm_ms": 80.0, "bubble_ms": 35.0, "window_ms": 1195.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 760.0, "comm_ms": 55.0, "bubble_ms": 20.0, "window_ms": 835.0, "peak_reserved_gib": 15.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="tail_drift", scope="skeleton").to_dict(),
+            candidate_limit=6,
+            llm_config={
+                "enabled": True,
+                "endpoint": "http://10.100.1.93:12365/v1/chat/completions",
+                "model": "/models/Qwen2.5-72B-Instruct",
+                "temperature": 0.2,
+                "log_llm": False,
+            },
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(str(proposals[0].program.metadata.get("program_kind")), "candidate_runtime_guided_partition")
+        self.assertEqual(str(proposals[0].source), "llm_supervisor")
+        self.assertEqual(str(proposals[0].program.metadata.get("planner_backend")), "llm_http")
+        self.assertEqual(str(proposals[0].program.metadata.get("planner_model")), "/models/Qwen2.5-72B-Instruct")
+        topology = dict(proposals[0].program.metadata.get("agent_topology") or {})
+        self.assertEqual(int(topology.get("llm_planner_agents") or 0), 1)
+        self.assertEqual(int(topology.get("verifier_agents") or 0), 1)
+        self.assertEqual(int(topology.get("executor_agents") or 0), 1)
+
+    def test_external_inputs_are_merged_into_context_and_digested(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = build_context_record(baseline, runtime_summary={"bubble_ratio": 0.04, "peak_memory_ratio": 0.72})
+        merged = agent_loop._augment_context_with_external_inputs(
+            context,
+            {
+                "model_structure_summary": {
+                    "num_layers": 40,
+                    "layers": [{"type": "attention"}, {"type": "mlp"}, {"type": "embedding"}, {"type": "lm_head"}],
+                },
+                "hardware_topology_summary": {
+                    "node_count": 1,
+                    "gpu_count": 8,
+                    "links": [{"type": "nvlink", "bandwidth_gbps": 900}, {"type": "pcie", "bandwidth_gbps": 64}],
+                },
+                "profile_summary": {
+                    "layers": [{"forward_ms": 1.2, "backward_ms": 2.4, "activation_mb": 110.0, "communication_ms": 0.3}],
+                    "peak_memory_gib": 28.4,
+                },
+                "baseline_catalog": {
+                    "baselines": [
+                        {"name": "vpp_neighbor_g8", "pp": 4, "vpp": 2, "family": "pp_vpp", "step_time_ms": 8040.0, "throughput": 43.4}
+                    ]
+                },
+            },
+        )
+        self.assertIn("external_structure_summary", merged["model_context"])
+        self.assertEqual(int((merged["model_context"]["structure_digest"] or {}).get("total_layers") or 0), 40)
+        self.assertEqual(str((merged["hardware_context"]["topology_digest"] or {}).get("dominant_fabric") or ""), "nvlink")
+        self.assertGreater(float((merged["evidence_record"]["profile_digest"] or {}).get("peak_activation_mb") or 0.0), 0.0)
+        self.assertEqual(
+            str((((merged["evidence_record"]["baseline_catalog_digest"] or {}).get("best_baseline") or {}).get("name")) or ""),
+            "vpp_neighbor_g8",
+        )
+
+    def test_verified_template_library_and_selector_prefer_long_context_template(self) -> None:
+        baseline = default_dense_program("single_g5")
+        baseline.metadata["seq_len"] = 4096
+        runtime_summary = {
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.13,
+            "optimizer_exposed_ratio": 0.10,
+            "peak_memory_ratio": 0.91,
+            "steady_state_step_time_ms_p50": 1600.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1180.0, "comm_ms": 180.0, "bubble_ms": 120.0, "window_ms": 1480.0, "peak_reserved_gib": 28.0},
+                "1": {"compute_ms": 980.0, "comm_ms": 110.0, "bubble_ms": 95.0, "window_ms": 1185.0, "peak_reserved_gib": 24.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="workload_drift", scope="local_parallel").to_dict(),
+            candidate_limit=8,
+        )
+        self.assertTrue(len(proposals) > 0)
+        self.assertTrue(any("estimated memory pressure" in str(item.get("reason") or "") for item in rejected))
+        library = agent_loop._build_verified_strategy_template_library(baseline, proposals, context)
+        template_ids = {str(item.get("template_id") or "") for item in library}
+        self.assertIn("D_long_context_conservative", template_ids)
+        decision = agent_loop._select_verified_strategy_template(library, context)
+        self.assertEqual(str(decision.get("batch_profile") or ""), "long_context")
+        self.assertEqual(str(decision.get("selector_mode") or ""), "verified_template_switch_only")
+        self.assertEqual(str(decision.get("selected_template_id") or ""), "D_long_context_conservative")
 
     def test_runtime_guided_partition_adds_position_aware_metadata(self) -> None:
         baseline = default_dense_program("single_g5")

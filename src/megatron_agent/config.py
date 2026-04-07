@@ -989,7 +989,7 @@ class MorphableStageFamilySpec:
 
 @dataclass
 class MorphablePipelineSpec:
-    shape_objective: str = "structure_memory_comm_coupled"
+    shape_objective: str = "memory_constrained_throughput_maximization"
     units: List[MorphableUnitSpec] = field(default_factory=list)
     structure_edges: List[MorphableEdgeSpec] = field(default_factory=list)
     memory_edges: List[MorphableEdgeSpec] = field(default_factory=list)
@@ -1005,8 +1005,8 @@ class MorphablePipelineSpec:
     def normalized(self) -> "MorphablePipelineSpec":
         norm = copy.deepcopy(self)
         norm.shape_objective = (
-            str(norm.shape_objective or "structure_memory_comm_coupled").strip().lower()
-            or "structure_memory_comm_coupled"
+            str(norm.shape_objective or "memory_constrained_throughput_maximization").strip().lower()
+            or "memory_constrained_throughput_maximization"
         )
         norm.units = [item.normalized() for item in (norm.units or [])]
         norm.structure_edges = [item.normalized() for item in (norm.structure_edges or [])]
@@ -1040,7 +1040,7 @@ class MorphablePipelineSpec:
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "MorphablePipelineSpec":
         return cls(
-            shape_objective=str(payload.get("shape_objective", "structure_memory_comm_coupled")),
+            shape_objective=str(payload.get("shape_objective", "memory_constrained_throughput_maximization")),
             units=[MorphableUnitSpec.from_dict(item) for item in (payload.get("units") or [])],
             structure_edges=[MorphableEdgeSpec.from_dict(item) for item in (payload.get("structure_edges") or [])],
             memory_edges=[MorphableEdgeSpec.from_dict(item) for item in (payload.get("memory_edges") or [])],
