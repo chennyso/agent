@@ -874,6 +874,50 @@ def program_to_strategy(program: MegatronProgram) -> MegatronStrategy:
     return validate_strategy(strategy)
 
 
+def _encode_morphable_stage_family_hints(stage_families: List[Dict[str, Any]]) -> str:
+    encoded: List[str] = []
+    for item in (stage_families or []):
+        try:
+            stage_index = int(item.get("stage_index"))
+        except Exception:
+            continue
+        payload: List[str] = [str(stage_index), f"family={str(item.get('family') or 'balanced_interleave')}"]
+        preferred_template = str(item.get("preferred_template") or "").strip()
+        if preferred_template:
+            payload.append(f"preferred_template={preferred_template}")
+        for key in (
+            "dispatch_order",
+            "warmup_policy",
+            "cooldown_policy",
+            "checkpoint_policy",
+            "p2p_policy",
+            "combined_policy",
+        ):
+            value = str(item.get(key) or "").strip()
+            if value:
+                payload.append(f"{key}={value}")
+        encoded.append(",".join(payload))
+    return ";".join(encoded)
+
+
+def _encode_stage_chunk_priority_hints(stage_families: List[Dict[str, Any]]) -> str:
+    encoded: List[str] = []
+    for item in (stage_families or []):
+        try:
+            stage_index = int(item.get("stage_index"))
+        except Exception:
+            continue
+        hints = []
+        for raw in list(item.get("chunk_priority_hints") or []):
+            try:
+                hints.append(str(int(raw)))
+            except Exception:
+                continue
+        if hints:
+            encoded.append(f"{stage_index}:{','.join(hints)}")
+    return ";".join(encoded)
+
+
 def compile_program(program: MegatronProgram, target: Optional[str] = None) -> CompiledProgram:
     norm = copy.deepcopy(program).normalized()
     if target:
@@ -1038,6 +1082,49 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
                 continue
         if parsed:
             env["SCHEDULE_FLUSH_MICROBATCHES"] = ",".join(parsed)
+    morphable_stage_families = list((norm.metadata or {}).get("morphable_stage_families") or [])
+    if not morphable_stage_families:
+        morphable_stage_families = [
+            {
+                "stage_index": int(item.stage_index),
+                "family": str(item.family),
+                "preferred_template": str(item.preferred_template or ""),
+                "dispatch_order": str(item.dispatch_order),
+                "warmup_policy": str(item.warmup_policy),
+                "cooldown_policy": str(item.cooldown_policy),
+                "checkpoint_policy": str(item.checkpoint_policy or ""),
+                "p2p_policy": str(item.p2p_policy or ""),
+                "combined_policy": str(item.combined_policy or ""),
+                "chunk_priority_hints": list(item.chunk_priority_hints or []),
+            }
+            for item in (norm.strategy_ir.morphable_pipe.stage_families or [])
+        ]
+    morphable_shape_signature = str(
+        (norm.metadata or {}).get("morphable_shape_signature")
+        or norm.strategy_ir.morphable_pipe.shape_signature
+        or ""
+    ).strip()
+    morphable_chunk_vector = list((norm.metadata or {}).get("morphable_chunk_shape_vector") or [])
+    if not morphable_chunk_vector:
+        morphable_chunk_vector = list(norm.strategy_ir.morphable_pipe.chunk_shape_vector or [])
+    if morphable_stage_families or morphable_shape_signature or morphable_chunk_vector:
+        env["ENABLE_MORPHABLE_PIPELINE"] = "1"
+        if morphable_shape_signature:
+            env["MORPHABLE_PIPE_SHAPE_SIGNATURE"] = morphable_shape_signature
+        if norm.strategy_ir.morphable_pipe.search_levels:
+            env["MORPHABLE_PIPE_SEARCH_LEVELS"] = ",".join(
+                str(item) for item in norm.strategy_ir.morphable_pipe.search_levels
+            )
+        stage_family_hints = _encode_morphable_stage_family_hints(morphable_stage_families)
+        if stage_family_hints:
+            env["SCHEDULE_STAGE_FAMILY_HINTS"] = stage_family_hints
+        stage_chunk_priority_hints = _encode_stage_chunk_priority_hints(morphable_stage_families)
+        if stage_chunk_priority_hints:
+            env["SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS"] = stage_chunk_priority_hints
+        if morphable_chunk_vector:
+            env["MORPHABLE_PIPE_CHUNK_SHAPE_VECTOR"] = ",".join(
+                str(max(int(item), 1)) for item in morphable_chunk_vector
+            )
     fsdp_scopes = {
         str(item.subgraph): str(item.fsdp_scope)
         for item in (norm.strategy_ir.local_parallel or [])

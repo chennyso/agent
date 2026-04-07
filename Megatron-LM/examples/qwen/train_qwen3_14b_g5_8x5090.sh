@@ -287,6 +287,23 @@ if [[ "$PRESET" == "vpp_neighbor_g8" ]]; then
   SCHEDULE_FLUSH_ORDER_POLICY=${SCHEDULE_FLUSH_ORDER_POLICY:-reverse_last_group}
 fi
 
+if [[ "$PRESET" == "vpp_structure_aware" ]]; then
+  if [[ "$RUN_TARGET" != "single_g5" ]]; then
+    echo "Invalid preset: vpp_structure_aware currently requires RUN_TARGET=single_g5"
+    exit 1
+  fi
+  MODEL_TRACK="dense"
+  TP_SIZE=1
+  PP_SIZE=4
+  VPP_SIZE=2
+  PIPELINE_LAYOUT=${PIPELINE_LAYOUT:-$VPP_NEIGHBOR_LAYOUT}
+  SCHEDULE_TEMPLATE=pp4_middle_relief
+  SCHEDULE_GROUP_SIZE=${SCHEDULE_GROUP_SIZE:-8}
+  DISPATCH_ORDER=${DISPATCH_ORDER:-structure_aware_critical_first}
+  SCHEDULE_WARMUP_POLICY=${SCHEDULE_WARMUP_POLICY:-balanced_fill}
+  SCHEDULE_COOLDOWN_POLICY=${SCHEDULE_COOLDOWN_POLICY:-opt_prioritized}
+fi
+
 if [[ "$PRESET" == "pp_micro_schedule" ]]; then
   if [[ "$RUN_TARGET" != "single_g5" ]]; then
     echo "Invalid preset: pp_micro_schedule currently requires RUN_TARGET=single_g5"

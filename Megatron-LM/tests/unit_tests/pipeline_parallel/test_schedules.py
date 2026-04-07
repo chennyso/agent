@@ -24,6 +24,37 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 
 
+def test_structure_aware_chunk_order_uses_pipeline_layout(monkeypatch, mocker):
+    monkeypatch.setenv("DISPATCH_ORDER", "structure_aware_critical_first")
+    monkeypatch.setenv("PIPELINE_LAYOUT", "Ett|tt|t|tL")
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(4, 2, 2)
+
+    # For pp_rank=1, chunk 1 contains the loss-adjacent stage ("tL"), so the
+    # structure-aware rule should prioritize it ahead of the plain decoder chunk.
+    assert schedule_table[:4] == [(0, 1), (1, 1), (0, 0), (1, 0)]
+
+
+def test_stage_family_hints_override_local_dispatch(monkeypatch, mocker):
+    monkeypatch.setenv("DISPATCH_ORDER", "default")
+    monkeypatch.setenv(
+        "SCHEDULE_STAGE_FAMILY_HINTS",
+        "1,family=critical_path_first,dispatch_order=structure_aware_critical_first,warmup_policy=balanced_fill,cooldown_policy=opt_prioritized",
+    )
+    monkeypatch.setenv("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", "1:1,5")
+    monkeypatch.setenv("PIPELINE_LAYOUT", "Ett|tt|t|tL")
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(4, 2, 2)
+
+    assert schedule_table[:4] == [(0, 1), (1, 1), (0, 0), (1, 0)]
+
+
 def _populate_embedding_and_position_groups(pp_group):
     """Create *new* embedding-related process groups from *pp_group* ranks."""
 

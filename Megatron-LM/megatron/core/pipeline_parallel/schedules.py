@@ -884,6 +884,186 @@ def _base_model_chunk_order(num_model_chunks: int, template: str) -> List[int]:
     return list(range(num_model_chunks))
 
 
+def _parse_structure_priority_hints(raw: str, num_model_chunks: int) -> Optional[List[int]]:
+    if not str(raw or "").strip():
+        return None
+    parsed: List[int] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed.append(int(token))
+        except ValueError:
+            return None
+    if len(parsed) != num_model_chunks:
+        return None
+    return parsed
+
+
+def _pipeline_parallel_location() -> tuple[Optional[int], Optional[int]]:
+    if not parallel_state.model_parallel_is_initialized():
+        return None, None
+    try:
+        pp_rank = int(parallel_state.get_pipeline_model_parallel_rank())
+        pp_world_size = int(parallel_state.get_pipeline_model_parallel_world_size())
+    except Exception:
+        return None, None
+    if pp_world_size <= 0:
+        return None, None
+    return pp_rank, pp_world_size
+
+
+def _parse_stage_chunk_priority_hints(raw: str, num_model_chunks: int) -> Dict[int, List[int]]:
+    parsed: Dict[int, List[int]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    for stage_entry in text.split(";"):
+        stage_entry = stage_entry.strip()
+        if not stage_entry or ":" not in stage_entry:
+            continue
+        stage_token, priorities_token = stage_entry.split(":", 1)
+        try:
+            stage_id = int(stage_token.strip())
+        except ValueError:
+            continue
+        priorities = _parse_structure_priority_hints(priorities_token, num_model_chunks)
+        if priorities is not None:
+            parsed[int(stage_id)] = priorities
+    return parsed
+
+
+def _parse_stage_family_hints(raw: str) -> Dict[int, Dict[str, str]]:
+    parsed: Dict[int, Dict[str, str]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    for stage_entry in text.split(";"):
+        stage_entry = stage_entry.strip()
+        if not stage_entry:
+            continue
+        tokens = [token.strip() for token in stage_entry.split(",") if token.strip()]
+        if not tokens:
+            continue
+        try:
+            stage_id = int(tokens[0])
+        except ValueError:
+            continue
+        payload: Dict[str, str] = {}
+        for token in tokens[1:]:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                payload[key] = value
+        if payload:
+            parsed[int(stage_id)] = payload
+    return parsed
+
+
+def _get_local_stage_family_hint() -> Dict[str, str]:
+    pp_rank, _ = _pipeline_parallel_location()
+    if pp_rank is None:
+        return {}
+    parsed = _parse_stage_family_hints(os.environ.get("SCHEDULE_STAGE_FAMILY_HINTS", ""))
+    return dict(parsed.get(int(pp_rank)) or {})
+
+
+def _get_structure_aware_chunk_metadata(num_model_chunks: int) -> Optional[List[Dict[str, int]]]:
+    pp_rank, pp_world_size = _pipeline_parallel_location()
+    per_stage_hints = _parse_stage_chunk_priority_hints(
+        os.environ.get("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", ""),
+        num_model_chunks,
+    )
+    if pp_rank is not None:
+        explicit_stage_hints = per_stage_hints.get(int(pp_rank))
+        if explicit_stage_hints is not None:
+            return [
+                {
+                    "chunk_id": int(chunk_id),
+                    "compute_weight": int(priority),
+                    "criticality": 0,
+                }
+                for chunk_id, priority in enumerate(explicit_stage_hints)
+            ]
+
+    raw_hints = os.environ.get("SCHEDULE_CHUNK_PRIORITY_HINTS", "")
+    explicit_hints = _parse_structure_priority_hints(raw_hints, num_model_chunks)
+    if explicit_hints is not None:
+        return [
+            {
+                "chunk_id": int(chunk_id),
+                "compute_weight": int(priority),
+                "criticality": 0,
+            }
+            for chunk_id, priority in enumerate(explicit_hints)
+        ]
+
+    layout = str(os.environ.get("PIPELINE_LAYOUT", "") or "").strip()
+    if not layout or pp_rank is None or pp_world_size is None:
+        return None
+
+    stages = [stage.strip() for stage in layout.split("|")]
+    if len(stages) != pp_world_size * num_model_chunks:
+        return None
+    metadata: List[Dict[str, int]] = []
+    for chunk_id in range(num_model_chunks):
+        stage_index = chunk_id * pp_world_size + pp_rank
+        if stage_index >= len(stages):
+            return None
+        stage_tokens = stages[stage_index]
+        decoder_count = stage_tokens.count("t")
+        criticality = 0
+        if "E" in stage_tokens:
+            criticality += 2
+        if "L" in stage_tokens:
+            criticality += 2
+        if chunk_id in {0, num_model_chunks - 1}:
+            criticality += 1
+        metadata.append(
+            {
+                "chunk_id": int(chunk_id),
+                "compute_weight": int(decoder_count),
+                "criticality": int(criticality),
+            }
+        )
+    return metadata
+
+
+def _apply_structure_aware_chunk_order(order: List[int], phase: str) -> List[int]:
+    metadata = _get_structure_aware_chunk_metadata(len(order))
+    if not metadata:
+        return order
+
+    by_chunk_id = {int(item["chunk_id"]): item for item in metadata}
+
+    def _warm_key(chunk_id: int):
+        item = by_chunk_id.get(int(chunk_id), {})
+        # Warmup / steady front-load structurally critical chunks, then heavier chunks.
+        return (
+            -int(item.get("criticality", 0)),
+            -int(item.get("compute_weight", 0)),
+            order.index(chunk_id),
+        )
+
+    def _cool_key(chunk_id: int):
+        item = by_chunk_id.get(int(chunk_id), {})
+        # Cooldown drains structurally critical chunks first, but prefers lighter
+        # chunks within the same criticality bucket to shorten tail exposure.
+        return (
+            -int(item.get("criticality", 0)),
+            int(item.get("compute_weight", 0)),
+            order.index(chunk_id),
+        )
+
+    if phase == "cooldown":
+        return sorted(order, key=_cool_key)
+    return sorted(order, key=_warm_key)
+
+
 def _resolve_model_chunk_order(
     num_model_chunks: int,
     *,
@@ -894,6 +1074,9 @@ def _resolve_model_chunk_order(
     cooldown_policy: str,
 ) -> List[int]:
     order = _base_model_chunk_order(num_model_chunks, template)
+
+    if dispatch_order in {"structure_aware_critical_first"}:
+        return _apply_structure_aware_chunk_order(order, phase)
 
     if dispatch_order in {"balanced_round_robin"}:
         order = _edge_interleave(order)
@@ -995,14 +1178,17 @@ def _default_checkpoint_activations_microbatch(
 
 
 def _resolve_phase_checkpoint_policy(phase: str, default_value):
-    raw = str(
-        os.environ.get(f"SCHEDULE_{phase.upper()}_CHECKPOINT_POLICY", "default") or "default"
-    ).strip().lower()
+    local_stage_hint = _get_local_stage_family_hint()
+    raw = str(local_stage_hint.get("checkpoint_policy") or "").strip().lower()
+    if not raw:
+        raw = str(
+            os.environ.get(f"SCHEDULE_{phase.upper()}_CHECKPOINT_POLICY", "default") or "default"
+        ).strip().lower()
     if raw in {"", "default", "inherit"}:
         return default_value
     if raw in {"full", "all", "force_full"}:
         return True
-    if raw in {"partial", "off", "none", "disable", "false", "prefer_partial"}:
+    if raw in {"partial", "off", "none", "disable", "false", "prefer_partial", "selective"}:
         return False
     return default_value
 
@@ -1010,7 +1196,10 @@ def _resolve_phase_checkpoint_policy(phase: str, default_value):
 def _phase_uses_p2p_overlap(phase: str, default_enabled: bool) -> bool:
     if not default_enabled:
         return False
-    raw = str(os.environ.get(f"SCHEDULE_{phase.upper()}_P2P_POLICY", "default") or "default").strip().lower()
+    local_stage_hint = _get_local_stage_family_hint()
+    raw = str(local_stage_hint.get("p2p_policy") or "").strip().lower()
+    if not raw:
+        raw = str(os.environ.get(f"SCHEDULE_{phase.upper()}_P2P_POLICY", "default") or "default").strip().lower()
     if raw in {"", "default", "inherit", "overlap", "on", "enabled"}:
         return True
     if raw in {"serial", "off", "none", "defer", "disabled"}:
@@ -1035,9 +1224,12 @@ def _resolve_execution_phase_for_virtual_microbatches(
 def _phase_uses_combined_overlap(phase: str, default_enabled: bool = True) -> bool:
     if not default_enabled:
         return False
-    raw = str(
-        os.environ.get(f"SCHEDULE_{phase.upper()}_COMBINED_POLICY", "default") or "default"
-    ).strip().lower()
+    local_stage_hint = _get_local_stage_family_hint()
+    raw = str(local_stage_hint.get("combined_policy") or "").strip().lower()
+    if not raw:
+        raw = str(
+            os.environ.get(f"SCHEDULE_{phase.upper()}_COMBINED_POLICY", "default") or "default"
+        ).strip().lower()
     if raw in {"", "default", "inherit", "combined", "overlap", "enabled", "on"}:
         return True
     if raw in {"serial", "off", "none", "disabled"}:
@@ -1047,6 +1239,7 @@ def _phase_uses_combined_overlap(phase: str, default_enabled: bool = True) -> bo
 
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
+    local_stage_hint = _get_local_stage_family_hint()
     template = str(os.environ.get("SCHEDULE_TEMPLATE", "fixed_1f1b") or "fixed_1f1b").strip()
     dispatch_order = str(os.environ.get("DISPATCH_ORDER", "default") or "default").strip()
     warmup_policy = str(
@@ -1059,6 +1252,10 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
         os.environ.get("SCHEDULE_FLUSH_ORDER_POLICY", "default") or "default"
     ).strip()
     explicit_flush_ids = str(os.environ.get("SCHEDULE_FLUSH_MICROBATCHES", "") or "").strip()
+    template = str(local_stage_hint.get("preferred_template") or template).strip()
+    dispatch_order = str(local_stage_hint.get("dispatch_order") or dispatch_order).strip()
+    warmup_policy = str(local_stage_hint.get("warmup_policy") or warmup_policy).strip()
+    cooldown_policy = str(local_stage_hint.get("cooldown_policy") or cooldown_policy).strip()
 
     schedule_table = []
     group_starts = list(range(0, num_microbatches, microbatch_group_size_per_vp_stage))

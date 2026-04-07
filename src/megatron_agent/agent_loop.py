@@ -1956,6 +1956,33 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
                 },
             )
         )
+    allow_morphable_pipeline = bool(
+        int(program.parallel.pp_degree) > 1
+        and (
+            allow_nonuniform
+            or allow_asymmetric_vpp
+            or stage_spread >= 0.06
+            or bubble_ratio >= 0.08
+            or cross_node_exposed >= 0.08
+            or peak_memory_ratio >= 0.84
+            or "compute_imbalance" in failure_labels
+            or "memory_hotspot" in failure_labels
+            or "communication_drag" in failure_labels
+        )
+    )
+    if allow_morphable_pipeline:
+        rules.append(
+            ConstraintRuleSpec(
+                name="allow_morphable_pipeline",
+                rationale="joint structure-memory-communication evidence justifies regrouping stage/chunk shape as a first-class search object",
+                params={
+                    "stage_spread_ratio": stage_spread,
+                    "bubble_ratio": bubble_ratio,
+                    "peak_memory_ratio": peak_memory_ratio,
+                    "cross_node_exposed_ratio": cross_node_exposed,
+                },
+            )
+        )
 
     allow_torchtitan_schedule_sandbox = bool(
         backend_family == "torchtitan"
@@ -2088,6 +2115,7 @@ def _rewrite_space(program: MegatronProgram, runtime_summary: Dict[str, Any]) ->
         allow_torchtitan_schedule_sandbox=allow_torchtitan_schedule_sandbox,
         allow_subgraph_submeshes=False,
         allow_heterogeneous_apipe=False,
+        allow_morphable_pipeline=allow_morphable_pipeline,
         max_tp_size=max_tp_size,
         max_pp_size=max_pp_size,
         max_ep_size=int(program.cluster.gpus_per_node) if is_dual else None,
@@ -2898,6 +2926,148 @@ def _build_stage_local_memory_policy_candidate(
     return _sync_batch_plan_metadata(candidate)
 
 
+def _build_morphable_pipeline_candidate(
+    program: MegatronProgram,
+    context_record: Dict[str, Any],
+) -> Optional[MegatronProgram]:
+    evidence = dict((context_record or {}).get("evidence_record") or {})
+    plan = dict(evidence.get("morphable_pipeline_plan") or {})
+    families = list(plan.get("stage_families") or [])
+    chunk_shape_vector = [max(int(item), 1) for item in list(plan.get("chunk_shape_vector") or []) if _safe_int(item) is not None]
+    regroup_actions = list(plan.get("regroup_actions") or [])
+    if not families and not chunk_shape_vector and not regroup_actions:
+        return None
+
+    candidate = _clone_program(program)
+    stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+    if stage_layers and regroup_actions:
+        for action in regroup_actions:
+            left_stage = _safe_int((action or {}).get("left_stage_id"))
+            right_stage = _safe_int((action or {}).get("right_stage_id"))
+            shift_blocks = max(_safe_int((action or {}).get("shift_blocks")) or 1, 1)
+            direction = str((action or {}).get("direction") or "left_to_right")
+            if left_stage is None or right_stage is None:
+                continue
+            if left_stage < 0 or right_stage < 0 or left_stage >= len(stage_layers) or right_stage >= len(stage_layers):
+                continue
+            if direction == "left_to_right":
+                movable = min(max(stage_layers[left_stage] - 1, 0), shift_blocks)
+                if movable > 0:
+                    stage_layers[left_stage] -= movable
+                    stage_layers[right_stage] += movable
+            else:
+                movable = min(max(stage_layers[right_stage] - 1, 0), shift_blocks)
+                if movable > 0:
+                    stage_layers[right_stage] -= movable
+                    stage_layers[left_stage] += movable
+        candidate.partition = candidate.partition.from_dict(_partition_from_stage_layers(stage_layers))
+        candidate.layout.pipeline_layout = None
+
+    stage_count = int(candidate.partition.num_stages)
+    if chunk_shape_vector:
+        if len(chunk_shape_vector) < stage_count:
+            fill = max(int(candidate.parallel.vpp_degree), 1)
+            chunk_shape_vector = chunk_shape_vector + [fill] * (stage_count - len(chunk_shape_vector))
+        else:
+            chunk_shape_vector = chunk_shape_vector[:stage_count]
+    else:
+        chunk_shape_vector = [max(int(candidate.parallel.vpp_degree), 1) for _ in range(stage_count)]
+    candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in chunk_shape_vector]
+    candidate.metadata["preserve_stage_local_vpp"] = True
+    candidate.metadata["morphable_chunk_shape_vector"] = [int(value) for value in chunk_shape_vector]
+    candidate.metadata["morphable_regroup_actions"] = list(regroup_actions)
+    candidate.metadata["morphable_shape_signature"] = str(plan.get("shape_signature") or "")
+    target_global_vpp = max([max(int(candidate.parallel.vpp_degree), 1)] + [int(value) for value in chunk_shape_vector])
+    candidate.parallel.vpp_degree = int(target_global_vpp)
+    candidate.layout.vpp_degree = int(target_global_vpp)
+    if int(target_global_vpp) > 1:
+        focus = "balanced"
+        dominant_family = str(plan.get("dominant_family") or "")
+        if dominant_family == "critical_path_first":
+            focus = "left_heavy"
+        elif dominant_family == "memory_guarded":
+            focus = "balanced"
+        stage_virtual_counts = _stage_local_virtual_counts(
+            stage_layers,
+            [int(value) for value in chunk_shape_vector],
+            global_vpp=int(target_global_vpp),
+            focus=focus,
+        )
+        if stage_virtual_counts and sum(stage_virtual_counts) == int(candidate.model.num_layers):
+            candidate.layout.pipeline_layout = _virtual_stage_layout(stage_virtual_counts)
+        candidate.schedule.skeleton = "stage_aware_grouped"
+        if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
+            candidate.schedule.template = "interleaved_grouped_g2" if int(target_global_vpp) >= 2 else "fixed_1f1b"
+        candidate.schedule.microbatch_group_size_per_vp_stage = max(
+            int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+            4 if int(target_global_vpp) >= 2 else 1,
+        )
+
+    family_hints: List[Dict[str, Any]] = []
+    runtime_recompute_modules: List[str] = []
+    runtime_offload_modules: List[str] = []
+    for family in families:
+        stage_index = _safe_int((family or {}).get("stage_index"))
+        if stage_index is None:
+            continue
+        hint = {
+            "stage_index": int(stage_index),
+            "family": str((family or {}).get("family") or "balanced_interleave"),
+            "preferred_template": str((family or {}).get("preferred_template") or "").strip(),
+            "dispatch_order": str((family or {}).get("dispatch_order") or "default"),
+            "warmup_policy": str((family or {}).get("warmup_policy") or "default"),
+            "cooldown_policy": str((family or {}).get("cooldown_policy") or "default"),
+            "checkpoint_policy": str((family or {}).get("checkpoint_policy") or "").strip(),
+            "p2p_policy": str((family or {}).get("p2p_policy") or "").strip(),
+            "combined_policy": str((family or {}).get("combined_policy") or "").strip(),
+            "chunk_priority_hints": [int(item) for item in list((family or {}).get("chunk_priority_hints") or []) if _safe_int(item) is not None],
+        }
+        family_hints.append(hint)
+        for module in list((family or {}).get("recompute_modules") or []):
+            token = str(module).strip()
+            if token and token not in runtime_recompute_modules:
+                runtime_recompute_modules.append(token)
+        for module in list((family or {}).get("offload_modules") or []):
+            token = str(module).strip()
+            if token and token not in runtime_offload_modules:
+                runtime_offload_modules.append(token)
+
+    if family_hints:
+        candidate.metadata["morphable_stage_families"] = family_hints
+        family_by_stage = {int(item["stage_index"]): item for item in family_hints}
+        ordered_families = [family_by_stage[index] for index in sorted(family_by_stage)]
+        dominant = ordered_families[0]
+        candidate.schedule.dispatch_order = str(dominant.get("dispatch_order") or candidate.schedule.dispatch_order or "default")
+        candidate.strategy_ir.pipe.warmup_policy = str(dominant.get("warmup_policy") or candidate.strategy_ir.pipe.warmup_policy or "default")
+        candidate.strategy_ir.pipe.cooldown_policy = str(dominant.get("cooldown_policy") or candidate.strategy_ir.pipe.cooldown_policy or "default")
+        if any(str(item.get("dispatch_order") or "") == "structure_aware_critical_first" for item in ordered_families):
+            candidate.schedule.dispatch_order = "structure_aware_critical_first"
+        if runtime_recompute_modules:
+            candidate.metadata["runtime_recompute_granularity"] = "selective"
+            candidate.metadata["runtime_enable_recompute_activations"] = True
+            candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
+        if runtime_offload_modules:
+            candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+            candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
+        if any(str(item.get("checkpoint_policy") or "") for item in ordered_families):
+            candidate.metadata["schedule_warmup_checkpoint_policy"] = str(
+                next((item["checkpoint_policy"] for item in ordered_families if item.get("checkpoint_policy")), "selective")
+            )
+        if any(str(item.get("p2p_policy") or "") for item in ordered_families):
+            candidate.metadata["schedule_cooldown_p2p_policy"] = str(
+                next((item["p2p_policy"] for item in ordered_families if item.get("p2p_policy")), "serial")
+            )
+        if any(str(item.get("combined_policy") or "") for item in ordered_families):
+            policy = str(next((item["combined_policy"] for item in ordered_families if item.get("combined_policy")), "serial"))
+            candidate.metadata["schedule_warmup_combined_policy"] = policy
+            candidate.metadata["schedule_steady_combined_policy"] = policy
+            candidate.metadata["schedule_cooldown_combined_policy"] = policy
+
+    candidate.metadata["program_kind"] = "candidate_morphable_pipeline"
+    candidate.metadata["priority_rank"] = 16
+    return _sync_batch_plan_metadata(candidate)
+
+
 def _build_boundary_semantic_schedule_candidates(
     program: MegatronProgram,
     context_record: Dict[str, Any],
@@ -3204,6 +3374,8 @@ def _build_runtime_branch_candidates(
                 candidate.metadata["runtime_memory_policy_mode"] = "moe_skew_relief"
         elif builder == "apipe_pipe_heuristic":
             candidate = _build_apipe_pipe_heuristic_candidate(baseline, context_record)
+        elif builder == "morphable_pipeline_candidate":
+            candidate = _build_morphable_pipeline_candidate(baseline, context_record)
         if candidate is None:
             continue
         candidate.metadata["runtime_branch_id"] = branch_id
@@ -3231,6 +3403,7 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
         for item in (program.strategy_ir.local_parallel or [])
     )
     uses_torchtitan_schedule = str(program.schedule.template or "") in {"torchtitan_zero_bubble", "torchtitan_dualpipev"}
+    uses_morphable_pipeline = str(program.metadata.get("program_kind") or "") == "candidate_morphable_pipeline"
     if search_space.max_tp_size is not None and int(program.parallel.tp_degree) > int(search_space.max_tp_size):
         return False, f"tp_degree={program.parallel.tp_degree} exceeds search-space max_tp_size={search_space.max_tp_size}"
     if search_space.max_pp_size is not None and int(program.parallel.pp_degree) > int(search_space.max_pp_size):
@@ -3266,6 +3439,8 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
         return False, "hybrid shard candidates are not allowed in the current search space"
     if uses_torchtitan_schedule and not search_space.allow_torchtitan_schedule_sandbox:
         return False, "torchtitan schedule sandbox is not allowed in the current search space"
+    if uses_morphable_pipeline and not search_space.allow_morphable_pipeline:
+        return False, "morphable pipeline candidates are not allowed in the current search space"
     if program.schedule.skeleton not in set(search_space.allowed_schedule_skeletons):
         return False, f"schedule skeleton {program.schedule.skeleton} is outside allowed search-space skeletons"
     if program.schedule.template not in set(search_space.allowed_schedule_templates):
@@ -3441,6 +3616,13 @@ def _build_schedule_candidates(
         and str(apipe_heuristic.schedule.template or "fixed_1f1b") in allowed_templates
     ):
         candidates.append(_annotate_local_parallel(apipe_heuristic, context_record))
+    if rewrite.allow_morphable_pipeline:
+        morphable_candidate = _build_morphable_pipeline_candidate(baseline, context_record)
+        if (
+            morphable_candidate is not None
+            and str(morphable_candidate.schedule.template or "fixed_1f1b") in allowed_templates
+        ):
+            candidates.append(_annotate_local_parallel(morphable_candidate, context_record))
     for skeleton in skeletons:
         if int(skeleton.parallel.pp_degree) >= 4:
             scaled = _build_pp_vpp_scaleout_candidate(skeleton, runtime_summary)

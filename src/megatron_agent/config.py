@@ -15,6 +15,7 @@ _DEFAULT_VARIABLE_TIERS = {
     "placement": "global_low_freq",
     "local_parallel": "local_mid_freq",
     "pipe": "runtime_high_freq",
+    "morphable_pipe": "runtime_high_freq",
 }
 
 
@@ -801,6 +802,260 @@ class LocalParallelSpec:
 
 
 @dataclass
+class MorphableUnitSpec:
+    name: str
+    semantic_role: str = "decoder"
+    atom_kind: str = "decoder_block"
+    parent_subgraph: Optional[str] = None
+    stage_index: int = 0
+    decoder_start: int = 0
+    decoder_end: int = 0
+    compute_weight: float = 0.0
+    memory_weight: float = 0.0
+    communication_weight: float = 0.0
+    boundary_cost: float = 0.0
+    liveness_weight: float = 0.0
+    special_tokens: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "MorphableUnitSpec":
+        norm = copy.deepcopy(self)
+        norm.name = str(norm.name or "unit")
+        norm.semantic_role = str(norm.semantic_role or "decoder").strip().lower() or "decoder"
+        norm.atom_kind = str(norm.atom_kind or "decoder_block").strip().lower() or "decoder_block"
+        if norm.parent_subgraph is not None:
+            norm.parent_subgraph = str(norm.parent_subgraph).strip() or None
+        norm.stage_index = max(int(norm.stage_index), 0)
+        norm.decoder_start = max(int(norm.decoder_start), 0)
+        norm.decoder_end = max(int(norm.decoder_end), norm.decoder_start)
+        norm.compute_weight = max(float(norm.compute_weight), 0.0)
+        norm.memory_weight = max(float(norm.memory_weight), 0.0)
+        norm.communication_weight = max(float(norm.communication_weight), 0.0)
+        norm.boundary_cost = max(float(norm.boundary_cost), 0.0)
+        norm.liveness_weight = max(float(norm.liveness_weight), 0.0)
+        norm.special_tokens = [str(token) for token in (norm.special_tokens or []) if str(token).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "name": norm.name,
+            "semantic_role": norm.semantic_role,
+            "atom_kind": norm.atom_kind,
+            "parent_subgraph": norm.parent_subgraph,
+            "stage_index": int(norm.stage_index),
+            "decoder_start": int(norm.decoder_start),
+            "decoder_end": int(norm.decoder_end),
+            "compute_weight": float(norm.compute_weight),
+            "memory_weight": float(norm.memory_weight),
+            "communication_weight": float(norm.communication_weight),
+            "boundary_cost": float(norm.boundary_cost),
+            "liveness_weight": float(norm.liveness_weight),
+            "special_tokens": list(norm.special_tokens),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MorphableUnitSpec":
+        return cls(
+            name=str(payload.get("name", "unit")),
+            semantic_role=str(payload.get("semantic_role", "decoder")),
+            atom_kind=str(payload.get("atom_kind", "decoder_block")),
+            parent_subgraph=payload.get("parent_subgraph"),
+            stage_index=int(payload.get("stage_index", 0) or 0),
+            decoder_start=int(payload.get("decoder_start", 0) or 0),
+            decoder_end=int(payload.get("decoder_end", payload.get("decoder_start", 0)) or 0),
+            compute_weight=float(payload.get("compute_weight", 0.0) or 0.0),
+            memory_weight=float(payload.get("memory_weight", 0.0) or 0.0),
+            communication_weight=float(payload.get("communication_weight", 0.0) or 0.0),
+            boundary_cost=float(payload.get("boundary_cost", 0.0) or 0.0),
+            liveness_weight=float(payload.get("liveness_weight", 0.0) or 0.0),
+            special_tokens=[str(token) for token in (payload.get("special_tokens") or [])],
+        )
+
+
+@dataclass
+class MorphableEdgeSpec:
+    src: str
+    dst: str
+    semantic: str = "structure"
+    criticality: float = 0.0
+    cost: float = 0.0
+
+    def normalized(self) -> "MorphableEdgeSpec":
+        norm = copy.deepcopy(self)
+        norm.src = str(norm.src or "src")
+        norm.dst = str(norm.dst or "dst")
+        norm.semantic = str(norm.semantic or "structure").strip().lower() or "structure"
+        norm.criticality = max(float(norm.criticality), 0.0)
+        norm.cost = max(float(norm.cost), 0.0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "src": norm.src,
+            "dst": norm.dst,
+            "semantic": norm.semantic,
+            "criticality": float(norm.criticality),
+            "cost": float(norm.cost),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MorphableEdgeSpec":
+        return cls(
+            src=str(payload.get("src", "src")),
+            dst=str(payload.get("dst", "dst")),
+            semantic=str(payload.get("semantic", "structure")),
+            criticality=float(payload.get("criticality", 0.0) or 0.0),
+            cost=float(payload.get("cost", 0.0) or 0.0),
+        )
+
+
+@dataclass
+class MorphableStageFamilySpec:
+    stage_index: int
+    family: str = "balanced_interleave"
+    semantic_role: str = "decoder"
+    preferred_template: Optional[str] = None
+    dispatch_order: Optional[str] = None
+    warmup_policy: Optional[str] = None
+    cooldown_policy: Optional[str] = None
+    checkpoint_policy: Optional[str] = None
+    p2p_policy: Optional[str] = None
+    combined_policy: Optional[str] = None
+    recompute_modules: List[str] = field(default_factory=list)
+    offload_modules: List[str] = field(default_factory=list)
+    chunk_priority_hints: List[int] = field(default_factory=list)
+
+    def normalized(self) -> "MorphableStageFamilySpec":
+        norm = copy.deepcopy(self)
+        norm.stage_index = max(int(norm.stage_index), 0)
+        norm.family = str(norm.family or "balanced_interleave").strip().lower() or "balanced_interleave"
+        norm.semantic_role = str(norm.semantic_role or "decoder").strip().lower() or "decoder"
+        if norm.preferred_template is not None:
+            norm.preferred_template = str(norm.preferred_template).strip() or None
+        if norm.dispatch_order is not None:
+            norm.dispatch_order = str(norm.dispatch_order).strip() or None
+        if norm.warmup_policy is not None:
+            norm.warmup_policy = str(norm.warmup_policy).strip() or None
+        if norm.cooldown_policy is not None:
+            norm.cooldown_policy = str(norm.cooldown_policy).strip() or None
+        if norm.checkpoint_policy is not None:
+            norm.checkpoint_policy = str(norm.checkpoint_policy).strip().lower() or None
+        if norm.p2p_policy is not None:
+            norm.p2p_policy = str(norm.p2p_policy).strip().lower() or None
+        if norm.combined_policy is not None:
+            norm.combined_policy = str(norm.combined_policy).strip().lower() or None
+        norm.recompute_modules = [str(item) for item in (norm.recompute_modules or []) if str(item).strip()]
+        norm.offload_modules = [str(item) for item in (norm.offload_modules or []) if str(item).strip()]
+        norm.chunk_priority_hints = [max(int(item), 0) for item in (norm.chunk_priority_hints or [])]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "stage_index": int(norm.stage_index),
+            "family": norm.family,
+            "semantic_role": norm.semantic_role,
+            "preferred_template": norm.preferred_template,
+            "dispatch_order": norm.dispatch_order,
+            "warmup_policy": norm.warmup_policy,
+            "cooldown_policy": norm.cooldown_policy,
+            "checkpoint_policy": norm.checkpoint_policy,
+            "p2p_policy": norm.p2p_policy,
+            "combined_policy": norm.combined_policy,
+            "recompute_modules": list(norm.recompute_modules),
+            "offload_modules": list(norm.offload_modules),
+            "chunk_priority_hints": list(norm.chunk_priority_hints),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MorphableStageFamilySpec":
+        return cls(
+            stage_index=int(payload.get("stage_index", 0) or 0),
+            family=str(payload.get("family", "balanced_interleave")),
+            semantic_role=str(payload.get("semantic_role", "decoder")),
+            preferred_template=payload.get("preferred_template"),
+            dispatch_order=payload.get("dispatch_order"),
+            warmup_policy=payload.get("warmup_policy"),
+            cooldown_policy=payload.get("cooldown_policy"),
+            checkpoint_policy=payload.get("checkpoint_policy"),
+            p2p_policy=payload.get("p2p_policy"),
+            combined_policy=payload.get("combined_policy"),
+            recompute_modules=[str(item) for item in (payload.get("recompute_modules") or [])],
+            offload_modules=[str(item) for item in (payload.get("offload_modules") or [])],
+            chunk_priority_hints=[int(item) for item in (payload.get("chunk_priority_hints") or [])],
+        )
+
+
+@dataclass
+class MorphablePipelineSpec:
+    shape_objective: str = "structure_memory_comm_coupled"
+    units: List[MorphableUnitSpec] = field(default_factory=list)
+    structure_edges: List[MorphableEdgeSpec] = field(default_factory=list)
+    memory_edges: List[MorphableEdgeSpec] = field(default_factory=list)
+    communication_edges: List[MorphableEdgeSpec] = field(default_factory=list)
+    stage_families: List[MorphableStageFamilySpec] = field(default_factory=list)
+    chunk_shape_vector: List[int] = field(default_factory=list)
+    search_levels: List[str] = field(
+        default_factory=lambda: ["structural_regroup", "stage_chunk_form", "family_policy_select"]
+    )
+    legality_guards: Dict[str, Any] = field(default_factory=dict)
+    shape_signature: Optional[str] = None
+
+    def normalized(self) -> "MorphablePipelineSpec":
+        norm = copy.deepcopy(self)
+        norm.shape_objective = (
+            str(norm.shape_objective or "structure_memory_comm_coupled").strip().lower()
+            or "structure_memory_comm_coupled"
+        )
+        norm.units = [item.normalized() for item in (norm.units or [])]
+        norm.structure_edges = [item.normalized() for item in (norm.structure_edges or [])]
+        norm.memory_edges = [item.normalized() for item in (norm.memory_edges or [])]
+        norm.communication_edges = [item.normalized() for item in (norm.communication_edges or [])]
+        norm.stage_families = [item.normalized() for item in (norm.stage_families or [])]
+        norm.chunk_shape_vector = [max(int(item), 1) for item in (norm.chunk_shape_vector or [])]
+        norm.search_levels = [str(item) for item in (norm.search_levels or []) if str(item).strip()]
+        if not norm.search_levels:
+            norm.search_levels = ["structural_regroup", "stage_chunk_form", "family_policy_select"]
+        norm.legality_guards = copy.deepcopy(norm.legality_guards or {})
+        if norm.shape_signature is not None:
+            norm.shape_signature = str(norm.shape_signature).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "shape_objective": norm.shape_objective,
+            "units": [item.to_dict() for item in norm.units],
+            "structure_edges": [item.to_dict() for item in norm.structure_edges],
+            "memory_edges": [item.to_dict() for item in norm.memory_edges],
+            "communication_edges": [item.to_dict() for item in norm.communication_edges],
+            "stage_families": [item.to_dict() for item in norm.stage_families],
+            "chunk_shape_vector": list(norm.chunk_shape_vector),
+            "search_levels": list(norm.search_levels),
+            "legality_guards": copy.deepcopy(norm.legality_guards),
+            "shape_signature": norm.shape_signature,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MorphablePipelineSpec":
+        return cls(
+            shape_objective=str(payload.get("shape_objective", "structure_memory_comm_coupled")),
+            units=[MorphableUnitSpec.from_dict(item) for item in (payload.get("units") or [])],
+            structure_edges=[MorphableEdgeSpec.from_dict(item) for item in (payload.get("structure_edges") or [])],
+            memory_edges=[MorphableEdgeSpec.from_dict(item) for item in (payload.get("memory_edges") or [])],
+            communication_edges=[MorphableEdgeSpec.from_dict(item) for item in (payload.get("communication_edges") or [])],
+            stage_families=[
+                MorphableStageFamilySpec.from_dict(item) for item in (payload.get("stage_families") or [])
+            ],
+            chunk_shape_vector=[int(item) for item in (payload.get("chunk_shape_vector") or [])],
+            search_levels=[str(item) for item in (payload.get("search_levels") or [])],
+            legality_guards=copy.deepcopy(payload.get("legality_guards") or {}),
+            shape_signature=payload.get("shape_signature"),
+        )
+
+
+@dataclass
 class PipeRuntimeSpec:
     template: str = "fixed_1f1b"
     microbatch_order: str = "default"
@@ -845,6 +1100,7 @@ class StrategyIRSpec:
     placement: List[PlacementEntrySpec] = field(default_factory=list)
     local_parallel: List[LocalParallelSpec] = field(default_factory=list)
     pipe: PipeRuntimeSpec = field(default_factory=PipeRuntimeSpec)
+    morphable_pipe: MorphablePipelineSpec = field(default_factory=MorphablePipelineSpec)
     variable_tiers: Dict[str, str] = field(default_factory=lambda: copy.deepcopy(_DEFAULT_VARIABLE_TIERS))
 
     def normalized(self) -> "StrategyIRSpec":
@@ -853,6 +1109,7 @@ class StrategyIRSpec:
         norm.placement = [item.normalized() for item in (norm.placement or [])]
         norm.local_parallel = [item.normalized() for item in (norm.local_parallel or [])]
         norm.pipe = norm.pipe.normalized()
+        norm.morphable_pipe = norm.morphable_pipe.normalized()
         tiers = copy.deepcopy(_DEFAULT_VARIABLE_TIERS)
         for key, value in (norm.variable_tiers or {}).items():
             tiers[str(key)] = str(value or tiers.get(str(key), "global_low_freq"))
@@ -866,6 +1123,7 @@ class StrategyIRSpec:
             "placement": [item.to_dict() for item in norm.placement],
             "local_parallel": [item.to_dict() for item in norm.local_parallel],
             "pipe": norm.pipe.to_dict(),
+            "morphable_pipe": norm.morphable_pipe.to_dict(),
             "variable_tiers": copy.deepcopy(norm.variable_tiers),
         }
 
@@ -876,6 +1134,7 @@ class StrategyIRSpec:
             placement=[PlacementEntrySpec.from_dict(item) for item in (payload.get("placement") or [])],
             local_parallel=[LocalParallelSpec.from_dict(item) for item in (payload.get("local_parallel") or [])],
             pipe=PipeRuntimeSpec.from_dict(payload.get("pipe") or {}),
+            morphable_pipe=MorphablePipelineSpec.from_dict(payload.get("morphable_pipe") or {}),
             variable_tiers={
                 str(key): str(value)
                 for key, value in (payload.get("variable_tiers") or {}).items()
@@ -965,6 +1224,7 @@ class SearchSpaceSpec:
     allow_torchtitan_schedule_sandbox: bool = False
     allow_subgraph_submeshes: bool = False
     allow_heterogeneous_apipe: bool = False
+    allow_morphable_pipeline: bool = False
     max_tp_size: Optional[int] = None
     max_pp_size: Optional[int] = None
     max_ep_size: Optional[int] = None
@@ -995,6 +1255,7 @@ class SearchSpaceSpec:
         norm.allow_torchtitan_schedule_sandbox = bool(norm.allow_torchtitan_schedule_sandbox)
         norm.allow_subgraph_submeshes = bool(norm.allow_subgraph_submeshes)
         norm.allow_heterogeneous_apipe = bool(norm.allow_heterogeneous_apipe)
+        norm.allow_morphable_pipeline = bool(norm.allow_morphable_pipeline)
         if norm.max_tp_size is not None:
             norm.max_tp_size = max(int(norm.max_tp_size), 1)
         if norm.max_pp_size is not None:
@@ -1038,6 +1299,7 @@ class SearchSpaceSpec:
             "allow_torchtitan_schedule_sandbox": bool(norm.allow_torchtitan_schedule_sandbox),
             "allow_subgraph_submeshes": bool(norm.allow_subgraph_submeshes),
             "allow_heterogeneous_apipe": bool(norm.allow_heterogeneous_apipe),
+            "allow_morphable_pipeline": bool(norm.allow_morphable_pipeline),
             "max_tp_size": norm.max_tp_size,
             "max_pp_size": norm.max_pp_size,
             "max_ep_size": norm.max_ep_size,
@@ -1070,6 +1332,7 @@ class SearchSpaceSpec:
             allow_torchtitan_schedule_sandbox=bool(payload.get("allow_torchtitan_schedule_sandbox", False)),
             allow_subgraph_submeshes=bool(payload.get("allow_subgraph_submeshes", False)),
             allow_heterogeneous_apipe=bool(payload.get("allow_heterogeneous_apipe", False)),
+            allow_morphable_pipeline=bool(payload.get("allow_morphable_pipeline", False)),
             max_tp_size=payload.get("max_tp_size"),
             max_pp_size=payload.get("max_pp_size"),
             max_ep_size=payload.get("max_ep_size"),
@@ -1508,7 +1771,12 @@ class ExperimentSpec:
 def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
     norm = copy.deepcopy(program)
     strategy_ir = norm.strategy_ir.normalized() if hasattr(norm, "strategy_ir") else StrategyIRSpec()
-    if strategy_ir.apipe and strategy_ir.placement and strategy_ir.local_parallel:
+    if (
+        strategy_ir.apipe
+        and strategy_ir.placement
+        and strategy_ir.local_parallel
+        and strategy_ir.morphable_pipe.units
+    ):
         return strategy_ir.normalized()
 
     total_layers = max(int(norm.model.num_layers), 1)
@@ -1518,6 +1786,11 @@ def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
     apipe: List[SubgraphSpec] = []
     placement: List[PlacementEntrySpec] = []
     local_parallel: List[LocalParallelSpec] = []
+    morphable_units: List[MorphableUnitSpec] = []
+    structure_edges: List[MorphableEdgeSpec] = []
+    memory_edges: List[MorphableEdgeSpec] = []
+    communication_edges: List[MorphableEdgeSpec] = []
+    stage_families: List[MorphableStageFamilySpec] = []
     stage_device_counts = list(norm.layout.stage_device_counts or [])
     if len(stage_device_counts) < len(norm.partition.stages):
         stage_device_counts.extend([logical_group_size] * (len(norm.partition.stages) - len(stage_device_counts)))
@@ -1531,14 +1804,21 @@ def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
         has_loss = "L" in set(stage.special_tokens or [])
         if has_embedding and has_loss:
             module_family = "embedding_decoder_loss"
+            semantic_role = "embedding_loss_anchor"
         elif has_embedding:
             module_family = "embedding_decoder"
+            semantic_role = "embedding_anchor"
         elif has_loss:
             module_family = "decoder_loss"
+            semantic_role = "loss_anchor"
         else:
             module_family = "decoder"
+            semantic_role = "decoder"
         stage_name = f"subg_stage_{stage_index}"
         attention_heavy = decoder_layers > 0 and decoder_start <= attention_boundary
+        compute_weight = float(decoder_layers + (2 if has_embedding or has_loss else 0))
+        memory_weight = float(decoder_layers + (1 if has_embedding or has_loss else 0))
+        communication_weight = float(1 + (1 if stage_index in {0, len(norm.partition.stages) - 1} else 0))
         apipe.append(
             SubgraphSpec(
                 name=stage_name,
@@ -1551,6 +1831,156 @@ def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
                 loss_heavy=has_loss,
             )
         )
+        stage_units: List[MorphableUnitSpec] = []
+        if has_embedding:
+            stage_units.append(
+                MorphableUnitSpec(
+                    name=f"{stage_name}.embedding_anchor",
+                    semantic_role="embedding_anchor",
+                    atom_kind="embedding_anchor",
+                    parent_subgraph=stage_name,
+                    stage_index=stage_index,
+                    decoder_start=decoder_start,
+                    decoder_end=decoder_start,
+                    compute_weight=2.0,
+                    memory_weight=1.5,
+                    communication_weight=1.0,
+                    boundary_cost=1.0,
+                    liveness_weight=1.0,
+                    special_tokens=list(stage.special_tokens),
+                )
+            )
+        if decoder_layers > 0:
+            attn_weight = max(float(decoder_layers) * 0.45, 1.0)
+            mlp_weight = max(float(decoder_layers) * 0.40, 1.0)
+            residual_weight = max(float(decoder_layers) * 0.15, 0.5)
+            stage_units.extend(
+                [
+                    MorphableUnitSpec(
+                        name=f"{stage_name}.attn_block",
+                        semantic_role="attention_block",
+                        atom_kind="attention_core",
+                        parent_subgraph=stage_name,
+                        stage_index=stage_index,
+                        decoder_start=decoder_start,
+                        decoder_end=decoder_end,
+                        compute_weight=attn_weight,
+                        memory_weight=max(attn_weight * 0.8, 0.5),
+                        communication_weight=max(attn_weight * 0.12, 0.2),
+                        boundary_cost=max(attn_weight * 0.10, 0.2),
+                        liveness_weight=max(attn_weight * 0.9, 0.5),
+                        special_tokens=list(stage.special_tokens),
+                    ),
+                    MorphableUnitSpec(
+                        name=f"{stage_name}.mlp_block",
+                        semantic_role="mlp_block",
+                        atom_kind="mlp_core",
+                        parent_subgraph=stage_name,
+                        stage_index=stage_index,
+                        decoder_start=decoder_start,
+                        decoder_end=decoder_end,
+                        compute_weight=mlp_weight,
+                        memory_weight=max(mlp_weight * 0.85, 0.5),
+                        communication_weight=max(mlp_weight * 0.06, 0.1),
+                        boundary_cost=max(mlp_weight * 0.08, 0.1),
+                        liveness_weight=max(mlp_weight * 0.95, 0.5),
+                        special_tokens=list(stage.special_tokens),
+                    ),
+                    MorphableUnitSpec(
+                        name=f"{stage_name}.residual_merge",
+                        semantic_role="residual_merge",
+                        atom_kind="residual_norm",
+                        parent_subgraph=stage_name,
+                        stage_index=stage_index,
+                        decoder_start=decoder_start,
+                        decoder_end=decoder_end,
+                        compute_weight=residual_weight,
+                        memory_weight=max(residual_weight * 0.75, 0.2),
+                        communication_weight=max(residual_weight * 0.04, 0.05),
+                        boundary_cost=max(residual_weight * 0.06, 0.05),
+                        liveness_weight=max(residual_weight * 0.6, 0.2),
+                        special_tokens=list(stage.special_tokens),
+                    ),
+                ]
+            )
+        if has_loss:
+            stage_units.append(
+                MorphableUnitSpec(
+                    name=f"{stage_name}.loss_anchor",
+                    semantic_role="loss_anchor",
+                    atom_kind="loss_anchor",
+                    parent_subgraph=stage_name,
+                    stage_index=stage_index,
+                    decoder_start=max(decoder_end, decoder_start),
+                    decoder_end=max(decoder_end, decoder_start),
+                    compute_weight=2.0,
+                    memory_weight=1.5,
+                    communication_weight=1.0,
+                    boundary_cost=1.0,
+                    liveness_weight=0.6,
+                    special_tokens=list(stage.special_tokens),
+                )
+            )
+        morphable_units.extend(stage_units)
+        if stage_index > 0:
+            prev_stage_name = f"subg_stage_{stage_index - 1}"
+            structure_edges.append(
+                MorphableEdgeSpec(
+                    src=prev_stage_name,
+                    dst=stage_name,
+                    semantic="structure",
+                    criticality=1.0,
+                    cost=float(compute_weight),
+                )
+            )
+            memory_edges.append(
+                MorphableEdgeSpec(
+                    src=prev_stage_name,
+                    dst=stage_name,
+                    semantic="memory",
+                    criticality=max(memory_weight, 1.0),
+                    cost=float(memory_weight),
+                )
+            )
+            communication_edges.append(
+                MorphableEdgeSpec(
+                    src=prev_stage_name,
+                    dst=stage_name,
+                    semantic="communication",
+                    criticality=max(communication_weight, 1.0),
+                    cost=float(communication_weight),
+                )
+            )
+        for local_index in range(len(stage_units) - 1):
+            src_unit = stage_units[local_index]
+            dst_unit = stage_units[local_index + 1]
+            structure_edges.append(
+                MorphableEdgeSpec(
+                    src=src_unit.name,
+                    dst=dst_unit.name,
+                    semantic="structure",
+                    criticality=max(float(dst_unit.compute_weight), 0.5),
+                    cost=max(float(dst_unit.boundary_cost), 0.05),
+                )
+            )
+            memory_edges.append(
+                MorphableEdgeSpec(
+                    src=src_unit.name,
+                    dst=dst_unit.name,
+                    semantic="memory",
+                    criticality=max(float(dst_unit.liveness_weight), 0.2),
+                    cost=max(float(dst_unit.memory_weight), 0.2),
+                )
+            )
+            communication_edges.append(
+                MorphableEdgeSpec(
+                    src=src_unit.name,
+                    dst=dst_unit.name,
+                    semantic="communication",
+                    criticality=max(float(dst_unit.communication_weight), 0.05),
+                    cost=max(float(dst_unit.boundary_cost), 0.05),
+                )
+            )
         nodes = [str(norm.layout.stage_to_node[stage_index])] if stage_index < len(norm.layout.stage_to_node) else []
         placement.append(
             PlacementEntrySpec(
@@ -1571,6 +2001,55 @@ def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
                 device_group_type=str(norm.machine_profile.device_class if norm.machine_profile is not None else "gpu"),
             )
         )
+        family = "balanced_interleave"
+        dispatch_order = "default"
+        warmup_policy = "default"
+        cooldown_policy = "default"
+        checkpoint_policy = None
+        p2p_policy = None
+        combined_policy = None
+        recompute_modules: List[str] = []
+        offload_modules: List[str] = []
+        chunk_priority_hints: List[int] = []
+        if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"}:
+            family = "critical_path_first"
+            dispatch_order = "structure_aware_critical_first"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "opt_prioritized"
+            chunk_priority_hints = [2] * max(int(norm.parallel.vpp_degree), 1)
+        elif attention_heavy:
+            family = "comm_guarded"
+            dispatch_order = "balanced_round_robin"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            p2p_policy = "serial"
+            combined_policy = "serial"
+            recompute_modules = ["core_attn"]
+        elif decoder_layers >= max(total_layers // max(len(norm.partition.stages), 1), 1) + 1:
+            family = "memory_guarded"
+            dispatch_order = "middle_stage_relief"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            checkpoint_policy = "selective"
+            combined_policy = "serial"
+            recompute_modules = ["core_attn", "mlp"]
+        stage_families.append(
+            MorphableStageFamilySpec(
+                stage_index=stage_index,
+                family=family,
+                semantic_role=semantic_role,
+                preferred_template=str(norm.schedule.template),
+                dispatch_order=dispatch_order,
+                warmup_policy=warmup_policy,
+                cooldown_policy=cooldown_policy,
+                checkpoint_policy=checkpoint_policy,
+                p2p_policy=p2p_policy,
+                combined_policy=combined_policy,
+                recompute_modules=recompute_modules,
+                offload_modules=offload_modules,
+                chunk_priority_hints=chunk_priority_hints,
+            )
+        )
 
     strategy_ir = StrategyIRSpec(
         apipe=apipe,
@@ -1582,6 +2061,32 @@ def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:
             steady_state_group_size=norm.schedule.microbatch_group_size_per_vp_stage,
             warmup_policy="default",
             cooldown_policy="default",
+        ),
+        morphable_pipe=MorphablePipelineSpec(
+            units=morphable_units,
+            structure_edges=structure_edges,
+            memory_edges=memory_edges,
+            communication_edges=communication_edges,
+            stage_families=stage_families,
+            chunk_shape_vector=[max(int(norm.parallel.vpp_degree), 1) for _ in norm.partition.stages],
+            legality_guards={
+                "memory_budget_gb": float(norm.constraints.memory_budget_gb or norm.cluster.device_memory_gb or 0.0),
+                "required_node_local_axes": list(norm.constraints.required_node_local_axes or []),
+                "pp_degree": int(norm.parallel.pp_degree),
+                "vpp_degree": int(norm.parallel.vpp_degree),
+            },
+            shape_signature=_stable_hash(
+                {
+                    "partition": norm.partition.to_dict(),
+                    "layout": norm.layout.to_dict(),
+                    "parallel": {
+                        "pp_degree": int(norm.parallel.pp_degree),
+                        "vpp_degree": int(norm.parallel.vpp_degree),
+                    },
+                    "families": [item.to_dict() for item in stage_families],
+                },
+                "morphable_pipeline_shape_v1",
+            ),
         ),
     )
     return strategy_ir.normalized()

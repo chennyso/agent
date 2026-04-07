@@ -71,6 +71,7 @@ from megatron_agent.config import (  # noqa: E402
     default_moe_smoke_program,
 )
 from megatron_agent.programs import classify_program_family, compile_program, verify_program  # noqa: E402
+from megatron_agent import trace_reducer  # noqa: E402
 from megatron_agent.trace_reducer import (  # noqa: E402
     build_agent_observation,
     build_context_record,
@@ -1013,6 +1014,46 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("branch_local_pipe_reorder", activated_ids)
         self.assertGreaterEqual(len(branch_plan["trigger_rules"]), 4)
 
+    def test_context_record_includes_morphable_pipeline_problem_and_plan(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.15,
+            "optimizer_exposed_ratio": 0.22,
+            "peak_memory_ratio": 0.89,
+            "comm_exposure_ratio": 0.13,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+                "1": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "2": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "3": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        problem = dict(context["evidence_record"]["morphable_pipeline_problem"])
+        plan = dict(context["evidence_record"]["morphable_pipeline_plan"])
+        branch_plan = dict(context["evidence_record"]["runtime_branch_plan"])
+
+        self.assertEqual(problem["status"], "executable_v1")
+        self.assertEqual(plan["status"], "executable_v1")
+        self.assertGreater(len(list((problem.get("three_semantic_execution_graph") or {}).get("units") or [])), 0)
+        self.assertIn("structure_aware_partition_ir", problem)
+        self.assertIn("selective_vpp_generator", problem)
+        self.assertIn("critical_path_communication_model", problem)
+        self.assertIn("liveness_aware_chunk_formation", problem)
+        self.assertGreater(len(list(plan.get("stage_families") or [])), 0)
+        self.assertGreater(len(list(plan.get("selective_vpp_decisions") or [])), 0)
+        self.assertGreater(len(list(plan.get("local_family_assignment") or [])), 0)
+        self.assertTrue(str(plan.get("shape_signature") or ""))
+        self.assertIn(
+            "branch_morphable_pipeline_shape",
+            {item["branch_id"] for item in branch_plan["activated_branches"]},
+        )
+
     def test_runtime_branch_candidates_follow_active_branches(self) -> None:
         program = default_dense_program("single_g5")
         program.parallel.pp_degree = 4
@@ -1038,6 +1079,61 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("branch_peak_window_memory_relief", branch_ids)
         self.assertIn("branch_local_pipe_reorder", branch_ids)
         self.assertTrue(any(str(candidate.metadata.get("program_kind") or "").startswith("candidate_branch_") for candidate in candidates))
+
+    def test_runtime_branch_candidates_include_morphable_pipeline_candidate(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.15,
+            "optimizer_exposed_ratio": 0.22,
+            "peak_memory_ratio": 0.89,
+            "comm_exposure_ratio": 0.13,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+                "1": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "2": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "3": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        candidates = agent_loop._build_runtime_branch_candidates(program, context)
+        branch_ids = {str(candidate.metadata.get("runtime_branch_id") or "") for candidate in candidates}
+        kinds = {str(candidate.metadata.get("program_kind") or "") for candidate in candidates}
+
+        self.assertIn("branch_morphable_pipeline_shape", branch_ids)
+        self.assertIn("candidate_branch_morphable_pipeline_shape", kinds)
+
+    def test_apipe_plan_uses_structure_aware_dispatch_for_vpp_wait(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8200.0,
+            "bubble_ratio": 0.05,
+            "pipeline_wait_ratio": 0.12,
+            "optimizer_exposed_ratio": 0.10,
+            "stage_tail_ratio": 0.07,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "2": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "3": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+            },
+        }
+
+        plan = trace_reducer._build_apipe_heuristic_plan(program, runtime_summary, [])
+        action_names = {item["name"] for item in plan["actions"]}
+
+        self.assertEqual(
+            plan["runtime_controls"]["dispatch_order"],
+            "structure_aware_critical_first",
+        )
+        self.assertIn("reprioritize_chunks_by_structure", action_names)
 
     def test_compile_program_exports_pipe_runtime_envs(self) -> None:
         program = default_dense_program("dual_g5_g5").normalized()
@@ -1085,6 +1181,45 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_P2P_POLICY"], "serial")
         self.assertEqual(compiled.launcher_env["SCHEDULE_WARMUP_COMBINED_POLICY"], "serial")
         self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_COMBINED_POLICY"], "serial")
+
+    def test_compile_program_exports_morphable_pipeline_envs(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.pp_degree = 4
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        program.metadata["morphable_shape_signature"] = "shape:test"
+        program.metadata["morphable_chunk_shape_vector"] = [2, 1, 1, 2]
+        program.metadata["morphable_stage_families"] = [
+            {
+                "stage_index": 0,
+                "family": "critical_path_first",
+                "dispatch_order": "structure_aware_critical_first",
+                "warmup_policy": "balanced_fill",
+                "cooldown_policy": "opt_prioritized",
+                "checkpoint_policy": "selective",
+                "p2p_policy": "serial",
+                "combined_policy": "serial",
+                "chunk_priority_hints": [4, 2],
+            },
+            {
+                "stage_index": 1,
+                "family": "memory_guarded",
+                "dispatch_order": "middle_stage_relief",
+                "warmup_policy": "balanced_fill",
+                "cooldown_policy": "tail_min",
+                "checkpoint_policy": "selective",
+                "p2p_policy": "serial",
+                "combined_policy": "serial",
+                "chunk_priority_hints": [3, 1],
+            },
+        ]
+
+        compiled = compile_program(program)
+        self.assertEqual(compiled.launcher_env["ENABLE_MORPHABLE_PIPELINE"], "1")
+        self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_SHAPE_SIGNATURE"], "shape:test")
+        self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_CHUNK_SHAPE_VECTOR"], "2,1,1,2")
+        self.assertIn("0,family=critical_path_first", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
+        self.assertIn("0:4,2", compiled.launcher_env["SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS"])
 
     def test_context_record_includes_runtime_memory_policy(self) -> None:
         program = default_dense_program("single_g5")
@@ -1255,6 +1390,8 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("stage_cost_model", artifact)
         self.assertIn("boundary_semantics", artifact)
         self.assertIn("nonuniform_vpp_shape", artifact)
+        self.assertIn("morphable_pipeline_problem", artifact)
+        self.assertIn("morphable_pipeline_plan", artifact)
         self.assertIn("pipe_search_space", artifact)
         self.assertIn("local_memory_search_space", artifact)
         perfetto = dict((artifact.get("visualization_artifacts") or {}).get("perfetto_trace") or {})
@@ -1267,6 +1404,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertGreater(len(list(artifact.get("stage_cost_model") or [])), 0)
         self.assertGreater(len(list(artifact.get("boundary_semantics") or [])), 0)
         self.assertEqual(dict(artifact.get("nonuniform_vpp_shape") or {}).get("vector_form"), "v = (v1, v2, ..., vS)")
+        self.assertTrue(str(dict(artifact.get("morphable_pipeline_plan") or {}).get("shape_signature") or ""))
+        self.assertIn("structure_aware_partition_ir", dict(artifact.get("morphable_pipeline_problem") or {}))
+        self.assertIn("selective_vpp_generator", dict(artifact.get("morphable_pipeline_problem") or {}))
 
     def test_context_record_includes_perfetto_trace_and_search_space_blueprint(self) -> None:
         program = default_dense_program("single_g5")
@@ -1766,6 +1906,42 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 if str(proposal.program.metadata.get("program_kind")) == "candidate_stage_local_memory_policy"
             )
             self.assertGreater(len(list(candidate.metadata.get("stage_local_memory_policy") or [])), 0)
+
+    def test_synthesize_proposals_emits_morphable_pipeline_candidate(self) -> None:
+        baseline = default_dense_program("single_g5")
+        baseline.parallel.pp_degree = 4
+        baseline.parallel.vpp_degree = 2
+        baseline.layout.vpp_degree = 2
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 8063.5,
+            "bubble_ratio": 0.12,
+            "pipeline_wait_ratio": 0.15,
+            "optimizer_exposed_ratio": 0.22,
+            "peak_memory_ratio": 0.89,
+            "comm_exposure_ratio": 0.13,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1700.0, "forward_ms": 900.0, "completion_ms": 2250.0, "window_ms": 2250.0, "peak_reserved_gib": 23.5},
+                "1": {"compute_ms": 1300.0, "forward_ms": 760.0, "completion_ms": 1500.0, "window_ms": 1500.0, "peak_reserved_gib": 18.0},
+                "2": {"compute_ms": 1320.0, "forward_ms": 770.0, "completion_ms": 1520.0, "window_ms": 1520.0, "peak_reserved_gib": 18.4},
+                "3": {"compute_ms": 1680.0, "forward_ms": 880.0, "completion_ms": 2200.0, "window_ms": 2200.0, "peak_reserved_gib": 23.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="joint_structure_memory_comm", scope="pipe").to_dict(),
+            candidate_limit=16,
+        )
+        proposal_kinds = {str(proposal.program.metadata.get("program_kind")) for proposal in proposals}
+        rejected_kinds = {
+            str((((item.get("proposal") or {}).get("program") or {}).get("metadata") or {}).get("program_kind"))
+            for item in rejected
+        }
+        self.assertIn("candidate_morphable_pipeline", proposal_kinds | rejected_kinds)
 
     def test_torchtitan_hybrid_plan_normalization_and_validation(self) -> None:
         plan = TorchTitanHybridPlanIR(

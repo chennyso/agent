@@ -1099,6 +1099,16 @@ def _build_apipe_heuristic_plan(
     dispatch_order = "default"
     if flush_order_policy != "default":
         dispatch_order = "tail_boundary_rewrite"
+    elif int(getattr(norm.parallel, "vpp_degree", 1) or 1) > 1 and pipeline_wait_ratio >= 0.08:
+        dispatch_order = "structure_aware_critical_first"
+        actions.append(
+            {
+                "name": "reprioritize_chunks_by_structure",
+                "status": "executable_now",
+                "dispatch_order": dispatch_order,
+                "reason": "interleaved VPP still exposes pipeline wait after fixed chunk ordering",
+            }
+        )
     elif bubble_ratio >= 0.10:
         dispatch_order = "balanced_round_robin"
     elif pipeline_wait_ratio >= 0.08:
@@ -1258,6 +1268,7 @@ def _build_runtime_branch_plan(
     runtime_evidence: Dict[str, Any],
     stage_evidence: Sequence[Dict[str, Any]],
     nonuniform_vpp_shape: Dict[str, Any],
+    morphable_pipeline_plan: Dict[str, Any],
     pipe_search_space: Dict[str, Any],
     apipe_heuristic_plan: Dict[str, Any],
     local_memory_search_space: Dict[str, Any],
@@ -1296,6 +1307,8 @@ def _build_runtime_branch_plan(
     }
     local_memory_runtime = dict(local_memory_search_space.get("runtime_policy") or {})
     runtime_controls = dict(apipe_heuristic_plan.get("runtime_controls") or {})
+    morphable_stage_families = list(morphable_pipeline_plan.get("stage_families") or [])
+    morphable_chunk_shape_vector = list(morphable_pipeline_plan.get("chunk_shape_vector") or [])
     trigger_rules: List[Dict[str, Any]] = []
     branches: List[Dict[str, Any]] = []
 
@@ -1376,6 +1389,38 @@ def _build_runtime_branch_plan(
                 "warmup_combined_policy": str(local_memory_runtime.get("warmup_combined_policy") or "default"),
             },
             "rationale": "raise recompute or offload only around peak windows instead of globally over-constraining the step",
+        }
+    )
+
+    morphable_rule = _trigger_rule(
+        "trigger_morphable_pipeline_shape",
+        metric="shape_joint_pressure",
+        threshold=0.08,
+        observed_value=max(
+            pipeline_wait_ratio,
+            mem_skew_ratio,
+            float(runtime_evidence.get("comm_exposure_ratio") or 0.0),
+        ),
+        branch_id="branch_morphable_pipeline_shape",
+        rationale="activate morphable regroup and stage-family specialization when fixed partition and uniform runtime family leave joint structure-memory-communication loss on the table",
+    )
+    trigger_rules.append(morphable_rule)
+    morphable_active = bool(morphable_stage_families and morphable_rule["satisfied"])
+    branches.append(
+        {
+            "branch_id": "branch_morphable_pipeline_shape",
+            "scope": "joint",
+            "label": "morphable_pipeline_shape",
+            "status": "active_executable_now" if morphable_active else "standby",
+            "builder": "morphable_pipeline_candidate",
+            "priority_rank": 18,
+            "active": morphable_active,
+            "trigger_rule_id": morphable_rule["rule_id"],
+            "shape_signature": str(morphable_pipeline_plan.get("shape_signature") or ""),
+            "chunk_shape_vector": [int(value) for value in morphable_chunk_shape_vector],
+            "stage_families": morphable_stage_families,
+            "regroup_actions": list(morphable_pipeline_plan.get("regroup_actions") or []),
+            "rationale": "treat pipeline shape as a first-class object and jointly specialize structure, chunk form, and local memory/communication policy",
         }
     )
 
@@ -1477,6 +1522,7 @@ def _build_runtime_branch_plan(
             "pipeline_layout": str(norm.layout.pipeline_layout or ""),
             "recompute_granularity": str((norm.metadata or {}).get("runtime_recompute_granularity") or ""),
             "offload_policy": str((norm.metadata or {}).get("runtime_memory_policy_mode") or "none"),
+            "morphable_shape_signature": str(morphable_pipeline_plan.get("shape_signature") or ""),
         },
         "branches": branches,
         "trigger_rules": trigger_rules,
@@ -1514,6 +1560,332 @@ def _build_single_node_deep_stats(
         "stall_ratio": round(float(runtime_evidence.get("stall_ratio") or 0.0), 4),
         "comm_exposure_ratio": round(float(runtime_evidence.get("comm_exposure_ratio") or 0.0), 4),
         "bubble_ratio": round(float(runtime_evidence.get("bubble_ratio") or 0.0), 4),
+    }
+
+
+def _normalized_stage_metric(item: Dict[str, Any], key: str) -> float:
+    return float(item.get(key) or item.get("window_ms") or 0.0) if key == "completion_ms" else float(item.get(key) or 0.0)
+
+
+def _build_morphable_pipeline_problem(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+    boundary_semantics: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    morphable = norm.strategy_ir.morphable_pipe.normalized()
+    stage_metrics = {
+        int(item.get("stage_id") or 0): dict(item)
+        for item in (stage_evidence or [])
+    }
+    communication_boundary_map: Dict[str, Dict[str, Any]] = {}
+    for boundary in (boundary_semantics or []):
+        left_stage_id = int(boundary.get("left_stage_id") or -1)
+        right_stage_id = int(boundary.get("right_stage_id") or -1)
+        if left_stage_id < 0 or right_stage_id < 0:
+            continue
+        key = f"{left_stage_id}->{right_stage_id}"
+        communication_boundary_map[key] = {
+            "left_stage_id": left_stage_id,
+            "right_stage_id": right_stage_id,
+            "boundary_wait_ms": round(float(boundary.get("boundary_wait_ms") or 0.0), 4),
+            "semantic": str(boundary.get("semantic") or "normal"),
+            "expected_topology": str(boundary.get("expected_topology") or ""),
+            "critical_path_exposure": round(
+                float(boundary.get("boundary_wait_ms") or 0.0)
+                + 20.0 * float(runtime_evidence.get("comm_exposure_ratio") or 0.0),
+                4,
+            ),
+        }
+    units: List[Dict[str, Any]] = []
+    for unit in morphable.units:
+        metrics = stage_metrics.get(int(unit.stage_index), {})
+        observed_completion = float(metrics.get("completion_ms") or metrics.get("window_ms") or unit.compute_weight)
+        observed_memory = float(metrics.get("peak_reserved_gib") or unit.memory_weight)
+        observed_comm = float(
+            metrics.get("send_recv_ms")
+            or metrics.get("comm_ms")
+            or metrics.get("fsdp_ag_ms")
+            or unit.communication_weight
+        )
+        critical_path_score = round(
+            float(observed_completion)
+            + 0.60 * float(observed_comm)
+            + (2.0 if unit.semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} else 0.0),
+            4,
+        )
+        units.append(
+            {
+                **unit.to_dict(),
+                "observed_completion_ms": round(observed_completion, 4),
+                "observed_memory_gib": round(observed_memory, 4),
+                "observed_comm_ms": round(observed_comm, 4),
+                "critical_path_score": critical_path_score,
+                "projected_liveness_cost": round(float(unit.liveness_weight) + 0.25 * observed_memory, 4),
+                "projected_boundary_cost": round(float(unit.boundary_cost) + 0.20 * observed_comm, 4),
+            }
+        )
+
+    regroup_candidates: List[Dict[str, Any]] = []
+    ordered_stages = sorted(stage_metrics.items(), key=lambda item: int(item[0]))
+    for index in range(len(ordered_stages) - 1):
+        left_stage_id, left = ordered_stages[index]
+        right_stage_id, right = ordered_stages[index + 1]
+        left_completion = float(left.get("completion_ms") or left.get("window_ms") or 0.0)
+        right_completion = float(right.get("completion_ms") or right.get("window_ms") or 0.0)
+        left_memory = float(left.get("peak_reserved_gib") or 0.0)
+        right_memory = float(right.get("peak_reserved_gib") or 0.0)
+        wait_ms = 0.0
+        for boundary in (boundary_semantics or []):
+            if int(boundary.get("left_stage_id") or -1) == int(left_stage_id) and int(
+                boundary.get("right_stage_id") or -1
+            ) == int(right_stage_id):
+                wait_ms = float(boundary.get("boundary_wait_ms") or 0.0)
+                break
+        if max(left_completion, right_completion) <= 0.0:
+            continue
+        imbalance_ratio = abs(left_completion - right_completion) / max(min(left_completion, right_completion, 1e-6), 1.0)
+        regroup_candidates.append(
+            {
+                "left_stage_id": int(left_stage_id),
+                "right_stage_id": int(right_stage_id),
+                "preferred_direction": "left_to_right" if left_completion > right_completion else "right_to_left",
+                "imbalance_ratio": round(float(imbalance_ratio), 4),
+                "boundary_wait_ms": round(float(wait_ms), 4),
+                "memory_skew_gib": round(abs(left_memory - right_memory), 4),
+                "shift_budget_blocks": 2 if imbalance_ratio >= 0.20 or wait_ms >= 80.0 else 1,
+            }
+        )
+
+    family_policy_space: List[Dict[str, Any]] = []
+    chunk_form_space: List[Dict[str, Any]] = []
+    selective_vpp_generator: List[Dict[str, Any]] = []
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    pipeline_wait_ratio = float(runtime_evidence.get("pipeline_wait_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    for unit in units:
+        stage_id = int(unit["stage_index"])
+        metrics = stage_metrics.get(stage_id, {})
+        local_memory_ratio = float(metrics.get("local_reserved_ratio") or 0.0)
+        completion_ms = float(unit.get("observed_completion_ms") or 0.0)
+        comm_ms = float(unit.get("observed_comm_ms") or 0.0)
+        semantic_role = str(unit.get("semantic_role") or "decoder")
+        family_candidates = ["balanced_interleave"]
+        if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"}:
+            family_candidates.insert(0, "critical_path_first")
+        if local_memory_ratio >= 0.84 or float(unit.get("observed_memory_gib") or 0.0) >= 0.84 * float(runtime_evidence.get("peak_reserved_gib") or 1.0):
+            family_candidates.append("memory_guarded")
+        if comm_ms >= 0.12 * max(completion_ms, 1.0) or comm_exposure_ratio >= 0.12:
+            family_candidates.append("comm_guarded")
+        chunk_options = [1]
+        if int(norm.parallel.pp_degree) > 1 and int(norm.model.num_layers) % max(int(norm.parallel.pp_degree) * 2, 1) == 0:
+            chunk_options.append(2)
+        if bubble_ratio >= 0.12 or pipeline_wait_ratio >= 0.08:
+            chunk_options = sorted(set(chunk_options + [2]))
+        bubble_gain = max(
+            0.0,
+            0.45 * float(bubble_ratio) * max(completion_ms, 1.0)
+            + 0.35 * float(pipeline_wait_ratio) * max(completion_ms, 1.0),
+        )
+        comm_penalty = max(
+            0.0,
+            float(unit.get("projected_boundary_cost") or 0.0)
+            + 0.35 * float(comm_exposure_ratio) * max(completion_ms, 1.0),
+        )
+        liveness_penalty = max(
+            0.0,
+            float(unit.get("projected_liveness_cost") or 0.0)
+            + 0.10 * float(local_memory_ratio) * max(completion_ms, 1.0),
+        )
+        should_virtualize = bool(
+            max(chunk_options) > 1 and bubble_gain > (comm_penalty + liveness_penalty) * 0.35
+        )
+        family_policy_space.append(
+            {
+                "stage_id": stage_id,
+                "subgraph": unit["name"],
+                "atom_kind": str(unit.get("atom_kind") or "decoder_block"),
+                "semantic_role": semantic_role,
+                "family_candidates": family_candidates,
+                "dominant_cost": "memory" if local_memory_ratio >= 0.84 else ("communication" if comm_ms >= 0.12 * max(completion_ms, 1.0) else "structure"),
+            }
+        )
+        chunk_form_space.append(
+            {
+                "stage_id": stage_id,
+                "candidate_chunk_shapes": [[value] * value for value in chunk_options],
+                "recommended_chunks": max(chunk_options) if should_virtualize else 1,
+                "activation_release_gain": round(max(0.0, float(unit.get("projected_liveness_cost") or 0.0) * 0.2), 4),
+                "activation_overlap_risk": round(liveness_penalty, 4),
+                "rationale": "prefer finer chunking on hot stages only when bubble/wait warrants it",
+            }
+        )
+        selective_vpp_generator.append(
+            {
+                "stage_id": stage_id,
+                "unit_name": unit["name"],
+                "semantic_role": semantic_role,
+                "candidate_virtual_chunks": sorted(set(chunk_options)),
+                "bubble_gain_score": round(bubble_gain, 4),
+                "communication_penalty_score": round(comm_penalty, 4),
+                "liveness_penalty_score": round(liveness_penalty, 4),
+                "should_virtualize": should_virtualize,
+                "recommended_vpp_chunks": max(chunk_options) if should_virtualize else 1,
+            }
+        )
+
+    return {
+        "status": "executable_v1",
+        "shape_objective": morphable.shape_objective,
+        "search_levels": list(morphable.search_levels),
+        "structure_aware_partition_ir": {
+            "units": units,
+            "adjacent_dependencies": [item.to_dict() for item in morphable.structure_edges],
+            "boundary_costs": [item.to_dict() for item in morphable.communication_edges],
+        },
+        "three_semantic_execution_graph": {
+            "units": units,
+            "structure_edges": [item.to_dict() for item in morphable.structure_edges],
+            "memory_edges": [item.to_dict() for item in morphable.memory_edges],
+            "communication_edges": [item.to_dict() for item in morphable.communication_edges],
+        },
+        "critical_path_communication_model": {
+            "boundaries": list(communication_boundary_map.values()),
+            "comm_exposure_ratio": round(comm_exposure_ratio, 4),
+        },
+        "liveness_aware_chunk_formation": {
+            "per_unit": chunk_form_space,
+            "peak_reserved_ratio": round(float(runtime_evidence.get("peak_reserved_ratio") or 0.0), 4),
+        },
+        "selective_vpp_generator": selective_vpp_generator,
+        "structural_regroup_space": regroup_candidates,
+        "stage_chunk_form_space": chunk_form_space,
+        "family_policy_space": family_policy_space,
+        "legality_guards": dict(morphable.legality_guards or {}),
+        "shape_signature": morphable.shape_signature,
+    }
+
+
+def _build_morphable_pipeline_plan(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+    morphable_problem: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    regroup_space = list(morphable_problem.get("structural_regroup_space") or [])
+    family_space = list(morphable_problem.get("family_policy_space") or [])
+    chunk_space = list(morphable_problem.get("stage_chunk_form_space") or [])
+    selective_vpp_space = list(morphable_problem.get("selective_vpp_generator") or [])
+    stage_metrics = {int(item.get("stage_id") or 0): dict(item) for item in (stage_evidence or [])}
+    pipeline_wait_ratio = float(runtime_evidence.get("pipeline_wait_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    regroup_actions: List[Dict[str, Any]] = []
+    for candidate in regroup_space:
+        if float(candidate.get("imbalance_ratio") or 0.0) >= 0.10 or float(candidate.get("boundary_wait_ms") or 0.0) >= 40.0:
+            regroup_actions.append(
+                {
+                    "left_stage_id": int(candidate.get("left_stage_id") or 0),
+                    "right_stage_id": int(candidate.get("right_stage_id") or 0),
+                    "direction": str(candidate.get("preferred_direction") or "left_to_right"),
+                    "shift_blocks": int(candidate.get("shift_budget_blocks") or 1),
+                }
+            )
+    stage_families: List[Dict[str, Any]] = []
+    for family in family_space:
+        stage_id = int(family.get("stage_id") or 0)
+        metrics = stage_metrics.get(stage_id, {})
+        local_memory_ratio = float(metrics.get("local_reserved_ratio") or 0.0)
+        completion_ms = float(metrics.get("completion_ms") or metrics.get("window_ms") or 0.0)
+        comm_ms = float(metrics.get("send_recv_ms") or metrics.get("comm_ms") or 0.0)
+        family_name = "balanced_interleave"
+        dispatch_order = "default"
+        warmup_policy = "default"
+        cooldown_policy = "default"
+        checkpoint_policy = None
+        p2p_policy = None
+        combined_policy = None
+        recompute_modules: List[str] = []
+        offload_modules: List[str] = []
+        chunk_priority_hints: List[int] = []
+        semantic_role = str(family.get("semantic_role") or "decoder")
+        if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} or completion_ms > 0.0 and pipeline_wait_ratio >= 0.08:
+            family_name = "critical_path_first"
+            dispatch_order = "structure_aware_critical_first"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min"
+            chunk_priority_hints = [4, 2] if int(norm.parallel.vpp_degree) > 1 else [4]
+        if local_memory_ratio >= 0.84:
+            family_name = "memory_guarded"
+            dispatch_order = "middle_stage_relief"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            checkpoint_policy = "selective"
+            combined_policy = "serial"
+            recompute_modules = ["core_attn", "mlp"]
+            offload_modules = ["core_attn"] if local_memory_ratio >= 0.90 else []
+            chunk_priority_hints = [3, 1] if int(norm.parallel.vpp_degree) > 1 else [3]
+        elif comm_ms >= 0.12 * max(completion_ms, 1.0) or comm_exposure_ratio >= 0.12:
+            family_name = "comm_guarded"
+            dispatch_order = "balanced_round_robin"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            p2p_policy = "serial"
+            combined_policy = "serial"
+            recompute_modules = ["core_attn"]
+            chunk_priority_hints = [2, 2] if int(norm.parallel.vpp_degree) > 1 else [2]
+        stage_families.append(
+            {
+                "stage_index": stage_id,
+                "family": family_name,
+                "semantic_role": semantic_role,
+                "preferred_template": "pp4_middle_relief" if family_name in {"critical_path_first", "memory_guarded"} and int(norm.parallel.pp_degree) == 4 else str(norm.schedule.template),
+                "dispatch_order": dispatch_order,
+                "warmup_policy": warmup_policy,
+                "cooldown_policy": cooldown_policy,
+                "checkpoint_policy": checkpoint_policy,
+                "p2p_policy": p2p_policy,
+                "combined_policy": combined_policy,
+                "recompute_modules": recompute_modules,
+                "offload_modules": offload_modules,
+                "chunk_priority_hints": chunk_priority_hints,
+            }
+        )
+    chunk_shape_vector = [max(int(norm.parallel.vpp_degree), 1) for _ in range(max(int(norm.parallel.pp_degree), 1))]
+    selective_vpp_decisions: List[Dict[str, Any]] = []
+    for item in selective_vpp_space:
+        stage_id = int(item.get("stage_id") or 0)
+        recommended = max(int(item.get("recommended_vpp_chunks") or 1), 1)
+        if stage_id < len(chunk_shape_vector):
+            chunk_shape_vector[stage_id] = max(chunk_shape_vector[stage_id], recommended)
+        selective_vpp_decisions.append(
+            {
+                "stage_id": stage_id,
+                "unit_name": str(item.get("unit_name") or ""),
+                "should_virtualize": bool(item.get("should_virtualize")),
+                "recommended_vpp_chunks": recommended,
+                "bubble_gain_score": float(item.get("bubble_gain_score") or 0.0),
+                "communication_penalty_score": float(item.get("communication_penalty_score") or 0.0),
+                "liveness_penalty_score": float(item.get("liveness_penalty_score") or 0.0),
+            }
+        )
+    for item in chunk_space:
+        stage_id = int(item.get("stage_id") or 0)
+        recommended = max(int(item.get("recommended_chunks") or 1), 1)
+        if stage_id < len(chunk_shape_vector):
+            chunk_shape_vector[stage_id] = max(chunk_shape_vector[stage_id], recommended)
+    return {
+        "status": "executable_v1",
+        "search_levels": list(morphable_problem.get("search_levels") or []),
+        "regroup_actions": regroup_actions,
+        "chunk_shape_vector": chunk_shape_vector,
+        "selective_vpp_decisions": selective_vpp_decisions,
+        "stage_families": stage_families,
+        "local_family_assignment": stage_families,
+        "shape_signature": str(morphable_problem.get("shape_signature") or ""),
+        "dominant_family": str(stage_families[0]["family"]) if stage_families else "balanced_interleave",
     }
 
 
@@ -1571,6 +1943,20 @@ def _search_space_blueprint(
             "status": "research_gap_with_partial_artifact_support",
             "values": "per-stage v_i and chunk shapes",
             "rationale": "uniform VPP is a convenience assumption; stages can prefer different virtual chunk granularities",
+        },
+        {
+            "name": "morphable.shape",
+            "scope": "joint",
+            "status": "executable_now_with_local_runtime_lowering",
+            "values": ["structural_regroup", "stage_chunk_form", "family_policy_select"],
+            "rationale": "pipeline shape should be optimized as a first-class object jointly constrained by structure, memory lifetime, and communication critical path",
+        },
+        {
+            "name": "morphable.stage_family",
+            "scope": "pipe",
+            "status": "executable_now_with_stage_local_runtime_hints",
+            "values": ["critical_path_first", "memory_guarded", "comm_guarded", "balanced_interleave"],
+            "rationale": "different stages can adopt different runtime families instead of inheriting a single global schedule family",
         },
         {
             "name": "boundary.semantic_type",
@@ -1702,6 +2088,7 @@ def _search_space_blueprint(
     return {
         "objective": "maximize_mfu_under_memory_and_communication_constraints",
         "dominant_bottleneck": str((bottleneck_signature or {}).get("dominant_label") or "balanced"),
+        "morphable_pipeline_enabled": bool(norm.search_space.allow_morphable_pipeline),
         "current_runtime_signature": {
             "bubble_ratio": round(float(runtime_evidence.get("bubble_ratio") or 0.0), 4),
             "comm_exposure_ratio": round(float(runtime_evidence.get("comm_exposure_ratio") or 0.0), 4),
@@ -1877,11 +2264,24 @@ def _build_context_from_trace(
         stage_cost_model,
         boundary_semantics,
     )
+    morphable_pipeline_problem = _build_morphable_pipeline_problem(
+        norm,
+        runtime_evidence,
+        stage_evidence,
+        boundary_semantics,
+    )
+    morphable_pipeline_plan = _build_morphable_pipeline_plan(
+        norm,
+        runtime_evidence,
+        stage_evidence,
+        morphable_pipeline_problem,
+    )
     runtime_branch_plan = _build_runtime_branch_plan(
         norm,
         runtime_evidence,
         stage_evidence,
         nonuniform_vpp_shape,
+        morphable_pipeline_plan,
         pipe_search_space,
         apipe_heuristic_plan,
         local_memory_search_space,
@@ -1906,6 +2306,8 @@ def _build_context_from_trace(
             "apipe_heuristic_plan": apipe_heuristic_plan,
             "local_memory_search_space": local_memory_search_space,
             "single_node_deep_stats": single_node_deep_stats,
+            "morphable_pipeline_problem": morphable_pipeline_problem,
+            "morphable_pipeline_plan": morphable_pipeline_plan,
             "runtime_branch_plan": runtime_branch_plan,
             "search_space_blueprint": search_space_blueprint,
             "visualization_artifacts": {
@@ -2049,6 +2451,8 @@ def build_trial_artifact(
         "apipe_heuristic_plan": dict(evidence.get("apipe_heuristic_plan") or {}),
         "local_memory_search_space": dict(evidence.get("local_memory_search_space") or {}),
         "single_node_deep_stats": dict(evidence.get("single_node_deep_stats") or {}),
+        "morphable_pipeline_problem": dict(evidence.get("morphable_pipeline_problem") or {}),
+        "morphable_pipeline_plan": dict(evidence.get("morphable_pipeline_plan") or {}),
         "runtime_branch_plan": dict(evidence.get("runtime_branch_plan") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
         "search_space_blueprint": dict(evidence.get("search_space_blueprint") or {}),
