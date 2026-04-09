@@ -436,6 +436,9 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     search_space_blueprint = dict(artifact.get("search_space_blueprint") or {})
     bottleneck_breakdown = list(artifact.get("bottleneck_breakdown") or [])
     critical_operator_clusters = list(artifact.get("critical_operator_clusters") or [])
+    trial_outcome = dict(metrics.get("trial_outcome") or {})
+    trial_reflection = dict(metrics.get("trial_reflection") or {})
+    failure_diagnosis = _build_failure_diagnosis(metrics)
 
     outputs = {
         "trial_artifact_json": str(artifact_dir / "trial_artifact.json"),
@@ -446,6 +449,9 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
         "search_space_blueprint_json": str(artifact_dir / "search_space_blueprint.json"),
         "bottleneck_breakdown_json": str(artifact_dir / "bottleneck_breakdown.json"),
         "critical_operator_clusters_json": str(artifact_dir / "critical_operator_clusters.json"),
+        "trial_outcome_json": str(artifact_dir / "trial_outcome.json"),
+        "trial_reflection_json": str(artifact_dir / "trial_reflection.json"),
+        "failure_diagnosis_json": str(artifact_dir / "failure_diagnosis.json"),
     }
     Path(outputs["trial_artifact_json"]).write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
     Path(outputs["context_record_json"]).write_text(json.dumps(context_record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -476,7 +482,97 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
             json.dumps(critical_operator_clusters, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    if trial_outcome:
+        Path(outputs["trial_outcome_json"]).write_text(
+            json.dumps(trial_outcome, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if trial_reflection:
+        Path(outputs["trial_reflection_json"]).write_text(
+            json.dumps(trial_reflection, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if failure_diagnosis:
+        Path(outputs["failure_diagnosis_json"]).write_text(
+            json.dumps(failure_diagnosis, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     return outputs
+
+
+def _build_failure_diagnosis(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    context_record = dict(metrics.get("context_record") or {})
+    trial_artifact = dict(metrics.get("trial_artifact") or {})
+    trial_outcome = dict(metrics.get("trial_outcome") or {})
+    trial_reflection = dict(metrics.get("trial_reflection") or {})
+    runtime = dict((context_record.get("runtime_evidence") or {}))
+    optimization_hints = list(trial_artifact.get("optimization_hints") or context_record.get("optimization_hints") or [])
+    failure_modes = list(trial_artifact.get("failure_modes") or context_record.get("failure_modes") or [])
+    derived_bottlenecks = list(
+        trial_artifact.get("derived_bottlenecks") or context_record.get("derived_bottlenecks") or []
+    )
+
+    recommended_actions: List[Dict[str, Any]] = []
+    for item in optimization_hints[:5]:
+        scope = str((item or {}).get("scope") or "").strip()
+        rationale = str((item or {}).get("rationale") or "").strip()
+        action = str((item or {}).get("action") or "").strip()
+        if scope or rationale or action:
+            recommended_actions.append(
+                {
+                    "source": "optimization_hint",
+                    "scope": scope,
+                    "action": action or "adjust_runtime_policy",
+                    "rationale": rationale,
+                }
+            )
+    next_action = str(trial_reflection.get("recommended_next_action") or "").strip()
+    if next_action:
+        recommended_actions.insert(
+            0,
+            {
+                "source": "trial_reflection",
+                "action": next_action,
+                "summary": str(trial_reflection.get("summary") or "").strip(),
+            },
+        )
+
+    return {
+        "config_name": str(metrics.get("config_name") or ""),
+        "program_kind": str(trial_artifact.get("program_kind") or ""),
+        "returncode": int(metrics.get("returncode") or 0),
+        "oom": bool(metrics.get("oom", False)),
+        "error_msg": str(metrics.get("error_msg") or ""),
+        "root_cause_excerpt": str(metrics.get("root_cause_excerpt") or ""),
+        "stdout_tail": str(metrics.get("stdout_tail") or ""),
+        "stderr_tail": str(metrics.get("stderr_tail") or ""),
+        "failure_modes": failure_modes,
+        "derived_bottlenecks": derived_bottlenecks,
+        "bottleneck_signature": dict(metrics.get("bottleneck_signature") or {}),
+        "optimization_hints": optimization_hints,
+        "recommended_actions": recommended_actions,
+        "trial_outcome": trial_outcome,
+        "trial_reflection": trial_reflection,
+        "runtime_focus": {
+            "bubble_ratio": float(runtime.get("bubble_ratio") or 0.0),
+            "peak_reserved_ratio": float(runtime.get("peak_reserved_ratio") or 0.0),
+            "stage_tail_ratio": float(runtime.get("stage_tail_ratio") or 0.0),
+            "tail_step_jitter_ratio": float(runtime.get("tail_step_jitter_ratio") or 0.0),
+            "optimizer_exposed_ratio": float(runtime.get("optimizer_exposed_ratio") or 0.0),
+            "comm_exposure_ratio": float(runtime.get("comm_exposure_ratio") or 0.0),
+        },
+    }
+
+
+def write_analysis_artifacts_for_trial(
+    args: argparse.Namespace,
+    trial_id: int,
+    metrics: Dict[str, Any],
+) -> Dict[str, str]:
+    output_dirs = _trial_output_dirs(args, trial_id)
+    paths = _write_analysis_artifacts(output_dirs, metrics)
+    metrics["analysis_artifact_paths"] = paths
+    return paths
 
 
 def _runtime_env_defaults() -> Dict[str, str]:

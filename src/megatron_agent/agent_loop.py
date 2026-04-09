@@ -65,6 +65,7 @@ from megatron_agent.trial_runner import (
     DEFAULT_TOKENIZER_MODEL,
     add_observability_args,
     run_trial,
+    write_analysis_artifacts_for_trial,
 )
 
 
@@ -5613,6 +5614,7 @@ def main() -> None:
                 None,
             ),
         )
+        write_analysis_artifacts_for_trial(args, 0, baseline_metrics)
         tested.append(baseline_metrics)
         paper_artifacts.append(dict(baseline_metrics.get("trial_artifact") or {}))
         if bool((baseline_metrics.get("family") or {}).get("is_family_outside")):
@@ -5776,6 +5778,7 @@ def main() -> None:
                     json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
+            write_analysis_artifacts_for_trial(args, index, metrics)
             tested.append(metrics)
             paper_artifacts.append(dict(metrics.get("trial_artifact") or {}))
             if bool((metrics.get("family") or {}).get("is_family_outside")):

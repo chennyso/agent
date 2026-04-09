@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -1689,6 +1690,78 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(Path(paths["search_space_blueprint_json"]).exists())
             self.assertTrue(Path(paths["bottleneck_breakdown_json"]).exists())
             self.assertTrue(Path(paths["critical_operator_clusters_json"]).exists())
+            self.assertTrue(Path(paths["failure_diagnosis_json"]).exists())
+
+    def test_write_analysis_artifacts_for_failed_trial_persists_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(run_root=tmpdir)
+            metrics = {
+                "config_name": "candidate_branch_local_pipe_reorder",
+                "returncode": 1,
+                "oom": False,
+                "error_msg": "Runtime Error: rank 5 failed",
+                "root_cause_excerpt": "rank 5 exited first",
+                "stdout_tail": "stdout tail",
+                "stderr_tail": "stderr tail",
+                "bottleneck_signature": {"labels": ["tail_heavy", "optimizer_exposed"]},
+                "context_record": {
+                    "runtime_evidence": {
+                        "bubble_ratio": 0.12,
+                        "peak_reserved_ratio": 0.88,
+                        "stage_tail_ratio": 0.24,
+                        "tail_step_jitter_ratio": 0.19,
+                        "optimizer_exposed_ratio": 0.33,
+                        "comm_exposure_ratio": 0.09,
+                    },
+                    "failure_modes": [{"label": "tail_heavy", "severity": "medium"}],
+                    "derived_bottlenecks": [{"label": "optimizer_exposed", "severity": "high"}],
+                    "optimization_hints": [
+                        {
+                            "scope": "cooldown",
+                            "action": "target_chunk_first",
+                            "rationale": "shorten optimizer-sensitive tail window",
+                        }
+                    ],
+                },
+                "trial_artifact": {
+                    "program_kind": "candidate_branch_local_pipe_reorder",
+                    "failure_modes": [{"label": "tail_heavy", "severity": "medium"}],
+                    "derived_bottlenecks": [{"label": "optimizer_exposed", "severity": "high"}],
+                    "optimization_hints": [
+                        {
+                            "scope": "cooldown",
+                            "action": "target_chunk_first",
+                            "rationale": "shorten optimizer-sensitive tail window",
+                        }
+                    ],
+                    "visualization_artifacts": {},
+                },
+                "trial_reflection": {
+                    "family": "dual_overlap_optimizer_hide",
+                    "config_name": "candidate_branch_local_pipe_reorder",
+                    "failure_sources": ["trial_failed"],
+                    "recommended_next_action": "retain_family_adjust_local_policy",
+                    "summary": "dual_overlap_optimizer_hide failed due to trial_failed",
+                },
+                "trial_outcome": {
+                    "config_name": "candidate_branch_local_pipe_reorder",
+                    "success": False,
+                    "launch_failure": True,
+                    "oom": False,
+                },
+            }
+            paths = trial_runner.write_analysis_artifacts_for_trial(args, 7, metrics)
+            artifact_dir = Path(tmpdir) / "trial_007" / "analysis"
+            self.assertEqual(Path(paths["failure_diagnosis_json"]), artifact_dir / "failure_diagnosis.json")
+            self.assertTrue((artifact_dir / "trial_artifact.json").exists())
+            self.assertTrue((artifact_dir / "context_record.json").exists())
+            self.assertTrue((artifact_dir / "trial_reflection.json").exists())
+            self.assertTrue((artifact_dir / "trial_outcome.json").exists())
+            diagnosis = json.loads((artifact_dir / "failure_diagnosis.json").read_text(encoding="utf-8"))
+            self.assertEqual(diagnosis["returncode"], 1)
+            self.assertEqual(diagnosis["error_msg"], "Runtime Error: rank 5 failed")
+            self.assertEqual(diagnosis["trial_reflection"]["recommended_next_action"], "retain_family_adjust_local_policy")
+            self.assertTrue(diagnosis["recommended_actions"])
 
     def test_pipeline_schedule_projection_highlights_runtime_strategy_options(self) -> None:
         program = default_dense_program("single_g5")
