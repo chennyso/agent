@@ -1590,6 +1590,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("local_window_observability", projection)
         self.assertIn("tail_window_ms", dict(projection.get("summary") or {}))
         self.assertTrue(any(item.get("name") == "optimizer_tail_guarded" for item in (projection.get("strategy_hypotheses") or [])))
+        event_trace = dict((artifact.get("visualization_artifacts") or {}).get("pipeline_event_trace") or {})
+        self.assertEqual(event_trace.get("format"), "pipeline_event_trace")
+        self.assertTrue(len(list(event_trace.get("events") or [])) > 0)
         svg = dict((artifact.get("visualization_artifacts") or {}).get("pipeline_projection_svg") or {})
         self.assertEqual(svg.get("format"), "svg_inline")
         self.assertIn("<svg", str(svg.get("content") or ""))
@@ -1636,6 +1639,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         projection = dict((evidence.get("visualization_artifacts") or {}).get("pipeline_schedule_projection") or {})
         self.assertEqual(projection.get("format"), "pipeline_schedule_projection")
         self.assertGreater(len(list(projection.get("stage_tracks") or [])), 0)
+        event_trace = dict((evidence.get("visualization_artifacts") or {}).get("pipeline_event_trace") or {})
+        self.assertEqual(event_trace.get("format"), "pipeline_event_trace")
+        self.assertTrue(len(list(event_trace.get("events") or [])) > 0)
         self.assertIn("tail_window_ms", runtime)
         self.assertIn("cooldown_idle_ms", runtime)
         self.assertIn("optimizer_exposed_window_ms", runtime)
@@ -1667,6 +1673,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                         "visualization_artifacts": {
                             "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]},
                             "pipeline_schedule_projection": {"format": "pipeline_schedule_projection", "stage_tracks": [{"stage_id": 0}]},
+                            "pipeline_event_trace": {"format": "pipeline_event_trace", "events": [{"stage_id": 0}]},
                             "pipeline_projection_svg": {"format": "svg_inline", "content": "<svg></svg>"},
                         },
                     },
@@ -1684,6 +1691,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     "visualization_artifacts": {
                         "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]},
                         "pipeline_schedule_projection": {"format": "pipeline_schedule_projection", "stage_tracks": [{"stage_id": 0}]},
+                        "pipeline_event_trace": {"format": "pipeline_event_trace", "events": [{"stage_id": 0}]},
                         "pipeline_projection_svg": {"format": "svg_inline", "content": "<svg></svg>"},
                     },
                 },
@@ -1693,6 +1701,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(Path(paths["context_record_json"]).exists())
             self.assertTrue(Path(paths["perfetto_trace_json"]).exists())
             self.assertTrue(Path(paths["pipeline_schedule_projection_json"]).exists())
+            self.assertTrue(Path(paths["pipeline_event_trace_json"]).exists())
             self.assertTrue(Path(paths["pipeline_projection_svg"]).exists())
             self.assertTrue(Path(paths["search_space_blueprint_json"]).exists())
             self.assertTrue(Path(paths["bottleneck_breakdown_json"]).exists())
@@ -1799,6 +1808,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         hypothesis_names = {str(item.get("name")) for item in (projection.get("strategy_hypotheses") or [])}
         self.assertIn("optimizer_tail_guarded", hypothesis_names)
         self.assertIn("checkpoint_boundary_joint", hypothesis_names)
+        event_trace = dict((((context.get("evidence_record") or {}).get("visualization_artifacts") or {}).get("pipeline_event_trace") or {}))
+        self.assertEqual(event_trace.get("format"), "pipeline_event_trace")
+        self.assertTrue(any(str(item.get("op_kind") or "") == "fwd" for item in (event_trace.get("events") or [])))
+        self.assertTrue(any(str(item.get("op_kind") or "") == "bwd" for item in (event_trace.get("events") or [])))
 
     def test_pipeline_schedule_projection_falls_back_when_stage_windows_are_sparse(self) -> None:
         program = default_dense_program("single_g5")
@@ -1823,6 +1836,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(len(tracks), 2)
         self.assertTrue(all(list(track.get("segments") or []) for track in tracks))
         self.assertTrue(all(str(track.get("evidence_source") or "") == "fallback_estimated" for track in tracks))
+        event_trace = dict((((context.get("evidence_record") or {}).get("visualization_artifacts") or {}).get("pipeline_event_trace") or {}))
+        self.assertEqual(event_trace.get("format"), "pipeline_event_trace")
+        self.assertTrue(any(str(item.get("op_kind") or "") == "fwd" for item in (event_trace.get("events") or [])))
+        self.assertTrue(any(str(item.get("op_kind") or "") == "bwd" for item in (event_trace.get("events") or [])))
         phase_windows = list(projection.get("phase_windows") or [])
         self.assertTrue(phase_windows)
         previous_end = 0.0

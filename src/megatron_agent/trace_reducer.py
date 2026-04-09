@@ -1060,7 +1060,374 @@ def _build_pipeline_schedule_projection(
     }
 
 
-def _build_pipeline_projection_svg(projection: Dict[str, Any]) -> Dict[str, Any]:
+def _stage_matches_window_selector(track: Dict[str, Any], selector: str) -> bool:
+    selector = str(selector or "").strip()
+    if not selector:
+        return False
+    stage_tags = {str(item) for item in list(track.get("stage_tags") or [])}
+    role = str(track.get("role") or "")
+    if selector == "tail_stage":
+        return "tail_stage" in stage_tags or "tail_sensitive" in stage_tags or "tail" in role
+    if selector == "hotspot_stage":
+        return "memory_hotspot" in stage_tags or "memory_hotspot" in role or "critical_path" in stage_tags
+    if selector == "optimizer_sensitive_stage":
+        return "optimizer_sensitive" in stage_tags or "optimizer_sensitive" in role
+    return False
+
+
+def _window_matches_event(
+    phase: str,
+    microbatch_index: int,
+    microbatch_count: int,
+    window: str,
+) -> bool:
+    phase = str(phase or "").strip()
+    window = str(window or "").strip()
+    if microbatch_count <= 0:
+        return False
+    if window == "last_1_group":
+        return phase == "steady" and microbatch_index == microbatch_count - 1
+    if window == "last_2_groups":
+        return phase == "steady" and microbatch_index >= max(microbatch_count - 2, 0)
+    if window == "cooldown_all":
+        return phase == "cooldown"
+    if window == "cooldown_first_group":
+        return phase == "cooldown" and microbatch_index == 0
+    return False
+
+
+def _chunk_order_for_policy(chunk_count: int, policy: str, target_chunk: Optional[int] = None) -> List[int]:
+    if chunk_count <= 1:
+        return [0]
+    policy = str(policy or "").strip()
+    base = list(range(chunk_count))
+    if policy == "reverse_chunk_order":
+        return list(reversed(base))
+    if policy == "target_chunk_first":
+        try:
+            target = int(target_chunk) if target_chunk is not None else chunk_count - 1
+        except Exception:
+            target = chunk_count - 1
+        target = max(0, min(target, chunk_count - 1))
+        return [target] + [item for item in base if item != target]
+    if policy == "center_out":
+        center = (chunk_count - 1) / 2.0
+        return sorted(base, key=lambda item: (abs(item - center), item))
+    if policy == "edge_interleave":
+        order: List[int] = []
+        left = 0
+        right = chunk_count - 1
+        while left <= right:
+            order.append(left)
+            if right != left:
+                order.append(right)
+            left += 1
+            right -= 1
+        return order
+    return base
+
+
+def _resolved_event_chunk_order(
+    program: MegatronProgram,
+    track: Dict[str, Any],
+    phase: str,
+    microbatch_index: int,
+    microbatch_count: int,
+) -> List[int]:
+    chunk_count = max(int(track.get("local_virtual_chunks") or 1), 1)
+    default_order = list(range(chunk_count))
+    overrides = list(program.metadata.get("runtime_window_overrides") or [])
+    for item in overrides:
+        if str((item or {}).get("phase") or "").strip() != str(phase):
+            continue
+        if not _window_matches_event(phase, microbatch_index, microbatch_count, str((item or {}).get("window") or "")):
+            continue
+        if not _stage_matches_window_selector(track, str((item or {}).get("stage_selector") or "")):
+            continue
+        return _chunk_order_for_policy(
+            chunk_count,
+            str((item or {}).get("chunk_order_policy") or ""),
+            target_chunk=(item or {}).get("optimizer_target_chunk"),
+        )
+    return default_order
+
+
+def _build_pipeline_event_trace(
+    program: MegatronProgram,
+    projection: Dict[str, Any],
+) -> Dict[str, Any]:
+    tracks = list(projection.get("stage_tracks") or [])
+    if not tracks:
+        return {}
+    summary = dict(projection.get("summary") or {})
+    phase_windows = list(projection.get("phase_windows") or [])
+    pp_degree = max(int(summary.get("pp_degree") or 1), 1)
+    microbatch_count = max(int(summary.get("estimated_microbatches") or 1), 1)
+    total_span_ms = max(float(summary.get("projected_timeline_span_ms") or 0.0), 1.0)
+    max_chunks = max(int(track.get("local_virtual_chunks") or 1) for track in tracks)
+    total_tokens = max(microbatch_count * max_chunks, 1)
+    total_slots = max((2 * total_tokens) + (2 * max(pp_degree - 1, 0)), 1)
+    slot_ms = total_span_ms / float(total_slots)
+    events: List[Dict[str, Any]] = []
+    lane_summaries: List[Dict[str, Any]] = []
+    palette = {
+        ("fwd", 0): "#4C78A8",
+        ("fwd", 1): "#72B7B2",
+        ("fwd", 2): "#54A24B",
+        ("fwd", 3): "#9FD356",
+        ("bwd", 0): "#F58518",
+        ("bwd", 1): "#E45756",
+        ("bwd", 2): "#FFBF79",
+        ("bwd", 3): "#F2CF5B",
+        ("comm", 0): "#B279A2",
+        ("idle", 0): "#B8B8B8",
+    }
+
+    for track in tracks:
+        stage_id = int(track.get("stage_id") or 0)
+        local_chunks = max(int(track.get("local_virtual_chunks") or 1), 1)
+        total_forward_ms = sum(
+            float(item.get("duration_ms") or 0.0)
+            for item in list(track.get("segments") or [])
+            if str(item.get("name") or "").startswith("forward")
+        )
+        total_backward_ms = sum(
+            float(item.get("duration_ms") or 0.0)
+            for item in list(track.get("segments") or [])
+            if str(item.get("name") or "").startswith("backward")
+        )
+        total_comm_ms = sum(
+            float(item.get("duration_ms") or 0.0)
+            for item in list(track.get("segments") or [])
+            if str(item.get("category") or "") == "communication"
+        )
+        total_idle_ms = sum(
+            float(item.get("duration_ms") or 0.0)
+            for item in list(track.get("segments") or [])
+            if str(item.get("category") or "") == "bubble"
+        )
+        total_forward_tokens = max(microbatch_count * local_chunks, 1)
+        total_backward_tokens = max(microbatch_count * local_chunks, 1)
+        fwd_unit_ms = max(total_forward_ms / float(total_forward_tokens), slot_ms * 0.82)
+        bwd_unit_ms = max(total_backward_ms / float(total_backward_tokens), slot_ms * 0.82)
+        comm_unit_ms = (total_comm_ms / float(total_forward_tokens + total_backward_tokens)) if total_comm_ms > 0.0 else 0.0
+        idle_unit_ms = (total_idle_ms / float(max(microbatch_count, 1))) if total_idle_ms > 0.0 else 0.0
+
+        token_counter = 0
+        for microbatch_index in range(microbatch_count):
+            fwd_order = _resolved_event_chunk_order(program, track, "steady", microbatch_index, microbatch_count)
+            for local_order, chunk_id in enumerate(fwd_order):
+                start_slot = stage_id + token_counter
+                start_ms = start_slot * slot_ms
+                events.append(
+                    {
+                        "stage_id": stage_id,
+                        "microbatch_id": microbatch_index,
+                        "chunk_id": int(chunk_id),
+                        "phase": "warmup" if start_ms < float((phase_windows[0] or {}).get("end_ms") or 0.0) else "steady",
+                        "op_kind": "fwd",
+                        "start_ms": round(start_ms, 4),
+                        "duration_ms": round(fwd_unit_ms, 4),
+                        "end_ms": round(start_ms + fwd_unit_ms, 4),
+                        "color": palette.get(("fwd", int(chunk_id) % 4), palette[("fwd", 0)]),
+                        "label": f"F{microbatch_index}:{chunk_id}",
+                        "evidence_source": str(track.get("evidence_source") or "observed"),
+                    }
+                )
+                if comm_unit_ms > 0.0:
+                    comm_start = start_ms + max(fwd_unit_ms - comm_unit_ms * 0.65, 0.0)
+                    events.append(
+                        {
+                            "stage_id": stage_id,
+                            "microbatch_id": microbatch_index,
+                            "chunk_id": int(chunk_id),
+                            "phase": "warmup" if start_ms < float((phase_windows[0] or {}).get("end_ms") or 0.0) else "steady",
+                            "op_kind": "comm",
+                            "start_ms": round(comm_start, 4),
+                            "duration_ms": round(comm_unit_ms, 4),
+                            "end_ms": round(comm_start + comm_unit_ms, 4),
+                            "color": palette[("comm", 0)],
+                            "label": "",
+                            "evidence_source": str(track.get("evidence_source") or "observed"),
+                        }
+                    )
+                token_counter += 1
+
+        if idle_unit_ms > 0.0:
+            events.append(
+                {
+                    "stage_id": stage_id,
+                    "microbatch_id": -1,
+                    "chunk_id": -1,
+                    "phase": "cooldown",
+                    "op_kind": "idle",
+                    "start_ms": round(max(total_span_ms - idle_unit_ms, 0.0), 4),
+                    "duration_ms": round(idle_unit_ms, 4),
+                    "end_ms": round(total_span_ms, 4),
+                    "color": palette[("idle", 0)],
+                    "label": "",
+                    "evidence_source": str(track.get("evidence_source") or "observed"),
+                }
+            )
+
+        backward_counter = 0
+        for microbatch_index in range(microbatch_count):
+            backward_phase = "cooldown" if microbatch_index >= max(microbatch_count - max(pp_degree - stage_id - 1, 1), 0) else "steady"
+            bwd_order = list(reversed(_resolved_event_chunk_order(program, track, backward_phase, microbatch_index, microbatch_count)))
+            for chunk_id in bwd_order:
+                start_slot = max(pp_degree - 1, 0) + total_tokens + backward_counter + max(pp_degree - 1 - stage_id, 0)
+                start_ms = start_slot * slot_ms
+                events.append(
+                    {
+                        "stage_id": stage_id,
+                        "microbatch_id": microbatch_index,
+                        "chunk_id": int(chunk_id),
+                        "phase": backward_phase,
+                        "op_kind": "bwd",
+                        "start_ms": round(start_ms, 4),
+                        "duration_ms": round(bwd_unit_ms, 4),
+                        "end_ms": round(start_ms + bwd_unit_ms, 4),
+                        "color": palette.get(("bwd", int(chunk_id) % 4), palette[("bwd", 0)]),
+                        "label": f"B{microbatch_index}:{chunk_id}",
+                        "evidence_source": str(track.get("evidence_source") or "observed"),
+                    }
+                )
+                backward_counter += 1
+
+        lane_summaries.append(
+            {
+                "stage_id": stage_id,
+                "role": str(track.get("role") or "normal"),
+                "stage_tags": list(track.get("stage_tags") or []),
+                "local_virtual_chunks": local_chunks,
+                "peak_reserved_gib": round(float(track.get("peak_reserved_gib") or 0.0), 4),
+                "evidence_source": str(track.get("evidence_source") or "observed"),
+            }
+        )
+
+    return {
+        "format": "pipeline_event_trace",
+        "timing_basis": "schedule_estimated_from_projection",
+        "summary": {
+            "schedule_template": str(summary.get("schedule_template") or "unknown"),
+            "pp_degree": pp_degree,
+            "vpp_degree": int(summary.get("vpp_degree") or 1),
+            "estimated_microbatches": microbatch_count,
+            "slot_ms": round(slot_ms, 4),
+            "projected_timeline_span_ms": round(total_span_ms, 4),
+        },
+        "phase_windows": phase_windows,
+        "lane_summaries": lane_summaries,
+        "events": sorted(events, key=lambda item: (float(item.get("start_ms") or 0.0), int(item.get("stage_id") or 0))),
+    }
+
+
+def _build_pipeline_projection_svg(
+    projection: Dict[str, Any],
+    event_trace: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    event_trace = dict(event_trace or {})
+    events = list(event_trace.get("events") or [])
+    lane_summaries = list(event_trace.get("lane_summaries") or [])
+    if events and lane_summaries:
+        phase_windows = list(event_trace.get("phase_windows") or [])
+        summary = dict(event_trace.get("summary") or {})
+        total_span_ms = max(float(summary.get("projected_timeline_span_ms") or 0.0), 1.0)
+        lane_height = 34
+        lane_gap = 8
+        label_width = 128
+        chart_width = 1240
+        width = label_width + chart_width + 52
+        height = 104 + len(lane_summaries) * (lane_height + lane_gap) + 58
+        scale = chart_width / total_span_ms
+        phase_colors = {
+            "warmup": "#F6E7C1",
+            "steady": "#EEF5EA",
+            "cooldown": "#F3E3D8",
+        }
+        lines: List[str] = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            "<style>",
+            "text { font-family: Consolas, 'Courier New', monospace; fill: #1f1f1f; }",
+            ".title { font-size: 15px; font-weight: 700; }",
+            ".sub { font-size: 11px; fill: #555; }",
+            ".label { font-size: 11px; }",
+            ".metric { font-size: 10px; fill: #444; }",
+            "</style>",
+            f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
+            f'<text class="title" x="16" y="24">Pipeline Timeline :: {escape(str(summary.get("schedule_template") or "unknown"))}</text>',
+            (
+                f'<text class="sub" x="16" y="44">PP={int(summary.get("pp_degree") or 1)} '
+                f'VPP={int(summary.get("vpp_degree") or 1)} '
+                f'Microbatches={int(summary.get("estimated_microbatches") or 1)} '
+                f'Slot={float(summary.get("slot_ms") or 0.0):.1f}ms</text>'
+            ),
+        ]
+        chart_x = label_width
+        chart_y = 68
+        for phase in phase_windows:
+            phase_name = str(phase.get("name") or "phase")
+            start_x = chart_x + float(phase.get("start_ms") or 0.0) * scale
+            width_x = max((float(phase.get("end_ms") or 0.0) - float(phase.get("start_ms") or 0.0)) * scale, 0.0)
+            if width_x <= 0.0:
+                continue
+            lines.append(
+                f'<rect x="{start_x:.2f}" y="{chart_y - 20}" width="{width_x:.2f}" height="{len(lane_summaries) * (lane_height + lane_gap) + 12}" fill="{phase_colors.get(phase_name, "#f2f2f2")}" opacity="0.32"/>'
+            )
+            lines.append(f'<text class="metric" x="{start_x + 4:.2f}" y="{chart_y - 8}">{escape(phase_name)}</text>')
+
+        lane_index = {int(item.get("stage_id") or 0): idx for idx, item in enumerate(lane_summaries)}
+        for idx, lane in enumerate(lane_summaries):
+            lane_y = chart_y + idx * (lane_height + lane_gap)
+            stage_id = int(lane.get("stage_id") or idx)
+            label = f"PP-{stage_id}"
+            role = str(lane.get("role") or "normal")
+            source = str(lane.get("evidence_source") or "observed")
+            lines.append(f'<text class="label" x="16" y="{lane_y + 18}">{escape(label)}</text>')
+            lines.append(f'<text class="metric" x="54" y="{lane_y + 18}">{escape(role)}</text>')
+            lines.append(f'<text class="metric" x="54" y="{lane_y + 30}">{escape(source)}</text>')
+            lines.append(f'<rect x="{chart_x}" y="{lane_y}" width="{chart_width}" height="{lane_height}" fill="#fafafa" stroke="#dcdcdc"/>')
+            lines.append(
+                f'<text class="metric" x="{chart_x + chart_width + 8}" y="{lane_y + 18}">{float(lane.get("peak_reserved_gib") or 0.0):.1f} GiB</text>'
+            )
+
+        for event in events:
+            stage_id = int(event.get("stage_id") or 0)
+            if stage_id not in lane_index:
+                continue
+            lane_y = chart_y + lane_index[stage_id] * (lane_height + lane_gap)
+            start_x = chart_x + float(event.get("start_ms") or 0.0) * scale
+            width_x = max(float(event.get("duration_ms") or 0.0) * scale, 1.2)
+            fill = str(event.get("color") or "#888888")
+            opacity = 0.92 if str(event.get("op_kind") or "") != "comm" else 0.78
+            lines.append(
+                f'<rect x="{start_x:.2f}" y="{lane_y + 3}" width="{width_x:.2f}" height="{lane_height - 6}" fill="{fill}" opacity="{opacity:.2f}" stroke="#ffffff" stroke-width="0.6"/>'
+            )
+            label = str(event.get("label") or "")
+            if label and width_x >= 18.0:
+                lines.append(
+                    f'<text class="metric" x="{start_x + 2:.2f}" y="{lane_y + 22}" fill="#111">{escape(label)}</text>'
+                )
+
+        legend = [
+            ("forward", "#4C78A8"),
+            ("backward", "#F58518"),
+            ("communication", "#B279A2"),
+            ("bubble", "#B8B8B8"),
+        ]
+        legend_y = height - 18
+        legend_x = 16
+        for name, color in legend:
+            lines.append(f'<rect x="{legend_x}" y="{legend_y - 10}" width="10" height="10" fill="{color}"/>')
+            lines.append(f'<text class="metric" x="{legend_x + 14}" y="{legend_y}">{escape(name)}</text>')
+            legend_x += 122
+        lines.append("</svg>")
+        return {
+            "format": "svg_inline",
+            "content": "\n".join(lines),
+            "source": "pipeline_event_trace",
+        }
+
     tracks = list(projection.get("stage_tracks") or [])
     if not tracks:
         return {}
@@ -3156,7 +3523,8 @@ def _build_context_from_trace(
     search_space_blueprint = _search_space_blueprint(norm, runtime_evidence, backend_context, bottleneck_signature)
     perfetto_trace = _build_perfetto_trace(norm, stage_evidence, subgraph_evidence, runtime_evidence)
     pipeline_schedule_projection = _build_pipeline_schedule_projection(norm, stage_evidence, runtime_evidence, backend_context)
-    pipeline_projection_svg = _build_pipeline_projection_svg(pipeline_schedule_projection)
+    pipeline_event_trace = _build_pipeline_event_trace(norm, pipeline_schedule_projection)
+    pipeline_projection_svg = _build_pipeline_projection_svg(pipeline_schedule_projection, pipeline_event_trace)
     return {
         "hardware_context": hardware_context,
         "backend_context": backend_context,
@@ -3182,6 +3550,7 @@ def _build_context_from_trace(
             "visualization_artifacts": {
                 "perfetto_trace": perfetto_trace,
                 "pipeline_schedule_projection": pipeline_schedule_projection,
+                "pipeline_event_trace": pipeline_event_trace,
                 "pipeline_projection_svg": pipeline_projection_svg,
                 "viewer_hint": "perfetto_trace can be opened directly in Perfetto for a synthetic nsys-like stage timeline.",
             },

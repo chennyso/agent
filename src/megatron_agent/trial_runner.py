@@ -432,6 +432,7 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     visualization = dict(artifact.get("visualization_artifacts") or {})
     perfetto_trace = dict(visualization.get("perfetto_trace") or {})
     pipeline_schedule_projection = dict(visualization.get("pipeline_schedule_projection") or {})
+    pipeline_event_trace = dict(visualization.get("pipeline_event_trace") or {})
     pipeline_projection_svg = dict(visualization.get("pipeline_projection_svg") or {})
     search_space_blueprint = dict(artifact.get("search_space_blueprint") or {})
     bottleneck_breakdown = list(artifact.get("bottleneck_breakdown") or [])
@@ -445,6 +446,7 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
         "context_record_json": str(artifact_dir / "context_record.json"),
         "perfetto_trace_json": str(artifact_dir / "perfetto_trace.json"),
         "pipeline_schedule_projection_json": str(artifact_dir / "pipeline_schedule_projection.json"),
+        "pipeline_event_trace_json": str(artifact_dir / "pipeline_event_trace.json"),
         "pipeline_projection_svg": str(artifact_dir / "pipeline_projection.svg"),
         "search_space_blueprint_json": str(artifact_dir / "search_space_blueprint.json"),
         "bottleneck_breakdown_json": str(artifact_dir / "bottleneck_breakdown.json"),
@@ -460,6 +462,11 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     if pipeline_schedule_projection:
         Path(outputs["pipeline_schedule_projection_json"]).write_text(
             json.dumps(pipeline_schedule_projection, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if pipeline_event_trace:
+        Path(outputs["pipeline_event_trace_json"]).write_text(
+            json.dumps(pipeline_event_trace, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
     if str(pipeline_projection_svg.get("content") or "").strip():
