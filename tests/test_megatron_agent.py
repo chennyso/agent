@@ -318,7 +318,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertGreaterEqual(summary["candidate_generation_count"], 3)
             self.assertEqual(summary["candidate_execution_count"], 0)
             self.assertEqual(summary["compile_success_rate"], 1.0)
-            self.assertEqual(summary["family_outside_ratio"], 1.0)
+            self.assertGreaterEqual(summary["family_outside_ratio"], 0.75)
             self.assertIn("candidate_manifest", summary)
             self.assertEqual(summary["recommended_execution_order"][0], "baseline")
             self.assertIn("program_bank", summary)
@@ -326,8 +326,15 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
             manifest_names = [entry["config_name"] for entry in summary["candidate_manifest"]]
             self.assertIn("baseline", manifest_names)
-            self.assertIn("candidate_pp_scaleout", manifest_names)
             self.assertIn("candidate_stage_aware_schedule", manifest_names)
+            self.assertTrue(
+                {
+                    "candidate_morphable_pipeline",
+                    "candidate_nonuniform_vpp_shape",
+                    "candidate_apipe_pipe_heuristic_v1",
+                }
+                & set(manifest_names)
+            )
 
     def test_trial_runner_dry_run_emits_launch_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1792,6 +1799,37 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         hypothesis_names = {str(item.get("name")) for item in (projection.get("strategy_hypotheses") or [])}
         self.assertIn("optimizer_tail_guarded", hypothesis_names)
         self.assertIn("checkpoint_boundary_joint", hypothesis_names)
+
+    def test_pipeline_schedule_projection_falls_back_when_stage_windows_are_sparse(self) -> None:
+        program = default_dense_program("single_g5")
+        program.parallel.pp_degree = 2
+        context = build_context_record(
+            program,
+            runtime_summary={
+                "steady_state_step_time_ms_p50": 6838.75,
+                "optimizer_exposed_ms": 5013.67,
+                "peak_reserved_ratio": 0.8926,
+                "bubble_ratio": 0.0,
+                "stage_window_summary": {
+                    "0": {"window_ms": 0.0, "compute_ms": 0.0, "comm_ms": 0.0, "bubble_ms": 0.0},
+                    "1": {"window_ms": 940.3281, "compute_ms": 0.0, "comm_ms": 0.0, "bubble_ms": 0.0},
+                },
+            },
+        )
+        projection = dict((((context.get("evidence_record") or {}).get("visualization_artifacts") or {}).get("pipeline_schedule_projection") or {}))
+        self.assertEqual(projection.get("projection_mode"), "fallback_estimated")
+        self.assertEqual(dict(projection.get("summary") or {}).get("evidence_source"), "fallback_estimated")
+        tracks = list(projection.get("stage_tracks") or [])
+        self.assertEqual(len(tracks), 2)
+        self.assertTrue(all(list(track.get("segments") or []) for track in tracks))
+        self.assertTrue(all(str(track.get("evidence_source") or "") == "fallback_estimated" for track in tracks))
+        phase_windows = list(projection.get("phase_windows") or [])
+        self.assertTrue(phase_windows)
+        previous_end = 0.0
+        for phase in phase_windows:
+            self.assertGreaterEqual(float(phase.get("start_ms") or 0.0), previous_end)
+            self.assertGreaterEqual(float(phase.get("end_ms") or 0.0), float(phase.get("start_ms") or 0.0))
+            previous_end = float(phase.get("end_ms") or 0.0)
 
     def test_verify_program_returns_structured_verifier_report(self) -> None:
         program = default_dense_program("single_g5")

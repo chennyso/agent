@@ -386,9 +386,138 @@ def _stage_evidence(program: MegatronProgram, trace_summary: Dict[str, Any], mer
                 "activation_lifetime_ms": max(completion_ms - float(window.get("bubble_ms") or 0.0), 0.0),
                 "recompute_delta": 0.22 if str(program.metadata.get("recompute_granularity") or "").strip().lower() == "selective" else 0.0,
                 "vpp_delta": 0.08 * float(max(int(program.parallel.vpp_degree) - 1, 0)),
+                "evidence_source": "observed",
             }
         )
+    if _stage_evidence_is_sparse(evidence):
+        return _fallback_stage_evidence(program, trace_summary, merged, observed=evidence)
     return evidence
+
+
+def _stage_evidence_is_sparse(evidence: Sequence[Dict[str, Any]]) -> bool:
+    if not evidence:
+        return True
+    populated = 0
+    for item in evidence:
+        total = (
+            float(item.get("forward_ms") or 0.0)
+            + float(item.get("backward_ms") or 0.0)
+            + float(item.get("send_recv_ms") or 0.0)
+            + float(item.get("idle_ms") or 0.0)
+        )
+        if total > 1e-6:
+            populated += 1
+    return populated < max(1, len(evidence) // 2)
+
+
+def _fallback_stage_evidence(
+    program: MegatronProgram,
+    trace_summary: Dict[str, Any],
+    merged: Dict[str, Any],
+    *,
+    observed: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    norm = program.normalized()
+    observed = list(observed or [])
+    stage_count = max(
+        int(norm.parallel.pp_degree),
+        len(observed),
+        len(dict(trace_summary.get("stage_window_summary") or {})),
+        1,
+    )
+    step_time_ms = (
+        _safe_float(trace_summary.get("steady_state_step_time_ms_p50"))
+        or _safe_float(merged.get("steady_state_step_time_ms_p50"))
+        or _safe_float(merged.get("step_time_ms_p50"))
+        or 0.0
+    )
+    optimizer_exposed_ms = (
+        _safe_float(trace_summary.get("optimizer_exposed_ms"))
+        or _safe_float(merged.get("optimizer_exposed_ms"))
+        or 0.0
+    )
+    bubble_ratio = (
+        _safe_float(trace_summary.get("bubble_ratio"))
+        or _safe_float(merged.get("bubble_ratio"))
+        or 0.0
+    )
+    comm_exposure_ratio = (
+        _safe_float(trace_summary.get("comm_exposure_ratio"))
+        or _safe_float(merged.get("comm_exposure_ratio"))
+        or 0.0
+    )
+    peak_reserved_ratio = (
+        _safe_float(trace_summary.get("peak_reserved_ratio"))
+        or _safe_float(merged.get("peak_reserved_ratio"))
+        or 0.0
+    )
+    memory_budget_gib = float(program.constraints.memory_budget_gb or program.cluster.device_memory_gb or 0.0)
+    peak_reserved_gib = (
+        _safe_float(trace_summary.get("peak_reserved_gib"))
+        or _safe_float(merged.get("peak_reserved_gib"))
+        or (peak_reserved_ratio * memory_budget_gib if memory_budget_gib > 0.0 else 0.0)
+    )
+
+    active_pipeline_ms = max(step_time_ms - optimizer_exposed_ms, step_time_ms * 0.25, 1.0)
+    total_idle_ms = max(active_pipeline_ms * bubble_ratio, 0.0)
+    total_comm_ms = max(active_pipeline_ms * comm_exposure_ratio, 0.0)
+    total_compute_ms = max(active_pipeline_ms - total_idle_ms - total_comm_ms, active_pipeline_ms * 0.55)
+    total_memory_gib = peak_reserved_gib if peak_reserved_gib > 0.0 else peak_reserved_ratio * max(memory_budget_gib, 0.0)
+
+    observed_by_stage = {int(item.get("stage_id") or 0): dict(item) for item in observed}
+    fallback: List[Dict[str, Any]] = []
+    raw_stage = _safe_stage_metrics(merged)
+    for stage_id in range(stage_count):
+        obs = observed_by_stage.get(stage_id, {})
+        tail_bias = float(stage_id) / max(float(stage_count - 1), 1.0)
+        stage_weight = 1.0 + 0.14 * tail_bias
+        stage_compute_ms = float(obs.get("forward_ms") or 0.0) + float(obs.get("backward_ms") or 0.0)
+        if stage_compute_ms <= 0.0:
+            stage_compute_ms = (total_compute_ms / float(stage_count)) * stage_weight
+        stage_comm_ms = float(obs.get("send_recv_ms") or 0.0)
+        if stage_comm_ms <= 0.0:
+            stage_comm_ms = (total_comm_ms / float(stage_count)) * (0.85 + 0.25 * tail_bias)
+        stage_idle_ms = float(obs.get("idle_ms") or 0.0)
+        if stage_idle_ms <= 0.0 and total_idle_ms > 0.0:
+            stage_idle_ms = (total_idle_ms / float(stage_count)) * (0.70 + 0.40 * tail_bias)
+        forward_ms = float(obs.get("forward_ms") or 0.0)
+        backward_ms = float(obs.get("backward_ms") or 0.0)
+        if forward_ms <= 0.0 and backward_ms <= 0.0:
+            forward_ms = stage_compute_ms * (0.44 - 0.04 * tail_bias)
+            backward_ms = max(stage_compute_ms - forward_ms, 0.0)
+        elif forward_ms <= 0.0:
+            forward_ms = max(stage_compute_ms - backward_ms, 0.0)
+        elif backward_ms <= 0.0:
+            backward_ms = max(stage_compute_ms - forward_ms, 0.0)
+
+        completion_ms = float(obs.get("completion_ms") or 0.0)
+        if completion_ms <= 0.0:
+            completion_ms = forward_ms + backward_ms + stage_comm_ms + stage_idle_ms
+        stage_peak_reserved_gib = float(obs.get("peak_reserved_gib") or 0.0)
+        if stage_peak_reserved_gib <= 0.0 and total_memory_gib > 0.0:
+            stage_peak_reserved_gib = (total_memory_gib / float(stage_count)) * (0.90 + 0.20 * tail_bias)
+        raw = raw_stage.get(str(stage_id)) or {}
+        fallback.append(
+            {
+                "stage_id": stage_id,
+                "subgraph": str(obs.get("subgraph") or f"subg_stage_{stage_id}"),
+                "forward_ms": round(forward_ms, 4),
+                "backward_ms": round(backward_ms, 4),
+                "idle_ms": round(stage_idle_ms, 4),
+                "completion_ms": round(completion_ms, 4),
+                "send_recv_ms": round(stage_comm_ms, 4),
+                "fsdp_ag_ms": round(float(obs.get("fsdp_ag_ms") or raw.get("ag_ms") or 0.0), 4),
+                "fsdp_rs_ms": round(float(obs.get("fsdp_rs_ms") or raw.get("rs_ms") or 0.0), 4),
+                "cp_collective_ms": round(float(obs.get("cp_collective_ms") or raw.get("cp_ms") or 0.0), 4),
+                "peak_reserved_gib": round(stage_peak_reserved_gib, 4),
+                "peak_active_gib": round(float(obs.get("peak_active_gib") or 0.0), 4),
+                "activation_lifetime_ms": round(max(completion_ms - stage_idle_ms, 0.0), 4),
+                "recompute_delta": float(obs.get("recompute_delta") or 0.22 if str(program.metadata.get("recompute_granularity") or "").strip().lower() == "selective" else 0.0),
+                "vpp_delta": float(obs.get("vpp_delta") or (0.08 * float(max(int(program.parallel.vpp_degree) - 1, 0)))),
+                "evidence_source": "fallback_estimated",
+            }
+        )
+    return fallback
 
 
 def _subgraph_evidence(program: MegatronProgram, trace_summary: Dict[str, Any], merged: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -796,6 +925,7 @@ def _build_pipeline_schedule_projection(
 
     tracks: List[Dict[str, Any]] = []
     max_end_ms = 0.0
+    track_sources: List[str] = []
     for index in range(stage_count):
         stage = dict(stage_evidence[index]) if index < len(stage_evidence) else {}
         stage_id = int(stage.get("stage_id") or index)
@@ -863,6 +993,7 @@ def _build_pipeline_schedule_projection(
                 "stage_id": stage_id,
                 "subgraph": str(stage.get("subgraph") or f"subg_stage_{stage_id}"),
                 "role": stage_role,
+                "evidence_source": str(stage.get("evidence_source") or "observed"),
                 "stage_tags": stage_tags,
                 "local_virtual_chunks": local_chunks,
                 "completion_ms": round(float(stage.get("completion_ms") or cursor_ms), 4),
@@ -871,25 +1002,29 @@ def _build_pipeline_schedule_projection(
                 "segments": segments,
             }
         )
+        track_sources.append(str(stage.get("evidence_source") or "observed"))
         max_end_ms = max(max_end_ms, cursor_ms)
 
+    warmup_end_ms = min(round(warmup_ms, 4), round(max_end_ms, 4))
+    cooldown_start_ms = max(round(max(max_end_ms - cooldown_ms, 0.0), 4), warmup_end_ms)
+    phase_end_ms = round(max(max_end_ms, warmup_end_ms), 4)
     phase_windows = [
-        {"name": "warmup", "start_ms": 0.0, "end_ms": round(warmup_ms, 4)},
+        {"name": "warmup", "start_ms": 0.0, "end_ms": warmup_end_ms},
         {
             "name": "steady",
-            "start_ms": round(warmup_ms, 4),
-            "end_ms": round(max(max_end_ms - cooldown_ms, warmup_ms), 4),
+            "start_ms": warmup_end_ms,
+            "end_ms": cooldown_start_ms,
         },
         {
             "name": "cooldown",
-            "start_ms": round(max(max_end_ms - cooldown_ms, warmup_ms), 4),
-            "end_ms": round(max_end_ms, 4),
+            "start_ms": cooldown_start_ms,
+            "end_ms": phase_end_ms,
         },
     ]
 
     return {
         "format": "pipeline_schedule_projection",
-        "projection_mode": "heuristic_from_runtime_evidence",
+        "projection_mode": "fallback_estimated" if any(source != "observed" for source in track_sources) else "heuristic_from_runtime_evidence",
         "viewer_hint": "Use pipeline_projection_svg for a quick visual or inspect stage_tracks for programmatic comparisons.",
         "summary": {
             "schedule_template": str(norm.schedule.template),
@@ -912,6 +1047,7 @@ def _build_pipeline_schedule_projection(
                 float(local_window_observability.get("optimizer_exposed_window_ms") or 0.0),
                 4,
             ),
+            "evidence_source": "fallback_estimated" if any(source != "observed" for source in track_sources) else "observed",
         },
         "phase_windows": phase_windows,
         "stage_tracks": tracks,
