@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 from pathlib import Path
@@ -30,6 +31,15 @@ from megatron_agent.config import (
     default_moe_smoke_program,
     weighted_stage_layer_allocation,
 )
+from megatron_agent.feedback_optimizer import (
+    build_feedback_search_plan,
+    build_trial_outcome,
+    enrich_program_with_runtime_policy_metadata,
+    record_trial_feedback,
+    reflect_on_trial,
+    reorder_agent_proposals_with_feedback,
+)
+from megatron_agent.policy_memory import PolicyMemoryBank
 from megatron_agent.programs import (
     assess_vpp_comm_tradeoff,
     check_program,
@@ -583,6 +593,136 @@ def _stage_local_virtual_counts(
     return counts
 
 
+def _stage_local_virtual_counts_from_chunk_shapes(
+    stage_layers: List[int],
+    stage_vpp_vector: List[int],
+    chunk_shapes: Dict[int, List[List[int]]],
+    *,
+    global_vpp: int,
+    focus: str = "balanced",
+) -> List[int]:
+    if global_vpp <= 1:
+        return [max(int(value), 0) for value in stage_layers]
+
+    stage_slot_counts: List[List[int]] = []
+    for stage_id, layers in enumerate(stage_layers):
+        local_vpp = 1
+        if stage_id < len(stage_vpp_vector):
+            local_vpp = max(min(int(stage_vpp_vector[stage_id]), int(global_vpp)), 1)
+        explicit_shape: Optional[List[int]] = None
+        for shape in list((chunk_shapes or {}).get(stage_id) or []):
+            if not isinstance(shape, list):
+                continue
+            parsed = [max(int(value), 0) for value in shape if _safe_int(value) is not None]
+            if len(parsed) != local_vpp:
+                continue
+            if sum(parsed) != max(int(layers), 0):
+                continue
+            explicit_shape = parsed
+            break
+        slots = [0 for _ in range(global_vpp)]
+        if explicit_shape is not None:
+            for slot_index, value in enumerate(explicit_shape):
+                slots[slot_index] = int(value)
+        else:
+            if local_vpp == 1:
+                slots[0] = max(int(layers), 0)
+            else:
+                base = max(int(layers), 0) // local_vpp
+                rem = max(int(layers), 0) % local_vpp
+                for slot_index in range(local_vpp):
+                    slots[slot_index] = base
+                distribute_order = list(range(local_vpp))
+                if focus == "tail-aware":
+                    distribute_order = list(reversed(distribute_order))
+                for offset in range(rem):
+                    slots[distribute_order[offset % len(distribute_order)]] += 1
+        stage_slot_counts.append(slots)
+
+    counts: List[int] = []
+    for virtual_slot in range(global_vpp):
+        for stage_id in range(len(stage_layers)):
+            counts.append(int(stage_slot_counts[stage_id][virtual_slot]))
+    return counts
+
+
+def _has_interleaved_pipeline_shape(program: MegatronProgram) -> bool:
+    if int(program.parallel.pp_degree) <= 1:
+        return False
+    if int(program.parallel.vpp_degree) > 1:
+        return True
+    layout = str(program.layout.pipeline_layout or "").strip()
+    if not layout:
+        return False
+    tokens = [token for token in layout.split("|")]
+    return len(tokens) > int(program.parallel.pp_degree) and len(tokens) % int(program.parallel.pp_degree) == 0
+
+
+def _ensure_interleaved_optimizer_runtime_baseline(
+    candidate: MegatronProgram,
+    *,
+    focus: str = "balanced",
+) -> MegatronProgram:
+    if _has_interleaved_pipeline_shape(candidate):
+        return candidate
+    if int(candidate.parallel.pp_degree) <= 1:
+        return candidate
+
+    stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+    target_global_vpp = max(int(candidate.parallel.vpp_degree), 2)
+    stage_vpp_vector = list(candidate.metadata.get("stage_local_vpp_vector") or [])
+    if len(stage_vpp_vector) < len(stage_layers):
+        stage_vpp_vector.extend([target_global_vpp] * (len(stage_layers) - len(stage_vpp_vector)))
+    stage_vpp_vector = [
+        max(min(int(stage_vpp_vector[stage_id]), int(target_global_vpp)), 1)
+        for stage_id in range(len(stage_layers))
+    ]
+    if not any(int(value) > 1 for value in stage_vpp_vector):
+        stage_vpp_vector = [int(target_global_vpp) for _ in stage_layers]
+
+    counts = _stage_local_virtual_counts(
+        stage_layers,
+        stage_vpp_vector,
+        global_vpp=int(target_global_vpp),
+        focus=focus,
+    )
+    candidate.parallel.vpp_degree = int(target_global_vpp)
+    candidate.layout.vpp_degree = int(target_global_vpp)
+    candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
+    candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in stage_vpp_vector]
+    candidate.metadata["preserve_stage_local_vpp"] = True
+    candidate.schedule.skeleton = "stage_aware_grouped"
+    target_group_size = max(
+        int(candidate.schedule.microbatch_group_size_per_vp_stage or 1),
+        min(max(int(candidate.parallel.pp_degree), 2), 4),
+    )
+    candidate.schedule.microbatch_group_size_per_vp_stage = target_group_size
+    if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
+        candidate.schedule.template = "interleaved_grouped_g4" if target_group_size >= 4 else "interleaved_grouped_g2"
+    return candidate
+
+
+def _attach_optimizer_runtime_contract(
+    candidate: MegatronProgram,
+    *,
+    peak_reserved_ratio: float,
+    tail_ratio: float,
+    chunk_scope: Optional[str] = None,
+) -> str:
+    resolved_chunk_scope = str(
+        chunk_scope or ("tail_and_hotspot" if peak_reserved_ratio >= 0.84 or tail_ratio >= 0.14 else "tail_only")
+    ).strip() or "tail_only"
+    candidate.metadata["runtime_optimizer_policy_mode"] = "tail_guarded_overlap"
+    candidate.metadata["runtime_optimizer_target_policy"] = "tail_stage_first"
+    candidate.metadata["runtime_optimizer_chunk_scope"] = resolved_chunk_scope
+    candidate.metadata["runtime_optimizer_window_policy"] = "tail_flush_aligned"
+    candidate.metadata["runtime_enable_distributed_optimizer"] = True
+    candidate.metadata["runtime_enable_overlap_grad_reduce"] = True
+    candidate.metadata["runtime_enable_overlap_param_gather"] = True
+    candidate.metadata["runtime_enable_overlap_param_gather_with_optimizer_step"] = True
+    return resolved_chunk_scope
+
+
 def _pp_vpp_layout_counts(pp_degree: int, num_layers: int, template: str) -> Optional[List[int]]:
     if int(pp_degree) == 2 and int(num_layers) == 40:
         if template == "interleaved_grouped_g2":
@@ -638,6 +778,47 @@ def _candidate_sort_key(program: MegatronProgram) -> tuple:
 
 def _structural_program_key(program: MegatronProgram) -> str:
     norm = program.normalized()
+    runtime_metadata = {
+        key: copy.deepcopy((norm.metadata or {}).get(key))
+        for key in (
+            "execution_backend",
+            "runtime_schedule_family",
+            "runtime_schedule_spec",
+            "runtime_phase_policy",
+            "runtime_chunk_priority_hints",
+            "runtime_stage_tags",
+            "runtime_window_overrides",
+            "runtime_operator_cluster_overrides",
+            "runtime_optimizer_policy_mode",
+            "runtime_optimizer_target_policy",
+            "runtime_optimizer_chunk_scope",
+            "runtime_optimizer_window_policy",
+            "runtime_enable_distributed_optimizer",
+            "runtime_enable_overlap_grad_reduce",
+            "runtime_enable_overlap_param_gather",
+            "runtime_enable_overlap_param_gather_with_optimizer_step",
+            "runtime_memory_policy_mode",
+            "runtime_checkpoint_boundary_mode",
+            "runtime_recompute_granularity",
+            "runtime_enable_recompute_activations",
+            "runtime_recompute_modules",
+            "runtime_enable_fine_grained_activation_offloading",
+            "runtime_offload_modules",
+            "stage_local_vpp_vector",
+            "stage_local_chunk_shapes",
+            "preserve_stage_local_vpp",
+            "morphable_stage_families",
+            "morphable_chunk_shape_vector",
+            "flush_order_policy",
+            "schedule_warmup_checkpoint_policy",
+            "schedule_steady_checkpoint_policy",
+            "schedule_warmup_combined_policy",
+            "schedule_steady_combined_policy",
+            "schedule_cooldown_combined_policy",
+            "schedule_cooldown_p2p_policy",
+        )
+        if key in (norm.metadata or {})
+    }
     payload = {
         "cluster": norm.cluster.to_dict(),
         "model": norm.model.to_dict(),
@@ -653,6 +834,7 @@ def _structural_program_key(program: MegatronProgram) -> str:
         "partition": norm.partition.to_dict(),
         "layout": norm.layout.to_dict(),
         "plane_map": norm.plane_map.to_dict(),
+        "strategy_ir": norm.strategy_ir.to_dict() if hasattr(norm.strategy_ir, "to_dict") else {},
         "schedule": norm.schedule.to_dict(),
         "batch_plan": norm.batch_plan.to_dict(),
         "constraints": norm.constraints.to_dict(),
@@ -662,6 +844,7 @@ def _structural_program_key(program: MegatronProgram) -> str:
         "use_bf16": bool(norm.metadata.get("use_bf16", True)),
         "use_fp16": bool(norm.metadata.get("use_fp16", False)),
         "recompute_granularity": norm.metadata.get("recompute_granularity"),
+        "runtime_metadata": runtime_metadata,
     }
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
@@ -1349,7 +1532,7 @@ def _annotate_candidate_runtime_evidence(
         if bool(tradeoff.get("should_veto")):
             annotated.metadata["vpp_veto_reason"] = str(tradeoff.get("reason") or "comm-exposure-aware VPP veto")
     annotated.metadata["evidence_score"] = round(float(evidence_score), 4)
-    return annotated.normalized()
+    return enrich_program_with_runtime_policy_metadata(annotated).normalized()
 
 
 def _stage_load_variance(payload: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1915,7 +2098,7 @@ def _select_verified_strategy_template(
                 reasons.append("communication exposure favors communication-aware templates")
         if batch_profile == "long_context":
             if str(item.get("template_id") or "") == "D_long_context_conservative":
-                score += 4.0
+                score += 6.0
                 reasons.append("long-context batches should use conservative VPP or CP relief")
         if optimizer_exposed_ratio >= 0.18:
             if str(item.get("category") or "") in {"execution", "tail", "checkpoint"}:
@@ -2221,6 +2404,11 @@ def _build_summary_payload(
     second_stage_context_record: Optional[Dict[str, Any]] = None,
     second_stage_replan_decision: Optional[Dict[str, Any]] = None,
     second_stage_bottleneck_signature: Optional[Dict[str, Any]] = None,
+    feedback_search_plan: Optional[Dict[str, Any]] = None,
+    second_stage_feedback_search_plan: Optional[Dict[str, Any]] = None,
+    policy_memory: Optional[Dict[str, Any]] = None,
+    family_scoreboard: Optional[List[Dict[str, Any]]] = None,
+    trial_reflections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     candidate_entries = _candidate_entries(candidate_manifest)
     compile_success_rate = None
@@ -2267,6 +2455,11 @@ def _build_summary_payload(
         "second_stage_context_record": dict(second_stage_context_record or {}),
         "second_stage_replan_decision": dict(second_stage_replan_decision or {}),
         "second_stage_bottleneck_signature": dict(second_stage_bottleneck_signature or {}),
+        "feedback_search_plan": dict(feedback_search_plan or {}),
+        "second_stage_feedback_search_plan": dict(second_stage_feedback_search_plan or {}),
+        "policy_memory": dict(policy_memory or {}),
+        "family_scoreboard": list(family_scoreboard or []),
+        "trial_reflections": list(trial_reflections or []),
         "recommended_execution_order": [entry["config_name"] for entry in candidate_manifest],
         "program_bank": program_bank.to_dict(),
         "candidate_generation_count": len(candidate_entries),
@@ -2858,6 +3051,7 @@ def _build_nonuniform_partition(program: MegatronProgram) -> Optional[MegatronPr
         stage.decoder_layers = stage_layers[index]
     candidate.layout.pipeline_layout = None
     candidate.metadata["program_kind"] = "candidate_nonuniform_partition"
+    candidate.metadata["priority_rank"] = 18
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3023,7 +3217,7 @@ def _build_pp_scaleout_candidate(program: MegatronProgram) -> Optional[MegatronP
     if candidate is None:
         return None
     candidate.metadata["program_kind"] = "candidate_pp_scaleout"
-    candidate.metadata["priority_rank"] = 24
+    candidate.metadata["priority_rank"] = 16
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3240,7 +3434,7 @@ def _build_torchtitan_hsdp_candidate(
         return None
     candidate = _apply_torchtitan_hybrid_shard_policy(program, selective_only=True, hot_subgraphs=hot_subgraphs)
     candidate.metadata["program_kind"] = "candidate_torchtitan_hsdp_mesh"
-    candidate.metadata["priority_rank"] = 14
+    candidate.metadata["priority_rank"] = 20
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3269,7 +3463,7 @@ def _build_pp_hsdp_hybrid_candidate(
     }
     candidate = _apply_torchtitan_hybrid_shard_policy(base, selective_only=True, hot_subgraphs=hot_subgraphs)
     candidate.metadata["program_kind"] = "candidate_pp_hsdp_hybrid"
-    candidate.metadata["priority_rank"] = 19
+    candidate.metadata["priority_rank"] = 10
     return _sync_batch_plan_metadata(candidate)
 
 
@@ -3461,6 +3655,19 @@ def _build_stage_local_vpp_shape_candidate(
 ) -> Optional[MegatronProgram]:
     if int(program.parallel.pp_degree) <= 1:
         return None
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    if not any(
+        float(runtime.get(key) or 0.0) > 0.0
+        for key in (
+            "bubble_ratio",
+            "optimizer_exposed_ratio",
+            "peak_reserved_ratio",
+            "stage_tail_ratio",
+            "tail_step_jitter_ratio",
+            "mem_skew_ratio",
+        )
+    ):
+        return None
     stage_count = int(program.partition.num_stages)
     target_vector, chunk_shapes = _nonuniform_vpp_vector_from_evidence(
         context_record,
@@ -3478,6 +3685,17 @@ def _build_stage_local_vpp_shape_candidate(
         return None
 
     candidate = _clone_program(program)
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+    tail_ratio = max(
+        float(runtime.get("stage_tail_ratio") or 0.0),
+        float(runtime.get("tail_step_jitter_ratio") or 0.0),
+    )
+    stage_windows = {
+        int(stage_id): dict(values or {})
+        for stage_id, values in dict(runtime.get("stage_window_summary") or {}).items()
+        if _safe_int(stage_id) is not None
+    }
     candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in target_vector]
     candidate.metadata["preserve_stage_local_vpp"] = True
     if chunk_shapes:
@@ -3497,16 +3715,15 @@ def _build_stage_local_vpp_shape_candidate(
         candidate.parallel.vpp_degree = int(target_global_vpp)
         candidate.layout.vpp_degree = int(target_global_vpp)
         if int(target_global_vpp) > 1:
-            counts = _pp_vpp_layout_counts(
-                int(candidate.parallel.pp_degree),
-                int(candidate.model.num_layers),
-                "interleaved_grouped_g2",
+            stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
+            counts = _stage_local_virtual_counts_from_chunk_shapes(
+                stage_layers,
+                [int(value) for value in target_vector],
+                chunk_shapes,
+                global_vpp=int(target_global_vpp),
+                focus="tail-aware" if tail_ratio >= 0.10 else "balanced",
             )
-            if counts is None:
-                total_virtual = int(candidate.parallel.pp_degree) * int(target_global_vpp)
-                if total_virtual > 0 and int(candidate.model.num_layers) % total_virtual == 0:
-                    counts = [int(candidate.model.num_layers) // total_virtual] * total_virtual
-            if counts is not None:
+            if counts and sum(int(value) for value in counts) == int(candidate.model.num_layers):
                 candidate.layout.pipeline_layout = _virtual_stage_layout(counts)
             candidate.schedule.skeleton = "stage_aware_grouped"
             if str(candidate.schedule.template or "fixed_1f1b") == "fixed_1f1b":
@@ -3517,9 +3734,110 @@ def _build_stage_local_vpp_shape_candidate(
                 2,
             )
 
+    hint_map = _stage_family_hint_map(candidate)
+    hotspot_stage_ids: List[int] = []
+    for stage_id in range(stage_count):
+        local_window = dict(stage_windows.get(stage_id) or {})
+        local_reserved_gib = float(local_window.get("peak_reserved_gib") or 0.0)
+        local_reserved_ratio = 0.0
+        if peak_reserved_ratio > 0.0 and local_reserved_gib > 0.0:
+            cluster_budget = float(
+                candidate.constraints.memory_budget_gb
+                or candidate.cluster.device_memory_gb
+                or 24.0
+            )
+            if cluster_budget > 0.0:
+                local_reserved_ratio = local_reserved_gib / cluster_budget
+        if local_reserved_ratio >= 0.84:
+            hotspot_stage_ids.append(stage_id)
+    runtime_recompute_modules: List[str] = []
+    runtime_offload_modules: List[str] = []
+    tail_stage = max(stage_count - 1, 0)
+    for stage_id in range(stage_count):
+        hint = hint_map.setdefault(stage_id, {"stage_index": stage_id, "family": "balanced_interleave"})
+        stage_tags: List[str] = ["heterogeneous_vpp"]
+        local_vpp = int(target_vector[stage_id]) if stage_id < len(target_vector) else 1
+        baseline_vpp = int(baseline_vector[stage_id]) if stage_id < len(baseline_vector) else 1
+        chunk_priority_hints: List[int] = []
+        family = "balanced_interleave"
+        dispatch_order = "default"
+        warmup_policy = ""
+        cooldown_policy = ""
+        checkpoint_policy = ""
+        combined_policy = ""
+        if stage_id in hotspot_stage_ids:
+            family = "memory_hotspot"
+            stage_tags.append("memory_hotspot")
+            dispatch_order = "middle_stage_relief"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            checkpoint_policy = "guarded_selective" if peak_reserved_ratio >= 0.88 else "selective"
+            combined_policy = "serial"
+            runtime_recompute_modules.extend(["core_attn", "mlp"] if peak_reserved_ratio >= 0.88 else ["core_attn"])
+            if peak_reserved_ratio >= 0.90:
+                runtime_offload_modules.extend(["core_attn", "attn_proj"])
+            chunk_priority_hints = [3, 1] if local_vpp > 1 else [3]
+        elif local_vpp > baseline_vpp:
+            family = "heterogeneous_middle_relief"
+            stage_tags.append("throughput_favoring")
+            dispatch_order = "stage_local_nonuniform_vpp"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_min"
+            chunk_priority_hints = [3, 1] if local_vpp > 1 else [2]
+        if stage_id == tail_stage:
+            family = "tail_guarded"
+            stage_tags.append("tail_sensitive")
+            dispatch_order = "tail_boundary_rewrite"
+            warmup_policy = "balanced_fill"
+            cooldown_policy = "tail_checkpoint_guard"
+            checkpoint_policy = checkpoint_policy or "tail_selective"
+            chunk_priority_hints = [1] if local_vpp <= 1 else [2, 1]
+            if optimizer_exposed_ratio >= 0.18:
+                stage_tags.append("optimizer_sensitive")
+        hint.update(
+            {
+                "family": family,
+                "stage_tags": sorted(set(stage_tags)),
+                "dispatch_order": dispatch_order,
+                "warmup_policy": warmup_policy,
+                "cooldown_policy": cooldown_policy,
+                "checkpoint_policy": checkpoint_policy,
+                "combined_policy": combined_policy,
+                "chunk_priority_hints": chunk_priority_hints,
+            }
+        )
+    if runtime_recompute_modules:
+        candidate.metadata["runtime_recompute_granularity"] = "selective"
+        candidate.metadata["runtime_enable_recompute_activations"] = True
+        candidate.metadata["runtime_recompute_modules"] = list(dict.fromkeys(runtime_recompute_modules))
+        candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
+        candidate.metadata["schedule_steady_checkpoint_policy"] = "guarded_selective"
+        candidate.metadata["runtime_checkpoint_boundary_mode"] = "stage_local_vpp_guarded"
+    if runtime_offload_modules:
+        candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+        candidate.metadata["runtime_offload_modules"] = list(dict.fromkeys(runtime_offload_modules))
+        candidate.metadata["runtime_memory_policy_mode"] = "stage_local_vpp_memory_guarded"
+    if _has_interleaved_pipeline_shape(candidate) and optimizer_exposed_ratio >= 0.18:
+        optimizer_chunk_scope = _attach_optimizer_runtime_contract(
+            candidate,
+            peak_reserved_ratio=peak_reserved_ratio,
+            tail_ratio=tail_ratio,
+            chunk_scope=("tail_and_hotspot" if hotspot_stage_ids else "tail_only"),
+        )
+        tail_hint = hint_map.setdefault(tail_stage, {"stage_index": tail_stage, "family": "tail_guarded"})
+        tail_hint.update(
+            {
+                "optimizer_runtime_mode": "tail_guarded_overlap",
+                "optimizer_target_policy": "tail_stage_first",
+                "optimizer_chunk_scope": optimizer_chunk_scope,
+                "optimizer_window_policy": "tail_flush_aligned",
+                "optimizer_target_chunk": "tail",
+            }
+        )
+    candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
     candidate.metadata["program_kind"] = "candidate_nonuniform_vpp_shape"
     candidate.metadata["priority_rank"] = 21
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_stage_local_memory_policy_candidate(
@@ -3613,7 +3931,7 @@ def _build_stage_local_memory_policy_candidate(
     )
     candidate.metadata["program_kind"] = "candidate_stage_local_memory_policy"
     candidate.metadata["priority_rank"] = 42
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_offload_first_refinement_candidate(
@@ -3716,7 +4034,7 @@ def _build_offload_first_refinement_candidate(
     candidate.metadata["runtime_checkpoint_boundary_mode"] = "edge_guarded_selective"
     candidate.metadata["program_kind"] = "candidate_offload_first_refinement"
     candidate.metadata["priority_rank"] = 14
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_optimizer_aware_pipeline_candidate(
@@ -3736,7 +4054,7 @@ def _build_optimizer_aware_pipeline_candidate(
     if optimizer_exposed_ratio < 0.18 and optimizer_ratio < 0.45:
         return None
 
-    candidate = _clone_program(program)
+    candidate = _ensure_interleaved_optimizer_runtime_baseline(_clone_program(program), focus="balanced")
     candidate.schedule.dispatch_order = "optimizer_tail_guarded"
     candidate.strategy_ir.pipe.warmup_policy = "balanced_fill"
     candidate.strategy_ir.pipe.cooldown_policy = "optimizer_tail_hide"
@@ -3758,6 +4076,12 @@ def _build_optimizer_aware_pipeline_candidate(
         candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
         candidate.metadata["runtime_checkpoint_boundary_mode"] = "optimizer_tail_guarded"
 
+    optimizer_chunk_scope = _attach_optimizer_runtime_contract(
+        candidate,
+        peak_reserved_ratio=peak_reserved_ratio,
+        tail_ratio=tail_ratio,
+        chunk_scope=("tail_and_hotspot" if peak_reserved_ratio >= 0.86 or tail_ratio >= 0.14 else "tail_only"),
+    )
     hint_map = _stage_family_hint_map(candidate)
     tail_stage = max(hint_map) if hint_map else 0
     tail_hint = hint_map.setdefault(tail_stage, {"stage_index": tail_stage, "family": "balanced_interleave"})
@@ -3771,10 +4095,14 @@ def _build_optimizer_aware_pipeline_candidate(
             "p2p_policy": "serial" if optimizer_exposed_ratio >= 0.22 else "",
             "combined_policy": "serial",
             "chunk_priority_hints": [4, 2] if int(candidate.parallel.vpp_degree) > 1 else [4],
+            "optimizer_runtime_mode": "tail_guarded_overlap",
+            "optimizer_target_policy": "tail_stage_first",
+            "optimizer_chunk_scope": optimizer_chunk_scope,
+            "optimizer_window_policy": "tail_flush_aligned",
+            "optimizer_target_chunk": "tail",
         }
     )
     candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
-    candidate.metadata["runtime_optimizer_policy_mode"] = "tail_hidden_overlap"
     candidate.metadata["runtime_optimizer_expected_effect"] = (
         "reduce optimizer exposure on the tail-stage critical path before larger PP/VPP repartitioning"
     )
@@ -3784,7 +4112,7 @@ def _build_optimizer_aware_pipeline_candidate(
     )
     candidate.metadata["program_kind"] = "candidate_optimizer_aware_pipeline"
     candidate.metadata["priority_rank"] = 12
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_tail_aware_execution_candidate(
@@ -3868,6 +4196,14 @@ def _build_tail_aware_execution_candidate(
         candidate.metadata["schedule_cooldown_combined_policy"] = "serial"
     candidate.metadata["runtime_checkpoint_boundary_mode"] = "tail_stage_guarded"
     candidate.metadata["runtime_memory_policy_mode"] = "tail_guarded_selective_recompute"
+    optimizer_chunk_scope = ""
+    if _has_interleaved_pipeline_shape(candidate):
+        optimizer_chunk_scope = _attach_optimizer_runtime_contract(
+            candidate,
+            peak_reserved_ratio=peak_reserved_ratio,
+            tail_ratio=tail_ratio,
+            chunk_scope=("tail_and_hotspot" if peak_reserved_ratio >= 0.84 else "tail_only"),
+        )
 
     hint_map = _stage_family_hint_map(candidate)
     tail_stage = max(hint_map) if hint_map else 0
@@ -3883,6 +4219,16 @@ def _build_tail_aware_execution_candidate(
             "chunk_priority_hints": [1],
         }
     )
+    if optimizer_chunk_scope:
+        tail_hint.update(
+            {
+                "optimizer_runtime_mode": "tail_guarded_overlap",
+                "optimizer_target_policy": "tail_stage_first",
+                "optimizer_chunk_scope": optimizer_chunk_scope,
+                "optimizer_window_policy": "tail_flush_aligned",
+                "optimizer_target_chunk": "tail",
+            }
+        )
     for stage_id in range(1, max(stage_count - 1, 1)):
         if stage_id >= tail_stage:
             continue
@@ -3899,7 +4245,7 @@ def _build_tail_aware_execution_candidate(
     candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
     candidate.metadata["program_kind"] = "candidate_tail_aware_execution"
     candidate.metadata["priority_rank"] = 11
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_checkpoint_boundary_refinement_candidate(
@@ -3996,7 +4342,7 @@ def _build_checkpoint_boundary_refinement_candidate(
     candidate.metadata["morphable_stage_families"] = _sorted_stage_family_hints(hint_map)
     candidate.metadata["program_kind"] = "candidate_checkpoint_boundary_refinement"
     candidate.metadata["priority_rank"] = 13
-    return _sync_batch_plan_metadata(candidate)
+    return enrich_program_with_runtime_policy_metadata(_sync_batch_plan_metadata(candidate))
 
 
 def _build_morphable_pipeline_candidate(
@@ -4092,6 +4438,7 @@ def _build_morphable_pipeline_candidate(
         hint = {
             "stage_index": int(stage_index),
             "family": str((family or {}).get("family") or "balanced_interleave"),
+            "stage_tags": [str(item).strip() for item in list((family or {}).get("stage_tags") or []) if str(item).strip()],
             "preferred_template": str((family or {}).get("preferred_template") or "").strip(),
             "dispatch_order": str((family or {}).get("dispatch_order") or "default"),
             "warmup_policy": str((family or {}).get("warmup_policy") or "default"),
@@ -4788,6 +5135,7 @@ def _build_agent_proposals(
     runtime_summary: Dict[str, Any],
     context_record: Dict[str, Any],
     replan_decision: Dict[str, Any],
+    policy_memory_bank: Optional[PolicyMemoryBank] = None,
 ) -> List[AgentProposal]:
     optimization_hints = list((context_record or {}).get("optimization_hints") or [])
     hinted_rationales: Dict[str, str] = {}
@@ -4820,32 +5168,52 @@ def _build_agent_proposals(
     ]
 
     if str(replan_decision.get("scope")) == "pipe":
-        ordered_pool = (
-            [(program, "pipe", hinted_rationales.get("pipe", "active runtime branch indicates a low-cost schedule-local intervention is worth trying first")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"]
-            + [(program, "pipe", hinted_rationales.get("pipe", "runtime evidence prefers schedule adaptation before touching local or global structure")) for program in schedules]
-            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says a local relief branch is already justified")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
-            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "schedule fix is insufficient; escalate to local subgraph policy")) for program in local_parallel]
-            + [(program, "skeleton", hinted_rationales.get("skeleton", "schedule/local adaptations are exhausted; escalate to PP skeleton change")) for program in skeletons]
-        )
+        ordered_groups = [
+            [(program, "pipe", hinted_rationales.get("pipe", "active runtime branch indicates a low-cost schedule-local intervention is worth trying first")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"],
+            [(program, "pipe", hinted_rationales.get("pipe", "runtime evidence prefers schedule adaptation before touching local or global structure")) for program in schedules],
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says a local relief branch is already justified")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"],
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "schedule fix is insufficient; escalate to local subgraph policy")) for program in local_parallel],
+            [(program, "skeleton", hinted_rationales.get("skeleton", "schedule/local adaptations are exhausted; escalate to PP skeleton change")) for program in skeletons],
+        ]
     elif str(replan_decision.get("scope")) == "local_parallel":
-        ordered_pool = (
-            [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel]
-            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says local policy relief is worth trying before broader search")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"]
-            + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"]
-            + [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in schedules]
-            + [(program, "skeleton", hinted_rationales.get("skeleton", "persistent local failures justify skeleton repartitioning")) for program in skeletons]
-        )
+        ordered_groups = [
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "memory or hotspot evidence prefers CP/VPP/FSDP relief first")) for program in local_parallel],
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "active runtime branch says local policy relief is worth trying before broader search")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "local_parallel"],
+            [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in runtime_branch_candidates if str((program.metadata or {}).get("runtime_branch_scope") or "") == "pipe"],
+            [(program, "pipe", hinted_rationales.get("pipe", "if local relief is insufficient, try lower-cost runtime pipe changes")) for program in schedules],
+            [(program, "skeleton", hinted_rationales.get("skeleton", "persistent local failures justify skeleton repartitioning")) for program in skeletons],
+        ]
+    elif str(replan_decision.get("scope")) == "skeleton":
+        ordered_groups = [
+            [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons],
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "after skeleton changes, refine local CP/VPP/FSDP policy")) for program in local_parallel],
+            [(program, str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), hinted_rationales.get(str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), "active runtime branch offers the cheapest next intervention")) for program in runtime_branch_candidates],
+            [(program, "pipe", hinted_rationales.get("pipe", "pipe is last-mile tuning after broader structural changes")) for program in schedules],
+        ]
     else:
-        ordered_pool = (
-            [(program, str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), hinted_rationales.get(str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), "active runtime branch offers the cheapest next intervention")) for program in runtime_branch_candidates]
-            + [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons]
-            + [(program, "local_parallel", hinted_rationales.get("local_parallel", "after skeleton changes, refine local CP/VPP/FSDP policy")) for program in local_parallel]
-            + [(program, "pipe", hinted_rationales.get("pipe", "pipe is last-mile tuning after broader structural changes")) for program in schedules]
-        )
+        ordered_groups = [
+            [(program, str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), hinted_rationales.get(str((program.metadata or {}).get("runtime_branch_scope") or "local_parallel"), "active runtime branch offers the cheapest next intervention")) for program in runtime_branch_candidates],
+            [(program, "skeleton", hinted_rationales.get("skeleton", "topology or persistent imbalance indicates broader stage repartitioning")) for program in skeletons],
+            [(program, "local_parallel", hinted_rationales.get("local_parallel", "after skeleton changes, refine local CP/VPP/FSDP policy")) for program in local_parallel],
+            [(program, "pipe", hinted_rationales.get("pipe", "pipe is last-mile tuning after broader structural changes")) for program in schedules],
+        ]
     proposals: List[AgentProposal] = []
-    for program, scope, rationale in sorted(ordered_pool, key=lambda item: _candidate_sort_key(item[0])):
-        proposals.append(_build_agent_proposal(program, scope=scope, rationale=rationale, source="heuristic_supervisor"))
-    return proposals
+    for group in ordered_groups:
+        for program, scope, rationale in sorted(group, key=lambda item: _candidate_sort_key(item[0])):
+            proposals.append(_build_agent_proposal(program, scope=scope, rationale=rationale, source="heuristic_supervisor"))
+    feedback_plan = build_feedback_search_plan(
+        baseline,
+        context_record,
+        replan_decision=replan_decision,
+        proposals=proposals,
+        memory_bank=policy_memory_bank,
+        top_k_families=2,
+    )
+    return reorder_agent_proposals_with_feedback(
+        proposals,
+        feedback_plan,
+        memory_bank=policy_memory_bank,
+    )
 
 
 def _verify_agent_proposals(
@@ -4888,6 +5256,7 @@ def _synthesize_proposals(
     replan_decision: Optional[Dict[str, Any]] = None,
     candidate_limit: int = 4,
     llm_config: Optional[Dict[str, Any]] = None,
+    policy_memory_bank: Optional[PolicyMemoryBank] = None,
 ) -> Tuple[List[AgentProposal], List[Dict[str, Any]]]:
     runtime_summary = runtime_summary or {}
     context_record = context_record or build_context_record(baseline, runtime_summary=runtime_summary)
@@ -4898,6 +5267,7 @@ def _synthesize_proposals(
         runtime_summary=runtime_summary,
         context_record=context_record,
         replan_decision=replan_decision,
+        policy_memory_bank=policy_memory_bank,
     )
     proposals = _apply_llm_supervisor(
         proposals,
@@ -4923,6 +5293,7 @@ def _synthesize_programs(
     replan_decision: Optional[Dict[str, Any]] = None,
     candidate_limit: int = 4,
     llm_config: Optional[Dict[str, Any]] = None,
+    policy_memory_bank: Optional[PolicyMemoryBank] = None,
 ) -> Tuple[List[MegatronProgram], List[Dict[str, Any]]]:
     proposals, rejected = _synthesize_proposals(
         baseline,
@@ -4932,6 +5303,7 @@ def _synthesize_programs(
         replan_decision=replan_decision,
         candidate_limit=candidate_limit,
         llm_config=llm_config,
+        policy_memory_bank=policy_memory_bank,
     )
     return [proposal.program for proposal in proposals], rejected
 
@@ -5081,6 +5453,11 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     programs_dir = Path(args.programs_dir) if args.programs_dir else workdir / "programs"
+    policy_memory_path = workdir / "policy_memory.json"
+    family_scoreboard_path = workdir / "family_scoreboard.json"
+    trial_reflections_path = workdir / "trial_reflections.json"
+    threshold_calibration_path = workdir / "threshold_calibration.json"
+    policy_memory_bank = PolicyMemoryBank.load(policy_memory_path)
 
     runtime_summary = _load_runtime_summary(args.runtime_summary)
     llm_config = {
@@ -5114,6 +5491,15 @@ def main() -> None:
         replan_decision=replan_decision,
         candidate_limit=int(args.candidate_limit),
         llm_config=llm_config,
+        policy_memory_bank=policy_memory_bank,
+    )
+    feedback_search_plan = build_feedback_search_plan(
+        baseline,
+        context_record,
+        replan_decision=replan_decision,
+        proposals=proposal_pool,
+        memory_bank=policy_memory_bank,
+        top_k_families=2,
     )
     strategy_template_library = _build_verified_strategy_template_library(
         baseline,
@@ -5203,6 +5589,8 @@ def main() -> None:
     second_stage_context_record: Optional[Dict[str, Any]] = None
     second_stage_replan_decision: Optional[Dict[str, Any]] = None
     second_stage_bottleneck_signature: Optional[Dict[str, Any]] = None
+    second_stage_feedback_search_plan: Optional[Dict[str, Any]] = None
+    trial_reflections: List[Dict[str, Any]] = []
 
     if not args.export_only:
         _progress("starting baseline trial")
@@ -5255,10 +5643,19 @@ def main() -> None:
                 replan_decision=second_stage_replan_decision,
                 candidate_limit=int(args.candidate_limit),
                 llm_config=llm_config,
+                policy_memory_bank=policy_memory_bank,
             )
             if second_stage_proposals:
                 proposal_pool = second_stage_proposals
                 rejected_candidates = second_stage_rejected
+                second_stage_feedback_search_plan = build_feedback_search_plan(
+                    baseline,
+                    second_stage_context_record,
+                    replan_decision=second_stage_replan_decision,
+                    proposals=proposal_pool,
+                    memory_bank=policy_memory_bank,
+                    top_k_families=2,
+                )
                 strategy_template_library = _build_verified_strategy_template_library(
                     baseline,
                     proposal_pool,
@@ -5298,6 +5695,13 @@ def main() -> None:
                 )
 
         trial_queue: List[Tuple[str, MegatronProgram, Optional[ExperimentSpec]]] = []
+        proposal_by_kind = {
+            str(proposal.proposal_id): proposal.normalized()
+            for proposal in proposal_pool
+        }
+        active_search_state = dict(
+            (second_stage_feedback_search_plan or feedback_search_plan or {}).get("search_state") or {}
+        )
         for program in evidence_programs:
             kind = str(program.metadata.get("program_kind") or "evidence")
             trial_queue.append(
@@ -5336,6 +5740,42 @@ def main() -> None:
                 bottleneck_signature=metrics["bottleneck_signature"],
                 experiment=experiment_spec,
             )
+            proposal = proposal_by_kind.get(str(config_name))
+            if proposal is not None:
+                outcome = build_trial_outcome(
+                    candidate,
+                    metrics,
+                    baseline_metrics=baseline_metrics,
+                )
+                reflection = reflect_on_trial(
+                    active_search_state,
+                    proposal,
+                    outcome,
+                    baseline_metrics=baseline_metrics,
+                )
+                record_trial_feedback(
+                    policy_memory_bank,
+                    active_search_state,
+                    proposal,
+                    outcome,
+                    reflection,
+                )
+                metrics["trial_outcome"] = outcome.to_dict()
+                metrics["trial_reflection"] = reflection.to_dict()
+                trial_reflections.append(reflection.to_dict())
+                policy_memory_bank.save(policy_memory_path)
+                family_scoreboard_path.write_text(
+                    json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                trial_reflections_path.write_text(
+                    json.dumps(trial_reflections, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                threshold_calibration_path.write_text(
+                    json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
             tested.append(metrics)
             paper_artifacts.append(dict(metrics.get("trial_artifact") or {}))
             if bool((metrics.get("family") or {}).get("is_family_outside")):
@@ -5416,9 +5856,24 @@ def main() -> None:
         second_stage_context_record=second_stage_context_record,
         second_stage_replan_decision=second_stage_replan_decision,
         second_stage_bottleneck_signature=second_stage_bottleneck_signature,
+        feedback_search_plan=feedback_search_plan,
+        second_stage_feedback_search_plan=second_stage_feedback_search_plan,
+        policy_memory=policy_memory_bank.to_dict(),
+        family_scoreboard=policy_memory_bank.family_scoreboard(),
+        trial_reflections=trial_reflections,
     )
     summary_path = workdir / "summary_megatron.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    policy_memory_bank.save(policy_memory_path)
+    family_scoreboard_path.write_text(
+        json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    trial_reflections_path.write_text(json.dumps(trial_reflections, indent=2, ensure_ascii=False), encoding="utf-8")
+    threshold_calibration_path.write_text(
+        json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"[megatron_agent] summary written to {summary_path}")
 
 

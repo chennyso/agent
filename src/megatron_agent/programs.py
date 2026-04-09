@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -222,6 +223,44 @@ def _execution_backend_family(program: MegatronProgram) -> str:
         or "megatron_core"
     ).strip().lower()
     return "torchtitan" if "torchtitan" in hint else "megatron_core"
+
+
+def _pipeline_layout_virtual_stages(pipeline_layout: Optional[str], pp_degree: int) -> int:
+    layout = str(pipeline_layout or "").strip()
+    if not layout:
+        return 1
+    stages = [token for token in layout.split("|")]
+    if pp_degree <= 0 or len(stages) % int(pp_degree) != 0:
+        return 1
+    return max(len(stages) // int(pp_degree), 1)
+
+
+def _program_uses_interleaved_pipeline(program: MegatronProgram) -> bool:
+    norm = program.normalized()
+    if int(norm.parallel.pp_degree) <= 1:
+        return False
+    if int(norm.parallel.vpp_degree) > 1:
+        return True
+    return _pipeline_layout_virtual_stages(norm.layout.pipeline_layout, int(norm.parallel.pp_degree)) > 1
+
+
+def _optimizer_runtime_contract(program: MegatronProgram) -> Dict[str, Any]:
+    metadata = copy.deepcopy((program.normalized().metadata or {}))
+    mode = str(metadata.get("runtime_optimizer_policy_mode") or "").strip()
+    if not mode:
+        return {}
+    return {
+        "mode": mode,
+        "target_policy": str(metadata.get("runtime_optimizer_target_policy") or "tail_stage_first").strip(),
+        "chunk_scope": str(metadata.get("runtime_optimizer_chunk_scope") or "tail_only").strip(),
+        "window_policy": str(metadata.get("runtime_optimizer_window_policy") or "tail_flush_aligned").strip(),
+        "enable_distributed_optimizer": bool(metadata.get("runtime_enable_distributed_optimizer", True)),
+        "enable_overlap_grad_reduce": bool(metadata.get("runtime_enable_overlap_grad_reduce", True)),
+        "enable_overlap_param_gather": bool(metadata.get("runtime_enable_overlap_param_gather", True)),
+        "enable_overlap_param_gather_with_optimizer_step": bool(
+            metadata.get("runtime_enable_overlap_param_gather_with_optimizer_step", True)
+        ),
+    }
 
 
 def _estimate_grouped_interleave_overhead(program: MegatronProgram, bubble_ratio: float) -> float:
@@ -670,6 +709,11 @@ def check_program(
     memory_estimate = estimate_program_memory(norm)
     stage_memory_estimates = estimate_stage_memory(norm)
     cost_model = _build_cost_model(norm, runtime_summary=runtime_summary, previous_program=previous_program)
+    optimizer_runtime = _optimizer_runtime_contract(norm)
+    runtime_window_overrides = _normalized_runtime_window_overrides((norm.metadata or {}).get("runtime_window_overrides"))
+    runtime_operator_cluster_overrides = _normalized_runtime_operator_cluster_overrides(
+        (norm.metadata or {}).get("runtime_operator_cluster_overrides")
+    )
     diagnosis: List[str] = []
 
     if norm.constraints.requires_runtime_pg_rebuild:
@@ -767,6 +811,88 @@ def check_program(
     ):
         if backend_family != "torchtitan":
             errors.append("reshard/offload policy requires execution_backend=torchtitan")
+    if optimizer_runtime:
+        interleaved_pipeline = _program_uses_interleaved_pipeline(norm)
+        if backend_family != "megatron_core":
+            errors.append("optimizer-aware runtime requires execution_backend=megatron_core")
+        if int(norm.parallel.pp_degree) <= 1:
+            errors.append("optimizer-aware runtime requires pp_degree > 1")
+        if not interleaved_pipeline:
+            errors.append("optimizer-aware runtime requires interleaved PP/VPP or layout-derived virtual stages")
+        if (
+            str(norm.schedule.template or "fixed_1f1b") in _DEFAULT_SCHEDULE_FAMILIES
+            and str(norm.schedule.skeleton or "fixed_1f1b") in _DEFAULT_SCHEDULE_FAMILIES
+        ):
+            errors.append("optimizer-aware runtime requires a grouped/interleaved schedule family")
+        if not bool(optimizer_runtime.get("enable_distributed_optimizer")):
+            errors.append("optimizer-aware runtime requires distributed optimizer to remain enabled")
+        if not bool(optimizer_runtime.get("enable_overlap_param_gather")):
+            errors.append("optimizer-aware runtime requires overlap_param_gather support")
+        if not bool(optimizer_runtime.get("enable_overlap_param_gather_with_optimizer_step")):
+            errors.append("optimizer-aware runtime requires overlap_param_gather_with_optimizer_step support")
+
+        overlap_memory_pressure = float(memory_estimate.pressure_score)
+        overlap_memory_pressure += 0.06 if optimizer_runtime.get("chunk_scope") == "tail_and_hotspot" else 0.04
+        peak_reserved_ratio = _safe_float((runtime_summary or {}).get("peak_reserved_ratio")) or 0.0
+        if peak_reserved_ratio >= 0.88:
+            overlap_memory_pressure += 0.04
+        elif peak_reserved_ratio >= 0.84:
+            overlap_memory_pressure += 0.02
+        has_memory_relief = bool((norm.metadata or {}).get("runtime_enable_fine_grained_activation_offloading")) or bool(
+            (norm.metadata or {}).get("runtime_enable_recompute_activations")
+        ) or bool((norm.metadata or {}).get("runtime_recompute_modules"))
+        if overlap_memory_pressure >= 1.12 or (overlap_memory_pressure >= 1.02 and not has_memory_relief):
+            diagnosis.append("optimizer_overlap_memory_risk")
+            errors.append(
+                "optimizer-aware runtime rejected because predicted memory pressure plus overlap overhead exceeds the safe budget"
+            )
+    if runtime_window_overrides:
+        interleaved_pipeline = _program_uses_interleaved_pipeline(norm)
+        if backend_family != "megatron_core":
+            errors.append("window-aware runtime overrides require execution_backend=megatron_core")
+        if int(norm.parallel.pp_degree) <= 1:
+            errors.append("window-aware runtime overrides require pp_degree > 1")
+        if not interleaved_pipeline:
+            errors.append("window-aware runtime overrides require interleaved PP/VPP or layout-derived virtual stages")
+        optimizer_targeted_override = any(
+            str(item.get("stage_selector") or "") == "optimizer_sensitive_stage"
+            or str(item.get("chunk_order_policy") or "") == "target_chunk_first"
+            or str(item.get("optimizer_target_chunk") or "").strip()
+            for item in runtime_window_overrides
+        )
+        if optimizer_targeted_override:
+            if not optimizer_runtime:
+                errors.append(
+                    "optimizer-targeted window overrides require optimizer-aware overlap runtime to be enabled"
+                )
+            else:
+                if not bool(optimizer_runtime.get("enable_distributed_optimizer")):
+                    errors.append(
+                        "optimizer-targeted window overrides require distributed optimizer to remain enabled"
+                    )
+                if not bool(optimizer_runtime.get("enable_overlap_param_gather")):
+                    errors.append(
+                        "optimizer-targeted window overrides require overlap_param_gather support"
+                    )
+                if not bool(optimizer_runtime.get("enable_overlap_param_gather_with_optimizer_step")):
+                    errors.append(
+                        "optimizer-targeted window overrides require overlap_param_gather_with_optimizer_step support"
+                    )
+    if runtime_operator_cluster_overrides:
+        interleaved_pipeline = _program_uses_interleaved_pipeline(norm)
+        if backend_family != "megatron_core":
+            errors.append("operator-cluster runtime refinement requires execution_backend=megatron_core")
+        if int(norm.parallel.pp_degree) <= 1:
+            errors.append("operator-cluster runtime refinement requires pp_degree > 1")
+        if not interleaved_pipeline:
+            errors.append("operator-cluster runtime refinement requires interleaved PP/VPP or layout-derived virtual stages")
+        optimizer_sensitive_clusters = any(
+            str(item.get("cluster_role") or "") == "optimizer_sensitive"
+            or str(item.get("optimizer_target_chunk") or "").strip()
+            for item in runtime_operator_cluster_overrides
+        )
+        if optimizer_sensitive_clusters and not optimizer_runtime:
+            errors.append("optimizer-sensitive operator-cluster refinement requires optimizer-aware overlap runtime")
     if any(item.pressure_score >= 1.0 for item in stage_memory_estimates):
         diagnosis.append("stage_memory_hotspot")
         hot = max(stage_memory_estimates, key=lambda item: item.pressure_score)
@@ -882,6 +1008,14 @@ def _encode_morphable_stage_family_hints(stage_families: List[Dict[str, Any]]) -
         except Exception:
             continue
         payload: List[str] = [str(stage_index), f"family={str(item.get('family') or 'balanced_interleave')}"]
+        raw_stage_tags = item.get("stage_tags")
+        stage_tags: List[str] = []
+        if isinstance(raw_stage_tags, list):
+            stage_tags = [str(tag).strip() for tag in raw_stage_tags if str(tag).strip()]
+        elif str(raw_stage_tags or "").strip():
+            stage_tags = [str(raw_stage_tags).strip()]
+        if stage_tags:
+            payload.append(f"stage_tags={'|'.join(stage_tags)}")
         preferred_template = str(item.get("preferred_template") or "").strip()
         if preferred_template:
             payload.append(f"preferred_template={preferred_template}")
@@ -892,6 +1026,11 @@ def _encode_morphable_stage_family_hints(stage_families: List[Dict[str, Any]]) -
             "checkpoint_policy",
             "p2p_policy",
             "combined_policy",
+            "optimizer_runtime_mode",
+            "optimizer_target_policy",
+            "optimizer_chunk_scope",
+            "optimizer_window_policy",
+            "optimizer_target_chunk",
         ):
             value = str(item.get(key) or "").strip()
             if value:
@@ -916,6 +1055,201 @@ def _encode_stage_chunk_priority_hints(stage_families: List[Dict[str, Any]]) -> 
         if hints:
             encoded.append(f"{stage_index}:{','.join(hints)}")
     return ";".join(encoded)
+
+
+def _encode_runtime_stage_tags(stage_tags: Dict[str, Any]) -> str:
+    encoded: List[str] = []
+    for raw_stage_id, raw_tags in dict(stage_tags or {}).items():
+        try:
+            stage_id = int(raw_stage_id)
+        except Exception:
+            continue
+        tags = []
+        for tag in list(raw_tags or []):
+            token = str(tag).strip()
+            if token:
+                tags.append(token)
+        if tags:
+            encoded.append(f"{stage_id},family=runtime_override,stage_tags={'|'.join(sorted(set(tags)))}")
+    return ";".join(encoded)
+
+
+def _encode_runtime_chunk_priority_hints(priority_hints: Dict[str, Any]) -> str:
+    encoded: List[str] = []
+    for raw_stage_id, raw_hints in dict(priority_hints or {}).items():
+        try:
+            stage_id = int(raw_stage_id)
+        except Exception:
+            continue
+        hints: List[str] = []
+        for item in list(raw_hints or []):
+            try:
+                hints.append(str(int(item)))
+            except Exception:
+                continue
+        if hints:
+            encoded.append(f"{stage_id}:{','.join(hints)}")
+    return ";".join(encoded)
+
+
+def _normalize_runtime_window_override(override: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(override, dict):
+        return None
+    phase = str(override.get("phase") or "").strip()
+    window = str(override.get("window") or "").strip()
+    stage_selector = str(override.get("stage_selector") or "").strip()
+    chunk_order_policy = str(override.get("chunk_order_policy") or "").strip()
+    if phase not in {"steady", "cooldown"}:
+        return None
+    if window not in {"last_1_group", "last_2_groups", "cooldown_all", "cooldown_first_group"}:
+        return None
+    if stage_selector not in {"tail_stage", "hotspot_stage", "optimizer_sensitive_stage"}:
+        return None
+    if chunk_order_policy not in {"reverse_chunk_order", "target_chunk_first", "center_out", "edge_interleave"}:
+        return None
+    payload: Dict[str, Any] = {
+        "phase": phase,
+        "window": window,
+        "stage_selector": stage_selector,
+        "chunk_order_policy": chunk_order_policy,
+    }
+    for key in (
+        "combined_policy",
+        "p2p_policy",
+        "flush_policy",
+        "checkpoint_policy",
+        "optimizer_target_chunk",
+    ):
+        value = override.get(key)
+        if value is None:
+            continue
+        token = str(value).strip()
+        if token:
+            payload[key] = token
+    return payload
+
+
+def _normalized_runtime_window_overrides(overrides: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in list(overrides or []):
+        payload = _normalize_runtime_window_override(item)
+        if payload is None:
+            continue
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if encoded in seen:
+            continue
+        seen.add(encoded)
+        normalized.append(payload)
+    return normalized
+
+
+def _encode_runtime_window_overrides(overrides: Any) -> str:
+    payload = _normalized_runtime_window_overrides(overrides)
+    if not payload:
+        return ""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_runtime_operator_cluster_override(override: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(override, dict):
+        return None
+    try:
+        stage_index = int(override.get("stage_index"))
+    except Exception:
+        return None
+    cluster_role = str(override.get("cluster_role") or "").strip()
+    semantic_role = str(override.get("semantic_role") or "").strip()
+    local_priority = str(override.get("local_priority") or "normal").strip()
+    overlap_policy = str(override.get("overlap_policy") or "guarded").strip()
+    memory_policy = str(override.get("memory_policy") or "resident").strip()
+    if cluster_role not in {
+        "attention_comm",
+        "backward_critical",
+        "memory_hotspot",
+        "optimizer_sensitive",
+        "embedding_loss_anchor",
+        "mlp_compute",
+    }:
+        return None
+    if local_priority not in {"high", "normal", "protected"}:
+        return None
+    if overlap_policy not in {"aggressive", "guarded", "disabled"}:
+        return None
+    if memory_policy not in {"resident", "checkpoint", "offload_guarded"}:
+        return None
+    phases: List[str] = []
+    for raw in list(override.get("phases") or []):
+        token = str(raw).strip()
+        if token in {"warmup", "steady", "cooldown"} and token not in phases:
+            phases.append(token)
+    if not phases:
+        phases = ["steady", "cooldown"]
+    payload: Dict[str, Any] = {
+        "stage_index": int(stage_index),
+        "cluster_role": cluster_role,
+        "semantic_role": semantic_role or "decoder",
+        "local_priority": local_priority,
+        "overlap_policy": overlap_policy,
+        "memory_policy": memory_policy,
+        "phases": phases,
+    }
+    for key in ("subgraph", "unit_name", "optimizer_target_chunk", "reason"):
+        value = str(override.get(key) or "").strip()
+        if value:
+            payload[key] = value
+    return payload
+
+
+def _normalized_runtime_operator_cluster_overrides(overrides: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in list(overrides or []):
+        payload = _normalize_runtime_operator_cluster_override(item)
+        if payload is None:
+            continue
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if encoded in seen:
+            continue
+        seen.add(encoded)
+        normalized.append(payload)
+    return normalized
+
+
+def _encode_runtime_operator_cluster_overrides(overrides: Any) -> str:
+    payload = _normalized_runtime_operator_cluster_overrides(overrides)
+    if not payload:
+        return ""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _infer_runtime_schedule_family(program: MegatronProgram) -> str:
+    metadata = copy.deepcopy((program.normalized().metadata or {}))
+    explicit = str(metadata.get("runtime_schedule_family") or "").strip()
+    if explicit:
+        return explicit
+    program_kind = str(metadata.get("program_kind") or "").strip()
+    if program_kind == "candidate_optimizer_aware_pipeline":
+        return "dual_overlap_optimizer_hide"
+    if program_kind == "candidate_tail_aware_execution":
+        return "dual_overlap_tail_guarded"
+    if program_kind in {
+        "candidate_offload_first_refinement",
+        "candidate_checkpoint_boundary_refinement",
+        "candidate_stage_local_memory_policy",
+        "candidate_memory_relief",
+        "candidate_local_fsdp_scope",
+    }:
+        return "dual_overlap_memory_safe"
+    if program_kind in {"candidate_nonuniform_vpp_shape", "candidate_morphable_pipeline"}:
+        return "dual_overlap_stage_asymmetric"
+    if str(metadata.get("runtime_optimizer_policy_mode") or "").strip():
+        return "dual_overlap_optimizer_hide"
+    if bool(metadata.get("stage_local_vpp_vector")):
+        return "dual_overlap_stage_asymmetric"
+    if str(metadata.get("runtime_memory_policy_mode") or "").strip():
+        return "dual_overlap_memory_safe"
+    return ""
 
 
 def compile_program(program: MegatronProgram, target: Optional[str] = None) -> CompiledProgram:
@@ -998,10 +1332,19 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         env["SCHEDULE_SKELETON"] = str(norm.schedule.skeleton)
     if norm.schedule.dispatch_order:
         env["DISPATCH_ORDER"] = str(norm.schedule.dispatch_order)
+    runtime_schedule_family = _infer_runtime_schedule_family(norm)
+    if runtime_schedule_family:
+        env["SCHEDULE_POLICY_FAMILY"] = runtime_schedule_family
     if norm.strategy_ir.pipe.warmup_policy:
         env["SCHEDULE_WARMUP_POLICY"] = str(norm.strategy_ir.pipe.warmup_policy)
     if norm.strategy_ir.pipe.cooldown_policy:
         env["SCHEDULE_COOLDOWN_POLICY"] = str(norm.strategy_ir.pipe.cooldown_policy)
+    runtime_phase_policy = dict((norm.metadata or {}).get("runtime_phase_policy") or {})
+    if runtime_phase_policy:
+        if str(runtime_phase_policy.get("warmup_policy") or "").strip() and "SCHEDULE_WARMUP_POLICY" not in env:
+            env["SCHEDULE_WARMUP_POLICY"] = str(runtime_phase_policy.get("warmup_policy"))
+        if str(runtime_phase_policy.get("cooldown_policy") or "").strip() and "SCHEDULE_COOLDOWN_POLICY" not in env:
+            env["SCHEDULE_COOLDOWN_POLICY"] = str(runtime_phase_policy.get("cooldown_policy"))
     schedule_warmup_checkpoint_policy = str(
         (norm.metadata or {}).get("schedule_warmup_checkpoint_policy") or ""
     ).strip()
@@ -1070,6 +1413,8 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         if parsed:
             env["OFFLOAD_MODULES"] = ",".join(parsed)
     flush_order_policy = str((norm.metadata or {}).get("flush_order_policy") or "").strip()
+    if not flush_order_policy:
+        flush_order_policy = str(runtime_phase_policy.get("flush_order_policy") or "").strip()
     if flush_order_policy:
         env["SCHEDULE_FLUSH_ORDER_POLICY"] = flush_order_policy
     flush_microbatches = (norm.metadata or {}).get("flush_microbatches")
@@ -1082,7 +1427,35 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
                 continue
         if parsed:
             env["SCHEDULE_FLUSH_MICROBATCHES"] = ",".join(parsed)
+    optimizer_runtime = _optimizer_runtime_contract(norm)
+    runtime_window_overrides = _normalized_runtime_window_overrides((norm.metadata or {}).get("runtime_window_overrides"))
+    runtime_operator_cluster_overrides = _normalized_runtime_operator_cluster_overrides(
+        (norm.metadata or {}).get("runtime_operator_cluster_overrides")
+    )
+    if optimizer_runtime:
+        env["ENABLE_DISTRIBUTED_OPTIMIZER"] = "1" if bool(optimizer_runtime["enable_distributed_optimizer"]) else "0"
+        env["ENABLE_OVERLAP_GRAD_REDUCE"] = "1" if bool(optimizer_runtime["enable_overlap_grad_reduce"]) else "0"
+        env["ENABLE_OVERLAP_PARAM_GATHER"] = "1" if bool(optimizer_runtime["enable_overlap_param_gather"]) else "0"
+        env["ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"] = (
+            "1" if bool(optimizer_runtime["enable_overlap_param_gather_with_optimizer_step"]) else "0"
+        )
+        env["SCHEDULE_OPTIMIZER_RUNTIME_MODE"] = str(optimizer_runtime["mode"])
+        env["SCHEDULE_OPTIMIZER_TARGET_POLICY"] = str(optimizer_runtime["target_policy"])
+        env["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"] = str(optimizer_runtime["chunk_scope"])
+        env["SCHEDULE_OPTIMIZER_WINDOW_POLICY"] = str(optimizer_runtime["window_policy"])
+    if runtime_window_overrides:
+        encoded_window_overrides = _encode_runtime_window_overrides(runtime_window_overrides)
+        if encoded_window_overrides:
+            env["SCHEDULE_WINDOW_OVERRIDE_HINTS"] = encoded_window_overrides
+    if runtime_operator_cluster_overrides:
+        encoded_operator_cluster_overrides = _encode_runtime_operator_cluster_overrides(
+            runtime_operator_cluster_overrides
+        )
+        if encoded_operator_cluster_overrides:
+            env["SCHEDULE_OPERATOR_CLUSTER_HINTS"] = encoded_operator_cluster_overrides
     morphable_stage_families = list((norm.metadata or {}).get("morphable_stage_families") or [])
+    runtime_stage_tags = dict((norm.metadata or {}).get("runtime_stage_tags") or {})
+    runtime_chunk_priority_hints = dict((norm.metadata or {}).get("runtime_chunk_priority_hints") or {})
     if not morphable_stage_families:
         morphable_stage_families = [
             {
@@ -1134,6 +1507,14 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
             env["MORPHABLE_PIPE_CHUNK_SHAPE_VECTOR"] = ",".join(
                 str(max(int(item), 1)) for item in morphable_chunk_vector
             )
+    if runtime_stage_tags and "SCHEDULE_STAGE_FAMILY_HINTS" not in env:
+        encoded_tags = _encode_runtime_stage_tags(runtime_stage_tags)
+        if encoded_tags:
+            env["SCHEDULE_STAGE_FAMILY_HINTS"] = encoded_tags
+    if runtime_chunk_priority_hints and "SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS" not in env:
+        encoded_hints = _encode_runtime_chunk_priority_hints(runtime_chunk_priority_hints)
+        if encoded_hints:
+            env["SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS"] = encoded_hints
     fsdp_scopes = {
         str(item.subgraph): str(item.fsdp_scope)
         for item in (norm.strategy_ir.local_parallel or [])

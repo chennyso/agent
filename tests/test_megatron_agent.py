@@ -49,7 +49,15 @@ if "tyro" not in sys.modules:
     sys.modules["tyro"] = tyro_stub
 
 from megatron_agent import agent_loop, trial_runner  # noqa: E402
+from megatron_agent.feedback_optimizer import (  # noqa: E402
+    build_feedback_search_plan,
+    build_trial_outcome,
+    infer_runtime_schedule_family,
+    record_trial_feedback,
+    reflect_on_trial,
+)
 from megatron_agent.metrics_parser import parse_megatron_logs  # noqa: E402
+from megatron_agent.policy_memory import PolicyMemoryBank  # noqa: E402
 from megatron_agent.torchtitan_hybrid import (  # noqa: E402
     TorchTitanHybridController,
     TorchTitanHybridEvidence,
@@ -70,7 +78,7 @@ from megatron_agent.config import (  # noqa: E402
     default_dense_program,
     default_moe_smoke_program,
 )
-from megatron_agent.programs import classify_program_family, compile_program, verify_program  # noqa: E402
+from megatron_agent.programs import check_program, classify_program_family, compile_program, verify_program  # noqa: E402
 from megatron_agent import trace_reducer  # noqa: E402
 from megatron_agent.trace_reducer import (  # noqa: E402
     build_agent_observation,
@@ -502,6 +510,64 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["launch_plan"]["launcher_env"]["ENABLE_SP"], "0")
             self.assertNotIn("--sequence-parallel", payload["launch_plan"]["megatron_command"])
+
+    def test_trial_runner_dry_run_emits_optimizer_overlap_runtime_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            megatron_root = tmp / "Megatron-LM"
+            megatron_root.mkdir()
+            (megatron_root / "pretrain_gpt.py").write_text("print('stub')\n", encoding="utf-8")
+
+            program = default_dense_program("single_g5").normalized()
+            program.parallel.vpp_degree = 2
+            program.layout.vpp_degree = 2
+            program.schedule.template = "interleaved_grouped_g2"
+            program.schedule.skeleton = "stage_aware_grouped"
+            program.schedule.microbatch_group_size_per_vp_stage = 2
+            program.metadata.update(
+                {
+                    "runtime_optimizer_policy_mode": "tail_guarded_overlap",
+                    "runtime_optimizer_target_policy": "tail_stage_first",
+                    "runtime_optimizer_chunk_scope": "tail_only",
+                    "runtime_optimizer_window_policy": "tail_flush_aligned",
+                }
+            )
+            program_path = tmp / "optimizer_runtime.json"
+            output_path = tmp / "optimizer_runtime_dry_run.json"
+            program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "trial_runner.py",
+                    "--program-file",
+                    str(program_path),
+                    "--output",
+                    str(output_path),
+                    "--megatron-root",
+                    str(megatron_root),
+                    "--launcher-script",
+                    "",
+                    "--transformer-impl",
+                    "local",
+                    "--dry-run",
+                ],
+            ):
+                trial_runner.main()
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            cmd = payload["launch_plan"]["megatron_command"]
+            env = payload["launch_plan"]["launcher_env"]
+            self.assertEqual(env["ENABLE_DISTRIBUTED_OPTIMIZER"], "1")
+            self.assertEqual(env["ENABLE_OVERLAP_GRAD_REDUCE"], "1")
+            self.assertEqual(env["ENABLE_OVERLAP_PARAM_GATHER"], "1")
+            self.assertEqual(env["ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"], "1")
+            self.assertEqual(env["SCHEDULE_OPTIMIZER_RUNTIME_MODE"], "tail_guarded_overlap")
+            self.assertIn("--use-distributed-optimizer", cmd)
+            self.assertIn("--overlap-grad-reduce", cmd)
+            self.assertIn("--overlap-param-gather", cmd)
+            self.assertIn("--overlap-param-gather-with-optimizer-step", cmd)
 
     def test_trial_runner_dry_run_deep_observability_emits_profiler_and_wandb_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1054,6 +1120,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertGreater(len(list(plan.get("stage_families") or [])), 0)
         self.assertGreater(len(list(plan.get("selective_vpp_decisions") or [])), 0)
         self.assertGreater(len(list(plan.get("local_family_assignment") or [])), 0)
+        self.assertGreater(len(list(context["evidence_record"].get("critical_operator_clusters") or [])), 0)
         self.assertTrue(str(plan.get("shape_signature") or ""))
         self.assertIn(
             "branch_morphable_pipeline_shape",
@@ -1204,6 +1271,86 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_P2P_POLICY"], "serial")
         self.assertEqual(compiled.launcher_env["SCHEDULE_WARMUP_COMBINED_POLICY"], "serial")
         self.assertEqual(compiled.launcher_env["SCHEDULE_COOLDOWN_COMBINED_POLICY"], "serial")
+
+    def test_compile_program_exports_optimizer_runtime_envs(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        program.schedule.template = "interleaved_grouped_g2"
+        program.schedule.skeleton = "stage_aware_grouped"
+        program.schedule.microbatch_group_size_per_vp_stage = 2
+        program.metadata.update(
+            {
+                "runtime_optimizer_policy_mode": "tail_guarded_overlap",
+                "runtime_optimizer_target_policy": "tail_stage_first",
+                "runtime_optimizer_chunk_scope": "tail_and_hotspot",
+                "runtime_optimizer_window_policy": "tail_flush_aligned",
+                "morphable_stage_families": [
+                    {
+                        "stage_index": 1,
+                        "family": "optimizer_guarded_tail",
+                        "stage_tags": ["tail_sensitive", "optimizer_sensitive"],
+                        "dispatch_order": "optimizer_tail_guarded",
+                        "warmup_policy": "balanced_fill",
+                        "cooldown_policy": "optimizer_tail_hide",
+                        "optimizer_runtime_mode": "tail_guarded_overlap",
+                        "optimizer_target_policy": "tail_stage_first",
+                        "optimizer_chunk_scope": "tail_and_hotspot",
+                        "optimizer_window_policy": "tail_flush_aligned",
+                        "optimizer_target_chunk": "tail",
+                    }
+                ],
+            }
+        )
+
+        compiled = compile_program(program)
+        self.assertEqual(compiled.launcher_env["ENABLE_DISTRIBUTED_OPTIMIZER"], "1")
+        self.assertEqual(compiled.launcher_env["ENABLE_OVERLAP_GRAD_REDUCE"], "1")
+        self.assertEqual(compiled.launcher_env["ENABLE_OVERLAP_PARAM_GATHER"], "1")
+        self.assertEqual(compiled.launcher_env["ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"], "1")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_RUNTIME_MODE"], "tail_guarded_overlap")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_TARGET_POLICY"], "tail_stage_first")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"], "tail_and_hotspot")
+        self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_WINDOW_POLICY"], "tail_flush_aligned")
+        self.assertIn("optimizer_window_policy=tail_flush_aligned", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
+        self.assertIn("stage_tags=tail_sensitive|optimizer_sensitive", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
+
+    def test_check_program_rejects_optimizer_runtime_without_interleaving(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.metadata.update(
+            {
+                "runtime_optimizer_policy_mode": "tail_guarded_overlap",
+                "runtime_optimizer_target_policy": "tail_stage_first",
+                "runtime_optimizer_chunk_scope": "tail_only",
+                "runtime_optimizer_window_policy": "tail_flush_aligned",
+            }
+        )
+
+        legality = check_program(program)
+        self.assertFalse(legality.is_valid)
+        self.assertTrue(any("interleaved" in error for error in legality.errors))
+
+    def test_check_program_rejects_optimizer_targeted_window_override_without_overlap_runtime(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.pp_degree = 2
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        program.schedule.template = "interleaved_grouped_g2"
+        program.schedule.skeleton = "stage_aware_grouped"
+        program.schedule.microbatch_group_size_per_vp_stage = 2
+        program.metadata["runtime_window_overrides"] = [
+            {
+                "phase": "steady",
+                "window": "last_2_groups",
+                "stage_selector": "optimizer_sensitive_stage",
+                "chunk_order_policy": "target_chunk_first",
+                "optimizer_target_chunk": "tail",
+            }
+        ]
+
+        legality = check_program(program)
+        self.assertFalse(legality.is_valid)
+        self.assertTrue(any("optimizer-targeted window overrides" in error for error in legality.errors))
 
     def test_compile_program_exports_morphable_pipeline_envs(self) -> None:
         program = default_dense_program("single_g5").normalized()
@@ -1386,6 +1533,8 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "stage_load_variance": 0.04,
                 "cross_node_exposed_ratio": 0.03,
                 "peak_memory_ratio": 0.72,
+                "steady_state_step_time_ms_p50": 1400.0,
+                "optimizer_exposed_ms": 320.0,
                 "stage_window_summary": {
                     "0": {"compute_ms": 1200.0, "comm_ms": 100.0, "bubble_ms": 90.0, "window_ms": 1390.0},
                     "1": {"compute_ms": 1180.0, "comm_ms": 80.0, "bubble_ms": 70.0, "window_ms": 1330.0},
@@ -1421,11 +1570,21 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("nonuniform_vpp_shape", artifact)
         self.assertIn("morphable_pipeline_problem", artifact)
         self.assertIn("morphable_pipeline_plan", artifact)
+        self.assertIn("critical_operator_clusters", artifact)
         self.assertIn("pipe_search_space", artifact)
         self.assertIn("local_memory_search_space", artifact)
         perfetto = dict((artifact.get("visualization_artifacts") or {}).get("perfetto_trace") or {})
         self.assertEqual(perfetto.get("format"), "perfetto_trace")
         self.assertGreater(len(list(perfetto.get("traceEvents") or [])), 4)
+        projection = dict((artifact.get("visualization_artifacts") or {}).get("pipeline_schedule_projection") or {})
+        self.assertEqual(projection.get("format"), "pipeline_schedule_projection")
+        self.assertGreater(len(list(projection.get("stage_tracks") or [])), 0)
+        self.assertIn("local_window_observability", projection)
+        self.assertIn("tail_window_ms", dict(projection.get("summary") or {}))
+        self.assertTrue(any(item.get("name") == "optimizer_tail_guarded" for item in (projection.get("strategy_hypotheses") or [])))
+        svg = dict((artifact.get("visualization_artifacts") or {}).get("pipeline_projection_svg") or {})
+        self.assertEqual(svg.get("format"), "svg_inline")
+        self.assertIn("<svg", str(svg.get("content") or ""))
         blueprint = dict(artifact.get("search_space_blueprint") or {})
         self.assertIn("executable_now", blueprint)
         self.assertTrue(any(item.get("name") == "parallel.vpp_degree" for item in (blueprint.get("executable_now") or [])))
@@ -1453,6 +1612,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             },
         )
         evidence = dict(context.get("evidence_record") or {})
+        runtime = dict(context.get("runtime_evidence") or {})
         self.assertIn("bottleneck_breakdown", evidence)
         self.assertIn("search_space_blueprint", evidence)
         self.assertIn("visualization_artifacts", evidence)
@@ -1462,8 +1622,19 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("pipe_search_space", evidence)
         self.assertIn("local_memory_search_space", evidence)
         self.assertIn("single_node_deep_stats", evidence)
+        self.assertIn("critical_operator_clusters", evidence)
         perfetto = dict((evidence.get("visualization_artifacts") or {}).get("perfetto_trace") or {})
         self.assertEqual(perfetto.get("format"), "perfetto_trace")
+        projection = dict((evidence.get("visualization_artifacts") or {}).get("pipeline_schedule_projection") or {})
+        self.assertEqual(projection.get("format"), "pipeline_schedule_projection")
+        self.assertGreater(len(list(projection.get("stage_tracks") or [])), 0)
+        self.assertIn("tail_window_ms", runtime)
+        self.assertIn("cooldown_idle_ms", runtime)
+        self.assertIn("optimizer_exposed_window_ms", runtime)
+        self.assertIn("last_groups_idle_by_stage", runtime)
+        svg = dict((evidence.get("visualization_artifacts") or {}).get("pipeline_projection_svg") or {})
+        self.assertEqual(svg.get("format"), "svg_inline")
+        self.assertIn("<svg", str(svg.get("content") or ""))
         self.assertTrue(any(item.get("label") == "pipeline_idle" for item in (evidence.get("bottleneck_breakdown") or [])))
         self.assertTrue(any(item.get("semantic") in {"normal", "tail-aware", "comm-aware", "memory-aware"} for item in (evidence.get("boundary_semantics") or [])))
         self.assertTrue(any(item.get("stage_id") == 0 for item in (evidence.get("stage_cost_model") or [])))
@@ -1483,9 +1654,12 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                         "pipe_search_space": {"variants": [{"name": "fixed_1f1b"}]},
                         "local_memory_search_space": {"per_stage_policy": [{"stage_id": 0}]},
                         "single_node_deep_stats": {"mode": "single_node_8gpu"},
+                        "critical_operator_clusters": [{"stage_index": 0, "cluster_role": "memory_hotspot"}],
                         "search_space_blueprint": {"executable_now": [{"name": "parallel.pp_degree"}]},
                         "visualization_artifacts": {
-                            "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]}
+                            "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]},
+                            "pipeline_schedule_projection": {"format": "pipeline_schedule_projection", "stage_tracks": [{"stage_id": 0}]},
+                            "pipeline_projection_svg": {"format": "svg_inline", "content": "<svg></svg>"},
                         },
                     },
                 },
@@ -1497,9 +1671,12 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     "pipe_search_space": {"variants": [{"name": "fixed_1f1b"}]},
                     "local_memory_search_space": {"per_stage_policy": [{"stage_id": 0}]},
                     "single_node_deep_stats": {"mode": "single_node_8gpu"},
+                    "critical_operator_clusters": [{"stage_index": 0, "cluster_role": "memory_hotspot"}],
                     "search_space_blueprint": {"executable_now": [{"name": "parallel.pp_degree"}]},
                     "visualization_artifacts": {
-                        "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]}
+                        "perfetto_trace": {"format": "perfetto_trace", "traceEvents": [{"name": "forward"}]},
+                        "pipeline_schedule_projection": {"format": "pipeline_schedule_projection", "stage_tracks": [{"stage_id": 0}]},
+                        "pipeline_projection_svg": {"format": "svg_inline", "content": "<svg></svg>"},
                     },
                 },
             }
@@ -1507,8 +1684,41 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(Path(paths["trial_artifact_json"]).exists())
             self.assertTrue(Path(paths["context_record_json"]).exists())
             self.assertTrue(Path(paths["perfetto_trace_json"]).exists())
+            self.assertTrue(Path(paths["pipeline_schedule_projection_json"]).exists())
+            self.assertTrue(Path(paths["pipeline_projection_svg"]).exists())
             self.assertTrue(Path(paths["search_space_blueprint_json"]).exists())
             self.assertTrue(Path(paths["bottleneck_breakdown_json"]).exists())
+            self.assertTrue(Path(paths["critical_operator_clusters_json"]).exists())
+
+    def test_pipeline_schedule_projection_highlights_runtime_strategy_options(self) -> None:
+        program = default_dense_program("single_g5")
+        context = build_context_record(
+            program,
+            runtime_summary={
+                "bubble_ratio": 0.17,
+                "stage_load_variance": 0.05,
+                "peak_memory_ratio": 0.86,
+                "steady_state_step_time_ms_p50": 1000.0,
+                "optimizer_exposed_ms": 320.0,
+                "steady_state_step_time_ms_p95": 1280.0,
+                "stage_window_summary": {
+                    "0": {"compute_ms": 860.0, "comm_ms": 90.0, "bubble_ms": 70.0, "window_ms": 1020.0, "peak_reserved_gib": 22.0},
+                    "1": {"compute_ms": 720.0, "comm_ms": 80.0, "bubble_ms": 160.0, "window_ms": 960.0, "peak_reserved_gib": 28.0},
+                },
+            },
+        )
+        projection = dict((((context.get("evidence_record") or {}).get("visualization_artifacts") or {}).get("pipeline_schedule_projection") or {}))
+        self.assertEqual(projection.get("format"), "pipeline_schedule_projection")
+        self.assertTrue(
+            any(
+                {"memory_hotspot", "optimizer_sensitive"} & set(track.get("stage_tags") or [])
+                or str(track.get("role") or "") in {"tail_hotspot", "optimizer_sensitive_tail", "memory_hotspot"}
+                for track in (projection.get("stage_tracks") or [])
+            )
+        )
+        hypothesis_names = {str(item.get("name")) for item in (projection.get("strategy_hypotheses") or [])}
+        self.assertIn("optimizer_tail_guarded", hypothesis_names)
+        self.assertIn("checkpoint_boundary_joint", hypothesis_names)
 
     def test_verify_program_returns_structured_verifier_report(self) -> None:
         program = default_dense_program("single_g5")
@@ -2057,6 +2267,243 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             )
             self.assertGreater(len(list(candidate.metadata.get("stage_local_memory_policy") or [])), 0)
 
+    def test_feedback_search_plan_prioritizes_optimizer_family_and_tags_proposals(self) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.07,
+            "optimizer_exposed_ratio": 0.26,
+            "optimizer_ratio": 0.60,
+            "peak_reserved_ratio": 0.85,
+            "stage_tail_ratio": 0.14,
+            "tail_step_jitter_ratio": 0.13,
+            "stage_window_summary": {
+                "0": {"window_ms": 980.0, "peak_reserved_gib": 21.0},
+                "1": {"window_ms": 1120.0, "peak_reserved_gib": 27.5},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = {
+            "runtime_evidence": dict(runtime_summary),
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        proposals, _ = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="steady", scope="pipe").to_dict(),
+            candidate_limit=10,
+            policy_memory_bank=PolicyMemoryBank(),
+        )
+        plan = build_feedback_search_plan(
+            baseline,
+            context,
+            replan_decision=ReplanDecision(trigger="steady", scope="pipe").to_dict(),
+            proposals=proposals,
+            memory_bank=PolicyMemoryBank(),
+        )
+        self.assertEqual(str((plan.get("selected_families") or [""])[0]), "dual_overlap_optimizer_hide")
+        optimizer_proposal = next(
+            proposal
+            for proposal in proposals
+            if str(proposal.program.metadata.get("program_kind") or "") == "candidate_optimizer_aware_pipeline"
+        )
+        self.assertEqual(str(optimizer_proposal.program.metadata.get("runtime_schedule_family") or ""), "dual_overlap_optimizer_hide")
+        self.assertIn("dual_overlap_optimizer_hide", list(optimizer_proposal.program.metadata.get("feedback_selected_families") or []))
+
+    def test_policy_memory_bank_records_reflection_and_updates_scoreboard(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "optimizer_exposed_ratio": 0.25,
+                "optimizer_ratio": 0.59,
+                "peak_reserved_ratio": 0.85,
+                "stage_tail_ratio": 0.15,
+                "tail_step_jitter_ratio": 0.14,
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_optimizer_aware_pipeline_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        proposal = agent_loop._build_agent_proposal(
+            candidate,
+            scope="pipe",
+            rationale="unit test",
+            source="heuristic_supervisor",
+        )
+        search_plan = build_feedback_search_plan(
+            baseline,
+            context,
+            replan_decision=ReplanDecision(trigger="steady", scope="pipe").to_dict(),
+            proposals=[proposal],
+            memory_bank=PolicyMemoryBank(),
+        )
+        baseline_metrics = {
+            "step_time_ms_p50": 1000.0,
+            "throughput_tokens_per_s": 1500.0,
+            "trace_summary": {
+                "optimizer_exposed_ratio": 0.25,
+                "stage_tail_ratio": 0.15,
+                "tail_step_jitter_ratio": 0.14,
+                "peak_reserved_ratio": 0.85,
+            },
+        }
+        metrics = {
+            "config_name": "candidate_optimizer_aware_pipeline",
+            "returncode": 0,
+            "step_time_ms_p50": 910.0,
+            "throughput_tokens_per_s": 1700.0,
+            "trace_summary": {
+                "optimizer_exposed_ratio": 0.16,
+                "stage_tail_ratio": 0.08,
+                "tail_step_jitter_ratio": 0.07,
+                "peak_reserved_ratio": 0.80,
+            },
+        }
+        outcome = build_trial_outcome(candidate, metrics, baseline_metrics=baseline_metrics)
+        reflection = reflect_on_trial(
+            dict(search_plan.get("search_state") or {}),
+            proposal,
+            outcome,
+            baseline_metrics=baseline_metrics,
+        )
+        memory_bank = PolicyMemoryBank()
+        case = record_trial_feedback(
+            memory_bank,
+            dict(search_plan.get("search_state") or {}),
+            proposal,
+            outcome,
+            reflection,
+        )
+        self.assertEqual(case.family, "dual_overlap_optimizer_hide")
+        self.assertTrue(
+            any(
+                str(item.get("window") or "") == "last_2_groups"
+                for item in list(case.local_policy.get("runtime_window_overrides") or [])
+            )
+        )
+        self.assertTrue(
+            any(
+                str(item.get("cluster_role") or "") == "optimizer_sensitive"
+                for item in list(case.local_policy.get("runtime_operator_cluster_overrides") or [])
+            )
+        )
+        scoreboard = memory_bank.family_scoreboard()
+        self.assertEqual(str(scoreboard[0].get("family") or ""), "dual_overlap_optimizer_hide")
+        self.assertGreater(float(scoreboard[0].get("score") or 0.0), 0.0)
+        retrieved = memory_bank.retrieve_cases(
+            dict(search_plan.get("search_state") or {}),
+            family="dual_overlap_optimizer_hide",
+            top_k=1,
+        )
+        self.assertEqual(len(retrieved), 1)
+
+    def test_compile_program_exports_feedback_runtime_family_env(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "bubble_ratio": 0.13,
+                "peak_reserved_ratio": 0.84,
+                "optimizer_exposed_ratio": 0.19,
+                "stage_tail_ratio": 0.16,
+                "tail_step_jitter_ratio": 0.18,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 23.0},
+                    "1": {"peak_reserved_gib": 25.5},
+                },
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_tail_aware_execution_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        compiled = compile_program(candidate)
+        self.assertEqual(str(compiled.launcher_env.get("SCHEDULE_POLICY_FAMILY") or ""), "dual_overlap_tail_guarded")
+        self.assertIn("SCHEDULE_STAGE_FAMILY_HINTS", compiled.launcher_env)
+
+    def test_compile_program_lowers_runtime_window_override_hints(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "optimizer_exposed_ratio": 0.26,
+                "optimizer_ratio": 0.61,
+                "peak_reserved_ratio": 0.84,
+                "stage_tail_ratio": 0.14,
+                "tail_step_jitter_ratio": 0.15,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 22.0},
+                    "1": {"peak_reserved_gib": 27.0},
+                },
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_optimizer_aware_pipeline_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        compiled = compile_program(candidate)
+        encoded = str(compiled.launcher_env.get("SCHEDULE_WINDOW_OVERRIDE_HINTS") or "")
+        self.assertTrue(encoded)
+        payload = json.loads(encoded)
+        self.assertTrue(any(str(item.get("window") or "") == "last_2_groups" for item in payload))
+        self.assertTrue(any(str(item.get("stage_selector") or "") == "optimizer_sensitive_stage" for item in payload))
+
+    def test_compile_program_lowers_runtime_operator_cluster_hints(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "optimizer_exposed_ratio": 0.24,
+                "optimizer_ratio": 0.58,
+                "peak_reserved_ratio": 0.84,
+                "stage_tail_ratio": 0.14,
+                "tail_step_jitter_ratio": 0.15,
+            },
+            "failure_modes": [{"label": "tail_heavy"}],
+            "derived_bottlenecks": [{"label": "tail_heavy"}],
+        }
+        candidate = agent_loop._build_optimizer_aware_pipeline_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        compiled = compile_program(candidate)
+        encoded = str(compiled.launcher_env.get("SCHEDULE_OPERATOR_CLUSTER_HINTS") or "")
+        self.assertTrue(encoded)
+        payload = json.loads(encoded)
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "optimizer_sensitive" for item in payload))
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "backward_critical" for item in payload))
+
+    def test_build_summary_payload_includes_feedback_memory_fields(self) -> None:
+        baseline = default_dense_program("single_g5")
+        rewrite = agent_loop._rewrite_space(baseline, {})
+        memory_bank = PolicyMemoryBank()
+        summary = agent_loop._build_summary_payload(
+            export_only=True,
+            programs_dir=Path("e:/python/Agent/runs_megatron_programs"),
+            runtime_summary={},
+            runtime_signature={},
+            context_record={},
+            replan_decision={},
+            bottleneck_signature={},
+            rewrite=rewrite,
+            baseline=baseline,
+            baseline_metrics=None,
+            best_program=None,
+            best_metrics=None,
+            tested=[],
+            family_outside_trials=[],
+            rejected_candidates=[],
+            candidate_manifest=[],
+            program_bank=ProgramBank(),
+            evidence_manifest=[],
+            feedback_search_plan={"selected_families": ["dual_overlap_tail_guarded"]},
+            policy_memory=memory_bank.to_dict(),
+            family_scoreboard=memory_bank.family_scoreboard(),
+            trial_reflections=[{"family": "dual_overlap_tail_guarded"}],
+        )
+        self.assertIn("feedback_search_plan", summary)
+        self.assertIn("policy_memory", summary)
+        self.assertIn("family_scoreboard", summary)
+        self.assertIn("trial_reflections", summary)
+
     def test_build_optimizer_aware_pipeline_candidate_emits_tail_guarded_execution_semantics(self) -> None:
         baseline = default_dense_program("single_g5")
         context = {
@@ -2079,7 +2526,18 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_optimizer_aware_pipeline")
         self.assertEqual(str(candidate.schedule.dispatch_order or ""), "optimizer_tail_guarded")
         self.assertEqual(str(candidate.metadata.get("flush_order_policy") or ""), "optimizer_tail_hide")
+        self.assertEqual(int(candidate.parallel.vpp_degree), 2)
+        self.assertEqual(int(candidate.layout.vpp_degree), 2)
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_policy_mode") or ""), "tail_guarded_overlap")
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_target_policy") or ""), "tail_stage_first")
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_window_policy") or ""), "tail_flush_aligned")
         self.assertTrue(bool(candidate.metadata.get("runtime_recompute_modules")))
+        window_overrides = list(candidate.metadata.get("runtime_window_overrides") or [])
+        cluster_overrides = list(candidate.metadata.get("runtime_operator_cluster_overrides") or [])
+        self.assertTrue(any(str(item.get("window") or "") == "last_2_groups" for item in window_overrides))
+        self.assertTrue(any(str(item.get("stage_selector") or "") == "optimizer_sensitive_stage" for item in window_overrides))
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "optimizer_sensitive" for item in cluster_overrides))
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "backward_critical" for item in cluster_overrides))
         stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
         self.assertTrue(any(str(item.get("family") or "") == "optimizer_guarded_tail" for item in stage_families))
 
@@ -2104,12 +2562,69 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_tail_aware_execution")
         self.assertEqual(str(candidate.metadata.get("runtime_checkpoint_boundary_mode") or ""), "tail_stage_guarded")
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_policy_mode") or ""), "tail_guarded_overlap")
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_window_policy") or ""), "tail_flush_aligned")
         self.assertTrue(bool(candidate.metadata.get("stage_local_vpp_vector")))
+        window_overrides = list(candidate.metadata.get("runtime_window_overrides") or [])
+        cluster_overrides = list(candidate.metadata.get("runtime_operator_cluster_overrides") or [])
+        self.assertTrue(any(str(item.get("window") or "") == "last_1_group" for item in window_overrides))
+        self.assertTrue(any(str(item.get("stage_selector") or "") == "tail_stage" for item in window_overrides))
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "backward_critical" for item in cluster_overrides))
         stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
         self.assertTrue(any(str(item.get("family") or "") == "tail_guarded" for item in stage_families))
 
+    def test_build_stage_local_vpp_shape_candidate_lowers_heterogeneous_layout_and_stage_tags(self) -> None:
+        baseline = default_dense_program("single_g5")
+        context = {
+            "runtime_evidence": {
+                "optimizer_exposed_ratio": 0.22,
+                "peak_reserved_ratio": 0.86,
+                "stage_tail_ratio": 0.13,
+                "tail_step_jitter_ratio": 0.12,
+                "stage_window_summary": {
+                    "0": {"peak_reserved_gib": 19.0},
+                    "1": {"peak_reserved_gib": 21.2},
+                },
+            },
+            "evidence_record": {
+                "nonuniform_vpp_shape": {
+                    "per_stage_candidates": [
+                        {
+                            "stage_id": 0,
+                            "recommended_v": 2,
+                            "currently_executable_values": [1, 2],
+                            "candidate_chunk_shapes": [[9, 11]],
+                        },
+                        {
+                            "stage_id": 1,
+                            "recommended_v": 1,
+                            "currently_executable_values": [1],
+                            "candidate_chunk_shapes": [[20]],
+                        },
+                    ]
+                }
+            },
+        }
+        candidate = agent_loop._build_stage_local_vpp_shape_candidate(baseline, context)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(str(candidate.metadata.get("program_kind") or ""), "candidate_nonuniform_vpp_shape")
+        self.assertEqual(int(candidate.parallel.vpp_degree), 2)
+        self.assertEqual(int(candidate.layout.vpp_degree), 2)
+        self.assertEqual(str(candidate.layout.pipeline_layout or ""), "Ettttttttt|tttttttttttttttttttt|ttttttttttt|L")
+        self.assertEqual(str(candidate.metadata.get("runtime_optimizer_policy_mode") or ""), "tail_guarded_overlap")
+        stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
+        tail_hint = next(item for item in stage_families if int(item.get("stage_index") or -1) == 1)
+        self.assertIn("tail_sensitive", list(tail_hint.get("stage_tags") or []))
+        self.assertIn("optimizer_sensitive", list(tail_hint.get("stage_tags") or []))
+
     def test_build_checkpoint_boundary_refinement_candidate_marks_joint_checkpoint_control(self) -> None:
         baseline = default_dense_program("single_g5")
+        baseline.parallel.pp_degree = 4
+        baseline.parallel.vpp_degree = 2
+        baseline.layout.vpp_degree = 2
+        baseline.schedule.template = "interleaved_grouped_g2"
+        baseline.schedule.skeleton = "stage_aware_grouped"
+        baseline.schedule.microbatch_group_size_per_vp_stage = 2
         context = {
             "runtime_evidence": {
                 "peak_reserved_ratio": 0.91,
@@ -2129,6 +2644,19 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(str(candidate.metadata.get("runtime_checkpoint_boundary_mode") or ""), "hotspot_tail_staggered")
         self.assertEqual(str(candidate.metadata.get("schedule_steady_checkpoint_policy") or ""), "guarded_selective")
         self.assertTrue(bool(candidate.metadata.get("stage_local_memory_policy")))
+        self.assertTrue(any(str(item.get("cluster_role") or "") == "memory_hotspot" for item in list(candidate.metadata.get("runtime_operator_cluster_overrides") or [])))
+        self.assertFalse(
+            any(
+                str(item.get("stage_selector") or "") == "optimizer_sensitive_stage"
+                for item in list(candidate.metadata.get("runtime_window_overrides") or [])
+            )
+        )
+        self.assertFalse(
+            any(
+                str(item.get("cluster_role") or "") == "optimizer_sensitive"
+                for item in list(candidate.metadata.get("runtime_operator_cluster_overrides") or [])
+            )
+        )
         stage_families = list(candidate.metadata.get("morphable_stage_families") or [])
         self.assertTrue(any(str(item.get("family") or "") == "checkpoint_guarded" for item in stage_families))
 

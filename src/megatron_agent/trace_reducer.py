@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from html import escape
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -624,6 +625,430 @@ def _build_perfetto_trace(
             "comm_exposure_ratio": round(float(runtime_evidence.get("comm_exposure_ratio") or 0.0), 4),
         },
         "traceEvents": metadata_events + trace_events,
+    }
+
+
+def _data_parallel_size(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    product = (
+        int(norm.parallel.tp_degree)
+        * int(norm.parallel.pp_degree)
+        * int(norm.parallel.cp_degree)
+        * int(norm.parallel.ep_degree)
+        * int(norm.parallel.expert_tp_degree)
+    )
+    if product <= 0:
+        return 1
+    return max(int(norm.cluster.world_size) // product, 1)
+
+
+def _estimated_microbatch_count(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    if norm.batch_plan.grad_accum_steps is not None:
+        return max(int(norm.batch_plan.grad_accum_steps), 1)
+    denom = max(int(norm.batch_plan.micro_batch_size) * _data_parallel_size(norm), 1)
+    return max(int(norm.batch_plan.global_batch_size) // denom, 1)
+
+
+def _stage_local_virtual_counts(program: MegatronProgram, stage_count: int) -> List[int]:
+    norm = program.normalized()
+    raw_vector = norm.metadata.get("stage_local_vpp_vector")
+    if isinstance(raw_vector, (list, tuple)) and len(raw_vector) == stage_count:
+        resolved: List[int] = []
+        for value in raw_vector:
+            try:
+                resolved.append(max(int(value), 1))
+            except Exception:
+                resolved.append(max(int(norm.parallel.vpp_degree), 1))
+        return resolved
+    return [max(int(norm.parallel.vpp_degree), 1) for _ in range(stage_count)]
+
+
+def _projection_impact_level(value: float, *, high: float, medium: float) -> str:
+    if value >= high:
+        return "high"
+    if value >= medium:
+        return "medium"
+    return "low"
+
+
+def _projection_strategy_hypotheses(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    backend_context: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    norm = program.normalized()
+    pp_degree = max(int(norm.parallel.pp_degree), 1)
+    interleaved = max(int(norm.parallel.vpp_degree), 1) > 1 or bool(norm.metadata.get("pipeline_layout"))
+    backend_family = str(backend_context.get("backend_family") or "megatron_core")
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    stage_tail_ratio = float(runtime_evidence.get("stage_tail_ratio") or 0.0)
+    mem_skew_ratio = float(runtime_evidence.get("mem_skew_ratio") or 0.0)
+
+    hypotheses: List[Dict[str, Any]] = [
+        {
+            "name": str(norm.schedule.template),
+            "kind": "current_schedule",
+            "execution_status": "active",
+            "expected_effects": {
+                "bubble": "baseline",
+                "memory": "baseline",
+                "optimizer_exposure": "baseline",
+            },
+            "rationale": "current baseline schedule observed from runtime evidence",
+        }
+    ]
+    if optimizer_exposed_ratio >= 0.18:
+        hypotheses.append(
+            {
+                "name": "optimizer_tail_guarded",
+                "kind": "runtime_semantics",
+                "execution_status": "direct_now" if pp_degree > 1 and interleaved and backend_family == "megatron_core" else "needs_interleaved_runtime",
+                "expected_effects": {
+                    "bubble": _projection_impact_level(bubble_ratio, high=0.16, medium=0.08),
+                    "memory": "neutral",
+                    "optimizer_exposure": _projection_impact_level(optimizer_exposed_ratio, high=0.30, medium=0.18),
+                },
+                "rationale": "optimizer time is materially exposed on the critical path, so tail-targeted overlap and flush alignment are more valuable than another PP/VPP scalar sweep",
+            }
+        )
+    if stage_tail_ratio >= 0.12 or bubble_ratio >= 0.12:
+        hypotheses.append(
+            {
+                "name": "tail_aware_stage_local_vpp",
+                "kind": "heterogeneous_vpp",
+                "execution_status": "direct_now" if pp_degree > 1 else "blocked_by_pp_degree",
+                "expected_effects": {
+                    "bubble": _projection_impact_level(max(stage_tail_ratio, bubble_ratio), high=0.22, medium=0.12),
+                    "memory": _projection_impact_level(peak_reserved_ratio, high=0.88, medium=0.78),
+                    "optimizer_exposure": _projection_impact_level(optimizer_exposed_ratio, high=0.30, medium=0.18),
+                },
+                "rationale": "tail-heavy stages should not inherit the same virtual chunk shape and cooldown semantics as middle stages",
+            }
+        )
+    if peak_reserved_ratio >= 0.82 or mem_skew_ratio >= 0.12:
+        hypotheses.append(
+            {
+                "name": "checkpoint_boundary_joint",
+                "kind": "memory_runtime",
+                "execution_status": "direct_now",
+                "expected_effects": {
+                    "bubble": "low",
+                    "memory": _projection_impact_level(max(peak_reserved_ratio, mem_skew_ratio), high=0.90, medium=0.82),
+                    "optimizer_exposure": "low",
+                },
+                "rationale": "memory headroom is limiting the feasible PP/VPP region, so checkpoint and offload must be treated as structural schedule companions",
+            }
+        )
+    if bubble_ratio >= 0.12 and backend_family == "torchtitan":
+        hypotheses.append(
+            {
+                "name": "zero_bubble_probe",
+                "kind": "schedule_sandbox",
+                "execution_status": "sandbox_only",
+                "expected_effects": {
+                    "bubble": _projection_impact_level(bubble_ratio, high=0.20, medium=0.12),
+                    "memory": _projection_impact_level(peak_reserved_ratio, high=0.88, medium=0.78),
+                    "optimizer_exposure": "unknown",
+                },
+                "rationale": "Primus-style zero-bubble or DualPipe-like schedules are worth probing in sandbox mode when idle windows remain visible after interleaving",
+            }
+        )
+    return hypotheses
+
+
+def _build_pipeline_schedule_projection(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+    backend_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    pp_degree = max(int(norm.parallel.pp_degree), 1)
+    stage_count = max(len(stage_evidence), pp_degree)
+    if stage_count <= 0:
+        stage_count = 1
+    local_vpp = _stage_local_virtual_counts(norm, stage_count)
+    step_time_ms = float(runtime_evidence.get("steady_state_step_time_ms_p50") or 0.0)
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    stage_tail_ratio = float(runtime_evidence.get("stage_tail_ratio") or 0.0)
+    mem_skew_ratio = float(runtime_evidence.get("mem_skew_ratio") or 0.0)
+    tail_step_jitter_ratio = float(runtime_evidence.get("tail_step_jitter_ratio") or 0.0)
+    schedule_group_size = max(int(norm.schedule.microbatch_group_size_per_vp_stage or 1), 1)
+    local_window_observability = _build_local_window_observability(norm, stage_evidence, runtime_evidence)
+
+    completion_values = [float(item.get("completion_ms") or 0.0) for item in stage_evidence if float(item.get("completion_ms") or 0.0) > 0.0]
+    forward_values = [float(item.get("forward_ms") or 0.0) for item in stage_evidence if float(item.get("forward_ms") or 0.0) > 0.0]
+    backward_values = [float(item.get("backward_ms") or 0.0) for item in stage_evidence if float(item.get("backward_ms") or 0.0) > 0.0]
+    median_forward = _median(forward_values) or (max(step_time_ms, 1.0) / max(2.0 * stage_count, 1.0))
+    median_backward = _median(backward_values) or median_forward
+    warmup_ms = median_forward * float(max(stage_count - 1, 0))
+    cooldown_ms = median_backward * float(max(stage_count - 1, 0))
+
+    hottest_stage = max(stage_evidence, key=lambda item: float(item.get("completion_ms") or 0.0), default={})
+    hottest_memory_stage = max(stage_evidence, key=lambda item: float(item.get("peak_reserved_gib") or 0.0), default={})
+    hottest_stage_id = int(hottest_stage.get("stage_id") or (stage_count - 1))
+    hottest_memory_stage_id = int(hottest_memory_stage.get("stage_id") or hottest_stage_id)
+
+    tracks: List[Dict[str, Any]] = []
+    max_end_ms = 0.0
+    for index in range(stage_count):
+        stage = dict(stage_evidence[index]) if index < len(stage_evidence) else {}
+        stage_id = int(stage.get("stage_id") or index)
+        forward_ms = float(stage.get("forward_ms") or 0.0)
+        backward_ms = float(stage.get("backward_ms") or 0.0)
+        comm_ms = (
+            float(stage.get("send_recv_ms") or 0.0)
+            + float(stage.get("fsdp_ag_ms") or 0.0)
+            + float(stage.get("fsdp_rs_ms") or 0.0)
+            + float(stage.get("cp_collective_ms") or 0.0)
+        )
+        idle_ms = float(stage.get("idle_ms") or 0.0)
+        peak_reserved_gib = float(stage.get("peak_reserved_gib") or 0.0)
+        local_chunks = max(int(local_vpp[min(stage_id, len(local_vpp) - 1)]), 1)
+        stage_offset_ms = float(stage_id) * median_forward * 0.55
+        warmup_idle_ms = idle_ms * (0.25 + (0.35 * float(stage_id) / max(float(stage_count - 1), 1.0)))
+        cooldown_idle_ms = max(idle_ms - warmup_idle_ms, 0.0)
+        cursor_ms = stage_offset_ms
+        segments: List[Dict[str, Any]] = []
+
+        def add_segment(name: str, category: str, duration_ms: float, chunk_id: Optional[int] = None) -> None:
+            nonlocal cursor_ms
+            if duration_ms <= 0.0:
+                return
+            segment = {
+                "name": name,
+                "category": category,
+                "start_ms": round(cursor_ms, 4),
+                "duration_ms": round(duration_ms, 4),
+                "end_ms": round(cursor_ms + duration_ms, 4),
+            }
+            if chunk_id is not None:
+                segment["chunk_id"] = int(chunk_id)
+            segments.append(segment)
+            cursor_ms += duration_ms
+
+        add_segment("idle_warmup", "bubble", warmup_idle_ms)
+        for chunk_id in range(local_chunks):
+            add_segment(f"forward_vp{chunk_id}", "compute", forward_ms / float(local_chunks), chunk_id=chunk_id)
+        if comm_ms > 0.0:
+            add_segment("collectives", "communication", comm_ms)
+        for chunk_id in reversed(range(local_chunks)):
+            add_segment(f"backward_vp{chunk_id}", "compute", backward_ms / float(local_chunks), chunk_id=chunk_id)
+        add_segment("idle_cooldown", "bubble", cooldown_idle_ms)
+
+        stage_role = "normal"
+        stage_tags: List[str] = []
+        if stage_id == hottest_stage_id and stage_tail_ratio >= 0.12:
+            stage_role = "tail_hotspot"
+            stage_tags.extend(["tail_sensitive", "critical_path"])
+        elif stage_id == hottest_stage_id:
+            stage_role = "critical_path"
+            stage_tags.append("critical_path")
+        if stage_id == hottest_memory_stage_id and peak_reserved_ratio >= 0.80:
+            stage_role = "memory_hotspot" if stage_role == "normal" else stage_role
+            stage_tags.append("memory_hotspot")
+        if stage_id == stage_count - 1 and optimizer_exposed_ratio >= 0.18:
+            stage_role = "optimizer_sensitive_tail" if stage_role == "normal" else stage_role
+            stage_tags.extend(["tail_sensitive", "optimizer_sensitive"])
+        if not stage_tags and stage_id == stage_count - 1:
+            stage_tags.append("tail_stage")
+
+        tracks.append(
+            {
+                "stage_id": stage_id,
+                "subgraph": str(stage.get("subgraph") or f"subg_stage_{stage_id}"),
+                "role": stage_role,
+                "stage_tags": stage_tags,
+                "local_virtual_chunks": local_chunks,
+                "completion_ms": round(float(stage.get("completion_ms") or cursor_ms), 4),
+                "peak_reserved_gib": round(peak_reserved_gib, 4),
+                "local_bubble_ratio": round(idle_ms / max(cursor_ms - stage_offset_ms, 1.0), 4),
+                "segments": segments,
+            }
+        )
+        max_end_ms = max(max_end_ms, cursor_ms)
+
+    phase_windows = [
+        {"name": "warmup", "start_ms": 0.0, "end_ms": round(warmup_ms, 4)},
+        {
+            "name": "steady",
+            "start_ms": round(warmup_ms, 4),
+            "end_ms": round(max(max_end_ms - cooldown_ms, warmup_ms), 4),
+        },
+        {
+            "name": "cooldown",
+            "start_ms": round(max(max_end_ms - cooldown_ms, warmup_ms), 4),
+            "end_ms": round(max_end_ms, 4),
+        },
+    ]
+
+    return {
+        "format": "pipeline_schedule_projection",
+        "projection_mode": "heuristic_from_runtime_evidence",
+        "viewer_hint": "Use pipeline_projection_svg for a quick visual or inspect stage_tracks for programmatic comparisons.",
+        "summary": {
+            "schedule_template": str(norm.schedule.template),
+            "pp_degree": pp_degree,
+            "vpp_degree": max(int(norm.parallel.vpp_degree), 1),
+            "stage_local_vpp_vector": local_vpp,
+            "estimated_microbatches": _estimated_microbatch_count(norm),
+            "schedule_group_size": schedule_group_size,
+            "step_time_ms": round(step_time_ms, 4),
+            "projected_timeline_span_ms": round(max_end_ms, 4),
+            "bubble_ratio": round(bubble_ratio, 4),
+            "peak_reserved_ratio": round(peak_reserved_ratio, 4),
+            "optimizer_exposed_ratio": round(optimizer_exposed_ratio, 4),
+            "stage_tail_ratio": round(stage_tail_ratio, 4),
+            "mem_skew_ratio": round(mem_skew_ratio, 4),
+            "tail_step_jitter_ratio": round(tail_step_jitter_ratio, 4),
+            "tail_window_ms": round(float(local_window_observability.get("tail_window_ms") or 0.0), 4),
+            "cooldown_idle_ms": round(float(local_window_observability.get("cooldown_idle_ms") or 0.0), 4),
+            "optimizer_exposed_window_ms": round(
+                float(local_window_observability.get("optimizer_exposed_window_ms") or 0.0),
+                4,
+            ),
+        },
+        "phase_windows": phase_windows,
+        "stage_tracks": tracks,
+        "local_window_observability": local_window_observability,
+        "strategy_hypotheses": _projection_strategy_hypotheses(norm, runtime_evidence, backend_context),
+        "limitations": [
+            "projection is synthesized from aggregated stage windows, not exact microbatch-level runtime events",
+            "zero-bubble or dual-pipe behavior still requires a dedicated schedule sandbox or backend implementation",
+        ],
+    }
+
+
+def _build_pipeline_projection_svg(projection: Dict[str, Any]) -> Dict[str, Any]:
+    tracks = list(projection.get("stage_tracks") or [])
+    if not tracks:
+        return {}
+    phase_windows = list(projection.get("phase_windows") or [])
+    summary = dict(projection.get("summary") or {})
+    total_span_ms = max(float(summary.get("projected_timeline_span_ms") or 0.0), 1.0)
+    lane_height = 28
+    lane_gap = 10
+    label_width = 124
+    chart_width = 920
+    width = label_width + chart_width + 36
+    height = 84 + len(tracks) * (lane_height + lane_gap) + 40
+    scale = chart_width / total_span_ms
+    colors = {
+        "compute": "#6BA368",
+        "communication": "#4C78A8",
+        "bubble": "#B8B8B8",
+    }
+    phase_colors = {
+        "warmup": "#F6E7C1",
+        "steady": "#EEF5EA",
+        "cooldown": "#F3E3D8",
+    }
+
+    lines: List[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<style>',
+        "text { font-family: Consolas, 'Courier New', monospace; fill: #1f1f1f; }",
+        ".title { font-size: 15px; font-weight: 700; }",
+        ".sub { font-size: 11px; fill: #555; }",
+        ".label { font-size: 11px; }",
+        ".metric { font-size: 10px; fill: #444; }",
+        "</style>",
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
+        f'<text class="title" x="16" y="24">Pipeline Projection :: {escape(str(summary.get("schedule_template") or "unknown"))}</text>',
+        (
+            f'<text class="sub" x="16" y="44">PP={int(summary.get("pp_degree") or 1)} '
+            f'VPP={int(summary.get("vpp_degree") or 1)} '
+            f'Bubble={float(summary.get("bubble_ratio") or 0.0):.3f} '
+            f'PeakMem={float(summary.get("peak_reserved_ratio") or 0.0):.3f} '
+            f'OptExpose={float(summary.get("optimizer_exposed_ratio") or 0.0):.3f}</text>'
+        ),
+    ]
+
+    chart_x = label_width
+    chart_y = 60
+    for phase in phase_windows:
+        phase_name = str(phase.get("name") or "phase")
+        start_x = chart_x + float(phase.get("start_ms") or 0.0) * scale
+        width_x = max((float(phase.get("end_ms") or 0.0) - float(phase.get("start_ms") or 0.0)) * scale, 0.0)
+        if width_x <= 0.0:
+            continue
+        lines.append(
+            f'<rect x="{start_x:.2f}" y="{chart_y - 18}" width="{width_x:.2f}" height="{len(tracks) * (lane_height + lane_gap) + 10}" fill="{phase_colors.get(phase_name, "#f2f2f2")}" opacity="0.35"/>'
+        )
+        lines.append(
+            f'<text class="metric" x="{start_x + 4:.2f}" y="{chart_y - 6}">{escape(phase_name)}</text>'
+        )
+
+    for idx, track in enumerate(tracks):
+        lane_y = chart_y + idx * (lane_height + lane_gap)
+        label = f"PP-{int(track.get('stage_id') or idx)}"
+        role = str(track.get("role") or "normal")
+        lines.append(f'<text class="label" x="16" y="{lane_y + 18}">{escape(label)}</text>')
+        lines.append(f'<text class="metric" x="54" y="{lane_y + 18}">{escape(role)}</text>')
+        lines.append(f'<rect x="{chart_x}" y="{lane_y}" width="{chart_width}" height="{lane_height}" fill="#fafafa" stroke="#e5e5e5"/>')
+        for segment in list(track.get("segments") or []):
+            start_x = chart_x + float(segment.get("start_ms") or 0.0) * scale
+            width_x = max(float(segment.get("duration_ms") or 0.0) * scale, 1.0)
+            category = str(segment.get("category") or "compute")
+            lines.append(
+                f'<rect x="{start_x:.2f}" y="{lane_y + 3}" width="{width_x:.2f}" height="{lane_height - 6}" fill="{colors.get(category, "#888")}" opacity="0.92"/>'
+            )
+        lines.append(
+            f'<text class="metric" x="{chart_x + chart_width + 8}" y="{lane_y + 18}">{float(track.get("peak_reserved_gib") or 0.0):.1f} GiB</text>'
+        )
+
+    legend_y = height - 18
+    legend_items = [("compute", colors["compute"]), ("communication", colors["communication"]), ("bubble", colors["bubble"])]
+    legend_x = 16
+    for name, color in legend_items:
+        lines.append(f'<rect x="{legend_x}" y="{legend_y - 10}" width="10" height="10" fill="{color}"/>')
+        lines.append(f'<text class="metric" x="{legend_x + 14}" y="{legend_y}">{escape(name)}</text>')
+        legend_x += 108
+
+    lines.append("</svg>")
+    return {
+        "format": "svg_inline",
+        "viewer_hint": "Open the saved SVG in a browser or IDE preview for a Primus-style projected pipeline timeline.",
+        "content": "".join(lines),
+    }
+
+
+def _build_local_window_observability(
+    program: MegatronProgram,
+    stage_evidence: Sequence[Dict[str, Any]],
+    runtime_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    completion_values = [
+        float(item.get("completion_ms") or 0.0)
+        for item in stage_evidence
+        if float(item.get("completion_ms") or 0.0) > 0.0
+    ]
+    stage_median_completion = _median(completion_values) or 0.0
+    hottest_stage = max(stage_evidence, key=lambda item: float(item.get("completion_ms") or 0.0), default={})
+    tail_window_ms = max(float(hottest_stage.get("completion_ms") or 0.0) - stage_median_completion, 0.0)
+    cooldown_ratio = float(runtime_evidence.get("cooldown_ratio") or 0.0)
+    cooldown_weight = cooldown_ratio if cooldown_ratio > 0.0 else 0.25
+    cooldown_idle_ms = sum(float(item.get("idle_ms") or 0.0) * cooldown_weight for item in stage_evidence)
+    optimizer_exposed_window_ms = float(runtime_evidence.get("optimizer_exposed_ms") or 0.0)
+    stage_count = max(int(norm.partition.num_stages or len(stage_evidence) or 1), 1)
+    last_groups_idle_by_stage: Dict[str, float] = {}
+    for item in stage_evidence:
+        stage_id = int(item.get("stage_id") or 0)
+        local_idle_ms = float(item.get("idle_ms") or 0.0)
+        if stage_id == stage_count - 1:
+            local_idle_ms *= 1.10
+        last_groups_idle_by_stage[str(stage_id)] = round(local_idle_ms * cooldown_weight, 4)
+    return {
+        "tail_window_ms": round(tail_window_ms, 4),
+        "cooldown_idle_ms": round(cooldown_idle_ms, 4),
+        "optimizer_exposed_window_ms": round(optimizer_exposed_window_ms, 4),
+        "last_groups_idle_by_stage": last_groups_idle_by_stage,
     }
 
 
@@ -1897,8 +2322,11 @@ def _build_morphable_pipeline_plan(
         recompute_modules: List[str] = []
         offload_modules: List[str] = []
         chunk_priority_hints: List[int] = []
+        stage_tags: List[str] = []
         semantic_role = str(family.get("semantic_role") or "decoder")
         is_tail_stage = bool(stage_id == stage_count - 1)
+        if is_tail_stage:
+            stage_tags.append("tail_sensitive")
         criticality_bonus = 1.0 if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} else 0.0
         throughput_gain_score = (
             0.55 * pipeline_wait_ratio * max(completion_ms, 1.0)
@@ -1912,12 +2340,14 @@ def _build_morphable_pipeline_plan(
         )
         if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"} or completion_ms > 0.0 and pipeline_wait_ratio >= 0.08:
             family_name = "critical_path_first"
+            stage_tags.append("critical_path")
             dispatch_order = "structure_aware_critical_first"
             warmup_policy = "balanced_fill"
             cooldown_policy = "opt_prioritized" if optimizer_exposed_ratio >= 0.18 else "tail_min"
             chunk_priority_hints = [4, 2] if int(norm.parallel.vpp_degree) > 1 else [4]
         if is_tail_stage and optimizer_exposed_ratio >= 0.18:
             family_name = "optimizer_guarded_tail"
+            stage_tags.extend(["tail_sensitive", "optimizer_sensitive"])
             dispatch_order = "optimizer_tail_guarded"
             warmup_policy = "balanced_fill"
             cooldown_policy = "optimizer_tail_hide"
@@ -1928,6 +2358,7 @@ def _build_morphable_pipeline_plan(
             chunk_priority_hints = [4, 1] if int(norm.parallel.vpp_degree) > 1 else [4]
         if local_memory_ratio >= 0.84:
             family_name = "memory_guarded"
+            stage_tags.append("memory_hotspot")
             dispatch_order = "middle_stage_relief"
             warmup_policy = "balanced_fill"
             cooldown_policy = "tail_min"
@@ -1938,11 +2369,14 @@ def _build_morphable_pipeline_plan(
             chunk_priority_hints = [3, 1] if int(norm.parallel.vpp_degree) > 1 else [3]
             if is_tail_stage:
                 family_name = "tail_memory_guarded"
+                if "tail_sensitive" not in stage_tags:
+                    stage_tags.append("tail_sensitive")
                 dispatch_order = "tail_boundary_rewrite"
                 cooldown_policy = "tail_checkpoint_guard"
                 checkpoint_policy = "guarded_selective"
         elif comm_ms >= 0.12 * max(completion_ms, 1.0) or comm_exposure_ratio >= 0.12:
             family_name = "comm_guarded"
+            stage_tags.append("comm_sensitive")
             dispatch_order = "balanced_round_robin"
             warmup_policy = "balanced_fill"
             cooldown_policy = "tail_min"
@@ -1977,6 +2411,7 @@ def _build_morphable_pipeline_plan(
                 "checkpoint_policy": checkpoint_policy,
                 "p2p_policy": p2p_policy,
                 "combined_policy": combined_policy,
+                "stage_tags": sorted(set(stage_tags)),
                 "recompute_modules": recompute_modules,
                 "offload_modules": offload_modules,
                 "chunk_priority_hints": chunk_priority_hints,
@@ -2067,6 +2502,107 @@ def _build_morphable_pipeline_plan(
         "shape_signature": str(morphable_problem.get("shape_signature") or ""),
         "dominant_family": str(stage_families[0]["family"]) if stage_families else "balanced_interleave",
     }
+
+
+def _build_critical_operator_clusters(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    morphable_problem: Dict[str, Any],
+    morphable_plan: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    units = list(((morphable_problem.get("three_semantic_execution_graph") or {}).get("units") or []))
+    if not units:
+        return []
+    stage_families = {
+        int(item.get("stage_index") or 0): dict(item)
+        for item in list(morphable_plan.get("stage_families") or [])
+    }
+    memory_margin_ratio = float(((morphable_problem.get("memory_budget") or {}).get("memory_margin_ratio") or 0.0))
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    tail_stage = max((int(item.get("stage_index") or 0) for item in units), default=0)
+    selected: List[Dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for unit in units:
+        stage_index = int(unit.get("stage_index") or 0)
+        family = dict(stage_families.get(stage_index) or {})
+        stage_tags = {
+            str(tag).strip()
+            for tag in list(family.get("stage_tags") or [])
+            if str(tag).strip()
+        }
+        semantic_role = str(unit.get("semantic_role") or "decoder")
+        observed_completion_ms = float(unit.get("observed_completion_ms") or 0.0)
+        observed_comm_ms = float(unit.get("observed_comm_ms") or 0.0)
+        cluster_role = ""
+        local_priority = "normal"
+        overlap_policy = "guarded"
+        memory_policy = "resident"
+        phases = ["steady", "cooldown"]
+        if semantic_role in {"embedding_anchor", "loss_anchor", "embedding_loss_anchor"}:
+            cluster_role = "embedding_loss_anchor"
+            local_priority = "protected"
+            phases = ["cooldown"] if stage_index == tail_stage else ["warmup", "cooldown"]
+        elif "optimizer_sensitive" in stage_tags and semantic_role in {"attention_block", "residual_merge", "mlp_block"}:
+            cluster_role = "optimizer_sensitive"
+            local_priority = "high"
+        elif ("tail_sensitive" in stage_tags or stage_index == tail_stage) and semantic_role in {"residual_merge", "mlp_block"}:
+            cluster_role = "backward_critical"
+            local_priority = "high"
+            phases = ["cooldown"]
+        elif "memory_hotspot" in stage_tags and semantic_role in {"attention_block", "mlp_block"}:
+            cluster_role = "memory_hotspot"
+            local_priority = "protected"
+            overlap_policy = "disabled" if memory_margin_ratio <= 0.08 else "guarded"
+            memory_policy = "offload_guarded" if semantic_role == "attention_block" else "checkpoint"
+        elif semantic_role == "attention_block" and (
+            comm_exposure_ratio >= 0.12
+            or observed_comm_ms >= 0.10 * max(observed_completion_ms, 1.0)
+        ):
+            cluster_role = "attention_comm"
+            local_priority = "protected"
+            overlap_policy = "guarded"
+            phases = ["steady"]
+        elif ("throughput_favoring" in stage_tags or str(family.get("family") or "") == "heterogeneous_middle_relief") and semantic_role == "mlp_block":
+            cluster_role = "mlp_compute"
+            local_priority = "normal"
+            overlap_policy = "aggressive"
+            phases = ["steady"]
+        if not cluster_role:
+            continue
+        dedupe_key = (stage_index, cluster_role)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        selected.append(
+            {
+                "stage_index": int(stage_index),
+                "subgraph": str(unit.get("parent_subgraph") or ""),
+                "unit_name": str(unit.get("name") or ""),
+                "semantic_role": semantic_role,
+                "cluster_role": cluster_role,
+                "local_priority": local_priority,
+                "overlap_policy": overlap_policy,
+                "memory_policy": memory_policy,
+                "phases": phases,
+                "criticality_score": round(
+                    float(unit.get("critical_path_score") or 0.0)
+                    + (8.0 if cluster_role in {"optimizer_sensitive", "backward_critical"} else 4.0 if cluster_role == "memory_hotspot" else 2.0),
+                    4,
+                ),
+                "reason": (
+                    "selected from constrained operator-cluster refinement space because the stage family indicates "
+                    f"{','.join(sorted(stage_tags)) or str(family.get('family') or 'balanced_interleave')}"
+                ),
+            }
+        )
+    selected.sort(
+        key=lambda item: (
+            -float(item.get("criticality_score") or 0.0),
+            int(item.get("stage_index") or 0),
+            str(item.get("cluster_role") or ""),
+        )
+    )
+    return selected[: max(2 * int(program.parallel.pp_degree or 1), 4)]
 
 
 def _candidate_schedule_templates(backend_family: str, seq_len: int) -> List[str]:
@@ -2291,6 +2827,8 @@ def _build_context_from_trace(
     bubble_ratio = float(trace_summary.get("bubble_ratio") or 0.0)
     cross_node_ratio = float(trace_summary.get("cross_node_exposed_ratio") or 0.0)
     optimizer_ratio = float(trace_summary.get("optimizer_ratio") or 0.0)
+    optimizer_exposed_ms = float(trace_summary.get("optimizer_exposed_ms") or 0.0)
+    optimizer_exposed_ratio = float(trace_summary.get("optimizer_exposed_ratio") or 0.0)
     stall_ratio = float(trace_summary.get("stall_ratio") or 0.0)
     stage_evidence = _stage_evidence(norm, trace_summary, merged)
     subgraph_evidence = _subgraph_evidence(norm, trace_summary, merged) or list(stage_evidence)
@@ -2364,6 +2902,8 @@ def _build_context_from_trace(
         "stage_load_variance": float(trace_summary.get("stage_load_variance") or 0.0),
         "cross_node_exposed_ratio": cross_node_ratio,
         "optimizer_ratio": optimizer_ratio,
+        "optimizer_exposed_ms": optimizer_exposed_ms,
+        "optimizer_exposed_ratio": optimizer_exposed_ratio,
         "stall_ratio": stall_ratio,
         "peak_reserved_gib": peak_reserved_gib,
         "peak_reserved_ratio": peak_reserved_ratio,
@@ -2378,7 +2918,10 @@ def _build_context_from_trace(
         "mem_skew_ratio": mem_skew_ratio,
         "comm_exposure_ratio": comm_exposure_ratio,
         "backend_family": str(backend_context.get("backend_family") or "megatron_core"),
+        "schedule_template": str(norm.schedule.template),
     }
+    local_window_observability = _build_local_window_observability(norm, stage_evidence, runtime_evidence)
+    runtime_evidence.update(local_window_observability)
     evidence_record = {
         "stage_evidence": stage_evidence,
         "subgraph_evidence": subgraph_evidence,
@@ -2387,6 +2930,7 @@ def _build_context_from_trace(
             "hottest_stage": hottest_stage,
             "memory_hot_stage": memory_hot_stage,
         },
+        "local_window_observability": local_window_observability,
     }
     derived_bottlenecks = _derive_runtime_bottlenecks(
         stage_evidence=stage_evidence,
@@ -2456,6 +3000,12 @@ def _build_context_from_trace(
         stage_evidence,
         morphable_pipeline_problem,
     )
+    critical_operator_clusters = _build_critical_operator_clusters(
+        norm,
+        runtime_evidence,
+        morphable_pipeline_problem,
+        morphable_pipeline_plan,
+    )
     runtime_branch_plan = _build_runtime_branch_plan(
         norm,
         runtime_evidence,
@@ -2469,6 +3019,8 @@ def _build_context_from_trace(
     )
     search_space_blueprint = _search_space_blueprint(norm, runtime_evidence, backend_context, bottleneck_signature)
     perfetto_trace = _build_perfetto_trace(norm, stage_evidence, subgraph_evidence, runtime_evidence)
+    pipeline_schedule_projection = _build_pipeline_schedule_projection(norm, stage_evidence, runtime_evidence, backend_context)
+    pipeline_projection_svg = _build_pipeline_projection_svg(pipeline_schedule_projection)
     return {
         "hardware_context": hardware_context,
         "backend_context": backend_context,
@@ -2488,10 +3040,13 @@ def _build_context_from_trace(
             "single_node_deep_stats": single_node_deep_stats,
             "morphable_pipeline_problem": morphable_pipeline_problem,
             "morphable_pipeline_plan": morphable_pipeline_plan,
+            "critical_operator_clusters": critical_operator_clusters,
             "runtime_branch_plan": runtime_branch_plan,
             "search_space_blueprint": search_space_blueprint,
             "visualization_artifacts": {
                 "perfetto_trace": perfetto_trace,
+                "pipeline_schedule_projection": pipeline_schedule_projection,
+                "pipeline_projection_svg": pipeline_projection_svg,
                 "viewer_hint": "perfetto_trace can be opened directly in Perfetto for a synthetic nsys-like stage timeline.",
             },
         },
@@ -2633,6 +3188,7 @@ def build_trial_artifact(
         "single_node_deep_stats": dict(evidence.get("single_node_deep_stats") or {}),
         "morphable_pipeline_problem": dict(evidence.get("morphable_pipeline_problem") or {}),
         "morphable_pipeline_plan": dict(evidence.get("morphable_pipeline_plan") or {}),
+        "critical_operator_clusters": list(evidence.get("critical_operator_clusters") or []),
         "runtime_branch_plan": dict(evidence.get("runtime_branch_plan") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
         "search_space_blueprint": dict(evidence.get("search_space_blueprint") or {}),

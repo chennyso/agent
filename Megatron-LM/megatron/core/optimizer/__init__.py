@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
 import warnings
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -72,6 +73,166 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_stage_family_hints(raw: str) -> Dict[int, Dict[str, str]]:
+    parsed: Dict[int, Dict[str, str]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    for stage_entry in text.split(";"):
+        stage_entry = stage_entry.strip()
+        if not stage_entry:
+            continue
+        tokens = [token.strip() for token in stage_entry.split(",") if token.strip()]
+        if not tokens:
+            continue
+        try:
+            stage_id = int(tokens[0])
+        except ValueError:
+            continue
+        payload: Dict[str, str] = {}
+        for token in tokens[1:]:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                payload[key] = value
+        if payload:
+            parsed[int(stage_id)] = payload
+    return parsed
+
+
+def _pipeline_parallel_location() -> Tuple[Optional[int], Optional[int]]:
+    if not parallel_state.model_parallel_is_initialized():
+        return None, None
+    try:
+        pp_rank = int(parallel_state.get_pipeline_model_parallel_rank())
+        pp_world_size = int(parallel_state.get_pipeline_model_parallel_world_size())
+    except Exception:
+        return None, None
+    if pp_world_size <= 0:
+        return None, None
+    return pp_rank, pp_world_size
+
+
+def _get_local_stage_family_hint() -> Dict[str, str]:
+    pp_rank, _ = _pipeline_parallel_location()
+    if pp_rank is None:
+        return {}
+    parsed = _parse_stage_family_hints(os.environ.get("SCHEDULE_STAGE_FAMILY_HINTS", ""))
+    return dict(parsed.get(int(pp_rank)) or {})
+
+
+def _resolve_optimizer_runtime_value(
+    local_stage_hint: Dict[str, str],
+    stage_key: str,
+    env_key: str,
+    default: str = "",
+) -> str:
+    value = str(local_stage_hint.get(stage_key) or "").strip()
+    if value:
+        return value
+    return str(os.environ.get(env_key, default) or default).strip()
+
+
+def _local_stage_tags(local_stage_hint: Dict[str, str]) -> set[str]:
+    raw = str(local_stage_hint.get("stage_tags") or "").strip()
+    if not raw:
+        return set()
+    return {
+        token.strip()
+        for token in raw.replace(",", "|").split("|")
+        if token.strip()
+    }
+
+
+def _get_local_pipeline_layout_tokens(num_model_chunks: int) -> List[str]:
+    layout = str(os.environ.get("PIPELINE_LAYOUT", "") or "").strip()
+    if not layout:
+        return []
+    pp_rank, pp_world_size = _pipeline_parallel_location()
+    if pp_rank is None or pp_world_size is None or num_model_chunks <= 0:
+        return []
+    stages = [stage.strip() for stage in layout.split("|")]
+    if len(stages) != pp_world_size * num_model_chunks:
+        return []
+    return [
+        stages[(chunk_id * pp_world_size) + pp_rank]
+        for chunk_id in range(num_model_chunks)
+        if (chunk_id * pp_world_size) + pp_rank < len(stages)
+    ]
+
+
+def _select_optimizer_overlap_target_chunk(num_model_chunks: int) -> int:
+    if num_model_chunks <= 1:
+        return 0
+
+    local_stage_hint = _get_local_stage_family_hint()
+    runtime_mode = _resolve_optimizer_runtime_value(
+        local_stage_hint,
+        "optimizer_runtime_mode",
+        "SCHEDULE_OPTIMIZER_RUNTIME_MODE",
+    )
+    if not runtime_mode:
+        return 0
+
+    target_policy = _resolve_optimizer_runtime_value(
+        local_stage_hint,
+        "optimizer_target_policy",
+        "SCHEDULE_OPTIMIZER_TARGET_POLICY",
+        "tail_stage_first",
+    )
+    family = str(local_stage_hint.get("family") or "").strip()
+    stage_tags = _local_stage_tags(local_stage_hint)
+    if (
+        target_policy == "tail_stage_first"
+        and family not in {"optimizer_guarded_tail", "tail_guarded"}
+        and not {"tail_sensitive", "optimizer_sensitive"}.issubset(stage_tags)
+    ):
+        return 0
+
+    explicit_target = str(local_stage_hint.get("optimizer_target_chunk") or "").strip().lower()
+    if explicit_target.isdigit():
+        return max(min(int(explicit_target), num_model_chunks - 1), 0)
+
+    layout_tokens = _get_local_pipeline_layout_tokens(num_model_chunks)
+    if explicit_target in {"tail", "last"} or target_policy == "tail_stage_first":
+        for chunk_id, tokens in enumerate(layout_tokens):
+            if "L" in tokens:
+                return int(chunk_id)
+        return num_model_chunks - 1
+
+    return 0
+
+
+def _split_dense_model_chunks_for_optimizer_overlap(
+    model_chunks: List[MegatronModule],
+    *,
+    overlap_with_optimizer_step: bool,
+) -> Tuple[List[List[MegatronModule]], List[bool]]:
+    for chunk_idx, model_chunk in enumerate(model_chunks):
+        setattr(model_chunk, 'optimizer_overlap_chunk_index', int(chunk_idx))
+        setattr(model_chunk, 'optimizer_overlap_target_chunk', False)
+
+    if not overlap_with_optimizer_step or len(model_chunks) <= 1:
+        return [model_chunks], [False]
+
+    target_chunk_idx = max(min(_select_optimizer_overlap_target_chunk(len(model_chunks)), len(model_chunks) - 1), 0)
+    setattr(model_chunks[target_chunk_idx], 'optimizer_overlap_target_chunk', True)
+
+    overlap_group = [model_chunks[target_chunk_idx]]
+    remaining_group = [
+        model_chunk for chunk_idx, model_chunk in enumerate(model_chunks) if chunk_idx != target_chunk_idx
+    ]
+    grouped_model_chunks = [overlap_group]
+    overlap_flags = [True]
+    if remaining_group:
+        grouped_model_chunks.append(remaining_group)
+        overlap_flags.append(False)
+    return grouped_model_chunks, overlap_flags
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -704,13 +865,12 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
-    # Separate out first model chunk if overlapping param AG with optimizer step.
-    if config.overlap_param_gather_with_optimizer_step:
-        all_dense_model_chunks = [[model_chunks[0]], model_chunks[1:]]
-        overlap_param_gather_with_optimizer_step_flags = [True, False]
-    else:
-        all_dense_model_chunks = [model_chunks]
-        overlap_param_gather_with_optimizer_step_flags = [False]
+    all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags = (
+        _split_dense_model_chunks_for_optimizer_overlap(
+            model_chunks,
+            overlap_with_optimizer_step=bool(config.overlap_param_gather_with_optimizer_step),
+        )
+    )
 
     # Setup process groups using helper method
     process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(

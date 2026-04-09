@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import json
 import os
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
@@ -972,6 +973,454 @@ def _get_local_stage_family_hint() -> Dict[str, str]:
     return dict(parsed.get(int(pp_rank)) or {})
 
 
+def _parse_window_override_hints(raw: str) -> List[Dict[str, str]]:
+    parsed: List[Dict[str, str]] = []
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return parsed
+    if not isinstance(payload, list):
+        return parsed
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        phase = str(item.get("phase") or "").strip()
+        window = str(item.get("window") or "").strip()
+        stage_selector = str(item.get("stage_selector") or "").strip()
+        chunk_order_policy = str(item.get("chunk_order_policy") or "").strip()
+        if phase not in {"steady", "cooldown"}:
+            continue
+        if window not in {"last_1_group", "last_2_groups", "cooldown_all", "cooldown_first_group"}:
+            continue
+        if stage_selector not in {"tail_stage", "hotspot_stage", "optimizer_sensitive_stage"}:
+            continue
+        if chunk_order_policy not in {"reverse_chunk_order", "target_chunk_first", "center_out", "edge_interleave"}:
+            continue
+        entry = {
+            "phase": phase,
+            "window": window,
+            "stage_selector": stage_selector,
+            "chunk_order_policy": chunk_order_policy,
+        }
+        for key in (
+            "combined_policy",
+            "p2p_policy",
+            "flush_policy",
+            "checkpoint_policy",
+            "optimizer_target_chunk",
+        ):
+            value = str(item.get(key) or "").strip()
+            if value:
+                entry[key] = value
+        parsed.append(entry)
+    return parsed
+
+
+def _parse_operator_cluster_hints(raw: str) -> Dict[int, List[Dict[str, object]]]:
+    parsed: Dict[int, List[Dict[str, object]]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return parsed
+    if not isinstance(payload, list):
+        return parsed
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            stage_index = int(item.get("stage_index"))
+        except Exception:
+            continue
+        cluster_role = str(item.get("cluster_role") or "").strip()
+        semantic_role = str(item.get("semantic_role") or "").strip()
+        local_priority = str(item.get("local_priority") or "normal").strip()
+        overlap_policy = str(item.get("overlap_policy") or "guarded").strip()
+        memory_policy = str(item.get("memory_policy") or "resident").strip()
+        if cluster_role not in {
+            "attention_comm",
+            "backward_critical",
+            "memory_hotspot",
+            "optimizer_sensitive",
+            "embedding_loss_anchor",
+            "mlp_compute",
+        }:
+            continue
+        if local_priority not in {"high", "normal", "protected"}:
+            continue
+        if overlap_policy not in {"aggressive", "guarded", "disabled"}:
+            continue
+        if memory_policy not in {"resident", "checkpoint", "offload_guarded"}:
+            continue
+        phases: List[str] = []
+        for raw_phase in list(item.get("phases") or []):
+            token = str(raw_phase).strip()
+            if token in {"warmup", "steady", "cooldown"} and token not in phases:
+                phases.append(token)
+        if not phases:
+            phases = ["steady", "cooldown"]
+        entry: Dict[str, object] = {
+            "stage_index": int(stage_index),
+            "cluster_role": cluster_role,
+            "semantic_role": semantic_role or "decoder",
+            "local_priority": local_priority,
+            "overlap_policy": overlap_policy,
+            "memory_policy": memory_policy,
+            "phases": phases,
+        }
+        for key in ("subgraph", "unit_name", "optimizer_target_chunk", "reason"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                entry[key] = value
+        parsed.setdefault(int(stage_index), []).append(entry)
+    return parsed
+
+
+def _get_local_operator_cluster_hints() -> List[Dict[str, object]]:
+    pp_rank, _ = _pipeline_parallel_location()
+    if pp_rank is None:
+        return []
+    parsed = _parse_operator_cluster_hints(os.environ.get("SCHEDULE_OPERATOR_CLUSTER_HINTS", ""))
+    return list(parsed.get(int(pp_rank)) or [])
+
+
+def _cluster_hint_matches_phase(hint: Dict[str, object], phase: str) -> bool:
+    phases = [str(item).strip() for item in list(hint.get("phases") or []) if str(item).strip()]
+    if not phases:
+        phases = ["steady", "cooldown"]
+    return phase in phases
+
+
+def _apply_operator_cluster_hint_chunk_order(
+    order: List[int],
+    *,
+    num_model_chunks: int,
+    phase: str,
+    local_stage_hint: Dict[str, str],
+) -> List[int]:
+    if not order:
+        return order
+    hints = [
+        item
+        for item in _get_local_operator_cluster_hints()
+        if _cluster_hint_matches_phase(item, phase)
+    ]
+    if not hints:
+        return order
+    for hint in hints:
+        cluster_role = str(hint.get("cluster_role") or "")
+        local_priority = str(hint.get("local_priority") or "normal")
+        overlap_policy = str(hint.get("overlap_policy") or "guarded")
+        memory_policy = str(hint.get("memory_policy") or "resident")
+        optimizer_target_chunk = str(hint.get("optimizer_target_chunk") or "").strip().lower()
+        if cluster_role in {"optimizer_sensitive", "backward_critical"} and local_priority == "high":
+            override = {
+                "chunk_order_policy": "target_chunk_first",
+                "optimizer_target_chunk": optimizer_target_chunk or "tail",
+            }
+            order = _apply_chunk_order_policy(
+                order,
+                num_model_chunks=num_model_chunks,
+                local_stage_hint=local_stage_hint,
+                override=override,
+            )
+        elif cluster_role == "memory_hotspot" and memory_policy in {"checkpoint", "offload_guarded"}:
+            override = {"chunk_order_policy": "center_out"}
+            order = _apply_chunk_order_policy(
+                order,
+                num_model_chunks=num_model_chunks,
+                local_stage_hint=local_stage_hint,
+                override=override,
+            )
+        elif cluster_role == "attention_comm" and overlap_policy in {"guarded", "disabled"}:
+            override = {"chunk_order_policy": "edge_interleave"}
+            order = _apply_chunk_order_policy(
+                order,
+                num_model_chunks=num_model_chunks,
+                local_stage_hint=local_stage_hint,
+                override=override,
+            )
+        elif cluster_role == "embedding_loss_anchor" and phase == "cooldown" and local_priority in {"high", "protected"}:
+            override = {"chunk_order_policy": "reverse_chunk_order"}
+            order = _apply_chunk_order_policy(
+                order,
+                num_model_chunks=num_model_chunks,
+                local_stage_hint=local_stage_hint,
+                override=override,
+            )
+    return order
+
+
+def _cluster_hint_for_phase_policy(phase: str, field: str) -> str:
+    for hint in _get_local_operator_cluster_hints():
+        if not _cluster_hint_matches_phase(hint, phase):
+            continue
+        if field == "checkpoint" and str(hint.get("memory_policy") or "") in {"checkpoint", "offload_guarded"}:
+            return "disable_full"
+        if field == "p2p" and str(hint.get("cluster_role") or "") == "attention_comm":
+            overlap_policy = str(hint.get("overlap_policy") or "")
+            if overlap_policy in {"guarded", "disabled"}:
+                return "serial"
+        if field == "combined":
+            overlap_policy = str(hint.get("overlap_policy") or "")
+            memory_policy = str(hint.get("memory_policy") or "")
+            if overlap_policy == "disabled" or memory_policy in {"checkpoint", "offload_guarded"}:
+                return "serial"
+    return ""
+
+
+def _local_stage_matches_selector(local_stage_hint: Dict[str, str], stage_selector: str) -> bool:
+    stage_tags = _local_stage_tags(local_stage_hint)
+    family = str(local_stage_hint.get("family") or "").strip()
+    pp_rank, pp_world_size = _pipeline_parallel_location()
+    if stage_selector == "tail_stage":
+        return (
+            (pp_rank is not None and pp_world_size is not None and pp_rank == (pp_world_size - 1))
+            or "tail_sensitive" in stage_tags
+            or family in {"tail_guarded", "optimizer_guarded_tail"}
+        )
+    if stage_selector == "hotspot_stage":
+        return "memory_hotspot" in stage_tags or family in {"memory_hotspot", "checkpoint_guarded"}
+    if stage_selector == "optimizer_sensitive_stage":
+        return (
+            "optimizer_sensitive" in stage_tags
+            or family == "optimizer_guarded_tail"
+            or bool(str(local_stage_hint.get("optimizer_runtime_mode") or "").strip())
+        )
+    return False
+
+
+def _phase_group_indices(phase: str, num_groups: int) -> List[int]:
+    return [group_index for group_index in range(max(int(num_groups), 0)) if _resolve_group_phase(group_index, num_groups) == phase]
+
+
+def _window_matches_group(phase: str, window: str, group_index: int, num_groups: int) -> bool:
+    phase_groups = _phase_group_indices(phase, num_groups)
+    if not phase_groups:
+        return False
+    if phase == "steady":
+        if window == "last_1_group":
+            return group_index == phase_groups[-1]
+        if window == "last_2_groups":
+            return group_index in phase_groups[-2:]
+        return False
+    if phase == "cooldown":
+        if window == "cooldown_all":
+            return group_index in phase_groups
+        if window == "cooldown_first_group":
+            return group_index == phase_groups[0]
+        return False
+    return False
+
+
+def _matching_window_overrides(
+    *,
+    phase: str,
+    group_index: int,
+    num_groups: int,
+    local_stage_hint: Dict[str, str],
+) -> List[Dict[str, str]]:
+    overrides = _parse_window_override_hints(os.environ.get("SCHEDULE_WINDOW_OVERRIDE_HINTS", ""))
+    if not overrides:
+        return []
+    return [
+        item
+        for item in overrides
+        if str(item.get("phase") or "") == phase
+        and _window_matches_group(phase, str(item.get("window") or ""), group_index, num_groups)
+        and _local_stage_matches_selector(local_stage_hint, str(item.get("stage_selector") or ""))
+    ]
+
+
+def _resolve_optimizer_runtime_value(
+    local_stage_hint: Dict[str, str],
+    stage_key: str,
+    env_key: str,
+    default: str = "",
+) -> str:
+    value = str(local_stage_hint.get(stage_key) or "").strip()
+    if value:
+        return value
+    return str(os.environ.get(env_key, default) or default).strip()
+
+
+def _local_stage_tags(local_stage_hint: Dict[str, str]) -> set[str]:
+    raw = str(local_stage_hint.get("stage_tags") or "").strip()
+    if not raw:
+        return set()
+    return {
+        token.strip()
+        for token in raw.replace(",", "|").split("|")
+        if token.strip()
+    }
+
+
+def _get_local_pipeline_layout_tokens(num_model_chunks: int) -> List[str]:
+    layout = str(os.environ.get("PIPELINE_LAYOUT", "") or "").strip()
+    pp_rank, pp_world_size = _pipeline_parallel_location()
+    if not layout or pp_rank is None or pp_world_size is None or num_model_chunks <= 0:
+        return []
+    stages = [stage.strip() for stage in layout.split("|")]
+    if len(stages) != pp_world_size * num_model_chunks:
+        return []
+    return [
+        stages[(chunk_id * pp_world_size) + pp_rank]
+        for chunk_id in range(num_model_chunks)
+        if (chunk_id * pp_world_size) + pp_rank < len(stages)
+    ]
+
+
+def _resolve_local_optimizer_target_chunk(
+    num_model_chunks: int,
+    local_stage_hint: Dict[str, str],
+) -> Optional[int]:
+    if num_model_chunks <= 1:
+        return None
+    runtime_mode = _resolve_optimizer_runtime_value(
+        local_stage_hint,
+        "optimizer_runtime_mode",
+        "SCHEDULE_OPTIMIZER_RUNTIME_MODE",
+    )
+    if runtime_mode != "tail_guarded_overlap":
+        return None
+
+    target_policy = _resolve_optimizer_runtime_value(
+        local_stage_hint,
+        "optimizer_target_policy",
+        "SCHEDULE_OPTIMIZER_TARGET_POLICY",
+        "tail_stage_first",
+    )
+    family = str(local_stage_hint.get("family") or "").strip()
+    stage_tags = _local_stage_tags(local_stage_hint)
+    if (
+        target_policy == "tail_stage_first"
+        and family not in {"optimizer_guarded_tail", "tail_guarded"}
+        and not {"tail_sensitive", "optimizer_sensitive"}.issubset(stage_tags)
+    ):
+        return None
+
+    explicit_target = str(local_stage_hint.get("optimizer_target_chunk") or "").strip().lower()
+    if explicit_target.isdigit():
+        return max(min(int(explicit_target), num_model_chunks - 1), 0)
+
+    layout_tokens = _get_local_pipeline_layout_tokens(num_model_chunks)
+    if explicit_target in {"tail", "last"} or target_policy == "tail_stage_first":
+        for chunk_id, tokens in enumerate(layout_tokens):
+            if "L" in tokens:
+                return int(chunk_id)
+        return num_model_chunks - 1
+
+    return None
+
+
+def _apply_optimizer_windowed_chunk_order(
+    order: List[int],
+    *,
+    num_model_chunks: int,
+    phase: str,
+    group_index: int,
+    num_groups: int,
+    local_stage_hint: Dict[str, str],
+) -> List[int]:
+    if not order or phase == "warmup":
+        return order
+    window_policy = _resolve_optimizer_runtime_value(
+        local_stage_hint,
+        "optimizer_window_policy",
+        "SCHEDULE_OPTIMIZER_WINDOW_POLICY",
+    )
+    if window_policy != "tail_flush_aligned":
+        return order
+    if group_index < max(num_groups - 2, 0):
+        return order
+    target_chunk = _resolve_local_optimizer_target_chunk(num_model_chunks, local_stage_hint)
+    if target_chunk is None or target_chunk not in order:
+        return order
+    return [target_chunk] + [chunk_id for chunk_id in order if chunk_id != target_chunk]
+
+
+def _apply_chunk_order_policy(
+    order: List[int],
+    *,
+    num_model_chunks: int,
+    local_stage_hint: Dict[str, str],
+    override: Dict[str, str],
+) -> List[int]:
+    if not order:
+        return order
+    policy = str(override.get("chunk_order_policy") or "").strip()
+    if policy == "reverse_chunk_order":
+        return list(reversed(order))
+    if policy == "target_chunk_first":
+        target_chunk_hint = str(override.get("optimizer_target_chunk") or "").strip().lower()
+        target_chunk = _resolve_local_optimizer_target_chunk(num_model_chunks, local_stage_hint)
+        if target_chunk_hint.isdigit():
+            target_chunk = max(min(int(target_chunk_hint), num_model_chunks - 1), 0)
+        elif target_chunk_hint in {"tail", "last"} and target_chunk is None:
+            target_chunk = num_model_chunks - 1
+        elif target_chunk_hint in {"head", "first"}:
+            target_chunk = 0
+        if target_chunk is None or target_chunk not in order:
+            return order
+        return [target_chunk] + [chunk_id for chunk_id in order if chunk_id != target_chunk]
+    if policy == "center_out":
+        center_order = _center_out_order(num_model_chunks)
+        return [chunk_id for chunk_id in center_order if chunk_id in order]
+    if policy == "edge_interleave":
+        return _edge_interleave(order)
+    return order
+
+
+def _apply_window_override_chunk_order(
+    order: List[int],
+    *,
+    num_model_chunks: int,
+    phase: str,
+    group_index: int,
+    num_groups: int,
+    local_stage_hint: Dict[str, str],
+) -> List[int]:
+    matched_overrides = _matching_window_overrides(
+        phase=phase,
+        group_index=group_index,
+        num_groups=num_groups,
+        local_stage_hint=local_stage_hint,
+    )
+    for override in matched_overrides:
+        order = _apply_chunk_order_policy(
+            order,
+            num_model_chunks=num_model_chunks,
+            local_stage_hint=local_stage_hint,
+            override=override,
+        )
+    return order
+
+
+def _resolve_window_override_value(
+    *,
+    phase: str,
+    group_index: int,
+    num_groups: int,
+    local_stage_hint: Dict[str, str],
+    key: str,
+) -> str:
+    for override in _matching_window_overrides(
+        phase=phase,
+        group_index=group_index,
+        num_groups=num_groups,
+        local_stage_hint=local_stage_hint,
+    ):
+        value = str(override.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _get_structure_aware_chunk_metadata(num_model_chunks: int) -> Optional[List[Dict[str, int]]]:
     pp_rank, pp_world_size = _pipeline_parallel_location()
     per_stage_hints = _parse_stage_chunk_priority_hints(
@@ -1072,6 +1521,9 @@ def _resolve_model_chunk_order(
     phase: str,
     warmup_policy: str,
     cooldown_policy: str,
+    group_index: int,
+    num_groups: int,
+    local_stage_hint: Dict[str, str],
 ) -> List[int]:
     order = _base_model_chunk_order(num_model_chunks, template)
 
@@ -1107,7 +1559,28 @@ def _resolve_model_chunk_order(
         } or dispatch_order in {"tail_boundary_rewrite", "zero_bubble_proxy"}:
             order = list(reversed(order))
 
-    return order
+    order = _apply_optimizer_windowed_chunk_order(
+        order,
+        num_model_chunks=num_model_chunks,
+        phase=phase,
+        group_index=group_index,
+        num_groups=num_groups,
+        local_stage_hint=local_stage_hint,
+    )
+    order = _apply_operator_cluster_hint_chunk_order(
+        order,
+        num_model_chunks=num_model_chunks,
+        phase=phase,
+        local_stage_hint=local_stage_hint,
+    )
+    return _apply_window_override_chunk_order(
+        order,
+        num_model_chunks=num_model_chunks,
+        phase=phase,
+        group_index=group_index,
+        num_groups=num_groups,
+        local_stage_hint=local_stage_hint,
+    )
 
 
 def _parse_explicit_flush_microbatch_ids(raw: str, valid_ids: List[int]) -> List[int]:
@@ -1141,11 +1614,30 @@ def _resolve_microbatch_order(
     cooldown_policy: str,
     flush_order_policy: str,
     explicit_flush_ids: str,
+    local_stage_hint: Optional[Dict[str, str]] = None,
+    group_index: int = 0,
+    num_groups: int = 1,
 ) -> List[int]:
     if not microbatch_ids:
         return []
+    local_stage_hint = dict(local_stage_hint or {})
 
     if phase == "cooldown":
+        override_flush_policy = _resolve_window_override_value(
+            phase=phase,
+            group_index=group_index,
+            num_groups=num_groups,
+            local_stage_hint=local_stage_hint,
+            key="flush_policy",
+        ).lower()
+        if override_flush_policy in {
+            "reverse_last_group",
+            "tail_checkpoint_guard",
+            "optimizer_tail_hide",
+            "tail_min",
+            "opt_prioritized",
+        }:
+            return list(reversed(microbatch_ids))
         explicit = _parse_explicit_flush_microbatch_ids(explicit_flush_ids, microbatch_ids)
         if explicit:
             return explicit
@@ -1190,6 +1682,9 @@ def _resolve_phase_checkpoint_policy(phase: str, default_value):
             os.environ.get(f"SCHEDULE_{phase.upper()}_CHECKPOINT_POLICY", "default") or "default"
         ).strip().lower()
     if raw in {"", "default", "inherit"}:
+        cluster_hint = _cluster_hint_for_phase_policy(phase, "checkpoint")
+        if cluster_hint == "disable_full":
+            return False
         return default_value
     if raw in {"full", "all", "force_full"}:
         return True
@@ -1206,6 +1701,9 @@ def _phase_uses_p2p_overlap(phase: str, default_enabled: bool) -> bool:
     if not raw:
         raw = str(os.environ.get(f"SCHEDULE_{phase.upper()}_P2P_POLICY", "default") or "default").strip().lower()
     if raw in {"", "default", "inherit", "overlap", "on", "enabled"}:
+        cluster_hint = _cluster_hint_for_phase_policy(phase, "p2p")
+        if cluster_hint == "serial":
+            return False
         return True
     if raw in {"serial", "off", "none", "defer", "disabled"}:
         return False
@@ -1236,6 +1734,9 @@ def _phase_uses_combined_overlap(phase: str, default_enabled: bool = True) -> bo
             os.environ.get(f"SCHEDULE_{phase.upper()}_COMBINED_POLICY", "default") or "default"
         ).strip().lower()
     if raw in {"", "default", "inherit", "combined", "overlap", "enabled", "on"}:
+        cluster_hint = _cluster_hint_for_phase_policy(phase, "combined")
+        if cluster_hint == "serial":
+            return False
         return True
     if raw in {"serial", "off", "none", "disabled"}:
         return False
@@ -1264,9 +1765,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
 
     schedule_table = []
     group_starts = list(range(0, num_microbatches, microbatch_group_size_per_vp_stage))
-    for group_index, min_microbatch_id_in_group in enumerate(
-        group_starts
-    ):
+    for group_index, min_microbatch_id_in_group in enumerate(group_starts):
         phase = _resolve_group_phase(group_index, len(group_starts))
         max_microbatch_id = min(
             min_microbatch_id_in_group + microbatch_group_size_per_vp_stage, num_microbatches
@@ -1278,6 +1777,9 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
             phase=phase,
             warmup_policy=warmup_policy,
             cooldown_policy=cooldown_policy,
+            group_index=group_index,
+            num_groups=len(group_starts),
+            local_stage_hint=local_stage_hint,
         )
         ordered_microbatch_ids = _resolve_microbatch_order(
             list(range(min_microbatch_id_in_group, max_microbatch_id)),
@@ -1286,6 +1788,9 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
             cooldown_policy=cooldown_policy,
             flush_order_policy=flush_order_policy,
             explicit_flush_ids=explicit_flush_ids,
+            local_stage_hint=local_stage_hint,
+            group_index=group_index,
+            num_groups=len(group_starts),
         )
         for model_chunk_id in model_chunk_order:
             for microbatch_id in ordered_microbatch_ids:

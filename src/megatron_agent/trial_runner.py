@@ -431,20 +431,36 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     context_record = dict(metrics.get("context_record") or {})
     visualization = dict(artifact.get("visualization_artifacts") or {})
     perfetto_trace = dict(visualization.get("perfetto_trace") or {})
+    pipeline_schedule_projection = dict(visualization.get("pipeline_schedule_projection") or {})
+    pipeline_projection_svg = dict(visualization.get("pipeline_projection_svg") or {})
     search_space_blueprint = dict(artifact.get("search_space_blueprint") or {})
     bottleneck_breakdown = list(artifact.get("bottleneck_breakdown") or [])
+    critical_operator_clusters = list(artifact.get("critical_operator_clusters") or [])
 
     outputs = {
         "trial_artifact_json": str(artifact_dir / "trial_artifact.json"),
         "context_record_json": str(artifact_dir / "context_record.json"),
         "perfetto_trace_json": str(artifact_dir / "perfetto_trace.json"),
+        "pipeline_schedule_projection_json": str(artifact_dir / "pipeline_schedule_projection.json"),
+        "pipeline_projection_svg": str(artifact_dir / "pipeline_projection.svg"),
         "search_space_blueprint_json": str(artifact_dir / "search_space_blueprint.json"),
         "bottleneck_breakdown_json": str(artifact_dir / "bottleneck_breakdown.json"),
+        "critical_operator_clusters_json": str(artifact_dir / "critical_operator_clusters.json"),
     }
     Path(outputs["trial_artifact_json"]).write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
     Path(outputs["context_record_json"]).write_text(json.dumps(context_record, indent=2, ensure_ascii=False), encoding="utf-8")
     if perfetto_trace:
         Path(outputs["perfetto_trace_json"]).write_text(json.dumps(perfetto_trace, indent=2, ensure_ascii=False), encoding="utf-8")
+    if pipeline_schedule_projection:
+        Path(outputs["pipeline_schedule_projection_json"]).write_text(
+            json.dumps(pipeline_schedule_projection, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if str(pipeline_projection_svg.get("content") or "").strip():
+        Path(outputs["pipeline_projection_svg"]).write_text(
+            str(pipeline_projection_svg.get("content") or ""),
+            encoding="utf-8",
+        )
     if search_space_blueprint:
         Path(outputs["search_space_blueprint_json"]).write_text(
             json.dumps(search_space_blueprint, indent=2, ensure_ascii=False),
@@ -453,6 +469,11 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     if bottleneck_breakdown:
         Path(outputs["bottleneck_breakdown_json"]).write_text(
             json.dumps(bottleneck_breakdown, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if critical_operator_clusters:
+        Path(outputs["critical_operator_clusters_json"]).write_text(
+            json.dumps(critical_operator_clusters, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
     return outputs
@@ -765,12 +786,76 @@ def _moe_shape_args(args: argparse.Namespace, program: MegatronProgram, strategy
     return shape_args
 
 
-def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy: MegatronStrategy, trial_id: int) -> List[str]:
+def _env_flag_enabled(env: Dict[str, str], key: str, default: bool = False) -> bool:
+    raw = env.get(key)
+    if raw is None:
+        return bool(default)
+    token = str(raw).strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _env_csv_tokens(env: Dict[str, str], key: str) -> List[str]:
+    raw = str(env.get(key) or "").strip()
+    if not raw:
+        return []
+    tokens: List[str] = []
+    for part in raw.replace(",", " ").split():
+        token = str(part).strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _training_args(
+    args: argparse.Namespace,
+    program: MegatronProgram,
+    strategy: MegatronStrategy,
+    trial_id: int,
+    launcher_env: Optional[Dict[str, str]] = None,
+) -> List[str]:
     output_dirs = _trial_output_dirs(args, trial_id)
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
     backend_caps = _resolve_backend_caps(args, program)
     transformer_impl = backend_caps["transformer_impl"]
     sequence_parallel_active = _sequence_parallel_active(args, program, strategy)
+    launcher_env = dict(launcher_env or {})
+    enable_distributed_optimizer = _env_flag_enabled(launcher_env, "ENABLE_DISTRIBUTED_OPTIMIZER", True)
+    enable_overlap_grad_reduce = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_OVERLAP_GRAD_REDUCE",
+        enable_distributed_optimizer,
+    )
+    enable_overlap_param_gather = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_OVERLAP_PARAM_GATHER",
+        enable_distributed_optimizer,
+    )
+    enable_overlap_param_gather_with_optimizer_step = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP",
+        False,
+    )
+    runtime_recompute_granularity = str(
+        launcher_env.get("RECOMPUTE_GRANULARITY") or strategy.recompute_granularity or ""
+    ).strip()
+    enable_recompute_activations = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_RECOMPUTE_ACTIVATIONS",
+        bool(runtime_recompute_granularity),
+    )
+    runtime_recompute_modules = _env_csv_tokens(launcher_env, "RECOMPUTE_MODULES")
+    if not runtime_recompute_modules and runtime_recompute_granularity == "selective":
+        runtime_recompute_modules = ["core_attn"]
+    enable_fine_grained_activation_offloading = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING",
+        False,
+    )
+    runtime_offload_modules = _env_csv_tokens(launcher_env, "OFFLOAD_MODULES")
     common = [
         "--use-mcore-models",
         "--transformer-impl",
@@ -802,9 +887,6 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         "--adam-eps",
         str(args.adam_eps),
         "--calculate-per-token-loss",
-        "--use-distributed-optimizer",
-        "--overlap-grad-reduce",
-        "--overlap-param-gather",
         "--log-interval",
         str(int(args.log_interval)),
         "--timing-log-level",
@@ -821,14 +903,28 @@ def _training_args(args: argparse.Namespace, program: MegatronProgram, strategy:
         "--data-cache-path",
         output_dirs["data_cache_path"],
     ]
+    if enable_distributed_optimizer:
+        common.append("--use-distributed-optimizer")
+    if enable_overlap_grad_reduce:
+        common.append("--overlap-grad-reduce")
+    if enable_overlap_param_gather:
+        common.append("--overlap-param-gather")
+    if enable_overlap_param_gather_with_optimizer_step:
+        common.append("--overlap-param-gather-with-optimizer-step")
     if strategy.use_bf16:
         common.append("--bf16")
     elif strategy.use_fp16:
         common.append("--fp16")
-    if strategy.recompute_granularity:
-        common += ["--recompute-granularity", str(strategy.recompute_granularity)]
-        if str(strategy.recompute_granularity) == "selective":
-            common += ["--recompute-activations", "--recompute-modules", "core_attn"]
+    if runtime_recompute_granularity:
+        common += ["--recompute-granularity", runtime_recompute_granularity]
+    if enable_recompute_activations:
+        common.append("--recompute-activations")
+    if runtime_recompute_modules:
+        common += ["--recompute-modules", *runtime_recompute_modules]
+    if enable_fine_grained_activation_offloading:
+        common.append("--fine-grained-activation-offloading")
+        if runtime_offload_modules:
+            common += ["--offload-modules", *runtime_offload_modules]
     if not backend_caps["supports_sequence_parallel"]:
         common.append("--no-gradient-accumulation-fusion")
     if args.enable_tp_comm_overlap:
@@ -990,7 +1086,7 @@ def _build_megatron_cmd(
         _moe_shape_args(args, program, strategy) if program.model.track == "moe" else _dense_shape_args(args, program, strategy)
     )
     cmd += shape_args
-    cmd += _training_args(args, program, strategy, trial_id)
+    cmd += _training_args(args, program, strategy, trial_id, launcher_env=compiled.launcher_env)
     cmd += _data_args(args, program)
     cmd += _load_args_from_file(args.megatron_args_file)
     if args.megatron_args:

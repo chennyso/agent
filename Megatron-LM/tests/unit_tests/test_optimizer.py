@@ -12,12 +12,14 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
+    _split_dense_model_chunks_for_optimizer_overlap,
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
@@ -361,6 +363,75 @@ def test_chained_optimizer_get_parameters():
 
     assert len(result) == len(all_params)
     assert result == opt1.params + opt2.params + opt3.params
+
+
+def test_split_dense_model_chunks_for_optimizer_overlap_defaults_to_first_chunk(monkeypatch):
+    class DummyChunk:
+        pass
+
+    chunks = [DummyChunk(), DummyChunk(), DummyChunk()]
+    monkeypatch.delenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", raising=False)
+    monkeypatch.delenv("SCHEDULE_STAGE_FAMILY_HINTS", raising=False)
+    groups, flags = _split_dense_model_chunks_for_optimizer_overlap(
+        chunks,
+        overlap_with_optimizer_step=True,
+    )
+
+    assert groups[0] == [chunks[0]]
+    assert flags == [True, False]
+    assert getattr(chunks[0], "optimizer_overlap_target_chunk", False) is True
+
+
+def test_split_dense_model_chunks_for_optimizer_overlap_targets_tail_chunk(monkeypatch):
+    class DummyChunk:
+        pass
+
+    chunks = [DummyChunk(), DummyChunk(), DummyChunk()]
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv(
+        "SCHEDULE_STAGE_FAMILY_HINTS",
+        "1,family=optimizer_guarded_tail,optimizer_runtime_mode=tail_guarded_overlap,optimizer_target_policy=tail_stage_first,optimizer_target_chunk=tail",
+    )
+    monkeypatch.setenv("PIPELINE_LAYOUT", "Et|t|t|t|t|tL")
+
+    with patch.object(parallel_state, "model_parallel_is_initialized", return_value=True):
+        with patch.object(parallel_state, "get_pipeline_model_parallel_rank", return_value=1):
+            with patch.object(parallel_state, "get_pipeline_model_parallel_world_size", return_value=2):
+                groups, flags = _split_dense_model_chunks_for_optimizer_overlap(
+                    chunks,
+                    overlap_with_optimizer_step=True,
+                )
+
+    assert groups[0] == [chunks[2]]
+    assert flags == [True, False]
+    assert getattr(chunks[2], "optimizer_overlap_target_chunk", False) is True
+
+
+def test_split_dense_model_chunks_for_optimizer_overlap_respects_stage_tags(monkeypatch):
+    class DummyChunk:
+        pass
+
+    chunks = [DummyChunk(), DummyChunk(), DummyChunk()]
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv(
+        "SCHEDULE_STAGE_FAMILY_HINTS",
+        "1,family=balanced_interleave,stage_tags=tail_sensitive|optimizer_sensitive,optimizer_runtime_mode=tail_guarded_overlap,optimizer_target_policy=tail_stage_first,optimizer_target_chunk=tail",
+    )
+    monkeypatch.setenv("PIPELINE_LAYOUT", "Et|t|t|t|t|tL")
+
+    with patch.object(parallel_state, "model_parallel_is_initialized", return_value=True):
+        with patch.object(parallel_state, "get_pipeline_model_parallel_rank", return_value=1):
+            with patch.object(parallel_state, "get_pipeline_model_parallel_world_size", return_value=2):
+                groups, flags = _split_dense_model_chunks_for_optimizer_overlap(
+                    chunks,
+                    overlap_with_optimizer_step=True,
+                )
+
+    assert groups[0] == [chunks[2]]
+    assert flags == [True, False]
+    assert getattr(chunks[2], "optimizer_overlap_target_chunk", False) is True
 
 
 def test_precision_aware_fused_adam():

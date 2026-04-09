@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import json
 import os
 
 import pytest
@@ -53,6 +54,334 @@ def test_stage_family_hints_override_local_dispatch(monkeypatch, mocker):
     schedule_table = schedule.get_schedule_table(4, 2, 2)
 
     assert schedule_table[:4] == [(0, 1), (1, 1), (0, 0), (1, 0)]
+
+
+def test_optimizer_window_policy_prioritizes_tail_chunk_on_target_stage(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_WINDOW_POLICY", "tail_flush_aligned")
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="optimizer_tail_guarded",
+        phase="cooldown",
+        warmup_policy="balanced_fill",
+        cooldown_policy="optimizer_tail_hide",
+        group_index=2,
+        num_groups=3,
+        local_stage_hint={
+            "family": "optimizer_guarded_tail",
+            "optimizer_runtime_mode": "tail_guarded_overlap",
+            "optimizer_target_policy": "tail_stage_first",
+            "optimizer_window_policy": "tail_flush_aligned",
+            "optimizer_target_chunk": "tail",
+        },
+    )
+
+    assert order == [2, 0, 1]
+
+
+def test_optimizer_window_policy_uses_stage_tags_for_target_stage(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_WINDOW_POLICY", "tail_flush_aligned")
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="optimizer_tail_guarded",
+        phase="cooldown",
+        warmup_policy="balanced_fill",
+        cooldown_policy="optimizer_tail_hide",
+        group_index=2,
+        num_groups=3,
+        local_stage_hint={
+            "family": "balanced_interleave",
+            "stage_tags": "tail_sensitive|optimizer_sensitive",
+            "optimizer_runtime_mode": "tail_guarded_overlap",
+            "optimizer_target_policy": "tail_stage_first",
+            "optimizer_window_policy": "tail_flush_aligned",
+            "optimizer_target_chunk": "tail",
+        },
+    )
+
+    assert order == [2, 0, 1]
+
+
+def test_optimizer_window_policy_preserves_non_target_stage(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_WINDOW_POLICY", "tail_flush_aligned")
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="optimizer_tail_guarded",
+        phase="cooldown",
+        warmup_policy="balanced_fill",
+        cooldown_policy="optimizer_tail_hide",
+        group_index=2,
+        num_groups=3,
+        local_stage_hint={"family": "balanced_interleave"},
+    )
+
+    assert order == [0, 2, 1]
+
+
+def test_optimizer_window_policy_no_runtime_mode_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", raising=False)
+    monkeypatch.delenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", raising=False)
+    monkeypatch.delenv("SCHEDULE_OPTIMIZER_WINDOW_POLICY", raising=False)
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="optimizer_tail_guarded",
+        phase="cooldown",
+        warmup_policy="balanced_fill",
+        cooldown_policy="optimizer_tail_hide",
+        group_index=2,
+        num_groups=3,
+        local_stage_hint={"family": "optimizer_guarded_tail"},
+    )
+
+    assert order == [0, 2, 1]
+
+
+def test_window_override_tail_stage_affects_only_last_steady_group(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_WINDOW_OVERRIDE_HINTS",
+        json.dumps(
+            [
+                {
+                    "phase": "steady",
+                    "window": "last_1_group",
+                    "stage_selector": "tail_stage",
+                    "chunk_order_policy": "reverse_chunk_order",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setenv("SCHEDULE_STAGE_FAMILY_HINTS", "1,family=tail_guarded,stage_tags=tail_sensitive")
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(4, 2, 1)
+
+    assert schedule_table == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1),
+        (2, 1), (2, 0),
+        (3, 0), (3, 1),
+    ]
+
+
+def test_window_override_optimizer_stage_affects_last_two_steady_groups_and_cooldown(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_WINDOW_OVERRIDE_HINTS",
+        json.dumps(
+            [
+                {
+                    "phase": "steady",
+                    "window": "last_2_groups",
+                    "stage_selector": "optimizer_sensitive_stage",
+                    "chunk_order_policy": "target_chunk_first",
+                    "optimizer_target_chunk": "tail",
+                },
+                {
+                    "phase": "cooldown",
+                    "window": "cooldown_first_group",
+                    "stage_selector": "optimizer_sensitive_stage",
+                    "chunk_order_policy": "target_chunk_first",
+                    "optimizer_target_chunk": "tail",
+                    "flush_policy": "optimizer_tail_hide",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_RUNTIME_MODE", "tail_guarded_overlap")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_TARGET_POLICY", "tail_stage_first")
+    monkeypatch.setenv(
+        "SCHEDULE_STAGE_FAMILY_HINTS",
+        (
+            "1,family=optimizer_guarded_tail,stage_tags=tail_sensitive|optimizer_sensitive,"
+            "optimizer_runtime_mode=tail_guarded_overlap,optimizer_target_policy=tail_stage_first,"
+            "optimizer_target_chunk=tail"
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(5, 2, 1)
+
+    assert schedule_table == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1),
+        (2, 1), (2, 0),
+        (3, 1), (3, 0),
+        (4, 1), (4, 0),
+    ]
+
+
+def test_window_override_hotspot_cooldown_guard_changes_only_cooldown(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_WINDOW_OVERRIDE_HINTS",
+        json.dumps(
+            [
+                {
+                    "phase": "cooldown",
+                    "window": "cooldown_all",
+                    "stage_selector": "hotspot_stage",
+                    "chunk_order_policy": "reverse_chunk_order",
+                    "checkpoint_policy": "guarded_selective",
+                    "combined_policy": "serial",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setenv("SCHEDULE_STAGE_FAMILY_HINTS", "1,family=memory_hotspot,stage_tags=memory_hotspot")
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(4, 2, 1)
+
+    assert schedule_table == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1),
+        (2, 0), (2, 1),
+        (3, 1), (3, 0),
+    ]
+
+
+def test_window_override_preserves_non_target_stage(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_WINDOW_OVERRIDE_HINTS",
+        json.dumps(
+            [
+                {
+                    "phase": "steady",
+                    "window": "last_1_group",
+                    "stage_selector": "tail_stage",
+                    "chunk_order_policy": "reverse_chunk_order",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setenv("SCHEDULE_STAGE_FAMILY_HINTS", "1,family=tail_guarded,stage_tags=tail_sensitive")
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=0)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    schedule_table = schedule.get_schedule_table(4, 2, 1)
+
+    assert schedule_table == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1),
+        (2, 0), (2, 1),
+        (3, 0), (3, 1),
+    ]
+
+
+def test_operator_cluster_optimizer_sensitive_prioritizes_target_chunk(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_OPERATOR_CLUSTER_HINTS",
+        json.dumps(
+            [
+                {
+                    "stage_index": 1,
+                    "cluster_role": "optimizer_sensitive",
+                    "semantic_role": "attention_block",
+                    "local_priority": "high",
+                    "overlap_policy": "guarded",
+                    "memory_policy": "resident",
+                    "phases": ["steady"],
+                    "optimizer_target_chunk": "tail",
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="default",
+        phase="steady",
+        warmup_policy="default",
+        cooldown_policy="default",
+        group_index=1,
+        num_groups=3,
+        local_stage_hint={},
+    )
+
+    assert order == [2, 0, 1]
+
+
+def test_operator_cluster_memory_hotspot_biases_cooldown_center_out(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_OPERATOR_CLUSTER_HINTS",
+        json.dumps(
+            [
+                {
+                    "stage_index": 1,
+                    "cluster_role": "memory_hotspot",
+                    "semantic_role": "attention_block",
+                    "local_priority": "protected",
+                    "overlap_policy": "disabled",
+                    "memory_policy": "checkpoint",
+                    "phases": ["cooldown"],
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    order = schedule._resolve_model_chunk_order(
+        3,
+        template="fixed_1f1b",
+        dispatch_order="default",
+        phase="cooldown",
+        warmup_policy="default",
+        cooldown_policy="default",
+        group_index=2,
+        num_groups=3,
+        local_stage_hint={},
+    )
+
+    assert order == [1, 2, 0]
+
+
+def test_operator_cluster_attention_comm_can_disable_phase_overlap(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_OPERATOR_CLUSTER_HINTS",
+        json.dumps(
+            [
+                {
+                    "stage_index": 1,
+                    "cluster_role": "attention_comm",
+                    "semantic_role": "attention_block",
+                    "local_priority": "protected",
+                    "overlap_policy": "guarded",
+                    "memory_policy": "checkpoint",
+                    "phases": ["steady", "cooldown"],
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    assert schedule._phase_uses_p2p_overlap("steady", True) is False
+    assert schedule._phase_uses_combined_overlap("cooldown", True) is False
 
 
 def _populate_embedding_and_position_groups(pp_group):

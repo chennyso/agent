@@ -1086,6 +1086,8 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.model_chunks = []
+        self.optimizer_overlap_dispatch_count = 0
+        self.optimizer_overlap_last_target_chunk_index = None
         # chained_optimizers would be empty in the case that a rank
         # has no trainable parameters
         if chained_optimizers:
@@ -1256,7 +1258,27 @@ class ChainedOptimizer(MegatronOptimizer):
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
                 assert success
                 assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+                target_chunk = optimizer.model_chunks[0]
+                self.optimizer_overlap_dispatch_count += 1
+                self.optimizer_overlap_last_target_chunk_index = int(
+                    getattr(target_chunk, 'optimizer_overlap_chunk_index', 0)
+                )
+                setattr(
+                    target_chunk,
+                    'optimizer_overlap_dispatch_count',
+                    int(getattr(target_chunk, 'optimizer_overlap_dispatch_count', 0)) + 1,
+                )
+                if self.config.timers is not None:
+                    self.config.timers(
+                        'optimizer-overlap-param-sync-dispatch',
+                        log_level=2,
+                    ).start()
+                target_chunk.start_param_sync(force_dispatch=True)
+                if self.config.timers is not None:
+                    self.config.timers(
+                        'optimizer-overlap-param-sync-dispatch',
+                        log_level=2,
+                    ).stop()
 
         return success
 
