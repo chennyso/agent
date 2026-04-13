@@ -521,65 +521,55 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(payload["launch_plan"]["launcher_env"]["ENABLE_SP"], "0")
             self.assertNotIn("--sequence-parallel", payload["launch_plan"]["megatron_command"])
 
-    def test_trial_runner_dry_run_emits_optimizer_overlap_runtime_contract(self) -> None:
+    def test_trial_runner_dry_run_stateful_single_g5_emits_window_override_hints(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             megatron_root = tmp / "Megatron-LM"
             megatron_root.mkdir()
             (megatron_root / "pretrain_gpt.py").write_text("print('stub')\n", encoding="utf-8")
 
-            program = default_dense_program("single_g5").normalized()
-            program.parallel.vpp_degree = 2
-            program.layout.vpp_degree = 2
-            program.schedule.template = "interleaved_grouped_g2"
-            program.schedule.skeleton = "stage_aware_grouped"
-            program.schedule.microbatch_group_size_per_vp_stage = 2
-            program.metadata.update(
-                {
-                    "runtime_optimizer_policy_mode": "tail_guarded_overlap",
-                    "runtime_optimizer_target_policy": "tail_stage_first",
-                    "runtime_optimizer_chunk_scope": "tail_only",
-                    "runtime_optimizer_window_policy": "tail_flush_aligned",
-                }
-            )
-            program_path = tmp / "optimizer_runtime.json"
-            output_path = tmp / "optimizer_runtime_dry_run.json"
-            program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
+            program_path = tmp / "stateful_single_g5.json"
+            output_path = tmp / "stateful_single_g5_dry_run.json"
+            program_path.write_text(json.dumps(default_dense_program("single_g5").to_dict(), indent=2), encoding="utf-8")
 
-            with mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "trial_runner.py",
-                    "--program-file",
-                    str(program_path),
-                    "--output",
-                    str(output_path),
-                    "--megatron-root",
-                    str(megatron_root),
-                    "--launcher-script",
-                    "",
-                    "--transformer-impl",
-                    "local",
-                    "--dry-run",
-                ],
-            ):
-                trial_runner.main()
+            with self._mock_runtime_stack():
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "trial_runner.py",
+                        "--program-file",
+                        str(program_path),
+                        "--output",
+                        str(output_path),
+                        "--megatron-root",
+                        str(megatron_root),
+                        "--launcher-script",
+                        "",
+                        "--run-root",
+                        str(tmp / "runs"),
+                        "--dry-run",
+                        "--telemetry-budget",
+                        "summary",
+                        "--window-steps",
+                        "4",
+                        "--enable-stateful-schedule",
+                    ],
+                ):
+                    trial_runner.main()
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
-            cmd = payload["launch_plan"]["megatron_command"]
             env = payload["launch_plan"]["launcher_env"]
-            self.assertEqual(env["ENABLE_DISTRIBUTED_OPTIMIZER"], "1")
-            self.assertEqual(env["ENABLE_OVERLAP_GRAD_REDUCE"], "1")
-            self.assertEqual(env["ENABLE_OVERLAP_PARAM_GATHER"], "1")
-            self.assertEqual(env["ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"], "1")
-            self.assertEqual(env["SCHEDULE_OPTIMIZER_RUNTIME_MODE"], "tail_guarded_overlap")
-            self.assertIn("--use-distributed-optimizer", cmd)
-            self.assertIn("--overlap-grad-reduce", cmd)
-            self.assertIn("--overlap-param-gather", cmd)
-            self.assertIn("--overlap-param-gather-with-optimizer-step", cmd)
+            self.assertEqual(env["ENABLE_STATEFUL_SCHEDULE"], "1")
+            self.assertEqual(env["SCHEDULE_RUNTIME_TRACE_LEVEL"], "summary")
+            self.assertIn("WINDOW_RECONFIG_PLAN", env)
+            self.assertIn("SCHEDULE_WINDOW_OVERRIDE_HINTS", env)
+            self.assertTrue(str(env["SCHEDULE_RUNTIME_TRACE_DIR"]).endswith("runtime_schedule_traces"))
+            overrides = json.loads(env["SCHEDULE_WINDOW_OVERRIDE_HINTS"])
+            self.assertTrue(any(str(item.get("stage_selector") or "") == "hotspot_stage" for item in overrides))
+            self.assertTrue(any(str(item.get("stage_selector") or "") == "optimizer_sensitive_stage" for item in overrides))
 
-    def test_trial_runner_dry_run_deep_observability_emits_profiler_and_wandb_flags(self) -> None:
+    def test_trial_runner_dry_run_emits_optimizer_overlap_runtime_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             megatron_root = tmp / "Megatron-LM"
@@ -1609,6 +1599,57 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertTrue(any(item.get("action_type") == "BWD_ACT" for item in derived_actions))
         self.assertTrue(any(item.get("action_type") == "WAIT" for item in derived_actions))
 
+    def test_compile_program_exports_stateful_plan_payloads(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+
+        compiled = compile_program(program)
+
+        self.assertEqual(compiled.launcher_env["ENABLE_STATEFUL_SCHEDULE"], "1")
+        self.assertIn("SCHEDULE_NODE_SPECS", compiled.launcher_env)
+        self.assertIn("SCHEDULE_EDGE_SPECS", compiled.launcher_env)
+        self.assertIn("STATE_PLAN", compiled.launcher_env)
+        self.assertIn("TELEMETRY_BUDGET", compiled.launcher_env)
+        self.assertIn("WINDOW_RECONFIG_PLAN", compiled.launcher_env)
+        self.assertIn("GLOBAL_STRATEGY_PLAN", compiled.launcher_env)
+        self.assertIn("REWRITE_EXECUTION_PLAN", compiled.launcher_env)
+        self.assertIn("WINDOW_FEEDBACK_PLAN", compiled.launcher_env)
+        self.assertGreater(len(compiled.stateful_schedule_nodes), 0)
+        self.assertGreater(len(compiled.stateful_schedule_edges), 0)
+        self.assertGreater(len(list((compiled.state_plan or {}).get("objects") or [])), 0)
+        self.assertEqual(str((compiled.telemetry_budget or {}).get("level") or ""), "summary")
+        global_strategy = json.loads(compiled.launcher_env["GLOBAL_STRATEGY_PLAN"])
+        rewrite_plan = json.loads(compiled.launcher_env["REWRITE_EXECUTION_PLAN"])
+        window_feedback_plan = json.loads(compiled.launcher_env["WINDOW_FEEDBACK_PLAN"])
+        self.assertEqual(str(global_strategy.get("primary_parallel_mode") or ""), "pp_vpp")
+        self.assertEqual(str((rewrite_plan.get("global_strategy") or {}).get("primary_parallel_mode") or ""), "pp_vpp")
+        self.assertIn("recommended_rewrites", window_feedback_plan)
+
+    def test_megatron_program_normalized_derives_global_strategy_and_rewrite_plan(self) -> None:
+        program = default_dense_program("single_g5")
+        program.global_strategy_plan = None
+        program.rewrite_plan = None
+
+        restored = type(program).from_dict(program.to_dict()).normalized()
+
+        self.assertIsNotNone(restored.global_strategy_plan)
+        self.assertIsNotNone(restored.rewrite_plan)
+        self.assertEqual(restored.global_strategy_plan.primary_parallel_mode, "pp_vpp")
+        self.assertEqual(restored.global_strategy_plan.stage_count, restored.parallel.pp_degree)
+        self.assertEqual(restored.rewrite_plan.global_strategy.primary_parallel_mode, "pp_vpp")
+        self.assertEqual(restored.rewrite_plan.telemetry_budget.level, "summary")
+        self.assertEqual(restored.rewrite_plan.window_reconfig.window_steps, 4)
+
+    def test_stateful_default_is_activation_centric(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+
+        compiled = compile_program(program)
+        state_objects = list((compiled.state_plan or {}).get("objects") or [])
+        state_types = {str(item.get("state_type") or "") for item in state_objects}
+
+        self.assertIn("activation", state_types)
+        self.assertNotIn("parameter", state_types)
+        self.assertNotIn("optimizer", state_types)
+
     def test_runtime_action_view_parses_grid_and_action_specs(self) -> None:
         from megatron.core.pipeline_parallel import schedules as pp_schedules
 
@@ -1656,6 +1697,30 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(action_view["action_count"], 1)
         self.assertIn("dualpipe_v", registry)
         self.assertEqual(registry["dualpipe_v"]["steady_rule"], "dualpipe_overlap")
+
+    def test_schedule_runtime_policy_parses_telemetry_budget(self) -> None:
+        from megatron.core.pipeline_parallel import schedules as pp_schedules
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TELEMETRY_BUDGET": json.dumps(
+                    {
+                        "level": "summary",
+                        "max_trace_mb": 64,
+                        "max_events_per_rank": 4096,
+                        "sampled_windows": 1,
+                        "emit_compare_svg": False,
+                    }
+                ),
+            },
+            clear=False,
+        ):
+            policy = pp_schedules.get_schedule_runtime_policy()
+
+        self.assertEqual(policy["telemetry_budget"]["level"], "summary")
+        self.assertEqual(policy["telemetry_budget"]["max_trace_mb"], 64)
+        self.assertEqual(policy["telemetry_budget"]["max_events_per_rank"], 4096)
 
     def test_schedule_action_runner_writes_runtime_trace(self) -> None:
         from megatron.core.pipeline_parallel import schedules as pp_schedules
@@ -1709,6 +1774,41 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue(any(item.get("action_type") == "COMM" for item in payload["events"]))
             self.assertGreaterEqual(float((payload.get("metrics") or {}).get("comm_ms") or 0.0), 0.0)
 
+    def test_schedule_action_runner_summary_mode_omits_full_events(self) -> None:
+        from megatron.core.pipeline_parallel import schedules as pp_schedules
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SCHEDULE_RUNTIME_TRACE_DIR": tmpdir,
+                    "SCHEDULE_FAMILY": "fixed_1f1b",
+                    "TELEMETRY_BUDGET": json.dumps(
+                        {
+                            "level": "summary",
+                            "max_trace_mb": 16,
+                            "max_events_per_rank": 8,
+                            "sampled_windows": 1,
+                            "emit_compare_svg": False,
+                        }
+                    ),
+                },
+                clear=False,
+            ):
+                with mock.patch.object(pp_schedules.parallel_state, "model_parallel_is_initialized", return_value=True):
+                    with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_rank", return_value=0):
+                        with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2):
+                            runner = pp_schedules.get_schedule_action_runner(force_reset=True)
+                            runner.set_context(microbatch_id=0, vchunk_id=0, lane_id=0)
+                            token = runner.begin_action("FWD", microbatch_id=0, vchunk_id=0, phase="steady")
+                            runner.end_action(token)
+                            trace_path = runner.flush()
+                            payload = json.loads(Path(str(trace_path)).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["telemetry"]["effective_level"], "summary")
+        self.assertEqual(payload["events"], [])
+        self.assertGreaterEqual(float((payload.get("metrics") or {}).get("observed_action_count") or 0.0), 1.0)
+
     def test_trial_runner_loads_runtime_schedule_traces(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             trace_dir = Path(tmpdir) / "runtime_schedule_traces"
@@ -1729,6 +1829,53 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(len(traces), 1)
         self.assertEqual(traces[0]["family"], "zero_bubble")
         self.assertTrue(str(traces[0]["artifact_path"]).endswith(".json"))
+
+    def test_trial_runner_skips_oversized_runtime_schedule_trace_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_dir = Path(tmpdir) / "runtime_schedule_traces"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            huge_path = trace_dir / "schedule_runtime_trace_rank000_stage000.json"
+            with huge_path.open("wb") as handle:
+                handle.truncate(129 * 1024 * 1024)
+
+            traces = trial_runner._load_runtime_schedule_traces({"runtime_trace_dir": str(trace_dir)})
+
+        self.assertEqual(len(traces), 1)
+        self.assertTrue(bool(traces[0].get("skipped_due_to_size")))
+        self.assertEqual(str((traces[0].get("telemetry") or {}).get("effective_level") or ""), "summary")
+
+    def test_write_analysis_artifacts_emits_window_feedback_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dirs = {
+                "trial_dir": str(root / "trial_000"),
+                "analysis_dir": str(root / "trial_000" / "analysis"),
+            }
+            metrics = {
+                "trial_artifact": {},
+                "context_record": {},
+                "trace_summary": {},
+                "returncode": 0,
+                "window_feedback": {
+                    "window_index": 1,
+                    "policy_signature": "sig-window",
+                    "critical_component_type": "reload",
+                    "rollback_triggered": True,
+                },
+                "window_feedback_history": [
+                    {"window_index": 0, "policy_signature": "sig-window"},
+                    {"window_index": 1, "policy_signature": "sig-window", "rollback_triggered": True},
+                ],
+            }
+
+            outputs = trial_runner._write_analysis_artifacts(output_dirs, metrics)
+
+            window_feedback = json.loads(Path(outputs["window_feedback_json"]).read_text(encoding="utf-8"))
+            history = json.loads(Path(outputs["window_feedback_history_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(window_feedback["policy_signature"], "sig-window")
+            self.assertTrue(window_feedback["rollback_triggered"])
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[-1]["window_index"], 1)
 
     def test_runtime_schedule_traces_feed_visualization_artifacts(self) -> None:
         program = default_dense_program("single_g5").normalized()
@@ -1789,6 +1936,7 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         event_trace = dict(visual.get("pipeline_event_trace") or {})
         grid_trace = dict(visual.get("pipeline_grid_trace") or {})
         next_step = dict(artifact.get("next_step_hypotheses") or {})
+        critical_path = dict((((observation.to_dict().get("evidence_record") or {}).get("critical_path_breakdown")) or {}))
 
         self.assertEqual(event_trace.get("timing_basis"), "runtime_observed")
         self.assertEqual((event_trace.get("summary") or {}).get("schedule_template"), "zero_bubble")
@@ -1796,6 +1944,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertTrue(any(item.get("kind") == "WGRAD_OPT" for item in grid_trace.get("cells", [])))
         self.assertIn("next_schedule_family", next_step)
         self.assertIn("stop_signal", next_step)
+        self.assertIn("local_verticalization_targets", next_step)
+        self.assertIn("critical_stage_id", critical_path)
+        self.assertIn("critical_layer_group_id", critical_path)
+        self.assertIn("critical_component_type", critical_path)
 
     def test_megatron_program_roundtrip_preserves_new_schedule_ir(self) -> None:
         from megatron_agent.config import (
@@ -1882,6 +2034,70 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("aggressive_vpp_expansion", guidance["harmful_patch_families"])
         self.assertIn("zero_bubble", guidance["schedule_families"])
         self.assertTrue(bank.should_avoid_patch_family(target_state, "aggressive_vpp_expansion"))
+
+    def test_policy_memory_records_rewrite_targets_and_rollback_history(self) -> None:
+        search_state = {
+            "model": {"model_track": "dense", "size_bucket": "qwen14b"},
+            "hardware": {"run_target": "single_g5", "backend_family": "megatron"},
+            "policy": {"runtime_schedule_family": "fixed_1f1b", "pp_degree": 2, "vpp_degree": 2},
+            "runtime": {"bubble_ratio": 0.06, "peak_reserved_ratio": 0.86},
+            "bottleneck_signature": "reload_bound",
+        }
+        candidate = default_dense_program("single_g5").normalized()
+        candidate.metadata["runtime_branch_target_stage_ids"] = [1]
+        candidate.metadata["target_layer_groups"] = ["group_reload_hot"]
+        candidate.metadata["target_state_objects"] = ["activation:group_reload_hot"]
+        candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-reload-shift",
+            patch_family="reload_shift_patch",
+            target_scope="memory",
+            changes={"direction": "earlier"},
+        )
+        proposal = AgentProposal(
+            proposal_id="candidate_reload_shift",
+            scope="memory",
+            program=candidate,
+            priority_rank=8,
+        ).normalized()
+        outcome = build_trial_outcome(
+            candidate,
+            {
+                "config_name": "candidate_reload_shift",
+                "returncode": 1,
+                "error_msg": "runtime regression",
+                "window_feedback": {
+                    "window_index": 1,
+                    "policy_signature": "sig-reload-shift",
+                    "critical_stage_id": 1,
+                    "critical_layer_group_id": "group_reload_hot",
+                    "critical_component_type": "reload",
+                    "step_time_ms_p50": 1110.0,
+                    "throughput_tokens_per_s": 1420.0,
+                    "reload_stall_ms": 82.0,
+                    "rollback_triggered": True,
+                    "critical_path_breakdown": {"target_state_objects": ["activation:group_reload_hot"]},
+                },
+                "trace_summary": {
+                    "critical_path_breakdown": {"critical_component_type": "reload"},
+                    "reload_interference_summary": {"reload_stall_ms": 82.0},
+                },
+            },
+            baseline_metrics={"step_time_ms_p50": 1000.0, "throughput_tokens_per_s": 1500.0},
+        )
+        reflection = reflect_on_trial(search_state, proposal, outcome, baseline_metrics={"step_time_ms_p50": 1000.0})
+        bank = PolicyMemoryBank()
+
+        case = record_trial_feedback(bank, search_state, proposal, outcome, reflection)
+        guidance = bank.recommend_patch_families(search_state, top_k=3)
+
+        self.assertEqual(case.local_policy["target_stage_ids"], [1])
+        self.assertEqual(case.local_policy["target_layer_group_ids"], ["group_reload_hot"])
+        self.assertEqual(case.local_policy["target_state_ids"], ["activation:group_reload_hot"])
+        self.assertIn("reload_shift_patch", guidance["harmful_patch_families"])
+        self.assertIn("reload_shift_patch", guidance["harmful_rewrite_families"])
+        self.assertEqual(list((guidance.get("rewrite_targets") or {}).get("target_stage_ids") or []), [1])
+        self.assertIn("performance_regression", list(guidance.get("recent_rollback_reasons") or []))
+        self.assertTrue(bank.should_avoid_patch_family(search_state, "reload_shift_patch"))
 
     def test_build_beam_snapshot_prefers_high_value_patch(self) -> None:
         baseline = default_dense_program("single_g5").normalized()
@@ -2062,6 +2278,163 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
         self.assertGreater(float(root.children[0].priority), float(root.children[1].priority))
         self.assertTrue(any("hypothesis_" in str(item) for item in (root.children[0].priority_reason or [])))
+
+    def test_build_search_tree_root_applies_target_hit_bonus_for_rewrite_patch(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        targeted = baseline.normalized()
+        targeted.metadata["program_kind"] = "candidate_targeted_reload"
+        targeted.metadata["runtime_branch_target_stage_ids"] = [1]
+        targeted.metadata["target_layer_groups"] = ["lg_reload_hot"]
+        targeted.metadata["target_state_objects"] = ["activation:lg_reload_hot"]
+        targeted.applied_patch = ProgramPatchSpec(
+            patch_id="patch-targeted-reload",
+            patch_family="reload_shift_patch",
+            target_scope="memory",
+            changes={"direction": "earlier"},
+        )
+        untargeted = baseline.normalized()
+        untargeted.metadata["program_kind"] = "candidate_untargeted_reload"
+        untargeted.applied_patch = ProgramPatchSpec(
+            patch_id="patch-untargeted-reload",
+            patch_family="reload_shift_patch",
+            target_scope="memory",
+            changes={"direction": "later"},
+        )
+        targeted_proposal = AgentProposal(
+            proposal_id="candidate_targeted_reload",
+            scope="memory",
+            program=targeted,
+            priority_rank=10,
+        ).normalized()
+        untargeted_proposal = AgentProposal(
+            proposal_id="candidate_untargeted_reload",
+            scope="memory",
+            program=untargeted,
+            priority_rank=10,
+        ).normalized()
+
+        root, _ = agent_loop._build_search_tree_root(
+            search_state={"bottleneck_signature": "reload_bound"},
+            proposal_pool=[untargeted_proposal, targeted_proposal],
+            policy_memory_bank=PolicyMemoryBank(),
+            search_unit="patch",
+            patch_memory_enabled=False,
+            next_step_hypotheses={
+                "next_memory_patch_family": "reload_shift_patch",
+                "target_stages": [1],
+                "target_layer_groups": ["lg_reload_hot"],
+                "target_state_objects": ["activation:lg_reload_hot"],
+            },
+        )
+
+        best_child = max(root.children, key=lambda item: float(item.priority))
+        worst_child = min(root.children, key=lambda item: float(item.priority))
+
+        self.assertEqual(str(best_child.patch_family or ""), "reload_shift_patch")
+        self.assertTrue(any("hypothesis_target:stage" in str(item) for item in (best_child.priority_reason or [])))
+        self.assertTrue(any("hypothesis_target:layer_group" in str(item) for item in (best_child.priority_reason or [])))
+        self.assertTrue(any("hypothesis_target:state_object" in str(item) for item in (best_child.priority_reason or [])))
+        self.assertGreater(float(best_child.priority), float(worst_child.priority))
+
+    def test_build_search_tree_root_critical_path_reload_biases_memory_patch(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        reload_candidate = baseline.normalized()
+        reload_candidate.metadata["program_kind"] = "candidate_reload"
+        reload_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-reload",
+            patch_family="tune_reload_prefetch",
+            target_scope="memory",
+            changes={"reload_policy": "prefetch"},
+        )
+        overlap_candidate = baseline.normalized()
+        overlap_candidate.metadata["program_kind"] = "candidate_overlap"
+        overlap_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-overlap",
+            patch_family="enable_p2p_overlap",
+            target_scope="overlap",
+            changes={"enable_p2p_overlap": True},
+        )
+        reload_proposal = AgentProposal(
+            proposal_id="candidate_reload",
+            scope="memory",
+            program=reload_candidate,
+            priority_rank=10,
+        ).normalized()
+        overlap_proposal = AgentProposal(
+            proposal_id="candidate_overlap",
+            scope="overlap",
+            program=overlap_candidate,
+            priority_rank=10,
+        ).normalized()
+        root, _ = agent_loop._build_search_tree_root(
+            search_state={"bottleneck_signature": "memory_bound"},
+            proposal_pool=[reload_proposal, overlap_proposal],
+            policy_memory_bank=PolicyMemoryBank(),
+            search_unit="patch",
+            patch_memory_enabled=False,
+            next_step_hypotheses={
+                "critical_path_breakdown": {
+                    "critical_component_type": "reload",
+                    "critical_shift_candidates": ["activation_reload_shift_patch"],
+                },
+                "reload_interference_summary": {"reload_stall_ratio": 0.18},
+                "policy_outcome_summary": {"promotion_action": "promote_memory_patch"},
+            },
+        )
+
+        self.assertGreater(float(root.children[0].priority), float(root.children[1].priority))
+        self.assertTrue(any("critical_component:reload" in str(item) or "reload_pressure" in str(item) for item in (root.children[0].priority_reason or [])))
+
+    def test_build_search_tree_root_demotes_overlap_when_policy_outcome_says_so(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        overlap_candidate = baseline.normalized()
+        overlap_candidate.metadata["program_kind"] = "candidate_overlap"
+        overlap_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-overlap",
+            patch_family="enable_p2p_overlap",
+            target_scope="overlap",
+            changes={"enable_p2p_overlap": True},
+        )
+        schedule_candidate = baseline.normalized()
+        schedule_candidate.metadata["program_kind"] = "candidate_schedule"
+        schedule_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-schedule",
+            patch_family="change_schedule_family",
+            target_scope="schedule",
+            changes={"family": "zero_bubble"},
+        )
+        schedule_candidate.schedule_ir.family = "zero_bubble"
+        overlap_proposal = AgentProposal(
+            proposal_id="candidate_overlap",
+            scope="overlap",
+            program=overlap_candidate,
+            priority_rank=10,
+        ).normalized()
+        schedule_proposal = AgentProposal(
+            proposal_id="candidate_schedule",
+            scope="schedule",
+            program=schedule_candidate,
+            priority_rank=10,
+        ).normalized()
+        root, _ = agent_loop._build_search_tree_root(
+            search_state={"bottleneck_signature": "comm_bound"},
+            proposal_pool=[overlap_proposal, schedule_proposal],
+            policy_memory_bank=PolicyMemoryBank(),
+            search_unit="patch",
+            patch_memory_enabled=False,
+            next_step_hypotheses={
+                "critical_path_breakdown": {
+                    "critical_component_type": "comm",
+                    "critical_shift_candidates": ["comm_chunk_patch"],
+                },
+                "comm_chunk_exposure_summary": {"comm_exposure_ratio": 0.12},
+                "policy_outcome_summary": {"demotion_action": "rollback_overlap"},
+                "next_schedule_family": "zero_bubble",
+            },
+        )
+
+        self.assertGreater(float(root.children[1].priority), float(root.children[0].priority))
+        self.assertTrue(any("demote_overlap" in str(item) or "rollback_overlap" in str(item) for item in (root.children[0].priority_reason or [])))
 
     def test_stage_memory_gate_rejects_hotspot_candidate(self) -> None:
         program = default_dense_program("single_g5")
@@ -2324,6 +2697,11 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertTrue((out_dir / "bottleneck_patch_success.csv").exists())
             self.assertTrue((out_dir / "bottleneck_patch_gain.csv").exists())
             self.assertTrue((out_dir / "search_ablation.csv").exists())
+            header = (out_dir / "patch_observations.csv").read_text(encoding="utf-8").splitlines()[0]
+            self.assertIn("primary_parallel_mode", header)
+            self.assertIn("rewrite_family", header)
+            self.assertIn("critical_component_type", header)
+            self.assertIn("rollback_triggered", header)
             manifest = json.loads((out_dir / "case_study_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(str(manifest.get("format") or ""), "patch_case_study_manifest")
             self.assertGreaterEqual(len(list(manifest.get("cases") or [])), 2)
@@ -2368,6 +2746,11 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "fig_bottleneck_patch_gain_heatmap.png",
                 "fig_search_ablation_curve.png",
                 "fig_case_study_compare.png",
+                "fig_stateful_vs_coarse.png",
+                "fig_reload_shift_gain.png",
+                "fig_adaptive_chunking_gain.png",
+                "fig_local_verticalization_gain.png",
+                "fig_budgeted_telemetry_cost.png",
             ):
                 self.assertTrue((out_dir / name).exists(), name)
 
@@ -2389,6 +2772,14 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     str(analysis_dir),
                     "--figures-dir",
                     str(figures_dir),
+                    "--enable-hierarchical-orchestrator",
+                    "--enable-reload-shift",
+                    "--enable-adaptive-chunking",
+                    "--enable-local-verticalization",
+                    "--telemetry-budget",
+                    "summary",
+                    "--window-steps",
+                    "4",
                 ],
                 check=True,
                 capture_output=True,
@@ -2403,9 +2794,16 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertEqual(len(variants), 3)
             whole_config = next(item for item in variants if str(item.get("name") or "") == "whole_config")
             patch_memory_off = next(item for item in variants if str(item.get("name") or "") == "patch_memory_off")
+            patch_variant = next(item for item in variants if str(item.get("name") or "") == "patch")
             self.assertIn("--search-unit", list(whole_config.get("command") or []))
             self.assertIn("whole_config", list(whole_config.get("command") or []))
             self.assertIn("--disable-patch-memory", list(patch_memory_off.get("command") or []))
+            self.assertIn("--enable-hierarchical-orchestrator", list(patch_variant.get("command") or []))
+            self.assertIn("--enable-reload-shift", list(patch_variant.get("command") or []))
+            self.assertIn("--enable-adaptive-chunking", list(patch_variant.get("command") or []))
+            self.assertIn("--enable-local-verticalization", list(patch_variant.get("command") or []))
+            self.assertIn("--telemetry-budget", list(patch_variant.get("command") or []))
+            self.assertIn("--window-steps", list(patch_variant.get("command") or []))
             self.assertTrue((analysis_dir / "patch_observations.csv").exists())
             self.assertTrue((analysis_dir / "search_ablation.csv").exists())
             self.assertTrue((analysis_dir / "case_study_manifest.json").exists())
@@ -3294,6 +3692,17 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "tail_step_jitter_ratio": 0.07,
                 "peak_reserved_ratio": 0.80,
             },
+            "window_feedback": {
+                "window_index": 1,
+                "policy_signature": "sig-optimizer-window",
+                "critical_stage_id": 1,
+                "critical_layer_group_id": "group_1",
+                "critical_component_type": "reload",
+                "step_time_ms_p50": 910.0,
+                "throughput_tokens_per_s": 1700.0,
+                "rollback_triggered": False,
+                "recommended_rewrites": [{"rewrite_type": "reload_shift"}],
+            },
         }
         outcome = build_trial_outcome(candidate, metrics, baseline_metrics=baseline_metrics)
         reflection = reflect_on_trial(
@@ -3311,6 +3720,15 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             reflection,
         )
         self.assertEqual(case.family, "dual_overlap_optimizer_hide")
+        self.assertEqual(outcome.policy_signature, "sig-optimizer-window")
+        self.assertFalse(outcome.rollback_triggered)
+        self.assertEqual(outcome.critical_component_type, "reload")
+        self.assertEqual(int((outcome.latest_window_outcome or {}).get("window_index") or -1), 1)
+        self.assertEqual(str((reflection.window_feedback_digest or {}).get("policy_signature") or ""), "sig-optimizer-window")
+        self.assertEqual(
+            str((((reflection.rewrite_recommendation or {}).get("recommended_rewrites") or [{}])[0].get("rewrite_type") or "")),
+            "reload_shift",
+        )
         self.assertTrue(
             any(
                 str(item.get("window") or "") == "last_2_groups"

@@ -968,9 +968,14 @@ def build_trial_outcome(
     success = bool(returncode == 0 and not oom and not error_msg)
     launch_failure = bool(returncode != 0 and not oom)
     step_time_ms = _pick_metric(metrics, "step_time_ms_p50", "steady_state_step_time_ms_p50")
+    window_feedback = dict(metrics.get("window_feedback") or {})
+    if step_time_ms <= 0.0:
+        step_time_ms = _safe_float(window_feedback.get("step_time_ms_p50"))
     if step_time_ms <= 0.0:
         step_time_ms = _pick_metric(trace_summary, "step_time_ms_p50", "steady_state_step_time_ms_p50")
     throughput = _pick_metric(metrics, "throughput_tokens_per_s", "throughput_effective_tokens_per_s")
+    if throughput <= 0.0:
+        throughput = _safe_float(window_feedback.get("throughput_tokens_per_s"))
     if throughput <= 0.0:
         throughput = _pick_metric(trace_summary, "throughput_tokens_per_s", "throughput_effective_tokens_per_s")
     forward_backward_ms = _pick_metric(
@@ -989,7 +994,6 @@ def build_trial_outcome(
     stage_tail_ratio = _pick_metric(trace_summary, "stage_tail_ratio")
     tail_step_jitter_ratio = _pick_metric(trace_summary, "tail_step_jitter_ratio")
     optimizer_exposed_ratio = _pick_metric(trace_summary, "optimizer_exposed_ratio")
-
     baseline_trace = dict((baseline_metrics or {}).get("trace_summary") or {})
     baseline_step_time_ms = _pick_metric(baseline_metrics or {}, "step_time_ms_p50", "steady_state_step_time_ms_p50")
     if baseline_step_time_ms <= 0.0:
@@ -1023,6 +1027,14 @@ def build_trial_outcome(
         optimizer_exposed_ratio=optimizer_exposed_ratio,
         step_improvement_ms=step_improvement_ms,
         throughput_gain=throughput_gain,
+        policy_signature=str(window_feedback.get("policy_signature") or ""),
+        rollback_triggered=bool(window_feedback.get("rollback_triggered", False)),
+        critical_component_type=str(
+            window_feedback.get("critical_component_type")
+            or (trace_summary.get("critical_path_breakdown") or {}).get("critical_component_type")
+            or ""
+        ),
+        latest_window_outcome=copy.deepcopy(window_feedback),
         runtime_delta=runtime_delta,
     )
 
@@ -1073,6 +1085,11 @@ def reflect_on_trial(
         next_action = "retain_family_adjust_local_policy"
     else:
         next_action = "switch_family"
+    window_feedback = copy.deepcopy(outcome.latest_window_outcome or {})
+    rewrite_recommendation = {
+        "recommended_rewrites": copy.deepcopy(window_feedback.get("recommended_rewrites") or []),
+        "rollback_triggered": bool(window_feedback.get("rollback_triggered", False)),
+    }
 
     summary = (
         f"{family or 'unclassified'} improved critical path via {', '.join(gain_sources)}"
@@ -1087,6 +1104,14 @@ def reflect_on_trial(
         failure_sources=failure_sources,
         recommended_next_action=next_action,
         summary=summary,
+        window_feedback_digest={
+            "policy_signature": str(window_feedback.get("policy_signature") or ""),
+            "window_index": int(window_feedback.get("window_index") or 0),
+            "critical_component_type": str(window_feedback.get("critical_component_type") or ""),
+            "rollback_triggered": bool(window_feedback.get("rollback_triggered", False)),
+            "rollback_reason": "performance_regression" if bool(window_feedback.get("rollback_triggered", False)) else "",
+        },
+        rewrite_recommendation=rewrite_recommendation,
     )
 
 
@@ -1097,6 +1122,36 @@ def record_trial_feedback(
     outcome: TrialOutcome,
     reflection: TrialReflection,
 ) -> PolicyCase:
+    window_feedback = copy.deepcopy(outcome.latest_window_outcome or {})
+    raw_stage_targets = list((proposal.program.metadata or {}).get("runtime_branch_target_stage_ids") or [])
+    if not raw_stage_targets and _safe_int(window_feedback.get("critical_stage_id")) is not None:
+        raw_stage_targets = [int(window_feedback.get("critical_stage_id"))]
+    target_stage_ids = [
+        int(item)
+        for item in raw_stage_targets
+        if _safe_int(item) is not None
+    ]
+    target_layer_group_ids = [
+        str(item)
+        for item in (
+            ((proposal.program.metadata or {}).get("target_layer_groups") or [])
+            or [str(window_feedback.get("critical_layer_group_id") or "")]
+        )
+        if str(item).strip()
+    ]
+    target_state_ids = [
+        str(item)
+        for item in (
+            ((proposal.program.metadata or {}).get("target_state_objects") or [])
+            or [
+                str(item)
+                for item in (
+                    ((window_feedback.get("critical_path_breakdown") or {}).get("target_state_objects") or [])
+                )
+            ]
+        )
+        if str(item).strip()
+    ]
     local_policy = {
         "runtime_schedule_family": str((proposal.program.metadata or {}).get("runtime_schedule_family") or infer_runtime_schedule_family(proposal.program)),
         "runtime_phase_policy": copy.deepcopy((proposal.program.metadata or {}).get("runtime_phase_policy") or {}),
@@ -1104,6 +1159,11 @@ def record_trial_feedback(
         "runtime_stage_tags": copy.deepcopy((proposal.program.metadata or {}).get("runtime_stage_tags") or {}),
         "runtime_window_overrides": copy.deepcopy((proposal.program.metadata or {}).get("runtime_window_overrides") or {}),
         "runtime_operator_cluster_overrides": copy.deepcopy((proposal.program.metadata or {}).get("runtime_operator_cluster_overrides") or []),
+        "patch_family": str((proposal.program.applied_patch.patch_family if proposal.program.applied_patch is not None else "") or ""),
+        "target_stage_ids": target_stage_ids,
+        "target_layer_group_ids": target_layer_group_ids,
+        "target_state_ids": target_state_ids,
+        "rollback_triggered": bool(outcome.rollback_triggered),
     }
     case = PolicyCase(
         case_id=f"case_{len(memory_bank.cases):04d}",

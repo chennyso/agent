@@ -122,6 +122,10 @@ class TrialOutcome:
     optimizer_exposed_ratio: float = 0.0
     step_improvement_ms: float = 0.0
     throughput_gain: float = 0.0
+    policy_signature: str = ""
+    rollback_triggered: bool = False
+    critical_component_type: str = ""
+    latest_window_outcome: Dict[str, Any] = field(default_factory=dict)
     runtime_delta: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -141,6 +145,10 @@ class TrialOutcome:
             "optimizer_exposed_ratio": round(_safe_float(self.optimizer_exposed_ratio), 4),
             "step_improvement_ms": round(_safe_float(self.step_improvement_ms), 4),
             "throughput_gain": round(_safe_float(self.throughput_gain), 4),
+            "policy_signature": str(self.policy_signature),
+            "rollback_triggered": bool(self.rollback_triggered),
+            "critical_component_type": str(self.critical_component_type),
+            "latest_window_outcome": copy.deepcopy(self.latest_window_outcome),
             "runtime_delta": {str(key): round(_safe_float(value), 4) for key, value in dict(self.runtime_delta).items()},
         }
 
@@ -162,6 +170,10 @@ class TrialOutcome:
             optimizer_exposed_ratio=_safe_float(payload.get("optimizer_exposed_ratio")),
             step_improvement_ms=_safe_float(payload.get("step_improvement_ms")),
             throughput_gain=_safe_float(payload.get("throughput_gain")),
+            policy_signature=str(payload.get("policy_signature") or ""),
+            rollback_triggered=bool(payload.get("rollback_triggered", False)),
+            critical_component_type=str(payload.get("critical_component_type") or ""),
+            latest_window_outcome=copy.deepcopy(payload.get("latest_window_outcome") or {}),
             runtime_delta={str(key): _safe_float(value) for key, value in dict(payload.get("runtime_delta") or {}).items()},
         )
 
@@ -175,6 +187,8 @@ class TrialReflection:
     failure_sources: List[str] = field(default_factory=list)
     recommended_next_action: str = "keep_observing"
     summary: str = ""
+    window_feedback_digest: Dict[str, Any] = field(default_factory=dict)
+    rewrite_recommendation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -185,6 +199,8 @@ class TrialReflection:
             "failure_sources": list(self.failure_sources),
             "recommended_next_action": str(self.recommended_next_action),
             "summary": str(self.summary),
+            "window_feedback_digest": copy.deepcopy(self.window_feedback_digest),
+            "rewrite_recommendation": copy.deepcopy(self.rewrite_recommendation),
         }
 
     @classmethod
@@ -197,6 +213,8 @@ class TrialReflection:
             failure_sources=_clean_string_list(payload.get("failure_sources") or []),
             recommended_next_action=str(payload.get("recommended_next_action") or "keep_observing"),
             summary=str(payload.get("summary") or ""),
+            window_feedback_digest=copy.deepcopy(payload.get("window_feedback_digest") or {}),
+            rewrite_recommendation=copy.deepcopy(payload.get("rewrite_recommendation") or {}),
         )
 
 
@@ -428,20 +446,60 @@ class PolicyMemoryBank:
         entry.setdefault("schedule_family", str(state_summary.get("runtime_schedule_family") or family or ""))
         entry.setdefault("useful_patch_families", [])
         entry.setdefault("harmful_patch_families", [])
+        entry.setdefault("useful_rewrite_families", [])
+        entry.setdefault("harmful_rewrite_families", [])
         entry.setdefault("uncertain_patch_families", [])
+        entry.setdefault("rewrite_targets", {"target_stage_ids": [], "target_layer_group_ids": [], "target_state_ids": []})
+        entry.setdefault("window_outcome_stats", {"attempts": 0, "rollback_count": 0, "best_step_time_ms": 0.0})
+        entry.setdefault("recent_rollback_reasons", [])
         entry.setdefault("pareto_stats", {"attempts": 0, "successes": 0, "best_step_improvement_ms": 0.0, "best_throughput_gain": 0.0})
         entry.setdefault("recent_failure_signatures", [])
         if patch_family:
             if case.outcome.success and (_safe_float(case.outcome.step_improvement_ms) > 0.0 or _safe_float(case.outcome.throughput_gain) > 0.0):
                 if patch_family not in entry["useful_patch_families"]:
                     entry["useful_patch_families"].append(patch_family)
+                if patch_family not in entry["useful_rewrite_families"]:
+                    entry["useful_rewrite_families"].append(patch_family)
             elif case.outcome.oom or case.outcome.launch_failure or not case.outcome.success:
                 if patch_family not in entry["harmful_patch_families"]:
                     entry["harmful_patch_families"].append(patch_family)
+                if patch_family not in entry["harmful_rewrite_families"]:
+                    entry["harmful_rewrite_families"].append(patch_family)
                 if case.reflection.failure_sources:
                     entry["recent_failure_signatures"].append(",".join(case.reflection.failure_sources))
             elif patch_family not in entry["uncertain_patch_families"]:
                 entry["uncertain_patch_families"].append(patch_family)
+        local_policy = dict(case.local_policy or {})
+        rewrite_targets = dict(entry.get("rewrite_targets") or {})
+        rewrite_targets["target_stage_ids"] = [
+            int(item)
+            for item in (local_policy.get("target_stage_ids") or rewrite_targets.get("target_stage_ids") or [])
+            if _safe_int(item) is not None
+        ]
+        rewrite_targets["target_layer_group_ids"] = [
+            str(item)
+            for item in (local_policy.get("target_layer_group_ids") or rewrite_targets.get("target_layer_group_ids") or [])
+            if str(item).strip()
+        ]
+        rewrite_targets["target_state_ids"] = [
+            str(item)
+            for item in (local_policy.get("target_state_ids") or rewrite_targets.get("target_state_ids") or [])
+            if str(item).strip()
+        ]
+        entry["rewrite_targets"] = rewrite_targets
+        window_stats = dict(entry.get("window_outcome_stats") or {})
+        window_stats["attempts"] = int(window_stats.get("attempts") or 0) + 1
+        if bool(case.outcome.rollback_triggered):
+            window_stats["rollback_count"] = int(window_stats.get("rollback_count") or 0) + 1
+        latest_step_time = _safe_float((case.outcome.latest_window_outcome or {}).get("step_time_ms_p50"))
+        best_step_time = _safe_float(window_stats.get("best_step_time_ms"))
+        if latest_step_time > 0.0 and (best_step_time <= 0.0 or latest_step_time < best_step_time):
+            window_stats["best_step_time_ms"] = latest_step_time
+        entry["window_outcome_stats"] = window_stats
+        if bool(case.outcome.rollback_triggered):
+            rollback_reason = str((case.reflection.window_feedback_digest or {}).get("rollback_reason") or "rollback_triggered").strip()
+            if rollback_reason:
+                entry["recent_rollback_reasons"].append(rollback_reason)
         pareto = dict(entry.get("pareto_stats") or {})
         pareto["attempts"] = int(pareto.get("attempts") or 0) + 1
         if case.outcome.success:
@@ -450,6 +508,7 @@ class PolicyMemoryBank:
         pareto["best_throughput_gain"] = max(_safe_float(pareto.get("best_throughput_gain")), _safe_float(case.outcome.throughput_gain))
         entry["pareto_stats"] = pareto
         entry["recent_failure_signatures"] = list(entry["recent_failure_signatures"])[-8:]
+        entry["recent_rollback_reasons"] = list(entry["recent_rollback_reasons"])[-8:]
         norm.patch_memory[patch_key] = entry
         self.cases = norm.cases
         self.family_scores = norm.family_scores
@@ -534,8 +593,13 @@ class PolicyMemoryBank:
                     "schedule_family": str(raw_value.get("schedule_family") or ""),
                     "useful_patch_families": _clean_string_list(raw_value.get("useful_patch_families") or []),
                     "harmful_patch_families": _clean_string_list(raw_value.get("harmful_patch_families") or []),
+                    "useful_rewrite_families": _clean_string_list(raw_value.get("useful_rewrite_families") or []),
+                    "harmful_rewrite_families": _clean_string_list(raw_value.get("harmful_rewrite_families") or []),
                     "uncertain_patch_families": _clean_string_list(raw_value.get("uncertain_patch_families") or []),
                     "recent_failure_signatures": _clean_string_list(raw_value.get("recent_failure_signatures") or []),
+                    "rewrite_targets": copy.deepcopy(raw_value.get("rewrite_targets") or {}),
+                    "window_outcome_stats": copy.deepcopy(raw_value.get("window_outcome_stats") or {}),
+                    "recent_rollback_reasons": _clean_string_list(raw_value.get("recent_rollback_reasons") or []),
                     "pareto_stats": pareto,
                     "state_key": copy.deepcopy(key_payload),
                 }
@@ -546,14 +610,23 @@ class PolicyMemoryBank:
                 float(item.get("success_ratio") or 0.0),
                 float((item.get("pareto_stats") or {}).get("best_throughput_gain") or 0.0),
                 float((item.get("pareto_stats") or {}).get("best_step_improvement_ms") or 0.0),
+                -float(((item.get("window_outcome_stats") or {}).get("rollback_count") or 0.0)),
             ),
             reverse=True,
         )
         useful: List[str] = []
         harmful: List[str] = []
+        useful_rewrite: List[str] = []
+        harmful_rewrite: List[str] = []
         uncertain: List[str] = []
         schedule_families: List[str] = []
         failure_signatures: List[str] = []
+        rewrite_targets: Dict[str, List[Any]] = {
+            "target_stage_ids": [],
+            "target_layer_group_ids": [],
+            "target_state_ids": [],
+        }
+        rollback_reasons: List[str] = []
         for entry in ranked[: max(int(top_k), 0)]:
             schedule_family = str(entry.get("schedule_family") or "").strip()
             if schedule_family and schedule_family not in schedule_families:
@@ -564,20 +637,37 @@ class PolicyMemoryBank:
             for family in _clean_string_list(entry.get("harmful_patch_families") or []):
                 if family not in harmful:
                     harmful.append(family)
+            for family in _clean_string_list(entry.get("useful_rewrite_families") or []):
+                if family not in useful_rewrite:
+                    useful_rewrite.append(family)
+            for family in _clean_string_list(entry.get("harmful_rewrite_families") or []):
+                if family not in harmful_rewrite:
+                    harmful_rewrite.append(family)
             for family in _clean_string_list(entry.get("uncertain_patch_families") or []):
                 if family not in uncertain:
                     uncertain.append(family)
             for signature in _clean_string_list(entry.get("recent_failure_signatures") or []):
                 if signature not in failure_signatures:
                     failure_signatures.append(signature)
+            for signature in _clean_string_list(entry.get("recent_rollback_reasons") or []):
+                if signature not in rollback_reasons:
+                    rollback_reasons.append(signature)
+            for key in ("target_stage_ids", "target_layer_group_ids", "target_state_ids"):
+                for item in list((entry.get("rewrite_targets") or {}).get(key) or []):
+                    if item not in rewrite_targets[key]:
+                        rewrite_targets[key].append(item)
         return {
             "state_summary": target,
             "matched_entries": ranked[: max(int(top_k), 0)],
             "schedule_families": schedule_families,
             "useful_patch_families": useful,
             "harmful_patch_families": harmful,
+            "useful_rewrite_families": useful_rewrite,
+            "harmful_rewrite_families": harmful_rewrite,
             "uncertain_patch_families": [family for family in uncertain if family not in useful and family not in harmful],
             "recent_failure_signatures": failure_signatures[:8],
+            "rewrite_targets": rewrite_targets,
+            "recent_rollback_reasons": rollback_reasons[:8],
         }
 
     def should_avoid_patch_family(

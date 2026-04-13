@@ -158,6 +158,103 @@ def _search_ablation_curve(rows: List[Dict[str, Any]], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _stateful_vs_coarse(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    plt, _ = _load_plotting_backend()
+    if plt is None:
+        _write_blank_png(out_path)
+        return
+    grouped: Dict[str, List[float]] = defaultdict(list)
+    for row in rows:
+        key = "stateful" if _safe_float(row.get("layer_group_count")) > 0 else "coarse"
+        grouped[key].append(_safe_float(row.get("throughput_gain_ratio")))
+    labels = ["coarse", "stateful"]
+    values = [_safe_float(sum(grouped.get(label, [])) / max(len(grouped.get(label, [])), 1)) for label in labels]
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    ax.bar(labels, values, color=["#9aa0a6", "#1b998b"])
+    ax.set_ylabel("Mean Throughput Gain Ratio")
+    ax.set_title("Stateful vs Coarse Schedule")
+    ax.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _reload_interference_breakdown(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    plt, _ = _load_plotting_backend()
+    if plt is None:
+        _write_blank_png(out_path)
+        return
+    shifted = [_safe_float(row.get("throughput_gain_ratio")) for row in rows if _safe_float(row.get("reload_shift_count")) > 0]
+    stable = [_safe_float(row.get("throughput_gain_ratio")) for row in rows if _safe_float(row.get("reload_shift_count")) <= 0]
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.bar(
+        ["no_reload_shift", "reload_shift"],
+        [
+            _safe_float(sum(stable) / max(len(stable), 1)),
+            _safe_float(sum(shifted) / max(len(shifted), 1)),
+        ],
+        color=["#577590", "#f3722c"],
+    )
+    ax.set_ylabel("Mean Throughput Gain Ratio")
+    ax.set_title("Reload Interference Breakdown")
+    ax.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _budgeted_telemetry_cost(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    plt, _ = _load_plotting_backend()
+    if plt is None:
+        _write_blank_png(out_path)
+        return
+    grouped: Dict[str, List[float]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("telemetry_level") or "summary")].append(_safe_float(row.get("throughput_gain_ratio")))
+    labels = sorted(grouped) or ["summary"]
+    values = [_safe_float(sum(grouped.get(label, [])) / max(len(grouped.get(label, [])), 1)) for label in labels]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.bar(labels, values, color="#6d597a")
+    ax.set_ylabel("Mean Throughput Gain Ratio")
+    ax.set_title("Budgeted Telemetry Cost Profile")
+    ax.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _rewrite_gain_by_family(rows: List[Dict[str, Any]], rewrite_family: str, title: str, out_path: Path) -> None:
+    plt, _ = _load_plotting_backend()
+    if plt is None:
+        _write_blank_png(out_path)
+        return
+    active = [
+        _safe_float(row.get("throughput_gain_ratio"))
+        for row in rows
+        if str(row.get("rewrite_family") or "") == str(rewrite_family)
+    ]
+    inactive = [
+        _safe_float(row.get("throughput_gain_ratio"))
+        for row in rows
+        if str(row.get("rewrite_family") or "") != str(rewrite_family)
+    ]
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.bar(
+        ["others", rewrite_family],
+        [
+            _safe_float(sum(inactive) / max(len(inactive), 1)),
+            _safe_float(sum(active) / max(len(active), 1)),
+        ],
+        color=["#7f8c8d", "#2a9d8f"],
+    )
+    ax.set_ylabel("Mean Throughput Gain Ratio")
+    ax.set_title(title)
+    ax.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def _load_svg_image(path: Path):
     try:
         import cairosvg  # type: ignore
@@ -241,6 +338,12 @@ def render_figures(analysis_dir: Path, out_dir: Path) -> Dict[str, Path]:
         "fig_bottleneck_patch_success_heatmap": out_dir / "fig_bottleneck_patch_success_heatmap.png",
         "fig_bottleneck_patch_gain_heatmap": out_dir / "fig_bottleneck_patch_gain_heatmap.png",
         "fig_search_ablation_curve": out_dir / "fig_search_ablation_curve.png",
+        "fig_stateful_vs_coarse": out_dir / "fig_stateful_vs_coarse.png",
+        "fig_reload_interference_breakdown": out_dir / "fig_reload_interference_breakdown.png",
+        "fig_reload_shift_gain": out_dir / "fig_reload_shift_gain.png",
+        "fig_adaptive_chunking_gain": out_dir / "fig_adaptive_chunking_gain.png",
+        "fig_local_verticalization_gain": out_dir / "fig_local_verticalization_gain.png",
+        "fig_budgeted_telemetry_cost": out_dir / "fig_budgeted_telemetry_cost.png",
         "fig_case_study_compare": out_dir / "fig_case_study_compare.png",
     }
     _scatter_patch_sparsity(patch_rows, outputs["fig_patch_sparsity"])
@@ -248,6 +351,12 @@ def render_figures(analysis_dir: Path, out_dir: Path) -> Dict[str, Path]:
     _heatmap(success_rows, "success_rate", "Patch Success Rate by Bottleneck", outputs["fig_bottleneck_patch_success_heatmap"])
     _heatmap(gain_rows, "median_throughput_gain_ratio", "Median Throughput Gain by Bottleneck", outputs["fig_bottleneck_patch_gain_heatmap"])
     _search_ablation_curve(patch_rows, outputs["fig_search_ablation_curve"])
+    _stateful_vs_coarse(patch_rows, outputs["fig_stateful_vs_coarse"])
+    _reload_interference_breakdown(patch_rows, outputs["fig_reload_interference_breakdown"])
+    _rewrite_gain_by_family(patch_rows, "reload_shift", "Reload Shift Gain", outputs["fig_reload_shift_gain"])
+    _rewrite_gain_by_family(patch_rows, "adaptive_chunking", "Adaptive Chunking Gain", outputs["fig_adaptive_chunking_gain"])
+    _rewrite_gain_by_family(patch_rows, "local_verticalization", "Local Verticalization Gain", outputs["fig_local_verticalization_gain"])
+    _budgeted_telemetry_cost(patch_rows, outputs["fig_budgeted_telemetry_cost"])
     _case_study_compare(manifest, outputs["fig_case_study_compare"])
     return outputs
 

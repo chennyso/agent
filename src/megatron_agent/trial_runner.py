@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,6 +19,8 @@ from typing import Any, Dict, List, Optional, Union
 from megatron_agent.config import (
     MegatronProgram,
     MegatronStrategy,
+    RewriteActionSpec,
+    WindowFeedbackSpec,
     default_backend_caps,
     default_dense_program,
     default_moe_smoke_program,
@@ -45,6 +49,11 @@ DEFAULT_G5_TOKENIZER_MODEL = DEFAULT_TOKENIZER_MODEL
 DEFAULT_G5_DATA_PATH = DEFAULT_DATA_PATH
 
 ProgramLike = Union[MegatronProgram, MegatronStrategy]
+
+_ITERATION_ELAPSED_RE = re.compile(
+    r"iteration\s+(\d+)\s*/\s*(\d+).*?elapsed time per iteration \(ms\):\s*([0-9\.]+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -136,6 +145,18 @@ def _trial_output_dirs(args: argparse.Namespace, trial_id: int) -> Dict[str, str
 
 def add_observability_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--observability-preset", type=str, choices=["none", "basic", "deep"], default="none")
+    parser.add_argument(
+        "--telemetry-budget",
+        dest="telemetry_budget_level",
+        type=str,
+        choices=["summary", "aggregated_grid", "full_debug"],
+        default=None,
+    )
+    parser.add_argument("--telemetry-max-trace-mb", type=int, default=None)
+    parser.add_argument("--telemetry-max-events-per-rank", type=int, default=None)
+    parser.add_argument("--telemetry-sampled-windows", type=int, default=None)
+    parser.add_argument("--window-steps", type=int, default=4)
+    parser.add_argument("--enable-stateful-schedule", action="store_true")
     parser.add_argument("--profile-step-start", type=int, default=4)
     parser.add_argument("--profile-step-end", type=int, default=6)
     parser.add_argument("--profile-ranks", type=int, nargs="*", default=None)
@@ -214,6 +235,14 @@ def _build_observability_config(
             output_dirs["trial_dir"],
             str(Path("nsys") / f"trial_{int(trial_id):03d}"),
         )
+    telemetry_level = getattr(args, "telemetry_budget_level", None)
+    telemetry_budget = {
+        "level": str(telemetry_level or "").strip(),
+        "max_trace_mb": max(int(getattr(args, "telemetry_max_trace_mb", 0) or 0), 0),
+        "max_events_per_rank": max(int(getattr(args, "telemetry_max_events_per_rank", 0) or 0), 0),
+        "sampled_windows": max(int(getattr(args, "telemetry_sampled_windows", 0) or 0), 0),
+        "emit_compare_svg": None if telemetry_level is None else str(telemetry_level) != "summary",
+    }
 
     return {
         "preset": preset,
@@ -245,6 +274,9 @@ def _build_observability_config(
         "torch_profile_path": output_dirs["torch_profile_path"],
         "chakra_path": output_dirs["chakra_path"],
         "nsys_path": output_dirs["nsys_path"],
+        "telemetry_budget": telemetry_budget,
+        "window_steps": max(int(getattr(args, "window_steps", 4) or 4), 1),
+        "enable_stateful_schedule": bool(getattr(args, "enable_stateful_schedule", False)),
     }
 
 
@@ -450,6 +482,8 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     critical_operator_clusters = list(artifact.get("critical_operator_clusters") or [])
     trial_outcome = dict(metrics.get("trial_outcome") or {})
     trial_reflection = dict(metrics.get("trial_reflection") or {})
+    window_feedback = dict(metrics.get("window_feedback") or {})
+    window_feedback_history = list(metrics.get("window_feedback_history") or [])
     failure_diagnosis = _build_failure_diagnosis(metrics)
     runtime_schedule_traces = list(metrics.get("runtime_schedule_traces") or [])
 
@@ -467,6 +501,8 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
         "critical_operator_clusters_json": str(artifact_dir / "critical_operator_clusters.json"),
         "trial_outcome_json": str(artifact_dir / "trial_outcome.json"),
         "trial_reflection_json": str(artifact_dir / "trial_reflection.json"),
+        "window_feedback_json": str(artifact_dir / "window_feedback.json"),
+        "window_feedback_history_json": str(artifact_dir / "window_feedback_history.json"),
         "failure_diagnosis_json": str(artifact_dir / "failure_diagnosis.json"),
         "runtime_schedule_traces_json": str(artifact_dir / "runtime_schedule_traces.json"),
     }
@@ -524,6 +560,16 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
             json.dumps(trial_reflection, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    if window_feedback:
+        Path(outputs["window_feedback_json"]).write_text(
+            json.dumps(window_feedback, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if window_feedback_history:
+        Path(outputs["window_feedback_history_json"]).write_text(
+            json.dumps(window_feedback_history, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     if failure_diagnosis:
         Path(outputs["failure_diagnosis_json"]).write_text(
             json.dumps(failure_diagnosis, indent=2, ensure_ascii=False),
@@ -544,6 +590,27 @@ def _load_runtime_schedule_traces(output_dirs: Dict[str, str]) -> List[Dict[str,
     traces: List[Dict[str, Any]] = []
     for path in sorted(trace_dir.glob("schedule_runtime_trace_*.json")):
         try:
+            size_mb = float(path.stat().st_size) / (1024.0 * 1024.0)
+        except Exception:
+            size_mb = 0.0
+        if size_mb > 128.0:
+            traces.append(
+                {
+                    "format": "schedule_runtime_event_trace",
+                    "artifact_path": str(path),
+                    "skipped_due_to_size": True,
+                    "telemetry": {
+                        "requested_level": "unknown",
+                        "effective_level": "summary",
+                        "downgrade_reason": "loader_file_size_guard",
+                    },
+                    "metrics": {"trace_file_mb": round(size_mb, 3)},
+                    "summary": {"trace_file_mb": round(size_mb, 3)},
+                    "events": [],
+                }
+            )
+            continue
+        try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
@@ -553,11 +620,180 @@ def _load_runtime_schedule_traces(output_dirs: Dict[str, str]) -> List[Dict[str,
     return traces
 
 
+def _median(values: List[float]) -> float:
+    cleaned = sorted(float(item) for item in values if float(item) > 0.0)
+    if not cleaned:
+        return 0.0
+    return float(cleaned[len(cleaned) // 2])
+
+
+def _extract_iteration_elapsed_ms(text: str) -> List[float]:
+    values: List[float] = []
+    for _iter_idx, _iter_total, elapsed_ms in _ITERATION_ELAPSED_RE.findall(text or ""):
+        try:
+            values.append(float(elapsed_ms))
+        except Exception:
+            continue
+    return values
+
+
+def _policy_signature(program: MegatronProgram, trace_summary: Optional[Dict[str, Any]] = None) -> str:
+    norm = program.normalized()
+    trace_summary = copy.deepcopy(trace_summary or {})
+    payload = {
+        "global_strategy_plan": norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else {},
+        "rewrite_actions": norm.rewrite_plan.to_dict().get("rewrite_actions", []) if norm.rewrite_plan is not None else [],
+        "schedule_family": str(norm.schedule_ir.family if norm.schedule_ir is not None else norm.schedule.template),
+        "stage_local_vpp": [int(item) for item in (norm.stage_local_vpp or [])],
+        "reload_prefetch_window": int((norm.state_plan.reload_prefetch_window if norm.state_plan is not None else 0) or 0),
+        "comm_chunk_level": str(
+            ((trace_summary.get("comm_chunk_exposure_summary") or {}).get("chunk_direction"))
+            or ((trace_summary.get("next_step_hypotheses") or {}).get("comm_chunk_direction"))
+            or "preserve"
+        ),
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[str, Any]) -> List[RewriteActionSpec]:
+    hypotheses = dict(trace_summary.get("next_step_hypotheses") or {})
+    actions: List[RewriteActionSpec] = []
+    target_stage_ids = [int(item) for item in (hypotheses.get("target_stages") or []) if _safe_int(item) is not None]
+    target_layer_groups = [str(item) for item in (hypotheses.get("target_layer_groups") or []) if str(item).strip()]
+    target_state_ids = [str(item) for item in (hypotheses.get("target_state_objects") or []) if str(item).strip()]
+    local_verticalization_targets = [
+        str(item)
+        for item in (hypotheses.get("local_verticalization_targets") or target_layer_groups[:2] or [])
+        if str(item).strip()
+    ]
+    memory_family = str(hypotheses.get("next_memory_patch_family") or "").strip()
+    overlap_family = str(hypotheses.get("next_overlap_patch_family") or "").strip()
+    schedule_family = str(hypotheses.get("next_partition_patch_family") or "").strip()
+    if memory_family in {"reload_shift_patch", "activation_reload_shift_patch", "reload_prefetch_patch"}:
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="reload_shift",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_ids,
+                direction=str(hypotheses.get("reload_shift_direction") or "hold"),
+                magnitude=1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                risk_flags=["rollback_watch"] if bool((trace_summary.get("policy_outcome_summary") or {}).get("demotion_action")) else [],
+            ).normalized()
+        )
+    if overlap_family in {"adaptive_chunking_patch", "comm_chunk_patch", "overlap_policy_patch"}:
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="adaptive_chunking",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_ids,
+                direction=str(hypotheses.get("comm_chunk_direction") or "preserve"),
+                magnitude=1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                risk_flags=["comm_interference_guard"],
+            ).normalized()
+        )
+    if schedule_family in {"local_verticalization_patch", "critical_path_relief_patch"} or (
+        not actions and local_verticalization_targets
+    ):
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="local_verticalization",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=local_verticalization_targets,
+                target_state_ids=[],
+                direction="enable",
+                magnitude=float(min(len(local_verticalization_targets), 2) or 1),
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                risk_flags=["memory_headroom_guard"],
+            ).normalized()
+        )
+    if not actions and program.rewrite_plan is not None:
+        actions = [item.normalized() for item in (program.rewrite_plan.rewrite_actions or [])]
+    return actions
+
+
+def _build_window_feedback_payload(
+    program: MegatronProgram,
+    metrics: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    trace_summary = dict(metrics.get("trace_summary") or {})
+    stdout_text = str(metrics.get("stdout_tail") or "")
+    stdout_log = metrics.get("stdout_log")
+    if stdout_log:
+        try:
+            stdout_text = Path(str(stdout_log)).read_text(encoding="utf-8")
+        except Exception:
+            pass
+    step_series = _extract_iteration_elapsed_ms(stdout_text)
+    window_steps = max(int((program.window_reconfig.window_steps if program.window_reconfig is not None else 0) or metrics.get("window_steps") or 4), 1)
+    if step_series:
+        window_chunks = [step_series[index : index + window_steps] for index in range(0, len(step_series), window_steps)]
+    else:
+        fallback_step = float(
+            metrics.get("step_time_ms_p50")
+            or trace_summary.get("steady_state_step_time_ms_p50")
+            or trace_summary.get("step_time_ms_p50")
+            or 0.0
+        )
+        window_chunks = [[fallback_step]] if fallback_step > 0.0 else []
+    policy_signature = _policy_signature(program, trace_summary)
+    critical_path = dict(trace_summary.get("critical_path_breakdown") or {})
+    latest_window = len(window_chunks) - 1 if window_chunks else 0
+    throughput = float(
+        metrics.get("throughput_tokens_per_s")
+        or metrics.get("throughput_effective_tokens_per_s")
+        or trace_summary.get("throughput_tokens_per_s")
+        or trace_summary.get("throughput_effective_tokens_per_s")
+        or 0.0
+    )
+    previous_confirmed = dict(metrics.get("previous_confirmed_policy") or {})
+    latest_step_time = _median(window_chunks[-1]) if window_chunks else 0.0
+    latest_reload_stall = float((trace_summary.get("reload_interference_summary") or {}).get("reload_stall_ms") or 0.0)
+    memory_headroom_risk = str((trace_summary.get("state_migration_diagnostics") or {}).get("memory_headroom_risk") or "medium")
+    rollback_triggered = False
+    confirmed_step = float(previous_confirmed.get("step_time_ms_p50") or 0.0)
+    confirmed_reload = float(previous_confirmed.get("reload_stall_ms") or 0.0)
+    if confirmed_step > 0.0 and latest_step_time > confirmed_step * 1.05:
+        rollback_triggered = True
+    if confirmed_reload > 0.0 and latest_reload_stall > confirmed_reload * 1.20:
+        rollback_triggered = True
+    if memory_headroom_risk == "high":
+        rollback_triggered = True
+    recommended_rewrites = _recommended_rewrite_actions(program, trace_summary)
+    history: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(window_chunks):
+        history.append(
+            WindowFeedbackSpec(
+                window_index=index,
+                policy_signature=policy_signature,
+                critical_stage_id=int(critical_path.get("critical_stage_id", -1) or -1),
+                critical_layer_group_id=str(critical_path.get("critical_layer_group_id") or ""),
+                critical_component_type=str(critical_path.get("critical_component_type") or "forward"),
+                step_time_ms_p50=_median(chunk),
+                throughput_tokens_per_s=throughput,
+                bubble_ratio=float(trace_summary.get("bubble_ratio") or 0.0),
+                reload_stall_ms=latest_reload_stall,
+                comm_exposure_ratio=float((trace_summary.get("comm_chunk_exposure_summary") or {}).get("comm_exposure_ratio") or trace_summary.get("comm_exposure_ratio") or 0.0),
+                offload_overlap_success_ratio=float(trace_summary.get("offload_overlap_success_ratio") or 0.0),
+                critical_path_breakdown=critical_path,
+                recommended_rewrites=recommended_rewrites if index == latest_window else [],
+                rollback_triggered=bool(rollback_triggered and index == latest_window),
+            ).to_dict()
+        )
+    latest = history[-1] if history else WindowFeedbackSpec(policy_signature=policy_signature).to_dict()
+    return latest, history
+
+
 def _build_failure_diagnosis(metrics: Dict[str, Any]) -> Dict[str, Any]:
     context_record = dict(metrics.get("context_record") or {})
     trial_artifact = dict(metrics.get("trial_artifact") or {})
     trial_outcome = dict(metrics.get("trial_outcome") or {})
     trial_reflection = dict(metrics.get("trial_reflection") or {})
+    window_feedback = dict(metrics.get("window_feedback") or {})
     runtime = dict((context_record.get("runtime_evidence") or {}))
     optimization_hints = list(trial_artifact.get("optimization_hints") or context_record.get("optimization_hints") or [])
     failure_modes = list(trial_artifact.get("failure_modes") or context_record.get("failure_modes") or [])
@@ -606,6 +842,12 @@ def _build_failure_diagnosis(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "recommended_actions": recommended_actions,
         "trial_outcome": trial_outcome,
         "trial_reflection": trial_reflection,
+        "window_feedback_digest": {
+            "window_index": int(window_feedback.get("window_index") or 0),
+            "policy_signature": str(window_feedback.get("policy_signature") or ""),
+            "critical_component_type": str(window_feedback.get("critical_component_type") or ""),
+            "rollback_triggered": bool(window_feedback.get("rollback_triggered", False)),
+        },
         "runtime_focus": {
             "bubble_ratio": float(runtime.get("bubble_ratio") or 0.0),
             "peak_reserved_ratio": float(runtime.get("peak_reserved_ratio") or 0.0),
@@ -1270,6 +1512,23 @@ def _launcher_env_overrides(
     transformer_impl = _resolve_transformer_impl(args, program)
     sequence_parallel_active = _sequence_parallel_active(args, program, compiled.strategy)
     env = dict(compiled.launcher_env)
+    merged_budget = dict(compiled.telemetry_budget or {})
+    budget_override = dict(observability.get("telemetry_budget") or {})
+    merged_budget.update(
+        {
+            "level": str(budget_override.get("level") or merged_budget.get("level") or "summary"),
+            "max_trace_mb": int(budget_override.get("max_trace_mb") or merged_budget.get("max_trace_mb") or 128),
+            "max_events_per_rank": int(
+                budget_override.get("max_events_per_rank") or merged_budget.get("max_events_per_rank") or 20000
+            ),
+            "sampled_windows": int(budget_override.get("sampled_windows") or merged_budget.get("sampled_windows") or 2),
+            "emit_compare_svg": (
+                budget_override.get("emit_compare_svg")
+                if budget_override.get("emit_compare_svg") is not None
+                else bool(merged_budget.get("emit_compare_svg", False))
+            ),
+        }
+    )
     env.update(
         {
             "GPUS_PER_NODE": str(int(args.nproc)),
@@ -1292,6 +1551,11 @@ def _launcher_env_overrides(
             "ENABLE_TP_COMM_OVERLAP": "1" if bool(args.enable_tp_comm_overlap) else "0",
             "ENABLE_PROFILE": "1" if bool(observability["profile_enabled"]) else "0",
             "OBSERVABILITY_PRESET": str(observability["preset"]),
+            "ENABLE_STATEFUL_SCHEDULE": (
+                "1"
+                if bool(observability["enable_stateful_schedule"])
+                else str(env.get("ENABLE_STATEFUL_SCHEDULE") or "1")
+            ),
             "ENABLE_LOG_TIMERS_TO_TENSORBOARD": "1" if bool(observability["enable_log_timers_to_tensorboard"]) else "0",
             "ENABLE_LOG_MEMORY_TO_TENSORBOARD": "1" if bool(observability["enable_log_memory_to_tensorboard"]) else "0",
             "TENSORBOARD_LOG_INTERVAL": str(int(observability["tensorboard_log_interval"])),
@@ -1314,11 +1578,51 @@ def _launcher_env_overrides(
             "ENABLE_NSYS": "1" if bool(observability["enable_nsys"]) else "0",
             "NSYS_OUTPUT": str(observability["nsys_output"] or ""),
             "NSYS_TRACE": str(observability["nsys_trace"]),
+            "SCHEDULE_RUNTIME_TRACE_LEVEL": str(merged_budget.get("level") or "summary"),
+            "SCHEDULE_RUNTIME_TRACE_MAX_MB": str(int(merged_budget.get("max_trace_mb") or 128)),
+            "SCHEDULE_RUNTIME_TRACE_MAX_EVENTS": str(int(merged_budget.get("max_events_per_rank") or 20000)),
+            "SCHEDULE_RUNTIME_TRACE_SAMPLED_WINDOWS": str(int(merged_budget.get("sampled_windows") or 2)),
             "TOKENIZER_MODEL": "MOCK" if bool(args.use_mock_data or program.model.track == "moe") else str(args.tokenizer_model),
             "DATA_PATH": "MOCK" if bool(args.use_mock_data or program.model.track == "moe") else str(args.data_path),
             "MODEL_NAME": str(program.model.model_name),
         }
     )
+    env["TELEMETRY_BUDGET"] = json.dumps(merged_budget, ensure_ascii=False)
+    window_reconfig_plan = {
+        **dict(compiled.window_reconfig or {}),
+        "window_steps": int(observability.get("window_steps") or (compiled.window_reconfig or {}).get("window_steps") or 4),
+    }
+    env["WINDOW_RECONFIG_PLAN"] = json.dumps(window_reconfig_plan, ensure_ascii=False)
+    if str(env.get("SCHEDULE_WINDOW_OVERRIDE_HINTS") or "").strip() == "":
+        allowed_categories = [
+            str(item).strip()
+            for item in list(window_reconfig_plan.get("allowed_patch_categories") or [])
+            if str(item).strip()
+        ]
+        generated_window_overrides = []
+        if "memory" in allowed_categories:
+            generated_window_overrides.append(
+                {
+                    "phase": "steady",
+                    "window": "last_2_groups",
+                    "stage_selector": "hotspot_stage",
+                    "chunk_order_policy": "center_out",
+                    "checkpoint_policy": "disable_full",
+                }
+            )
+        if "overlap" in allowed_categories:
+            generated_window_overrides.append(
+                {
+                    "phase": "cooldown",
+                    "window": "cooldown_first_group",
+                    "stage_selector": "optimizer_sensitive_stage",
+                    "chunk_order_policy": "target_chunk_first",
+                    "optimizer_target_chunk": "tail",
+                    "flush_policy": "tail_flush_aligned",
+                }
+            )
+        if generated_window_overrides:
+            env["SCHEDULE_WINDOW_OVERRIDE_HINTS"] = json.dumps(generated_window_overrides, sort_keys=True, separators=(",", ":"))
     if str(env.get("PYTORCH_CUDA_ALLOC_CONF") or "").strip() == "":
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     cuda_visible_devices = str(getattr(args, "cuda_visible_devices", "") or "").strip()
@@ -1477,6 +1781,7 @@ def run_trial(
     metrics["trial_context"]["launcher_script"] = str(launcher_script) if launcher_script else None
     metrics["trial_context"]["megatron_entry"] = str(resolved_entry)
     metrics["trial_context"]["megatron_root"] = str(args.megatron_root)
+    effective_telemetry_budget = dict(json.loads(str(launcher_env_overrides.get("TELEMETRY_BUDGET") or "{}")))
     metrics["trial_context"]["observability"] = {
         "preset": observability["preset"],
         "enable_wandb": bool(observability["enable_wandb"]),
@@ -1484,6 +1789,9 @@ def run_trial(
         "enable_straggler_log": bool(observability["enable_straggler_log"]),
         "enable_memory_history": bool(observability["enable_memory_history"]),
         "enable_nsys": bool(observability["enable_nsys"]),
+        "telemetry_budget": effective_telemetry_budget,
+        "window_steps": int(observability.get("window_steps") or 4),
+        "enable_stateful_schedule": bool(observability.get("enable_stateful_schedule")),
     }
     metrics["trial_context"]["runtime_stack"] = runtime_stack
     metrics["trial_context"]["resolved_backend_caps"] = resolved_backend_caps
@@ -1570,6 +1878,9 @@ def run_trial(
                 "enable_memory_history": bool(observability["enable_memory_history"]),
                 "enable_straggler_log": bool(observability["enable_straggler_log"]),
                 "enable_nsys": bool(observability["enable_nsys"]),
+                "telemetry_budget": effective_telemetry_budget,
+                "window_steps": int(observability.get("window_steps") or 4),
+                "enable_stateful_schedule": bool(observability.get("enable_stateful_schedule")),
                 "tensorboard_path": observability["tensorboard_path"],
                 "torch_profile_path": observability["torch_profile_path"],
                 "chakra_path": observability["chakra_path"] if bool(observability["profile_collect_chakra"]) else None,
@@ -1632,6 +1943,8 @@ def run_trial(
     stderr_text = proc.stderr or ""
     Path(log_paths["stdout_log"]).write_text(stdout_text, encoding="utf-8")
     Path(log_paths["stderr_log"]).write_text(stderr_text, encoding="utf-8")
+    metrics["stdout_log"] = log_paths["stdout_log"]
+    metrics["stderr_log"] = log_paths["stderr_log"]
     metrics["returncode"] = proc.returncode
     metrics["stdout_tail"] = stdout_text[-2000:]
     metrics["stderr_tail"] = stderr_text[-2000:]
@@ -1658,6 +1971,10 @@ def run_trial(
         except Exception:
             pass
         metrics["trace_summary"] = reduce_trial_trace(program, metrics=metrics)
+        metrics["window_steps"] = int(observability.get("window_steps") or 4)
+        latest_window_feedback, window_feedback_history = _build_window_feedback_payload(program, metrics)
+        metrics["window_feedback"] = latest_window_feedback
+        metrics["window_feedback_history"] = window_feedback_history
         _update_trial_search_metadata(metrics, program)
         observation = build_agent_observation(program, trace_summary=metrics["trace_summary"])
         metrics["context_record"] = observation.to_dict()
@@ -1685,6 +2002,10 @@ def run_trial(
     )
     metrics.update(parsed)
     metrics["trace_summary"] = reduce_trial_trace(program, metrics=metrics)
+    metrics["window_steps"] = int(observability.get("window_steps") or 4)
+    latest_window_feedback, window_feedback_history = _build_window_feedback_payload(program, metrics)
+    metrics["window_feedback"] = latest_window_feedback
+    metrics["window_feedback_history"] = window_feedback_history
     _update_trial_search_metadata(metrics, program)
     observation = build_agent_observation(program, trace_summary=metrics["trace_summary"])
     metrics["context_record"] = observation.to_dict()
@@ -1759,7 +2080,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trial-evaluation-level",
         type=str,
-        choices=["dry_run", "smoke_trial", "benchmark_trial", "full_trial"],
+        choices=["dry_run", "smoke_trial", "benchmark_trial", "window_refinement_trial", "full_trial"],
         default="benchmark_trial",
     )
     add_observability_args(parser)

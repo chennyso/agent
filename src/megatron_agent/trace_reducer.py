@@ -1483,7 +1483,22 @@ def _build_runtime_pipeline_event_trace(
         for event in list(trace.get("events") or []):
             all_events.append(_normalize_runtime_event(dict(event), stage_id))
     if not all_events:
-        return {}
+        return {
+            "format": "pipeline_event_trace",
+            "timing_basis": "runtime_observed_summary",
+            "summary": {
+                "schedule_template": schedule_family or str(program.schedule.template or "fixed_1f1b"),
+                "pp_degree": max(int(program.parallel.pp_degree), len(seen_stage_ids) or 1),
+                "vpp_degree": max(int(program.parallel.vpp_degree), 1),
+                "estimated_microbatches": max(int(program.batch_plan.grad_accum_steps or 1), 1),
+                "slot_ms": 0.0,
+                "projected_timeline_span_ms": 0.0,
+            },
+            "phase_windows": [],
+            "lane_summaries": sorted(lane_summaries, key=lambda item: int(item.get("stage_id") or 0)),
+            "events": [],
+            "notes": ["runtime trace consumed in summary-first mode; no full event list emitted"],
+        }
     total_span_ms = max(float(item.get("end_ms") or 0.0) for item in all_events)
     positive_microbatches = [int(item.get("microbatch_id") or -1) for item in all_events if int(item.get("microbatch_id") or -1) >= 0]
     microbatch_count = (max(positive_microbatches) + 1) if positive_microbatches else max(int(program.batch_plan.grad_accum_steps or 1), 1)
@@ -1581,7 +1596,11 @@ def _build_runtime_pipeline_grid_trace(
         if isinstance(item.get("observed_grid_trace"), dict) and dict(item.get("observed_grid_trace") or {}).get("cells")
     ]
     if not observed_grids:
-        return _build_pipeline_grid_trace(program, event_trace)
+        fallback = _build_pipeline_grid_trace(program, event_trace)
+        fallback["notes"] = list(fallback.get("notes") or []) + [
+            "runtime observed grid unavailable; fell back to projected grid",
+        ]
+        return fallback
     stage_ids = [int(item.get("stage_id") or 0) for item in traces if item.get("stage_id") is not None]
     cells: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {key: 0 for key in ("FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD", "BUBBLE")}
@@ -1664,42 +1683,70 @@ def _build_next_step_hypotheses(
     next_memory_patch_family = "preserve_memory_policy"
     next_overlap_patch_family = "preserve_overlap_policy"
     stop_signal = "continue_search"
+    sorted_groups = sorted(
+        list(norm.layer_groups or []),
+        key=lambda item: (
+            float(item.fwd_time_ms + item.bwd_input_time_ms + item.bwd_weight_time_ms),
+            float(item.activation_size_mb + item.parameter_size_mb),
+        ),
+        reverse=True,
+    )
+    target_layer_groups = [str(item.group_id) for item in sorted_groups[:2]]
+    target_stages = sorted({int(item.stage_id) for item in sorted_groups[:2]})
+    state_objects = list((norm.state_plan.objects if norm.state_plan is not None else []) or [])
+    state_objects = sorted(
+        state_objects,
+        key=lambda item: float(item.size_mb),
+        reverse=True,
+    )
+    target_state_objects = [str(item.state_id) for item in state_objects[:2]]
+    reload_shift_direction = "hold"
+    comm_chunk_direction = "preserve"
+    local_verticalization_targets: List[str] = []
 
     if dominant == "bubble_bound":
         next_schedule_family = "zero_bubble" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
-        next_partition_patch_family = "change_stage_boundary"
-        next_memory_patch_family = "checkpoint_boundary_joint" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
-        next_overlap_patch_family = "enable_p2p_overlap"
+        next_partition_patch_family = "local_verticalization_patch"
+        next_memory_patch_family = "reload_shift_patch" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
+        next_overlap_patch_family = "adaptive_chunking_patch"
+        comm_chunk_direction = "finer"
+        local_verticalization_targets = list(target_layer_groups[:2])
     elif dominant == "memory_bound":
         next_schedule_family = next_schedule_family if interleaved else "interleaved"
-        next_partition_patch_family = "enable_nonuniform_partition"
-        next_memory_patch_family = "add_offload_policy"
-        next_overlap_patch_family = "enable_reload_overlap"
+        next_partition_patch_family = "layer_group_repartition"
+        next_memory_patch_family = "reload_shift_patch"
+        next_overlap_patch_family = "adaptive_chunking_patch"
+        reload_shift_direction = "earlier"
+        local_verticalization_targets = list(target_layer_groups[:2])
     elif dominant == "comm_bound":
         next_schedule_family = "interleaved" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
-        next_partition_patch_family = "change_stage_boundary"
+        next_partition_patch_family = "change_schedule_family"
         next_memory_patch_family = "preserve_memory_policy"
-        next_overlap_patch_family = "enable_p2p_overlap"
+        next_overlap_patch_family = "adaptive_chunking_patch"
+        comm_chunk_direction = "coarser"
     elif dominant == "tail_bound":
         next_schedule_family = "dualpipe_v" if interleaved else "interleaved"
-        next_partition_patch_family = "tail_aware_stage_local_vpp"
+        next_partition_patch_family = "local_verticalization_patch"
         next_memory_patch_family = "preserve_memory_policy"
-        next_overlap_patch_family = "enable_optimizer_tail_overlap"
+        next_overlap_patch_family = "tail_relief_patch"
+        local_verticalization_targets = list(target_layer_groups[:2])
     elif dominant == "reload_bound":
         next_schedule_family = next_schedule_family
         next_partition_patch_family = "preserve_partition"
-        next_memory_patch_family = "tune_reload_prefetch"
-        next_overlap_patch_family = "enable_reload_overlap"
+        next_memory_patch_family = "reload_shift_patch"
+        next_overlap_patch_family = "adaptive_chunking_patch"
+        reload_shift_direction = "earlier"
+        local_verticalization_targets = list(target_layer_groups[:1])
     elif dominant == "optimizer_bound":
         next_schedule_family = next_schedule_family
         next_partition_patch_family = "preserve_partition"
         next_memory_patch_family = "preserve_memory_policy"
-        next_overlap_patch_family = "enable_optimizer_tail_overlap"
+        next_overlap_patch_family = "tail_relief_patch"
     else:
         next_schedule_family = "dualpipe_v" if interleaved and bubble_ratio >= 0.10 else next_schedule_family
-        next_partition_patch_family = "change_stage_boundary" if bubble_ratio >= 0.10 else "preserve_partition"
-        next_memory_patch_family = "add_offload_policy" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
-        next_overlap_patch_family = "enable_p2p_overlap" if comm_exposure_ratio >= 0.12 else "preserve_overlap_policy"
+        next_partition_patch_family = "critical_path_relief_patch" if bubble_ratio >= 0.10 else "preserve_partition"
+        next_memory_patch_family = "reload_shift_patch" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
+        next_overlap_patch_family = "adaptive_chunking_patch" if comm_exposure_ratio >= 0.12 else "preserve_overlap_policy"
 
     if peak_reserved_ratio >= 0.98:
         stop_signal = "memory_saturation"
@@ -1713,6 +1760,12 @@ def _build_next_step_hypotheses(
         "next_partition_patch_family": str(next_partition_patch_family),
         "next_memory_patch_family": str(next_memory_patch_family),
         "next_overlap_patch_family": str(next_overlap_patch_family),
+        "target_layer_groups": list(target_layer_groups),
+        "target_stages": list(target_stages),
+        "target_state_objects": list(target_state_objects),
+        "reload_shift_direction": str(reload_shift_direction),
+        "comm_chunk_direction": str(comm_chunk_direction),
+        "local_verticalization_targets": list(local_verticalization_targets),
         "stop_signal": str(stop_signal),
     }
 
@@ -4015,6 +4068,7 @@ def _build_context_from_trace(
     }
     if runtime_trace_metrics:
         runtime_evidence["runtime_comm_ms"] = float(runtime_trace_metrics.get("runtime_comm_ms") or 0.0)
+        runtime_evidence["runtime_wait_ms"] = float(runtime_trace_metrics.get("runtime_wait_ms") or 0.0)
         runtime_evidence["reload_stall_ms"] = float(runtime_trace_metrics.get("reload_stall_ms") or 0.0)
         runtime_evidence["offload_overlap_success_ratio"] = float(
             runtime_trace_metrics.get("offload_overlap_success_ratio") or 0.0
@@ -4080,6 +4134,118 @@ def _build_context_from_trace(
         runtime_evidence,
         bottleneck_signature,
     )
+    layer_group_diagnostics = {
+        "count": int(len(norm.layer_groups or [])),
+        "hot_layer_groups": [
+            {
+                "group_id": str(item.group_id),
+                "stage_id": int(item.stage_id),
+                "module_family": str(item.module_family),
+                "activation_size_mb": round(float(item.activation_size_mb), 4),
+                "combined_time_ms": round(float(item.fwd_time_ms + item.bwd_input_time_ms + item.bwd_weight_time_ms), 4),
+            }
+            for item in sorted(
+                list(norm.layer_groups or []),
+                key=lambda entry: float(entry.activation_size_mb + entry.fwd_time_ms + entry.bwd_input_time_ms + entry.bwd_weight_time_ms),
+                reverse=True,
+            )[:4]
+        ],
+    }
+    state_migration_diagnostics = {
+        "object_count": int(len((norm.state_plan.objects if norm.state_plan is not None else []) or [])),
+        "reload_prefetch_window": int((norm.state_plan.reload_prefetch_window if norm.state_plan is not None else 0) or 0),
+        "offload_budget_mb": round(float((norm.state_plan.offload_budget_mb if norm.state_plan is not None else 0.0) or 0.0), 4),
+        "target_state_objects": list(next_step_hypotheses.get("target_state_objects") or []),
+    }
+    reload_interference_summary = {
+        "reload_stall_ms": round(float(runtime_evidence.get("reload_stall_ms") or 0.0), 4),
+        "reload_stall_ratio": round(float(runtime_evidence.get("reload_stall_ratio") or 0.0), 4),
+        "suggested_direction": str(next_step_hypotheses.get("reload_shift_direction") or "hold"),
+    }
+    comm_chunk_exposure_summary = {
+        "runtime_comm_ms": round(float(runtime_evidence.get("runtime_comm_ms") or 0.0), 4),
+        "comm_exposure_ratio": round(float(runtime_evidence.get("comm_exposure_ratio") or 0.0), 4),
+        "chunk_direction": str(next_step_hypotheses.get("comm_chunk_direction") or "preserve"),
+        "action_type_duration_breakdown": dict(runtime_trace_metrics.get("action_type_duration_breakdown") or {}),
+    }
+    hottest_layer_group = dict((layer_group_diagnostics.get("hot_layer_groups") or [{}])[0] or {})
+    critical_component_type = "forward"
+    critical_exposed_time_ms = round(float(runtime_evidence.get("runtime_wait_ms") or 0.0), 4)
+    critical_shift_candidates = [str(item) for item in filter(None, [
+        next_step_hypotheses.get("next_partition_patch_family"),
+        next_step_hypotheses.get("next_memory_patch_family"),
+        next_step_hypotheses.get("next_overlap_patch_family"),
+    ])]
+    dominant_label = str(
+        (bottleneck_signature or {}).get("canonical_dominant_label")
+        or (bottleneck_signature or {}).get("dominant_label")
+        or "mixed_bound"
+    )
+    if dominant_label == "comm_bound":
+        critical_component_type = "comm"
+        critical_exposed_time_ms = round(float(runtime_evidence.get("runtime_comm_ms") or 0.0), 4)
+    elif dominant_label in {"reload_bound", "memory_bound"}:
+        critical_component_type = "reload"
+        critical_exposed_time_ms = round(float(runtime_evidence.get("reload_stall_ms") or 0.0), 4)
+    elif dominant_label in {"optimizer_bound", "tail_bound"}:
+        critical_component_type = "backward_weight"
+        critical_exposed_time_ms = round(float(runtime_evidence.get("optimizer_exposed_ms") or 0.0), 4)
+    elif dominant_label == "bubble_bound":
+        critical_component_type = "backward_input"
+        critical_exposed_time_ms = round(float(runtime_evidence.get("runtime_wait_ms") or 0.0), 4)
+    critical_path_breakdown = {
+        "critical_stage_id": int(hottest_layer_group.get("stage_id") or 0),
+        "critical_layer_group_id": str(hottest_layer_group.get("group_id") or ""),
+        "critical_component_type": str(critical_component_type),
+        "critical_exposed_time_ms": round(float(critical_exposed_time_ms), 4),
+        "critical_shift_candidates": critical_shift_candidates,
+        "bubble_ratio": round(float(runtime_evidence.get("bubble_ratio") or 0.0), 4),
+        "runtime_comm_ms": round(float(runtime_evidence.get("runtime_comm_ms") or 0.0), 4),
+        "runtime_wait_ms": round(float(runtime_evidence.get("runtime_wait_ms") or 0.0), 4),
+        "optimizer_exposed_ms": round(float(runtime_evidence.get("optimizer_exposed_ms") or 0.0), 4),
+        "reload_stall_ms": round(float(runtime_evidence.get("reload_stall_ms") or 0.0), 4),
+        "dominant_label": dominant_label,
+    }
+    policy_outcome_summary = {
+        "schedule_family": str(norm.schedule.template or "fixed_1f1b"),
+        "patch_family": infer_program_patch_family(norm),
+        "patch_category": infer_program_patch_category(norm),
+        "telemetry_level": str((norm.telemetry_budget.level if norm.telemetry_budget is not None else "summary") or "summary"),
+        "window_steps": int((norm.window_reconfig.window_steps if norm.window_reconfig is not None else 4) or 4),
+        "allowed_patch_categories": list((norm.window_reconfig.allowed_patch_categories if norm.window_reconfig is not None else []) or []),
+        "rollback_guard_steps": int((norm.window_reconfig.rollback_guard_steps if norm.window_reconfig is not None else 0) or 0),
+        "promotion_threshold": round(float((norm.window_reconfig.promotion_threshold if norm.window_reconfig is not None else 0.0) or 0.0), 4),
+        "demotion_threshold": round(float((norm.window_reconfig.demotion_threshold if norm.window_reconfig is not None else 0.0) or 0.0), 4),
+    }
+    current_patch_category = str(policy_outcome_summary.get("patch_category") or "")
+    reward_delta = float(runtime_evidence.get("estimated_reward_delta") or 0.0)
+    if reward_delta >= float(policy_outcome_summary["promotion_threshold"] or 0.0):
+        policy_outcome_summary["promotion_action"] = (
+            "promote_memory_patch"
+            if current_patch_category == "memory"
+            else "promote_current_patch"
+        )
+    elif reward_delta <= -max(float(policy_outcome_summary["demotion_threshold"] or 0.0), 0.0):
+        if current_patch_category == "overlap":
+            policy_outcome_summary["demotion_action"] = "rollback_overlap"
+        else:
+            policy_outcome_summary["demotion_action"] = "demote_current_patch"
+    elif reload_interference_summary["reload_stall_ratio"] >= 0.08:
+        policy_outcome_summary["promotion_action"] = "promote_memory_patch"
+    elif comm_chunk_exposure_summary["comm_exposure_ratio"] >= 0.08 and current_patch_category == "overlap":
+        policy_outcome_summary["demotion_action"] = "demote_overlap"
+    window_feedback_digest = {
+        "critical_stage_id": int(critical_path_breakdown.get("critical_stage_id") or 0),
+        "critical_layer_group_id": str(critical_path_breakdown.get("critical_layer_group_id") or ""),
+        "critical_component_type": str(critical_path_breakdown.get("critical_component_type") or ""),
+        "rewrite_recommendation": {
+            "memory": str(next_step_hypotheses.get("next_memory_patch_family") or ""),
+            "overlap": str(next_step_hypotheses.get("next_overlap_patch_family") or ""),
+            "schedule": str(next_step_hypotheses.get("next_partition_patch_family") or ""),
+            "local_verticalization_targets": list(next_step_hypotheses.get("local_verticalization_targets") or []),
+        },
+        "rollback_triggered": bool(str(policy_outcome_summary.get("demotion_action") or "").startswith("rollback")),
+    }
     bottleneck_breakdown = _build_bottleneck_breakdown(stage_evidence, subgraph_evidence, runtime_evidence)
     stage_cost_model = _derive_stage_costs(norm, stage_evidence, runtime_evidence)
     boundary_semantics = _build_boundary_semantics(norm, stage_evidence, runtime_evidence)
@@ -4137,7 +4303,20 @@ def _build_context_from_trace(
         pipeline_event_trace,
     )
     pipeline_projection_svg = _build_pipeline_projection_svg(pipeline_schedule_projection, pipeline_event_trace)
-    compare_pipeline_svg = _build_compare_pipeline_svg(pipeline_grid_trace)
+    runtime_emit_compare = any(
+        bool(dict(item.get("telemetry") or {}).get("emit_compare_svg"))
+        for item in runtime_schedule_traces
+        if isinstance(item, dict)
+    )
+    compare_pipeline_svg = (
+        _build_compare_pipeline_svg(pipeline_grid_trace)
+        if bool(
+            runtime_emit_compare
+            or norm.telemetry_budget is None
+            or norm.telemetry_budget.emit_compare_svg
+        )
+        else {}
+    )
     return {
         "hardware_context": hardware_context,
         "backend_context": backend_context,
@@ -4148,6 +4327,13 @@ def _build_context_from_trace(
             **evidence_record,
             "bottleneck_breakdown": bottleneck_breakdown,
             "stage_cost_model": stage_cost_model,
+            "layer_group_diagnostics": layer_group_diagnostics,
+            "state_migration_diagnostics": state_migration_diagnostics,
+            "reload_interference_summary": reload_interference_summary,
+            "comm_chunk_exposure_summary": comm_chunk_exposure_summary,
+            "critical_path_breakdown": critical_path_breakdown,
+            "policy_outcome_summary": policy_outcome_summary,
+            "window_feedback_digest": window_feedback_digest,
             "boundary_semantics": boundary_semantics,
             "nonuniform_vpp_shape": nonuniform_vpp_shape,
             "pipe_search_space": pipe_search_space,
@@ -4175,6 +4361,7 @@ def _build_context_from_trace(
         "derived_bottlenecks": derived_bottlenecks,
         "optimization_hints": optimization_hints,
         "next_step_hypotheses": next_step_hypotheses,
+        "window_feedback_digest": window_feedback_digest,
     }
 
 
@@ -4323,6 +4510,7 @@ def build_trial_artifact(
         "critical_operator_clusters": list(evidence.get("critical_operator_clusters") or []),
         "runtime_branch_plan": dict(evidence.get("runtime_branch_plan") or {}),
         "next_step_hypotheses": dict(evidence.get("next_step_hypotheses") or {}),
+        "window_feedback_digest": dict(evidence.get("window_feedback_digest") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
         "runtime_trace_summary": {
             "wait_ms": float(runtime.get("runtime_wait_ms") or 0.0),

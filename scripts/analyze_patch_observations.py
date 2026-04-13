@@ -156,6 +156,24 @@ def _preferred_visual_path(paths: Dict[str, Any]) -> str:
     return ""
 
 
+def _program_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(record.get("program") or {})
+
+
+def _telemetry_level(record: Dict[str, Any]) -> str:
+    trial_context = dict(record.get("trial_context") or {})
+    observability = dict(trial_context.get("observability") or {})
+    telemetry_budget = dict(observability.get("telemetry_budget") or {})
+    compiled = dict(record.get("compiled") or {})
+    compiled_budget = dict(compiled.get("telemetry_budget") or {})
+    return (
+        str(telemetry_budget.get("level") or "").strip()
+        or str(compiled_budget.get("level") or "").strip()
+        or str(((_program_payload(record).get("telemetry_budget") or {}) or {}).get("level") or "").strip()
+        or "summary"
+    )
+
+
 def collect_patch_observations(inputs: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     summaries = _discover_summary_paths(inputs)
     rows: List[Dict[str, Any]] = []
@@ -185,6 +203,13 @@ def collect_patch_observations(inputs: Sequence[str]) -> Tuple[List[Dict[str, An
         )
         for trial in list(summary.get("tested_trials") or []):
             record = dict(trial or {})
+            trace_summary = dict(record.get("trace_summary") or {})
+            program_payload = _program_payload(record)
+            state_plan = dict(program_payload.get("state_plan") or {})
+            context_record = dict(record.get("context_record") or {})
+            evidence_record = dict(context_record.get("evidence_record") or {})
+            hypotheses = dict(context_record.get("next_step_hypotheses") or evidence_record.get("next_step_hypotheses") or {})
+            comm_summary = dict(evidence_record.get("comm_chunk_exposure_summary") or {})
             trial_id = _safe_int(record.get("trial_id"), -1)
             step_time_ms = _safe_float(
                 dict(record.get("trace_summary") or {}).get("steady_state_step_time_ms_p50")
@@ -222,6 +247,18 @@ def collect_patch_observations(inputs: Sequence[str]) -> Tuple[List[Dict[str, An
                 "memory_skew_ratio": round(_trial_metric(record, "mem_skew_ratio"), 6),
                 "tail_ratio": round(_trial_metric(record, "stage_tail_ratio"), 6),
                 "optimizer_exposed_ratio": round(_trial_metric(record, "optimizer_exposed_ratio"), 6),
+                "primary_parallel_mode": str((program_payload.get("global_strategy_plan") or {}).get("primary_parallel_mode") or "pp_vpp"),
+                "rewrite_family": str((dict(record.get("window_feedback") or {}).get("recommended_rewrites") or [{}])[0].get("rewrite_type") or ""),
+                "rewrite_target_stage_count": _safe_int(len(list((dict(record.get("window_feedback") or {}).get("recommended_rewrites") or [{}])[0].get("target_stage_ids") or []))),
+                "rewrite_target_layer_group_count": _safe_int(len(list((dict(record.get("window_feedback") or {}).get("recommended_rewrites") or [{}])[0].get("target_layer_group_ids") or []))),
+                "critical_component_type": str(dict(record.get("window_feedback") or {}).get("critical_component_type") or dict(trace_summary.get("critical_path_breakdown") or {}).get("critical_component_type") or ""),
+                "rollback_triggered": _safe_bool(dict(record.get("window_feedback") or {}).get("rollback_triggered")),
+                "window_index": _safe_int(dict(record.get("window_feedback") or {}).get("window_index"), 0),
+                "layer_group_count": _safe_int(len(list(program_payload.get("layer_groups") or []))),
+                "state_object_count": _safe_int(len(list(state_plan.get("objects") or []))),
+                "reload_shift_count": 0 if str(hypotheses.get("reload_shift_direction") or "hold") == "hold" else 1,
+                "comm_chunk_level": str(comm_summary.get("chunk_direction") or "preserve"),
+                "telemetry_level": _telemetry_level(record),
                 "success": _successful_trial(record),
                 "harmful": False,
                 "summary_path": str(summary_path),
@@ -404,6 +441,9 @@ def _build_case_study_manifest(rows: List[Dict[str, Any]], *, case_study_topk: i
                     "memory_skew_ratio": round(_safe_float(selected.get("memory_skew_ratio")), 6),
                     "tail_ratio": round(_safe_float(selected.get("tail_ratio")), 6),
                     "optimizer_exposed_ratio": round(_safe_float(selected.get("optimizer_exposed_ratio")), 6),
+                    "layer_group_count": _safe_int(selected.get("layer_group_count")),
+                    "state_object_count": _safe_int(selected.get("state_object_count")),
+                    "telemetry_level": str(selected.get("telemetry_level") or "summary"),
                 },
             }
         )
@@ -446,6 +486,18 @@ def analyze_runs(inputs: Sequence[str], out_dir: Path, case_study_topk: int = 2)
             "memory_skew_ratio": row["memory_skew_ratio"],
             "tail_ratio": row["tail_ratio"],
             "optimizer_exposed_ratio": row["optimizer_exposed_ratio"],
+            "primary_parallel_mode": row["primary_parallel_mode"],
+            "rewrite_family": row["rewrite_family"],
+            "rewrite_target_stage_count": row["rewrite_target_stage_count"],
+            "rewrite_target_layer_group_count": row["rewrite_target_layer_group_count"],
+            "critical_component_type": row["critical_component_type"],
+            "rollback_triggered": row["rollback_triggered"],
+            "window_index": row["window_index"],
+            "layer_group_count": row["layer_group_count"],
+            "state_object_count": row["state_object_count"],
+            "reload_shift_count": row["reload_shift_count"],
+            "comm_chunk_level": row["comm_chunk_level"],
+            "telemetry_level": row["telemetry_level"],
         }
         for row in rows
     ]
@@ -475,6 +527,18 @@ def analyze_runs(inputs: Sequence[str], out_dir: Path, case_study_topk: int = 2)
             "memory_skew_ratio",
             "tail_ratio",
             "optimizer_exposed_ratio",
+            "primary_parallel_mode",
+            "rewrite_family",
+            "rewrite_target_stage_count",
+            "rewrite_target_layer_group_count",
+            "critical_component_type",
+            "rollback_triggered",
+            "window_index",
+            "layer_group_count",
+            "state_object_count",
+            "reload_shift_count",
+            "comm_chunk_level",
+            "telemetry_level",
         ],
     )
     _write_csv(

@@ -1056,6 +1056,654 @@ class ScheduleIRSpec:
 
 
 @dataclass
+class LayerGroupSpec:
+    group_id: str = ""
+    stage_id: int = 0
+    layer_range: List[int] = field(default_factory=list)
+    module_family: str = "decoder"
+    fwd_time_ms: float = 0.0
+    bwd_input_time_ms: float = 0.0
+    bwd_weight_time_ms: float = 0.0
+    activation_size_mb: float = 0.0
+    parameter_size_mb: float = 0.0
+    optimizer_state_size_mb: float = 0.0
+    offload_cost_ms: float = 0.0
+    reload_cost_ms: float = 0.0
+    comm_boundary_cost_ms: float = 0.0
+
+    def normalized(self) -> "LayerGroupSpec":
+        norm = copy.deepcopy(self)
+        norm.group_id = str(norm.group_id or "")
+        norm.stage_id = max(int(norm.stage_id), 0)
+        raw_range = list(norm.layer_range or [])
+        if len(raw_range) >= 2:
+            start = max(int(raw_range[0]), 0)
+            end = max(int(raw_range[1]), start)
+            norm.layer_range = [start, end]
+        elif len(raw_range) == 1:
+            start = max(int(raw_range[0]), 0)
+            norm.layer_range = [start, start]
+        else:
+            norm.layer_range = [0, 0]
+        norm.module_family = str(norm.module_family or "decoder")
+        norm.fwd_time_ms = max(float(norm.fwd_time_ms or 0.0), 0.0)
+        norm.bwd_input_time_ms = max(float(norm.bwd_input_time_ms or 0.0), 0.0)
+        norm.bwd_weight_time_ms = max(float(norm.bwd_weight_time_ms or 0.0), 0.0)
+        norm.activation_size_mb = max(float(norm.activation_size_mb or 0.0), 0.0)
+        norm.parameter_size_mb = max(float(norm.parameter_size_mb or 0.0), 0.0)
+        norm.optimizer_state_size_mb = max(float(norm.optimizer_state_size_mb or 0.0), 0.0)
+        norm.offload_cost_ms = max(float(norm.offload_cost_ms or 0.0), 0.0)
+        norm.reload_cost_ms = max(float(norm.reload_cost_ms or 0.0), 0.0)
+        norm.comm_boundary_cost_ms = max(float(norm.comm_boundary_cost_ms or 0.0), 0.0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "group_id": norm.group_id,
+            "stage_id": int(norm.stage_id),
+            "layer_range": list(norm.layer_range),
+            "module_family": norm.module_family,
+            "fwd_time_ms": float(norm.fwd_time_ms),
+            "bwd_input_time_ms": float(norm.bwd_input_time_ms),
+            "bwd_weight_time_ms": float(norm.bwd_weight_time_ms),
+            "activation_size_mb": float(norm.activation_size_mb),
+            "parameter_size_mb": float(norm.parameter_size_mb),
+            "optimizer_state_size_mb": float(norm.optimizer_state_size_mb),
+            "offload_cost_ms": float(norm.offload_cost_ms),
+            "reload_cost_ms": float(norm.reload_cost_ms),
+            "comm_boundary_cost_ms": float(norm.comm_boundary_cost_ms),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "LayerGroupSpec":
+        return cls(
+            group_id=str(payload.get("group_id") or ""),
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            layer_range=[int(item) for item in (payload.get("layer_range") or [])],
+            module_family=str(payload.get("module_family", "decoder")),
+            fwd_time_ms=float(payload.get("fwd_time_ms", 0.0) or 0.0),
+            bwd_input_time_ms=float(payload.get("bwd_input_time_ms", 0.0) or 0.0),
+            bwd_weight_time_ms=float(payload.get("bwd_weight_time_ms", 0.0) or 0.0),
+            activation_size_mb=float(payload.get("activation_size_mb", 0.0) or 0.0),
+            parameter_size_mb=float(payload.get("parameter_size_mb", 0.0) or 0.0),
+            optimizer_state_size_mb=float(payload.get("optimizer_state_size_mb", 0.0) or 0.0),
+            offload_cost_ms=float(payload.get("offload_cost_ms", 0.0) or 0.0),
+            reload_cost_ms=float(payload.get("reload_cost_ms", 0.0) or 0.0),
+            comm_boundary_cost_ms=float(payload.get("comm_boundary_cost_ms", 0.0) or 0.0),
+        )
+
+
+@dataclass
+class StateObjectSpec:
+    state_id: str = ""
+    state_type: str = "activation"
+    owner_stage: int = 0
+    owner_layer_group: str = ""
+    size_mb: float = 0.0
+    offloadable: bool = False
+    prefetchable: bool = False
+
+    def normalized(self) -> "StateObjectSpec":
+        norm = copy.deepcopy(self)
+        norm.state_id = str(norm.state_id or "")
+        norm.state_type = str(norm.state_type or "activation")
+        norm.owner_stage = max(int(norm.owner_stage), 0)
+        norm.owner_layer_group = str(norm.owner_layer_group or "")
+        norm.size_mb = max(float(norm.size_mb or 0.0), 0.0)
+        norm.offloadable = bool(norm.offloadable)
+        norm.prefetchable = bool(norm.prefetchable)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "state_id": norm.state_id,
+            "state_type": norm.state_type,
+            "owner_stage": int(norm.owner_stage),
+            "owner_layer_group": norm.owner_layer_group,
+            "size_mb": float(norm.size_mb),
+            "offloadable": bool(norm.offloadable),
+            "prefetchable": bool(norm.prefetchable),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "StateObjectSpec":
+        return cls(
+            state_id=str(payload.get("state_id") or ""),
+            state_type=str(payload.get("state_type", "activation")),
+            owner_stage=int(payload.get("owner_stage", 0) or 0),
+            owner_layer_group=str(payload.get("owner_layer_group") or ""),
+            size_mb=float(payload.get("size_mb", 0.0) or 0.0),
+            offloadable=bool(payload.get("offloadable", False)),
+            prefetchable=bool(payload.get("prefetchable", False)),
+        )
+
+
+@dataclass
+class StatePlacementSpec:
+    state_id: str = ""
+    placement: str = "hbm"
+    ready_for_use: bool = True
+    valid_from_slot: int = 0
+    valid_until_slot: Optional[int] = None
+
+    def normalized(self) -> "StatePlacementSpec":
+        norm = copy.deepcopy(self)
+        norm.state_id = str(norm.state_id or "")
+        norm.placement = str(norm.placement or "hbm")
+        norm.ready_for_use = bool(norm.ready_for_use)
+        norm.valid_from_slot = max(int(norm.valid_from_slot or 0), 0)
+        if norm.valid_until_slot is not None:
+            norm.valid_until_slot = max(int(norm.valid_until_slot), norm.valid_from_slot)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "state_id": norm.state_id,
+            "placement": norm.placement,
+            "ready_for_use": bool(norm.ready_for_use),
+            "valid_from_slot": int(norm.valid_from_slot),
+            "valid_until_slot": norm.valid_until_slot,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "StatePlacementSpec":
+        return cls(
+            state_id=str(payload.get("state_id") or ""),
+            placement=str(payload.get("placement", "hbm")),
+            ready_for_use=bool(payload.get("ready_for_use", True)),
+            valid_from_slot=int(payload.get("valid_from_slot", 0) or 0),
+            valid_until_slot=payload.get("valid_until_slot"),
+        )
+
+
+@dataclass
+class ScheduleNodeSpec:
+    node_id: str = ""
+    node_type: str = "wait"
+    stage_id: int = 0
+    microbatch_id: int = 0
+    layer_group_id: str = ""
+    lane_id: int = 0
+    chunk_id: int = 0
+    duration_hint_ms: float = 0.0
+    state_refs: List[str] = field(default_factory=list)
+    resource_class: str = "compute"
+
+    def normalized(self) -> "ScheduleNodeSpec":
+        norm = copy.deepcopy(self)
+        norm.node_id = str(norm.node_id or "")
+        norm.node_type = str(norm.node_type or "wait")
+        norm.stage_id = max(int(norm.stage_id), 0)
+        norm.microbatch_id = max(int(norm.microbatch_id), 0)
+        norm.layer_group_id = str(norm.layer_group_id or "")
+        norm.lane_id = max(int(norm.lane_id), 0)
+        norm.chunk_id = max(int(norm.chunk_id), 0)
+        norm.duration_hint_ms = max(float(norm.duration_hint_ms or 0.0), 0.0)
+        norm.state_refs = [str(item) for item in (norm.state_refs or []) if str(item).strip()]
+        norm.resource_class = str(norm.resource_class or "compute")
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "node_id": norm.node_id,
+            "node_type": norm.node_type,
+            "stage_id": int(norm.stage_id),
+            "microbatch_id": int(norm.microbatch_id),
+            "layer_group_id": norm.layer_group_id,
+            "lane_id": int(norm.lane_id),
+            "chunk_id": int(norm.chunk_id),
+            "duration_hint_ms": float(norm.duration_hint_ms),
+            "state_refs": list(norm.state_refs),
+            "resource_class": norm.resource_class,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ScheduleNodeSpec":
+        return cls(
+            node_id=str(payload.get("node_id") or ""),
+            node_type=str(payload.get("node_type", "wait")),
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            microbatch_id=int(payload.get("microbatch_id", 0) or 0),
+            layer_group_id=str(payload.get("layer_group_id") or ""),
+            lane_id=int(payload.get("lane_id", 0) or 0),
+            chunk_id=int(payload.get("chunk_id", 0) or 0),
+            duration_hint_ms=float(payload.get("duration_hint_ms", 0.0) or 0.0),
+            state_refs=[str(item) for item in (payload.get("state_refs") or [])],
+            resource_class=str(payload.get("resource_class", "compute")),
+        )
+
+
+@dataclass
+class ScheduleEdgeSpec:
+    src: str = ""
+    dst: str = ""
+    edge_type: str = "data_dep"
+    required: bool = True
+    slack_hint_ms: float = 0.0
+
+    def normalized(self) -> "ScheduleEdgeSpec":
+        norm = copy.deepcopy(self)
+        norm.src = str(norm.src or "")
+        norm.dst = str(norm.dst or "")
+        norm.edge_type = str(norm.edge_type or "data_dep")
+        norm.required = bool(norm.required)
+        norm.slack_hint_ms = max(float(norm.slack_hint_ms or 0.0), 0.0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "src": norm.src,
+            "dst": norm.dst,
+            "edge_type": norm.edge_type,
+            "required": bool(norm.required),
+            "slack_hint_ms": float(norm.slack_hint_ms),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ScheduleEdgeSpec":
+        return cls(
+            src=str(payload.get("src") or ""),
+            dst=str(payload.get("dst") or ""),
+            edge_type=str(payload.get("edge_type", "data_dep")),
+            required=bool(payload.get("required", True)),
+            slack_hint_ms=float(payload.get("slack_hint_ms", 0.0) or 0.0),
+        )
+
+
+@dataclass
+class StatePlanSpec:
+    objects: List[StateObjectSpec] = field(default_factory=list)
+    placements: List[StatePlacementSpec] = field(default_factory=list)
+    offload_budget_mb: float = 0.0
+    reload_prefetch_window: int = 1
+
+    def normalized(self) -> "StatePlanSpec":
+        norm = copy.deepcopy(self)
+        norm.objects = [item.normalized() for item in (norm.objects or [])]
+        norm.placements = [item.normalized() for item in (norm.placements or [])]
+        norm.offload_budget_mb = max(float(norm.offload_budget_mb or 0.0), 0.0)
+        norm.reload_prefetch_window = max(int(norm.reload_prefetch_window or 1), 0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "objects": [item.to_dict() for item in norm.objects],
+            "placements": [item.to_dict() for item in norm.placements],
+            "offload_budget_mb": float(norm.offload_budget_mb),
+            "reload_prefetch_window": int(norm.reload_prefetch_window),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "StatePlanSpec":
+        return cls(
+            objects=[StateObjectSpec.from_dict(item) for item in (payload.get("objects") or [])],
+            placements=[StatePlacementSpec.from_dict(item) for item in (payload.get("placements") or [])],
+            offload_budget_mb=float(payload.get("offload_budget_mb", 0.0) or 0.0),
+            reload_prefetch_window=int(payload.get("reload_prefetch_window", 1) or 1),
+        )
+
+
+@dataclass
+class TelemetryBudgetSpec:
+    level: str = "summary"
+    max_trace_mb: int = 128
+    max_events_per_rank: int = 20000
+    sampled_windows: int = 2
+    emit_compare_svg: bool = False
+
+    def normalized(self) -> "TelemetryBudgetSpec":
+        norm = copy.deepcopy(self)
+        norm.level = str(norm.level or "summary").strip().lower() or "summary"
+        if norm.level not in {"summary", "aggregated_grid", "full_debug"}:
+            norm.level = "summary"
+        norm.max_trace_mb = max(int(norm.max_trace_mb or 128), 1)
+        norm.max_events_per_rank = max(int(norm.max_events_per_rank or 20000), 0)
+        norm.sampled_windows = max(int(norm.sampled_windows or 2), 0)
+        norm.emit_compare_svg = bool(norm.emit_compare_svg)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "level": norm.level,
+            "max_trace_mb": int(norm.max_trace_mb),
+            "max_events_per_rank": int(norm.max_events_per_rank),
+            "sampled_windows": int(norm.sampled_windows),
+            "emit_compare_svg": bool(norm.emit_compare_svg),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "TelemetryBudgetSpec":
+        return cls(
+            level=str(payload.get("level", "summary")),
+            max_trace_mb=int(payload.get("max_trace_mb", 128) or 128),
+            max_events_per_rank=int(payload.get("max_events_per_rank", 20000) or 20000),
+            sampled_windows=int(payload.get("sampled_windows", 2) or 2),
+            emit_compare_svg=bool(payload.get("emit_compare_svg", False)),
+        )
+
+
+@dataclass
+class WindowReconfigSpec:
+    window_steps: int = 4
+    allowed_patch_categories: List[str] = field(default_factory=lambda: ["schedule", "memory", "overlap", "partition"])
+    rollback_guard_steps: int = 1
+    promotion_threshold: float = 0.03
+    demotion_threshold: float = 0.05
+
+    def normalized(self) -> "WindowReconfigSpec":
+        norm = copy.deepcopy(self)
+        norm.window_steps = max(int(norm.window_steps or 4), 1)
+        normalized_categories: List[str] = []
+        for item in (norm.allowed_patch_categories or []):
+            token = str(item).strip().lower()
+            if token in {"partition", "schedule", "memory", "overlap"} and token not in normalized_categories:
+                normalized_categories.append(token)
+        norm.allowed_patch_categories = normalized_categories or ["schedule", "memory", "overlap", "partition"]
+        norm.rollback_guard_steps = max(int(norm.rollback_guard_steps or 1), 0)
+        norm.promotion_threshold = max(float(norm.promotion_threshold or 0.03), 0.0)
+        norm.demotion_threshold = max(float(norm.demotion_threshold or 0.05), 0.0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "window_steps": int(norm.window_steps),
+            "allowed_patch_categories": list(norm.allowed_patch_categories),
+            "rollback_guard_steps": int(norm.rollback_guard_steps),
+            "promotion_threshold": float(norm.promotion_threshold),
+            "demotion_threshold": float(norm.demotion_threshold),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "WindowReconfigSpec":
+        return cls(
+            window_steps=int(payload.get("window_steps", 4) or 4),
+            allowed_patch_categories=[str(item) for item in (payload.get("allowed_patch_categories") or [])],
+            rollback_guard_steps=int(payload.get("rollback_guard_steps", 1) or 1),
+            promotion_threshold=float(payload.get("promotion_threshold", 0.03) or 0.03),
+            demotion_threshold=float(payload.get("demotion_threshold", 0.05) or 0.05),
+        )
+
+
+@dataclass
+class GlobalStrategyPlanSpec:
+    primary_parallel_mode: str = "pp_vpp"
+    dp_degree: int = 1
+    tp_degree: int = 1
+    pp_degree: int = 1
+    vpp_degree: int = 1
+    stage_count: int = 1
+    stage_boundaries: List[List[int]] = field(default_factory=list)
+    layer_group_to_stage: Dict[str, int] = field(default_factory=dict)
+    activation_offload_enabled_groups: List[str] = field(default_factory=list)
+    overlap_enabled_channels: List[str] = field(default_factory=list)
+    selection_rationale: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "GlobalStrategyPlanSpec":
+        norm = copy.deepcopy(self)
+        mode = str(norm.primary_parallel_mode or "pp_vpp").strip().lower()
+        norm.primary_parallel_mode = mode if mode in {"pp_vpp", "fsdp_zero"} else "pp_vpp"
+        norm.dp_degree = max(int(norm.dp_degree or 1), 1)
+        norm.tp_degree = max(int(norm.tp_degree or 1), 1)
+        norm.pp_degree = max(int(norm.pp_degree or 1), 1)
+        norm.vpp_degree = max(int(norm.vpp_degree or 1), 1)
+        norm.stage_count = max(int(norm.stage_count or norm.pp_degree or 1), 1)
+        normalized_boundaries: List[List[int]] = []
+        for item in (norm.stage_boundaries or []):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            start = int(item[0])
+            end = int(item[1])
+            if end < start:
+                start, end = end, start
+            normalized_boundaries.append([start, end])
+        norm.stage_boundaries = normalized_boundaries
+        norm.layer_group_to_stage = {
+            str(key): int(value)
+            for key, value in dict(norm.layer_group_to_stage or {}).items()
+            if str(key).strip()
+        }
+        norm.activation_offload_enabled_groups = [
+            str(item) for item in (norm.activation_offload_enabled_groups or []) if str(item).strip()
+        ]
+        channels: List[str] = []
+        for item in (norm.overlap_enabled_channels or []):
+            token = str(item or "").strip().lower()
+            if token and token not in channels:
+                channels.append(token)
+        norm.overlap_enabled_channels = channels
+        norm.selection_rationale = [str(item) for item in (norm.selection_rationale or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "primary_parallel_mode": str(norm.primary_parallel_mode),
+            "dp_degree": int(norm.dp_degree),
+            "tp_degree": int(norm.tp_degree),
+            "pp_degree": int(norm.pp_degree),
+            "vpp_degree": int(norm.vpp_degree),
+            "stage_count": int(norm.stage_count),
+            "stage_boundaries": [list(item) for item in norm.stage_boundaries],
+            "layer_group_to_stage": dict(norm.layer_group_to_stage),
+            "activation_offload_enabled_groups": list(norm.activation_offload_enabled_groups),
+            "overlap_enabled_channels": list(norm.overlap_enabled_channels),
+            "selection_rationale": list(norm.selection_rationale),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "GlobalStrategyPlanSpec":
+        return cls(
+            primary_parallel_mode=str(payload.get("primary_parallel_mode", "pp_vpp") or "pp_vpp"),
+            dp_degree=int(payload.get("dp_degree", 1) or 1),
+            tp_degree=int(payload.get("tp_degree", 1) or 1),
+            pp_degree=int(payload.get("pp_degree", 1) or 1),
+            vpp_degree=int(payload.get("vpp_degree", 1) or 1),
+            stage_count=int(payload.get("stage_count", 1) or 1),
+            stage_boundaries=[
+                [int(item[0]), int(item[1])]
+                for item in (payload.get("stage_boundaries") or [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ],
+            layer_group_to_stage={
+                str(key): int(value)
+                for key, value in dict(payload.get("layer_group_to_stage") or {}).items()
+            },
+            activation_offload_enabled_groups=[
+                str(item) for item in (payload.get("activation_offload_enabled_groups") or [])
+            ],
+            overlap_enabled_channels=[str(item) for item in (payload.get("overlap_enabled_channels") or [])],
+            selection_rationale=[str(item) for item in (payload.get("selection_rationale") or [])],
+        )
+
+
+@dataclass
+class RewriteActionSpec:
+    rewrite_type: str = "reload_shift"
+    target_stage_ids: List[int] = field(default_factory=list)
+    target_layer_group_ids: List[str] = field(default_factory=list)
+    target_state_ids: List[str] = field(default_factory=list)
+    direction: str = "hold"
+    magnitude: float = 0.0
+    expected_gain: float = 0.0
+    risk_flags: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "RewriteActionSpec":
+        norm = copy.deepcopy(self)
+        rewrite_type = str(norm.rewrite_type or "reload_shift").strip().lower()
+        if rewrite_type not in {"reload_shift", "adaptive_chunking", "local_verticalization"}:
+            rewrite_type = "reload_shift"
+        norm.rewrite_type = rewrite_type
+        norm.target_stage_ids = sorted({int(item) for item in (norm.target_stage_ids or [])})
+        norm.target_layer_group_ids = [str(item) for item in (norm.target_layer_group_ids or []) if str(item).strip()]
+        norm.target_state_ids = [str(item) for item in (norm.target_state_ids or []) if str(item).strip()]
+        norm.direction = str(norm.direction or "hold").strip().lower() or "hold"
+        norm.magnitude = float(norm.magnitude or 0.0)
+        norm.expected_gain = float(norm.expected_gain or 0.0)
+        norm.risk_flags = [str(item) for item in (norm.risk_flags or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "rewrite_type": str(norm.rewrite_type),
+            "target_stage_ids": list(norm.target_stage_ids),
+            "target_layer_group_ids": list(norm.target_layer_group_ids),
+            "target_state_ids": list(norm.target_state_ids),
+            "direction": str(norm.direction),
+            "magnitude": float(norm.magnitude),
+            "expected_gain": float(norm.expected_gain),
+            "risk_flags": list(norm.risk_flags),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "RewriteActionSpec":
+        return cls(
+            rewrite_type=str(payload.get("rewrite_type", "reload_shift") or "reload_shift"),
+            target_stage_ids=[int(item) for item in (payload.get("target_stage_ids") or [])],
+            target_layer_group_ids=[str(item) for item in (payload.get("target_layer_group_ids") or [])],
+            target_state_ids=[str(item) for item in (payload.get("target_state_ids") or [])],
+            direction=str(payload.get("direction", "hold") or "hold"),
+            magnitude=float(payload.get("magnitude", 0.0) or 0.0),
+            expected_gain=float(payload.get("expected_gain", 0.0) or 0.0),
+            risk_flags=[str(item) for item in (payload.get("risk_flags") or [])],
+        )
+
+
+@dataclass
+class WindowFeedbackSpec:
+    window_index: int = 0
+    policy_signature: str = ""
+    critical_stage_id: int = -1
+    critical_layer_group_id: str = ""
+    critical_component_type: str = "forward"
+    step_time_ms_p50: float = 0.0
+    throughput_tokens_per_s: float = 0.0
+    bubble_ratio: float = 0.0
+    reload_stall_ms: float = 0.0
+    comm_exposure_ratio: float = 0.0
+    offload_overlap_success_ratio: float = 0.0
+    critical_path_breakdown: Dict[str, Any] = field(default_factory=dict)
+    recommended_rewrites: List[RewriteActionSpec] = field(default_factory=list)
+    rollback_triggered: bool = False
+
+    def normalized(self) -> "WindowFeedbackSpec":
+        norm = copy.deepcopy(self)
+        norm.window_index = max(int(norm.window_index or 0), 0)
+        norm.policy_signature = str(norm.policy_signature or "").strip()
+        norm.critical_stage_id = int(norm.critical_stage_id if norm.critical_stage_id is not None else -1)
+        norm.critical_layer_group_id = str(norm.critical_layer_group_id or "").strip()
+        norm.critical_component_type = str(norm.critical_component_type or "forward").strip().lower() or "forward"
+        norm.step_time_ms_p50 = max(float(norm.step_time_ms_p50 or 0.0), 0.0)
+        norm.throughput_tokens_per_s = max(float(norm.throughput_tokens_per_s or 0.0), 0.0)
+        norm.bubble_ratio = max(float(norm.bubble_ratio or 0.0), 0.0)
+        norm.reload_stall_ms = max(float(norm.reload_stall_ms or 0.0), 0.0)
+        norm.comm_exposure_ratio = max(float(norm.comm_exposure_ratio or 0.0), 0.0)
+        norm.offload_overlap_success_ratio = max(float(norm.offload_overlap_success_ratio or 0.0), 0.0)
+        norm.critical_path_breakdown = copy.deepcopy(norm.critical_path_breakdown or {})
+        norm.recommended_rewrites = [item.normalized() for item in (norm.recommended_rewrites or [])]
+        norm.rollback_triggered = bool(norm.rollback_triggered)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "window_index": int(norm.window_index),
+            "policy_signature": str(norm.policy_signature),
+            "critical_stage_id": int(norm.critical_stage_id),
+            "critical_layer_group_id": str(norm.critical_layer_group_id),
+            "critical_component_type": str(norm.critical_component_type),
+            "step_time_ms_p50": float(norm.step_time_ms_p50),
+            "throughput_tokens_per_s": float(norm.throughput_tokens_per_s),
+            "bubble_ratio": float(norm.bubble_ratio),
+            "reload_stall_ms": float(norm.reload_stall_ms),
+            "comm_exposure_ratio": float(norm.comm_exposure_ratio),
+            "offload_overlap_success_ratio": float(norm.offload_overlap_success_ratio),
+            "critical_path_breakdown": copy.deepcopy(norm.critical_path_breakdown),
+            "recommended_rewrites": [item.to_dict() for item in norm.recommended_rewrites],
+            "rollback_triggered": bool(norm.rollback_triggered),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "WindowFeedbackSpec":
+        return cls(
+            window_index=int(payload.get("window_index", 0) or 0),
+            policy_signature=str(payload.get("policy_signature", "") or ""),
+            critical_stage_id=int(payload.get("critical_stage_id", -1) or -1),
+            critical_layer_group_id=str(payload.get("critical_layer_group_id", "") or ""),
+            critical_component_type=str(payload.get("critical_component_type", "forward") or "forward"),
+            step_time_ms_p50=float(payload.get("step_time_ms_p50", 0.0) or 0.0),
+            throughput_tokens_per_s=float(payload.get("throughput_tokens_per_s", 0.0) or 0.0),
+            bubble_ratio=float(payload.get("bubble_ratio", 0.0) or 0.0),
+            reload_stall_ms=float(payload.get("reload_stall_ms", 0.0) or 0.0),
+            comm_exposure_ratio=float(payload.get("comm_exposure_ratio", 0.0) or 0.0),
+            offload_overlap_success_ratio=float(payload.get("offload_overlap_success_ratio", 0.0) or 0.0),
+            critical_path_breakdown=copy.deepcopy(payload.get("critical_path_breakdown") or {}),
+            recommended_rewrites=[
+                RewriteActionSpec.from_dict(item) for item in (payload.get("recommended_rewrites") or [])
+            ],
+            rollback_triggered=bool(payload.get("rollback_triggered", False)),
+        )
+
+
+@dataclass
+class RewriteExecutionPlanSpec:
+    global_strategy: Optional[GlobalStrategyPlanSpec] = None
+    rewrite_actions: List[RewriteActionSpec] = field(default_factory=list)
+    telemetry_budget: Optional[TelemetryBudgetSpec] = None
+    window_reconfig: Optional[WindowReconfigSpec] = None
+    version_tag: str = "v1"
+
+    def normalized(self) -> "RewriteExecutionPlanSpec":
+        norm = copy.deepcopy(self)
+        norm.global_strategy = (
+            norm.global_strategy.normalized() if isinstance(norm.global_strategy, GlobalStrategyPlanSpec) else None
+        )
+        norm.rewrite_actions = [item.normalized() for item in (norm.rewrite_actions or [])]
+        norm.telemetry_budget = (
+            norm.telemetry_budget.normalized() if isinstance(norm.telemetry_budget, TelemetryBudgetSpec) else None
+        )
+        norm.window_reconfig = (
+            norm.window_reconfig.normalized() if isinstance(norm.window_reconfig, WindowReconfigSpec) else None
+        )
+        norm.version_tag = str(norm.version_tag or "v1").strip() or "v1"
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "global_strategy": norm.global_strategy.to_dict() if norm.global_strategy is not None else None,
+            "rewrite_actions": [item.to_dict() for item in norm.rewrite_actions],
+            "telemetry_budget": norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else None,
+            "window_reconfig": norm.window_reconfig.to_dict() if norm.window_reconfig is not None else None,
+            "version_tag": str(norm.version_tag),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "RewriteExecutionPlanSpec":
+        return cls(
+            global_strategy=GlobalStrategyPlanSpec.from_dict(payload.get("global_strategy") or {})
+            if payload.get("global_strategy") is not None
+            else None,
+            rewrite_actions=[RewriteActionSpec.from_dict(item) for item in (payload.get("rewrite_actions") or [])],
+            telemetry_budget=TelemetryBudgetSpec.from_dict(payload.get("telemetry_budget") or {})
+            if payload.get("telemetry_budget") is not None
+            else None,
+            window_reconfig=WindowReconfigSpec.from_dict(payload.get("window_reconfig") or {})
+            if payload.get("window_reconfig") is not None
+            else None,
+            version_tag=str(payload.get("version_tag", "v1") or "v1"),
+        )
+
+
+@dataclass
 class BatchPlanSpec:
     micro_batch_size: int = 1
     global_batch_size: int = 16
@@ -1889,6 +2537,16 @@ class MegatronProgram:
     applied_patch: Optional[ProgramPatchSpec] = None
     baseline_family: Optional[str] = None
     policy_objective: Optional[str] = None
+    layer_groups: List[LayerGroupSpec] = field(default_factory=list)
+    schedule_graph_nodes: List[ScheduleNodeSpec] = field(default_factory=list)
+    schedule_graph_edges: List[ScheduleEdgeSpec] = field(default_factory=list)
+    state_plan: Optional[StatePlanSpec] = None
+    global_strategy_plan: Optional[GlobalStrategyPlanSpec] = None
+    rewrite_plan: Optional[RewriteExecutionPlanSpec] = None
+    telemetry_budget: Optional[TelemetryBudgetSpec] = None
+    window_reconfig: Optional[WindowReconfigSpec] = None
+    stage_local_vpp: List[int] = field(default_factory=list)
+    overlap_policy: Optional[OverlapIntentSpec] = None
     constraints: ConstraintSpec = field(default_factory=ConstraintSpec)
     search_space: SearchSpaceSpec = field(default_factory=SearchSpaceSpec)
     length_bucket_policies: List[LengthBucketPolicy] = field(default_factory=list)
@@ -1918,6 +2576,22 @@ class MegatronProgram:
             norm.baseline_family = str(norm.baseline_family).strip() or None
         if norm.policy_objective is not None:
             norm.policy_objective = str(norm.policy_objective).strip() or None
+        norm.layer_groups = [item.normalized() for item in (norm.layer_groups or [])]
+        norm.schedule_graph_nodes = [item.normalized() for item in (norm.schedule_graph_nodes or [])]
+        norm.schedule_graph_edges = [item.normalized() for item in (norm.schedule_graph_edges or [])]
+        if norm.state_plan is not None:
+            norm.state_plan = norm.state_plan.normalized()
+        if norm.global_strategy_plan is not None:
+            norm.global_strategy_plan = norm.global_strategy_plan.normalized()
+        if norm.rewrite_plan is not None:
+            norm.rewrite_plan = norm.rewrite_plan.normalized()
+        if norm.telemetry_budget is not None:
+            norm.telemetry_budget = norm.telemetry_budget.normalized()
+        if norm.window_reconfig is not None:
+            norm.window_reconfig = norm.window_reconfig.normalized()
+        norm.stage_local_vpp = [max(int(item), 1) for item in (norm.stage_local_vpp or [])]
+        if norm.overlap_policy is not None:
+            norm.overlap_policy = norm.overlap_policy.normalized()
         norm.constraints = norm.constraints.normalized()
         norm.search_space = norm.search_space.normalized()
         norm.length_bucket_policies = [item.normalized() for item in (norm.length_bucket_policies or [])]
@@ -1960,6 +2634,28 @@ class MegatronProgram:
             norm.policy_objective = str(
                 (norm.metadata or {}).get("policy_objective") or "maximize_throughput_under_memory_and_legality_constraints"
             )
+        if not norm.layer_groups:
+            norm.layer_groups = _derive_layer_groups(norm)
+        if norm.state_plan is None:
+            norm.state_plan = _derive_state_plan(norm)
+        if not norm.schedule_graph_nodes or not norm.schedule_graph_edges:
+            derived_nodes, derived_edges = _derive_schedule_graph(norm)
+            if not norm.schedule_graph_nodes:
+                norm.schedule_graph_nodes = derived_nodes
+            if not norm.schedule_graph_edges:
+                norm.schedule_graph_edges = derived_edges
+        if norm.global_strategy_plan is None:
+            norm.global_strategy_plan = _derive_global_strategy_plan(norm)
+        if norm.telemetry_budget is None:
+            norm.telemetry_budget = _derive_telemetry_budget(norm)
+        if norm.window_reconfig is None:
+            norm.window_reconfig = _derive_window_reconfig(norm)
+        if norm.rewrite_plan is None:
+            norm.rewrite_plan = _derive_rewrite_plan(norm)
+        if not norm.stage_local_vpp:
+            norm.stage_local_vpp = list(norm.partition_optimization.stage_local_vpp_vector or [])
+        if norm.overlap_policy is None:
+            norm.overlap_policy = norm.schedule_ir.overlap_intents.normalized()
         _backfill_legacy_policy_fields(norm)
         return norm
 
@@ -1983,6 +2679,16 @@ class MegatronProgram:
             "applied_patch": norm.applied_patch.to_dict() if norm.applied_patch is not None else None,
             "baseline_family": norm.baseline_family,
             "policy_objective": norm.policy_objective,
+            "layer_groups": [item.to_dict() for item in norm.layer_groups],
+            "schedule_graph_nodes": [item.to_dict() for item in norm.schedule_graph_nodes],
+            "schedule_graph_edges": [item.to_dict() for item in norm.schedule_graph_edges],
+            "state_plan": norm.state_plan.to_dict() if norm.state_plan is not None else None,
+            "global_strategy_plan": norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else None,
+            "rewrite_plan": norm.rewrite_plan.to_dict() if norm.rewrite_plan is not None else None,
+            "telemetry_budget": norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else None,
+            "window_reconfig": norm.window_reconfig.to_dict() if norm.window_reconfig is not None else None,
+            "stage_local_vpp": list(norm.stage_local_vpp),
+            "overlap_policy": norm.overlap_policy.to_dict() if norm.overlap_policy is not None else None,
             "constraints": norm.constraints.to_dict(),
             "search_space": norm.search_space.to_dict(),
             "length_bucket_policies": [item.to_dict() for item in norm.length_bucket_policies],
@@ -2031,6 +2737,28 @@ class MegatronProgram:
             else None,
             baseline_family=payload.get("baseline_family"),
             policy_objective=payload.get("policy_objective"),
+            layer_groups=[LayerGroupSpec.from_dict(item) for item in (payload.get("layer_groups") or [])],
+            schedule_graph_nodes=[ScheduleNodeSpec.from_dict(item) for item in (payload.get("schedule_graph_nodes") or [])],
+            schedule_graph_edges=[ScheduleEdgeSpec.from_dict(item) for item in (payload.get("schedule_graph_edges") or [])],
+            state_plan=StatePlanSpec.from_dict(payload.get("state_plan") or {})
+            if payload.get("state_plan") is not None
+            else None,
+            global_strategy_plan=GlobalStrategyPlanSpec.from_dict(payload.get("global_strategy_plan") or {})
+            if payload.get("global_strategy_plan") is not None
+            else None,
+            rewrite_plan=RewriteExecutionPlanSpec.from_dict(payload.get("rewrite_plan") or {})
+            if payload.get("rewrite_plan") is not None
+            else None,
+            telemetry_budget=TelemetryBudgetSpec.from_dict(payload.get("telemetry_budget") or {})
+            if payload.get("telemetry_budget") is not None
+            else None,
+            window_reconfig=WindowReconfigSpec.from_dict(payload.get("window_reconfig") or {})
+            if payload.get("window_reconfig") is not None
+            else None,
+            stage_local_vpp=[int(item) for item in (payload.get("stage_local_vpp") or [])],
+            overlap_policy=OverlapIntentSpec.from_dict(payload.get("overlap_policy") or {})
+            if payload.get("overlap_policy") is not None
+            else None,
             constraints=ConstraintSpec.from_dict(payload.get("constraints") or {}),
             search_space=SearchSpaceSpec.from_dict(payload.get("search_space") or {}),
             length_bucket_policies=[
@@ -2500,6 +3228,451 @@ def _derive_partition_optimization(program: MegatronProgram) -> PartitionOptimiz
         preferred_boundary_modules=boundary_modules,
         anti_boundary_modules=anti_boundary_modules,
         asymmetry_notes=[str(item) for item in (metadata.get("partition_asymmetry_notes") or [])],
+    ).normalized()
+
+
+def _estimated_microbatch_count(program: MegatronProgram) -> int:
+    batch_plan = program.batch_plan.normalized()
+    if batch_plan.grad_accum_steps is not None:
+        return max(int(batch_plan.grad_accum_steps), 1)
+    micro_batch_size = max(int(batch_plan.micro_batch_size), 1)
+    global_batch_size = max(int(batch_plan.global_batch_size), micro_batch_size)
+    return max(int(global_batch_size // micro_batch_size), 1)
+
+
+def _stage_module_family(stage_index: int, stage: StageSpec, program: MegatronProgram) -> str:
+    special_tokens = set(stage.special_tokens or [])
+    if "E" in special_tokens and stage_index == 0:
+        return "embedding"
+    if "L" in special_tokens and stage_index == (program.partition.num_stages - 1):
+        return "loss"
+    return "experts" if str(program.model.track or "") == "moe" else "decoder"
+
+
+def _derive_layer_groups(program: MegatronProgram) -> List[LayerGroupSpec]:
+    norm = copy.deepcopy(program)
+    seq_len = int((norm.metadata or {}).get("seq_len", 1024) or 1024)
+    groups: List[LayerGroupSpec] = []
+    global_layer_start = 0
+    for stage_index, stage in enumerate(norm.partition.stages):
+        layer_count = max(int(stage.decoder_layers), 0)
+        if layer_count <= 0:
+            continue
+        group_count = 2 if layer_count <= 8 else 3 if layer_count <= 24 else 4
+        family = _stage_module_family(stage_index, stage, norm)
+        cursor = global_layer_start
+        for group_index in range(group_count):
+            remaining_layers = layer_count - (cursor - global_layer_start)
+            remaining_groups = group_count - group_index
+            span = max(int(round(float(remaining_layers) / float(remaining_groups))), 1)
+            start = cursor
+            end = min(cursor + span - 1, global_layer_start + layer_count - 1)
+            actual_span = max(end - start + 1, 1)
+            base_time = float(actual_span) * (1.3 if family == "decoder" else 1.0)
+            activation_size = float(actual_span) * max(float(seq_len) / 1024.0, 1.0) * 96.0
+            parameter_size = float(actual_span) * 128.0
+            optimizer_size = parameter_size * 2.0
+            groups.append(
+                LayerGroupSpec(
+                    group_id=f"stage{stage_index:02d}_lg{group_index:02d}",
+                    stage_id=stage_index,
+                    layer_range=[start, end],
+                    module_family=family,
+                    fwd_time_ms=round(base_time, 4),
+                    bwd_input_time_ms=round(base_time * 1.25, 4),
+                    bwd_weight_time_ms=round(base_time * 1.15, 4),
+                    activation_size_mb=round(activation_size, 4),
+                    parameter_size_mb=round(parameter_size, 4),
+                    optimizer_state_size_mb=round(optimizer_size, 4),
+                    offload_cost_ms=round(max(activation_size / 6400.0, 0.1), 4),
+                    reload_cost_ms=round(max(activation_size / 6000.0, 0.1), 4),
+                    comm_boundary_cost_ms=round(max(float(actual_span) * 0.15, 0.05), 4),
+                ).normalized()
+            )
+            cursor = end + 1
+        global_layer_start += layer_count
+    return groups
+
+
+def _derive_state_plan(program: MegatronProgram) -> StatePlanSpec:
+    norm = copy.deepcopy(program)
+    groups = list(norm.layer_groups or [])
+    allow_activation_offload = str(norm.schedule_ir.memory_intents.offload_policy or "none").strip().lower() not in {"", "none", "off"}
+    enable_parameter_state_schedule = bool((norm.metadata or {}).get("enable_parameter_state_schedule", False))
+    enable_optimizer_state_schedule = bool((norm.metadata or {}).get("enable_optimizer_state_schedule", False))
+    optimizer_cpu_offload = bool((norm.metadata or {}).get("runtime_enable_optimizer_cpu_offload", False)) or bool(
+        (norm.metadata or {}).get("optimizer_cpu_offload", False)
+    )
+    objects: List[StateObjectSpec] = []
+    placements: List[StatePlacementSpec] = []
+    offload_budget_mb = 0.0
+    for group in groups:
+        activation_id = f"{group.group_id}:activation"
+        parameter_id = f"{group.group_id}:parameter"
+        optimizer_id = f"{group.group_id}:optimizer"
+        objects.extend(
+            [
+                StateObjectSpec(
+                    state_id=activation_id,
+                    state_type="activation",
+                    owner_stage=int(group.stage_id),
+                    owner_layer_group=str(group.group_id),
+                    size_mb=float(group.activation_size_mb),
+                    offloadable=allow_activation_offload,
+                    prefetchable=allow_activation_offload,
+                ).normalized(),
+            ]
+        )
+        if enable_parameter_state_schedule:
+            objects.append(
+                StateObjectSpec(
+                    state_id=parameter_id,
+                    state_type="parameter",
+                    owner_stage=int(group.stage_id),
+                    owner_layer_group=str(group.group_id),
+                    size_mb=float(group.parameter_size_mb),
+                    offloadable=False,
+                    prefetchable=False,
+                ).normalized()
+            )
+        if enable_optimizer_state_schedule or optimizer_cpu_offload:
+            objects.append(
+                StateObjectSpec(
+                    state_id=optimizer_id,
+                    state_type="optimizer",
+                    owner_stage=int(group.stage_id),
+                    owner_layer_group=str(group.group_id),
+                    size_mb=float(group.optimizer_state_size_mb),
+                    offloadable=optimizer_cpu_offload,
+                    prefetchable=optimizer_cpu_offload,
+                ).normalized()
+            )
+        placements.extend(
+            [
+                StatePlacementSpec(state_id=activation_id, placement="hbm", ready_for_use=True, valid_from_slot=0).normalized(),
+            ]
+        )
+        if enable_parameter_state_schedule:
+            placements.append(
+                StatePlacementSpec(state_id=parameter_id, placement="hbm", ready_for_use=True, valid_from_slot=0).normalized()
+            )
+        if enable_optimizer_state_schedule or optimizer_cpu_offload:
+            placements.append(
+                StatePlacementSpec(
+                    state_id=optimizer_id,
+                    placement="host" if optimizer_cpu_offload else "hbm",
+                    ready_for_use=not optimizer_cpu_offload,
+                    valid_from_slot=0,
+                ).normalized()
+            )
+        if allow_activation_offload:
+            offload_budget_mb += float(group.activation_size_mb)
+    return StatePlanSpec(
+        objects=objects,
+        placements=placements,
+        offload_budget_mb=round(offload_budget_mb, 4),
+        reload_prefetch_window=max(int(norm.schedule_ir.memory_intents.prefetch_policy not in {"none", "off"}), 1),
+    ).normalized()
+
+
+def _derive_global_strategy_plan(program: MegatronProgram) -> GlobalStrategyPlanSpec:
+    norm = copy.deepcopy(program)
+    metadata = copy.deepcopy(norm.metadata or {})
+    model_track = str(norm.model.track or "dense").strip().lower()
+    run_target = str(norm.cluster.target or "single_g5").strip().lower()
+    seq_len = int(metadata.get("seq_len", 1024) or 1024)
+    activation_pressure = float(sum(float(item.activation_size_mb) for item in (norm.layer_groups or [])))
+    memory_headroom_ratio = float(metadata.get("memory_headroom_ratio", 0.0) or 0.0)
+    comm_exposure = float(metadata.get("comm_exposure_ratio", 0.0) or 0.0)
+    stage_boundaries: List[List[int]] = []
+    layer_group_to_stage: Dict[str, int] = {}
+    stage_ranges: Dict[int, List[int]] = {}
+    for group in (norm.layer_groups or []):
+        stage_id = int(group.stage_id)
+        layer_group_to_stage[str(group.group_id)] = stage_id
+        if len(group.layer_range or []) == 2:
+            entry = stage_ranges.setdefault(stage_id, [int(group.layer_range[0]), int(group.layer_range[1])])
+            entry[0] = min(int(entry[0]), int(group.layer_range[0]))
+            entry[1] = max(int(entry[1]), int(group.layer_range[1]))
+    for stage_id in sorted(stage_ranges):
+        stage_boundaries.append([int(stage_ranges[stage_id][0]), int(stage_ranges[stage_id][1])])
+    activation_offload_enabled_groups = [
+        str(item.owner_layer_group)
+        for item in list((norm.state_plan.objects if norm.state_plan is not None else []) or [])
+        if str(item.state_type) == "activation" and bool(item.offloadable)
+    ]
+    overlap_enabled_channels: List[str] = []
+    if norm.overlap_policy is not None:
+        if bool(norm.overlap_policy.enable_p2p_overlap):
+            overlap_enabled_channels.append("p2p")
+        if bool(norm.overlap_policy.enable_reload_overlap):
+            overlap_enabled_channels.append("reload")
+        if bool(norm.overlap_policy.enable_tp_comm_overlap):
+            overlap_enabled_channels.append("tp_comm")
+        if bool(norm.overlap_policy.enable_optimizer_tail_overlap):
+            overlap_enabled_channels.append("optimizer_tail")
+    primary_parallel_mode = "pp_vpp"
+    selection_rationale = [
+        f"target={run_target or 'single_g5'}",
+        f"model_track={model_track or 'dense'}",
+        f"seq_len={seq_len}",
+    ]
+    if run_target == "single_g5" and model_track == "dense":
+        primary_parallel_mode = "pp_vpp"
+        selection_rationale.append("single_g5_dense_prefers_pp_vpp")
+    elif activation_pressure <= 0.0 and memory_headroom_ratio >= 0.25 and comm_exposure <= 0.06:
+        primary_parallel_mode = "fsdp_zero"
+        selection_rationale.append("low_activation_pressure_recommend_fsdp_zero")
+    else:
+        selection_rationale.append("stateful_pp_vpp_default")
+    return GlobalStrategyPlanSpec(
+        primary_parallel_mode=primary_parallel_mode,
+        dp_degree=max(int(norm.cluster.world_size // max(int(norm.parallel.tp_degree * norm.parallel.pp_degree), 1)), 1),
+        tp_degree=int(norm.parallel.tp_degree),
+        pp_degree=int(norm.parallel.pp_degree),
+        vpp_degree=int(norm.parallel.vpp_degree),
+        stage_count=max(int(norm.partition.num_stages or norm.parallel.pp_degree), 1),
+        stage_boundaries=stage_boundaries,
+        layer_group_to_stage=layer_group_to_stage,
+        activation_offload_enabled_groups=activation_offload_enabled_groups,
+        overlap_enabled_channels=overlap_enabled_channels,
+        selection_rationale=selection_rationale,
+    ).normalized()
+
+
+def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
+    norm = copy.deepcopy(program)
+    metadata = copy.deepcopy(norm.metadata or {})
+    rewrite_actions: List[RewriteActionSpec] = []
+    for item in list(metadata.get("rewrite_actions") or []):
+        if isinstance(item, dict):
+            rewrite_actions.append(RewriteActionSpec.from_dict(item).normalized())
+    if not rewrite_actions and norm.applied_patch is not None:
+        patch_family = str(norm.applied_patch.patch_family or "").strip()
+        target_layer_groups = [
+            str(item)
+            for item in list((norm.applied_patch.expected_effects or {}).get("target_layer_groups") or [])
+            if str(item).strip()
+        ]
+        target_state_objects = [
+            str(item)
+            for item in list((norm.applied_patch.expected_effects or {}).get("target_state_objects") or [])
+            if str(item).strip()
+        ]
+        target_stage_ids = [
+            int(item)
+            for item in list((norm.metadata or {}).get("runtime_branch_target_stage_ids") or [])
+            if str(item).strip()
+        ]
+        if patch_family in {"reload_shift_patch", "activation_reload_shift_patch", "reload_prefetch_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="reload_shift",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("reload_shift_direction") or "hold"),
+                    magnitude=float((norm.metadata or {}).get("reload_shift_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"adaptive_chunking_patch", "comm_chunk_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="adaptive_chunking",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("comm_chunk_direction") or "preserve"),
+                    magnitude=float((norm.metadata or {}).get("comm_chunk_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"local_verticalization_patch", "layer_group_repack"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="local_verticalization",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("local_verticalization_direction") or "enable"),
+                    magnitude=float((norm.metadata or {}).get("local_verticalization_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+    return RewriteExecutionPlanSpec(
+        global_strategy=norm.global_strategy_plan if norm.global_strategy_plan is not None else _derive_global_strategy_plan(norm),
+        rewrite_actions=rewrite_actions,
+        telemetry_budget=norm.telemetry_budget if norm.telemetry_budget is not None else _derive_telemetry_budget(norm),
+        window_reconfig=norm.window_reconfig if norm.window_reconfig is not None else _derive_window_reconfig(norm),
+        version_tag=str(metadata.get("rewrite_plan_version", "v1") or "v1"),
+    ).normalized()
+
+
+def _derive_schedule_graph(program: MegatronProgram) -> tuple[List[ScheduleNodeSpec], List[ScheduleEdgeSpec]]:
+    norm = copy.deepcopy(program)
+    groups = list(norm.layer_groups or [])
+    microbatch_count = _estimated_microbatch_count(norm)
+    enable_offload = str(norm.schedule_ir.memory_intents.offload_policy or "none").strip().lower() not in {"", "none", "off"}
+    enable_comm = int(norm.parallel.pp_degree) > 1
+    enable_parameter_state_schedule = bool((norm.metadata or {}).get("enable_parameter_state_schedule", False))
+    enable_optimizer_state_schedule = bool((norm.metadata or {}).get("enable_optimizer_state_schedule", False))
+    nodes: List[ScheduleNodeSpec] = []
+    edges: List[ScheduleEdgeSpec] = []
+    previous_forward_by_key: Dict[tuple[int, int], str] = {}
+    previous_backward_by_key: Dict[tuple[int, int], str] = {}
+    for group in groups:
+        activation_state_id = f"{group.group_id}:activation"
+        for microbatch_id in range(microbatch_count):
+            fwd_id = f"{group.group_id}:mb{microbatch_id}:fwd"
+            bwd_in_id = f"{group.group_id}:mb{microbatch_id}:bwd_in"
+            bwd_w_id = f"{group.group_id}:mb{microbatch_id}:bwd_w"
+            nodes.append(
+                ScheduleNodeSpec(
+                    node_id=fwd_id,
+                    node_type="forward",
+                    stage_id=int(group.stage_id),
+                    microbatch_id=microbatch_id,
+                    layer_group_id=str(group.group_id),
+                    lane_id=0,
+                    chunk_id=0,
+                    duration_hint_ms=float(group.fwd_time_ms),
+                    state_refs=[activation_state_id],
+                    resource_class="compute",
+                ).normalized()
+            )
+            nodes.append(
+                ScheduleNodeSpec(
+                    node_id=bwd_in_id,
+                    node_type="backward_input",
+                    stage_id=int(group.stage_id),
+                    microbatch_id=microbatch_id,
+                    layer_group_id=str(group.group_id),
+                    lane_id=0,
+                    chunk_id=0,
+                    duration_hint_ms=float(group.bwd_input_time_ms),
+                    state_refs=[activation_state_id],
+                    resource_class="compute",
+                ).normalized()
+            )
+            nodes.append(
+                ScheduleNodeSpec(
+                    node_id=bwd_w_id,
+                    node_type="backward_weight",
+                    stage_id=int(group.stage_id),
+                    microbatch_id=microbatch_id,
+                    layer_group_id=str(group.group_id),
+                    lane_id=0,
+                    chunk_id=0,
+                    duration_hint_ms=float(group.bwd_weight_time_ms),
+                    state_refs=(
+                        ([f"{group.group_id}:parameter"] if enable_parameter_state_schedule else [])
+                        + ([f"{group.group_id}:optimizer"] if enable_optimizer_state_schedule else [])
+                    ),
+                    resource_class="compute",
+                ).normalized()
+            )
+            edges.append(ScheduleEdgeSpec(src=fwd_id, dst=bwd_in_id, edge_type="data_dep", required=True).normalized())
+            edges.append(ScheduleEdgeSpec(src=bwd_in_id, dst=bwd_w_id, edge_type="stage_order", required=True).normalized())
+            previous_forward = previous_forward_by_key.get((int(group.stage_id), microbatch_id))
+            if previous_forward:
+                edges.append(
+                    ScheduleEdgeSpec(
+                        src=previous_forward,
+                        dst=fwd_id,
+                        edge_type="same_resource_mutex",
+                        required=True,
+                    ).normalized()
+                )
+            previous_forward_by_key[(int(group.stage_id), microbatch_id)] = fwd_id
+            previous_backward = previous_backward_by_key.get((int(group.stage_id), microbatch_id))
+            if previous_backward:
+                edges.append(
+                    ScheduleEdgeSpec(
+                        src=previous_backward,
+                        dst=bwd_in_id,
+                        edge_type="same_resource_mutex",
+                        required=True,
+                    ).normalized()
+                )
+            previous_backward_by_key[(int(group.stage_id), microbatch_id)] = bwd_w_id
+            if enable_offload:
+                offload_id = f"{group.group_id}:mb{microbatch_id}:offload"
+                reload_id = f"{group.group_id}:mb{microbatch_id}:reload"
+                nodes.append(
+                    ScheduleNodeSpec(
+                        node_id=offload_id,
+                        node_type="offload",
+                        stage_id=int(group.stage_id),
+                        microbatch_id=microbatch_id,
+                        layer_group_id=str(group.group_id),
+                        lane_id=1,
+                        chunk_id=0,
+                        duration_hint_ms=float(group.offload_cost_ms),
+                        state_refs=[activation_state_id],
+                        resource_class="memory_io",
+                    ).normalized()
+                )
+                nodes.append(
+                    ScheduleNodeSpec(
+                        node_id=reload_id,
+                        node_type="reload",
+                        stage_id=int(group.stage_id),
+                        microbatch_id=microbatch_id,
+                        layer_group_id=str(group.group_id),
+                        lane_id=1,
+                        chunk_id=0,
+                        duration_hint_ms=float(group.reload_cost_ms),
+                        state_refs=[activation_state_id],
+                        resource_class="memory_io",
+                    ).normalized()
+                )
+                edges.append(ScheduleEdgeSpec(src=fwd_id, dst=offload_id, edge_type="state_dep", required=False).normalized())
+                edges.append(ScheduleEdgeSpec(src=offload_id, dst=reload_id, edge_type="state_dep", required=False).normalized())
+                edges.append(ScheduleEdgeSpec(src=reload_id, dst=bwd_in_id, edge_type="reload_before_use", required=False).normalized())
+            if enable_comm:
+                comm_id = f"{group.group_id}:mb{microbatch_id}:comm"
+                nodes.append(
+                    ScheduleNodeSpec(
+                        node_id=comm_id,
+                        node_type="comm_chunk",
+                        stage_id=int(group.stage_id),
+                        microbatch_id=microbatch_id,
+                        layer_group_id=str(group.group_id),
+                        lane_id=1,
+                        chunk_id=0,
+                        duration_hint_ms=float(group.comm_boundary_cost_ms),
+                        state_refs=[activation_state_id],
+                        resource_class="comm",
+                    ).normalized()
+                )
+                edges.append(ScheduleEdgeSpec(src=fwd_id, dst=comm_id, edge_type="cross_stage_dep", required=False).normalized())
+    return nodes, edges
+
+
+def _derive_telemetry_budget(program: MegatronProgram) -> TelemetryBudgetSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    level = str(metadata.get("telemetry_budget_level") or metadata.get("runtime_trace_level") or "summary")
+    return TelemetryBudgetSpec(
+        level=level,
+        max_trace_mb=int(metadata.get("telemetry_max_trace_mb", 128) or 128),
+        max_events_per_rank=int(metadata.get("telemetry_max_events_per_rank", 20000) or 20000),
+        sampled_windows=int(metadata.get("telemetry_sampled_windows", 2) or 2),
+        emit_compare_svg=bool(metadata.get("telemetry_emit_compare_svg", False)),
+    ).normalized()
+
+
+def _derive_window_reconfig(program: MegatronProgram) -> WindowReconfigSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    return WindowReconfigSpec(
+        window_steps=int(metadata.get("window_steps", 4) or 4),
+        allowed_patch_categories=list(metadata.get("window_allowed_patch_categories") or ["schedule", "memory", "overlap", "partition"]),
+        rollback_guard_steps=int(metadata.get("rollback_guard_steps", 1) or 1),
+        promotion_threshold=float(metadata.get("window_promotion_threshold", 0.03) or 0.03),
+        demotion_threshold=float(metadata.get("window_demotion_threshold", 0.05) or 0.05),
     ).normalized()
 
 

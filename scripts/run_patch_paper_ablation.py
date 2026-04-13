@@ -50,12 +50,14 @@ def _agent_loop_command(
     workdir: Path,
     forwarded_args: Sequence[str],
     variant_extra_args: Sequence[str],
+    orchestrator_args: Sequence[str],
 ) -> List[str]:
     return [
         python_executable,
         "-m",
         "megatron_agent.agent_loop",
         *list(forwarded_args),
+        *list(orchestrator_args),
         "--workdir",
         str(workdir),
         *list(variant_extra_args),
@@ -146,6 +148,11 @@ def _manifest_payload(
                 str(figures_dir / "fig_bottleneck_patch_success_heatmap.png"),
                 str(figures_dir / "fig_bottleneck_patch_gain_heatmap.png"),
                 str(figures_dir / "fig_search_ablation_curve.png"),
+                str(figures_dir / "fig_stateful_vs_coarse.png"),
+                str(figures_dir / "fig_reload_shift_gain.png"),
+                str(figures_dir / "fig_adaptive_chunking_gain.png"),
+                str(figures_dir / "fig_local_verticalization_gain.png"),
+                str(figures_dir / "fig_budgeted_telemetry_cost.png"),
                 str(figures_dir / "fig_case_study_compare.png"),
             ],
         },
@@ -164,6 +171,12 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, L
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--plots-only", action="store_true")
+    parser.add_argument("--enable-hierarchical-orchestrator", action="store_true")
+    parser.add_argument("--enable-reload-shift", action="store_true")
+    parser.add_argument("--enable-adaptive-chunking", action="store_true")
+    parser.add_argument("--enable-local-verticalization", action="store_true")
+    parser.add_argument("--telemetry-budget", choices=["summary", "aggregated_grid", "full_debug"], default=None)
+    parser.add_argument("--window-steps", type=int, default=None)
     args, extra_args = parser.parse_known_args(argv)
     return args, _normalize_forwarded_args(extra_args)
 
@@ -174,6 +187,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     analysis_dir = Path(args.analysis_dir) if args.analysis_dir else work_root / "paper_analysis"
     figures_dir = Path(args.figures_dir) if args.figures_dir else analysis_dir / "figures"
     manifest_path = work_root / "paper_ablation_manifest.json"
+    orchestrator_args: List[str] = []
+    if bool(args.enable_hierarchical_orchestrator):
+        orchestrator_args.append("--enable-hierarchical-orchestrator")
+        orchestrator_args.append("--enable-stateful-schedule")
+    if bool(args.enable_reload_shift):
+        orchestrator_args.append("--enable-reload-shift")
+    if bool(args.enable_adaptive_chunking):
+        orchestrator_args.append("--enable-adaptive-chunking")
+    if bool(args.enable_local_verticalization):
+        orchestrator_args.append("--enable-local-verticalization")
+    if args.telemetry_budget:
+        orchestrator_args.extend(["--telemetry-budget", str(args.telemetry_budget)])
+    if args.window_steps is not None:
+        orchestrator_args.extend(["--window-steps", str(int(args.window_steps))])
 
     variants = _variant_specs(work_root)
     for item in variants:
@@ -182,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             workdir=Path(item["workdir"]),
             forwarded_args=forwarded_agent_args,
             variant_extra_args=list(item.get("extra_args") or []),
+            orchestrator_args=orchestrator_args,
         )
 
     analyze_command = _analysis_command(

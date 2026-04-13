@@ -182,6 +182,20 @@ def _proposal_hypothesis_bonus(
     schedule_family = _proposal_schedule_family(proposal)
     bonus = 0.0
     reasons: List[str] = []
+    stateful_family_aliases = {
+        "critical_path_relief_patch": {"change_stage_boundary", "critical_path_relief_patch"},
+        "stage_local_vpp_patch": {"tail_aware_stage_local_vpp", "stage_local_vpp_patch"},
+        "offload_enable_patch": {"add_offload_policy", "offload_enable_patch"},
+        "reload_prefetch_patch": {"tune_reload_prefetch", "reload_prefetch_patch", "reload_shift_patch", "activation_reload_shift_patch"},
+        "reload_shift_patch": {"tune_reload_prefetch", "reload_prefetch_patch", "reload_shift_patch", "activation_reload_shift_patch"},
+        "overlap_policy_patch": {"enable_p2p_overlap", "enable_reload_overlap", "overlap_policy_patch"},
+        "adaptive_chunking_patch": {"enable_p2p_overlap", "comm_chunk_patch", "adaptive_chunking_patch"},
+        "comm_chunk_patch": {"enable_p2p_overlap", "comm_chunk_patch", "adaptive_chunking_patch"},
+        "local_verticalization_patch": {"local_verticalization_patch", "layer_group_repack"},
+        "tail_relief_patch": {"enable_optimizer_tail_overlap", "tail_relief_patch"},
+        "change_schedule_family": {"change_schedule_family"},
+        "layer_group_repartition": {"enable_nonuniform_partition", "layer_group_repartition"},
+    }
     schedule_target = str(hypotheses.get("next_schedule_family") or "").strip()
     if schedule_target:
         if schedule_family == schedule_target and patch_category == "schedule":
@@ -198,12 +212,132 @@ def _proposal_hypothesis_bonus(
         family_target = str(hypotheses.get(key) or "").strip()
         if not family_target or family_target.startswith("preserve_"):
             continue
-        if patch_family == family_target:
+        family_aliases = set(stateful_family_aliases.get(family_target) or {family_target})
+        if patch_family in family_aliases:
             bonus += 0.30
             reasons.append(f"hypothesis_exact:{category}:{family_target}")
         elif patch_category == category:
             bonus += 0.15
             reasons.append(f"hypothesis_category:{category}:{family_target}")
+    target_stage_ids: List[int] = []
+    target_layer_groups: List[str] = []
+    target_state_objects: List[str] = []
+    proposal_program = proposal if isinstance(proposal, MegatronProgram) else getattr(proposal, "program", None)
+    if proposal_program is not None:
+        proposal_norm = proposal_program.normalized()
+        target_stage_ids = [
+            int(item)
+            for item in list((proposal_norm.metadata or {}).get("runtime_branch_target_stage_ids") or [])
+            if _safe_int(item) is not None
+        ]
+        target_layer_groups = [
+            str(item)
+            for item in list(
+                (proposal_norm.metadata or {}).get("target_layer_groups")
+                or ((proposal_norm.applied_patch.expected_effects or {}).get("target_layer_groups") if proposal_norm.applied_patch is not None else [])
+                or []
+            )
+            if str(item).strip()
+        ]
+        target_state_objects = [
+            str(item)
+            for item in list(
+                (proposal_norm.metadata or {}).get("target_state_objects")
+                or ((proposal_norm.applied_patch.expected_effects or {}).get("target_state_objects") if proposal_norm.applied_patch is not None else [])
+                or []
+            )
+            if str(item).strip()
+        ]
+    hypothesis_stage_ids = [
+        int(item) for item in list(hypotheses.get("target_stages") or []) if _safe_int(item) is not None
+    ]
+    hypothesis_layer_groups = [str(item) for item in list(hypotheses.get("target_layer_groups") or []) if str(item).strip()]
+    hypothesis_state_objects = [str(item) for item in list(hypotheses.get("target_state_objects") or []) if str(item).strip()]
+    if hypothesis_stage_ids and set(target_stage_ids) & set(hypothesis_stage_ids):
+        bonus += 0.10
+        reasons.append("hypothesis_target:stage")
+    if hypothesis_layer_groups and set(target_layer_groups) & set(hypothesis_layer_groups):
+        bonus += 0.10
+        reasons.append("hypothesis_target:layer_group")
+    if hypothesis_state_objects and set(target_state_objects) & set(hypothesis_state_objects):
+        bonus += 0.10
+        reasons.append("hypothesis_target:state_object")
+
+    critical_path = dict(hypotheses.get("critical_path_breakdown") or {})
+    critical_component = str(critical_path.get("critical_component_type") or hypotheses.get("critical_component_type") or "").strip()
+    if critical_component:
+        component_bonus_map = {
+            "reload": {"activation_reload_shift_patch", "reload_shift_patch"},
+            "comm": {"adaptive_chunking_patch", "comm_chunk_patch", "overlap_policy_patch"},
+            "backward_input": {"local_verticalization_patch", "layer_group_repack", "overlap_policy_patch"},
+            "backward_weight": {"local_verticalization_patch", "layer_group_repack", "overlap_policy_patch"},
+            "forward": {"local_verticalization_patch", "layer_group_repack", "activation_offload_patch"},
+        }
+        preferred_families = component_bonus_map.get(critical_component, set())
+        for family_name in preferred_families:
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.24
+                reasons.append(f"hypothesis_critical_component:{critical_component}:{family_name}")
+                break
+
+    shift_candidates = [str(item).strip() for item in list(critical_path.get("critical_shift_candidates") or []) if str(item).strip()]
+    if shift_candidates:
+        for family_name in shift_candidates:
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or stateful_family_aliases.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.18
+                reasons.append(f"hypothesis_critical_shift:{family_name}")
+                break
+
+    reload_summary = dict(hypotheses.get("reload_interference_summary") or {})
+    reload_ratio = _safe_float(reload_summary.get("reload_stall_ratio"))
+    if reload_ratio is None:
+        reload_ratio = _safe_float(hypotheses.get("reload_stall_ratio"))
+    if reload_ratio is not None and reload_ratio >= 0.08:
+        for family_name in ("activation_reload_shift_patch", "reload_shift_patch"):
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.18
+                reasons.append(f"hypothesis_reload_pressure:{family_name}")
+                break
+
+    comm_summary = dict(hypotheses.get("comm_chunk_exposure_summary") or {})
+    comm_ratio = _safe_float(comm_summary.get("comm_exposure_ratio"))
+    if comm_ratio is None:
+        comm_ratio = _safe_float(hypotheses.get("comm_exposure_ratio"))
+    if comm_ratio is not None and comm_ratio >= 0.08:
+        for family_name in ("adaptive_chunking_patch", "comm_chunk_patch", "overlap_policy_patch"):
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.16
+                reasons.append(f"hypothesis_comm_pressure:{family_name}")
+                break
+
+    if list(hypotheses.get("local_verticalization_targets") or []):
+        for family_name in ("local_verticalization_patch", "layer_group_repack"):
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.16
+                reasons.append("hypothesis_local_verticalization")
+                break
+
+    policy_outcome = dict(hypotheses.get("policy_outcome_summary") or {})
+    demotion_action = str(policy_outcome.get("demotion_action") or "").strip()
+    if demotion_action == "demote_overlap" and patch_category == "overlap":
+        bonus -= 0.20
+        reasons.append("hypothesis_penalty:demote_overlap")
+    if demotion_action == "rollback_overlap" and patch_category == "overlap":
+        bonus -= 0.30
+        reasons.append("hypothesis_penalty:rollback_overlap")
+    promotion_action = str(policy_outcome.get("promotion_action") or "").strip()
+    if promotion_action == "promote_memory_patch":
+        for family_name in ("activation_reload_shift_patch", "activation_offload_patch"):
+            aliases = _PATCH_FAMILY_PRIORITY_ALIASES.get(family_name) or {family_name}
+            if patch_family in aliases:
+                bonus += 0.12
+                reasons.append(f"hypothesis_promotion:{promotion_action}")
+                break
     return bonus, reasons
 
 
@@ -279,6 +413,21 @@ def _build_search_tree_root(
     )
     useful = set(str(item) for item in (guidance.get("useful_patch_families") or []))
     harmful = set(str(item) for item in (guidance.get("harmful_patch_families") or []))
+    rewrite_targets = dict(guidance.get("rewrite_targets") or {})
+    hypotheses = dict(next_step_hypotheses or {})
+    reload_trigger = float(
+        ((hypotheses.get("reload_interference_summary") or {}).get("reload_stall_ratio"))
+        or hypotheses.get("reload_stall_ratio")
+        or 0.0
+    ) >= 0.08
+    comm_trigger = float(
+        ((hypotheses.get("comm_chunk_exposure_summary") or {}).get("comm_exposure_ratio"))
+        or hypotheses.get("comm_exposure_ratio")
+        or 0.0
+    ) >= 0.12
+    local_verticalization_trigger = bool(hypotheses.get("local_verticalization_targets")) and float(
+        (guidance.get("state_summary") or {}).get("peak_reserved_ratio") or 0.0
+    ) <= 0.92
     for index, proposal in enumerate(proposal_pool, start=1):
         patch_proposal = _build_patch_proposal_from_agent_proposal(
             proposal,
@@ -287,10 +436,57 @@ def _build_search_tree_root(
         priority = max(0.0, 1.0 - (float(patch_proposal.search_priority) / 32.0))
         priority_reason: List[str] = []
         if str(search_unit or "patch") == "patch":
+            family_aliases = {
+                "reload_shift_patch": _PATCH_FAMILY_PRIORITY_ALIASES.get("activation_reload_shift_patch") or {"reload_shift_patch"},
+                "adaptive_chunking_patch": _PATCH_FAMILY_PRIORITY_ALIASES.get("adaptive_chunking_patch") or {"adaptive_chunking_patch"},
+                "local_verticalization_patch": _PATCH_FAMILY_PRIORITY_ALIASES.get("local_verticalization_patch") or {"local_verticalization_patch"},
+                "critical_path_relief_patch": _PATCH_FAMILY_PRIORITY_ALIASES.get("critical_path_relief_patch") or {"critical_path_relief_patch"},
+                "layer_group_repartition": _PATCH_FAMILY_PRIORITY_ALIASES.get("layer_group_repack") or {"layer_group_repartition"},
+            }
+            if patch_proposal.patch_family in family_aliases["reload_shift_patch"] and reload_trigger:
+                priority += 0.18
+                priority_reason.append("default_priority:reload_shift_patch")
+            elif patch_proposal.patch_family in family_aliases["adaptive_chunking_patch"] and comm_trigger:
+                priority += 0.16
+                priority_reason.append("default_priority:adaptive_chunking_patch")
+            elif patch_proposal.patch_family in family_aliases["local_verticalization_patch"] and local_verticalization_trigger:
+                priority += 0.14
+                priority_reason.append("default_priority:local_verticalization_patch")
+            elif patch_proposal.patch_family in family_aliases["critical_path_relief_patch"]:
+                priority += 0.08
+                priority_reason.append("default_priority:critical_path_relief_patch")
+            elif patch_proposal.patch_family in family_aliases["layer_group_repartition"]:
+                priority += 0.04
+                priority_reason.append("default_priority:layer_group_repartition")
             if bool(patch_memory_enabled) and patch_proposal.patch_family in harmful:
                 priority -= 0.40
                 priority_reason.append(f"patch_memory_harmful:{patch_proposal.patch_family}")
             else:
+                proposal_program = getattr(proposal, "program", None)
+                if proposal_program is not None:
+                    proposal_norm = proposal_program.normalized()
+                    proposal_stage_targets = {
+                        int(item)
+                        for item in list((proposal_norm.metadata or {}).get("runtime_branch_target_stage_ids") or [])
+                        if _safe_int(item) is not None
+                    }
+                    proposal_layer_targets = {
+                        str(item)
+                        for item in list((proposal_norm.metadata or {}).get("target_layer_groups") or [])
+                        if str(item).strip()
+                    }
+                    guidance_stage_targets = {
+                        int(item) for item in list(rewrite_targets.get("target_stage_ids") or []) if _safe_int(item) is not None
+                    }
+                    guidance_layer_targets = {
+                        str(item) for item in list(rewrite_targets.get("target_layer_group_ids") or []) if str(item).strip()
+                    }
+                    if guidance_stage_targets and proposal_stage_targets & guidance_stage_targets:
+                        priority += 0.10
+                        priority_reason.append("patch_memory_target:stage")
+                    if guidance_layer_targets and proposal_layer_targets & guidance_layer_targets:
+                        priority += 0.10
+                        priority_reason.append("patch_memory_target:layer_group")
                 if bool(patch_memory_enabled) and patch_proposal.patch_family in useful:
                     priority += 0.35
                     priority_reason.append(f"patch_memory_useful:{patch_proposal.patch_family}")
@@ -1251,7 +1447,6 @@ def _load_runtime_summary(path: Optional[str]) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _safe_float(value: Any) -> Optional[float]:
     try:
         if value is None:
@@ -1259,6 +1454,18 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+_PATCH_FAMILY_PRIORITY_ALIASES: Dict[str, set[str]] = {
+    "activation_offload_patch": {"add_offload_policy", "offload_enable_patch", "activation_offload_patch"},
+    "activation_reload_shift_patch": {"tune_reload_prefetch", "reload_prefetch_patch", "reload_shift_patch", "activation_reload_shift_patch"},
+    "adaptive_chunking_patch": {"enable_p2p_overlap", "comm_chunk_patch", "adaptive_chunking_patch"},
+    "comm_chunk_patch": {"enable_p2p_overlap", "comm_chunk_patch", "adaptive_chunking_patch"},
+    "overlap_policy_patch": {"enable_p2p_overlap", "enable_reload_overlap", "overlap_policy_patch"},
+    "local_verticalization_patch": {"local_verticalization_patch", "layer_group_repack"},
+    "layer_group_repack": {"enable_nonuniform_partition", "change_stage_boundary", "layer_group_repartition", "layer_group_repack", "critical_path_relief_patch", "local_verticalization_patch"},
+    "critical_path_relief_patch": {"change_stage_boundary", "critical_path_relief_patch"},
+}
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -3063,6 +3270,20 @@ def _profile_max_pp(program: MegatronProgram, profile: MachineProfile) -> int:
 
 def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
     program = default_moe_smoke_program(args.run_target) if args.model_track == "moe" else default_dense_program(args.run_target)
+    enable_hierarchical_orchestrator = bool(getattr(args, "enable_hierarchical_orchestrator", False))
+    enable_stateful_schedule = bool(getattr(args, "enable_stateful_schedule", False) or enable_hierarchical_orchestrator)
+    enable_reload_shift = bool(getattr(args, "enable_reload_shift", False) or enable_hierarchical_orchestrator)
+    enable_adaptive_chunking = bool(getattr(args, "enable_adaptive_chunking", False) or enable_hierarchical_orchestrator)
+    enable_local_verticalization = bool(getattr(args, "enable_local_verticalization", False) or enable_hierarchical_orchestrator)
+    enabled_rewrite_primitives = [
+        primitive
+        for primitive, enabled in (
+            ("reload_shift", enable_reload_shift),
+            ("adaptive_chunking", enable_adaptive_chunking),
+            ("local_verticalization", enable_local_verticalization),
+        )
+        if enabled
+    ]
     explicit_tp = int(args.tp or 0) > 0
     explicit_pp = int(args.pp or 0) > 0
     explicit_cp = int(args.cp or 0) > 0
@@ -3166,6 +3387,18 @@ def _build_baseline_program(args: argparse.Namespace) -> MegatronProgram:
             "use_fp16": bool(args.fp16),
             "recompute_granularity": args.recompute_granularity,
             "program_kind": "baseline",
+            "enable_stateful_schedule": enable_stateful_schedule,
+            "enable_hierarchical_orchestrator": enable_hierarchical_orchestrator,
+            "enable_reload_shift": enable_reload_shift,
+            "enable_adaptive_chunking": enable_adaptive_chunking,
+            "enable_local_verticalization": enable_local_verticalization,
+            "enabled_rewrite_primitives": enabled_rewrite_primitives,
+            "primary_parallel_mode": "pp_vpp",
+            "telemetry_budget_level": str(getattr(args, "telemetry_budget_level", None) or "summary"),
+            "telemetry_max_trace_mb": int(getattr(args, "telemetry_max_trace_mb", 128) or 128),
+            "telemetry_max_events_per_rank": int(getattr(args, "telemetry_max_events_per_rank", 20000) or 20000),
+            "telemetry_sampled_windows": int(getattr(args, "telemetry_sampled_windows", 2) or 2),
+            "window_steps": int(getattr(args, "window_steps", 4) or 4),
         }
     )
     program.search_space = SearchSpaceSpec()
@@ -6285,12 +6518,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--megatron-args-file", type=str, default=None)
     parser.add_argument("--transformer-impl", type=str, default="auto")
     parser.add_argument("--attention-backend", type=str, default="auto")
+    parser.add_argument("--enable-stateful-schedule", action="store_true")
+    parser.add_argument("--enable-hierarchical-orchestrator", action="store_true")
+    parser.add_argument("--enable-reload-shift", action="store_true")
+    parser.add_argument("--enable-adaptive-chunking", action="store_true")
+    parser.add_argument("--enable-local-verticalization", action="store_true")
+    parser.add_argument(
+        "--telemetry-budget",
+        dest="telemetry_budget_level",
+        type=str,
+        choices=["summary", "aggregated_grid", "full_debug"],
+        default="summary",
+    )
+    parser.add_argument("--telemetry-max-trace-mb", type=int, default=128)
+    parser.add_argument("--telemetry-max-events-per-rank", type=int, default=20000)
+    parser.add_argument("--telemetry-sampled-windows", type=int, default=2)
+    parser.add_argument("--window-steps", type=int, default=4)
     parser.add_argument("--tokenizer-model", type=str, default=DEFAULT_TOKENIZER_MODEL)
     parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)
     parser.add_argument("--use-mock-data", action="store_true")
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--enable-tp-comm-overlap", action="store_true")
     add_observability_args(parser)
+    parser.add_argument(
+        "--trial-evaluation-level",
+        type=str,
+        choices=["dry_run", "smoke_trial", "benchmark_trial", "window_refinement_trial", "full_trial"],
+        default="window_refinement_trial",
+    )
     parser.add_argument("--cuda-visible-devices", type=str, default=None)
     parser.add_argument("--allow-busy-gpus", action="store_true")
     parser.add_argument("--min-free-gpu-memory-mib", type=int, default=28672)

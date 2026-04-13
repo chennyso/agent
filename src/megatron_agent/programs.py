@@ -11,6 +11,7 @@ from megatron_agent.config import (
     BatchPlanSpec,
     ClusterSpec,
     ConstraintSpec,
+    GlobalStrategyPlanSpec,
     LengthBucketPolicy,
     LayoutSpec,
     MachineProfile,
@@ -23,11 +24,19 @@ from megatron_agent.config import (
     PartitionSpec,
     PartitionOptimizationSpec,
     ProgramPatchSpec,
+    LayerGroupSpec,
+    RewriteExecutionPlanSpec,
+    ScheduleEdgeSpec,
+    ScheduleNodeSpec,
     ScheduleActionSpec,
     ScheduleGridSpec,
     ScheduleIRSpec,
     ScheduleSpec,
+    StatePlanSpec,
+    TelemetryBudgetSpec,
     VerifierReport,
+    WindowFeedbackSpec,
+    WindowReconfigSpec,
     default_backend_caps,
     default_machine_profile,
     validate_strategy,
@@ -125,6 +134,15 @@ class CompiledProgram:
     applied_patch: Dict[str, Any] = field(default_factory=dict)
     schedule_grid: Dict[str, Any] = field(default_factory=dict)
     derived_actions: List[Dict[str, Any]] = field(default_factory=list)
+    stateful_schedule_nodes: List[Dict[str, Any]] = field(default_factory=list)
+    stateful_schedule_edges: List[Dict[str, Any]] = field(default_factory=list)
+    state_plan: Dict[str, Any] = field(default_factory=dict)
+    global_strategy_plan: Dict[str, Any] = field(default_factory=dict)
+    rewrite_plan: Dict[str, Any] = field(default_factory=dict)
+    telemetry_budget: Dict[str, Any] = field(default_factory=dict)
+    window_reconfig: Dict[str, Any] = field(default_factory=dict)
+    window_feedback_plan: Dict[str, Any] = field(default_factory=dict)
+    stateful_plan_notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -142,6 +160,15 @@ class CompiledProgram:
             "applied_patch": copy.deepcopy(self.applied_patch),
             "schedule_grid": copy.deepcopy(self.schedule_grid),
             "derived_actions": copy.deepcopy(self.derived_actions),
+            "stateful_schedule_nodes": copy.deepcopy(self.stateful_schedule_nodes),
+            "stateful_schedule_edges": copy.deepcopy(self.stateful_schedule_edges),
+            "state_plan": copy.deepcopy(self.state_plan),
+            "global_strategy_plan": copy.deepcopy(self.global_strategy_plan),
+            "rewrite_plan": copy.deepcopy(self.rewrite_plan),
+            "telemetry_budget": copy.deepcopy(self.telemetry_budget),
+            "window_reconfig": copy.deepcopy(self.window_reconfig),
+            "window_feedback_plan": copy.deepcopy(self.window_feedback_plan),
+            "stateful_plan_notes": list(self.stateful_plan_notes),
             "resolved_profile": {
                 "machine_profile": self.resolved_profile.get("machine_profile").to_dict()
                 if self.resolved_profile.get("machine_profile") is not None
@@ -237,6 +264,207 @@ def _stage_semantic_summary(schedule_ir: ScheduleIRSpec) -> List[Dict[str, Any]]
     ]
 
 
+def _stateful_layer_group_summary(program: MegatronProgram) -> List[Dict[str, Any]]:
+    return [item.to_dict() for item in list(program.layer_groups or [])]
+
+
+def _stateful_plan_payload(program: MegatronProgram) -> Dict[str, Any]:
+    norm = program.normalized()
+    return {
+        "layer_groups": [item.to_dict() for item in (norm.layer_groups or [])],
+        "schedule_graph_nodes": [item.to_dict() for item in (norm.schedule_graph_nodes or [])],
+        "schedule_graph_edges": [item.to_dict() for item in (norm.schedule_graph_edges or [])],
+        "state_plan": norm.state_plan.to_dict() if norm.state_plan is not None else {},
+        "global_strategy_plan": norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else {},
+        "rewrite_plan": norm.rewrite_plan.to_dict() if norm.rewrite_plan is not None else {},
+        "telemetry_budget": norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else {},
+        "window_reconfig": norm.window_reconfig.to_dict() if norm.window_reconfig is not None else {},
+        "stage_local_vpp": [int(item) for item in (norm.stage_local_vpp or [])],
+        "overlap_policy": norm.overlap_policy.to_dict() if norm.overlap_policy is not None else {},
+    }
+
+
+def _stateful_compile_notes(program: MegatronProgram) -> List[str]:
+    norm = program.normalized()
+    notes: List[str] = []
+    layer_groups = list(norm.layer_groups or [])
+    if layer_groups:
+        notes.append(f"stateful schedule graph active with {len(layer_groups)} layer-groups")
+    if norm.state_plan is not None:
+        notes.append(
+            "state plan objects="
+            f"{len(norm.state_plan.objects or [])}, placements={len(norm.state_plan.placements or [])}"
+        )
+    if norm.telemetry_budget is not None:
+        notes.append(
+            "telemetry budget="
+            f"{norm.telemetry_budget.level}, max_trace_mb={int(norm.telemetry_budget.max_trace_mb)}, "
+            f"max_events_per_rank={int(norm.telemetry_budget.max_events_per_rank)}"
+        )
+    if norm.global_strategy_plan is not None:
+        notes.append(
+            "global strategy="
+            f"{norm.global_strategy_plan.primary_parallel_mode} pp={int(norm.global_strategy_plan.pp_degree)} "
+            f"vpp={int(norm.global_strategy_plan.vpp_degree)}"
+        )
+    if norm.rewrite_plan is not None and list(norm.rewrite_plan.rewrite_actions or []):
+        notes.append(
+            "rewrite actions="
+            + ",".join(sorted({str(item.rewrite_type) for item in (norm.rewrite_plan.rewrite_actions or [])}))
+        )
+    if norm.window_reconfig is not None:
+        notes.append(
+            "window reconfig="
+            f"{int(norm.window_reconfig.window_steps)} steps, categories={','.join(norm.window_reconfig.allowed_patch_categories)}"
+        )
+    return notes
+
+
+def _stateful_plan_diagnostics(program: MegatronProgram) -> Dict[str, Any]:
+    norm = program.normalized()
+    layer_groups = list(norm.layer_groups or [])
+    state_plan = norm.state_plan or StatePlanSpec()
+    schedule_nodes = list(norm.schedule_graph_nodes or [])
+    schedule_edges = list(norm.schedule_graph_edges or [])
+    offloadable_objects = [
+        item.to_dict()
+        for item in (state_plan.objects or [])
+        if bool(item.offloadable)
+    ]
+    reload_nodes = [item.to_dict() for item in schedule_nodes if str(item.node_type) == "reload"]
+    offload_nodes = [item.to_dict() for item in schedule_nodes if str(item.node_type) == "offload"]
+    comm_nodes = [item.to_dict() for item in schedule_nodes if str(item.node_type) == "comm_chunk"]
+    return {
+        "layer_group_count": int(len(layer_groups)),
+        "state_object_count": int(len(state_plan.objects or [])),
+        "schedule_node_count": int(len(schedule_nodes)),
+        "schedule_edge_count": int(len(schedule_edges)),
+        "global_strategy_plan": norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else {},
+        "rewrite_plan": norm.rewrite_plan.to_dict() if norm.rewrite_plan is not None else {},
+        "offload_plan": {
+            "enabled": bool(offload_nodes),
+            "node_count": int(len(offload_nodes)),
+            "target_state_ids": [str(item.get("state_id") or "") for item in offloadable_objects],
+        },
+        "reload_plan": {
+            "enabled": bool(reload_nodes),
+            "node_count": int(len(reload_nodes)),
+            "prefetch_window": int((state_plan.reload_prefetch_window if state_plan is not None else 0) or 0),
+        },
+        "comm_chunk_plan": {
+            "enabled": bool(comm_nodes),
+            "node_count": int(len(comm_nodes)),
+            "level": "coarse" if len(comm_nodes) <= max(int(len(layer_groups) or 1), 1) else "fine",
+        },
+        "telemetry_budget": norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else {},
+        "window_reconfig": norm.window_reconfig.to_dict() if norm.window_reconfig is not None else {},
+    }
+
+
+def _validate_stateful_plan(program: MegatronProgram) -> tuple[List[str], List[str]]:
+    norm = program.normalized()
+    errors: List[str] = []
+    diagnosis: List[str] = []
+    layer_groups = list(norm.layer_groups or [])
+    stage_count = max(int(norm.partition.num_stages), 1)
+    stage_ids = {int(item.stage_id) for item in layer_groups}
+    if any(stage_id < 0 or stage_id >= stage_count for stage_id in stage_ids):
+        errors.append("layer_groups contain stage ids outside the partition range")
+    group_ids = [str(item.group_id) for item in layer_groups]
+    if len(group_ids) != len(set(group_ids)):
+        errors.append("layer_groups must have unique group_id values")
+    for item in layer_groups:
+        if len(item.layer_range or []) != 2 or int(item.layer_range[1]) < int(item.layer_range[0]):
+            errors.append(f"invalid layer_range for layer_group={item.group_id}")
+    node_ids = [str(item.node_id) for item in (norm.schedule_graph_nodes or [])]
+    if len(node_ids) != len(set(node_ids)):
+        errors.append("schedule_graph_nodes must have unique node_id values")
+    known_node_ids = set(node_ids)
+    known_group_ids = set(group_ids)
+    for node in list(norm.schedule_graph_nodes or []):
+        if str(node.layer_group_id or "") and str(node.layer_group_id or "") not in known_group_ids:
+            errors.append(f"schedule node {node.node_id} references unknown layer_group_id={node.layer_group_id}")
+    for edge in list(norm.schedule_graph_edges or []):
+        if str(edge.src or "") not in known_node_ids or str(edge.dst or "") not in known_node_ids:
+            errors.append(f"schedule edge {edge.src}->{edge.dst} references unknown node ids")
+    state_plan = norm.state_plan or StatePlanSpec()
+    known_state_ids = {str(item.state_id) for item in (state_plan.objects or [])}
+    for state in list(state_plan.objects or []):
+        if str(state.owner_layer_group or "") not in known_group_ids:
+            errors.append(f"state object {state.state_id} references unknown layer group")
+    for placement in list(state_plan.placements or []):
+        if str(placement.state_id or "") not in known_state_ids:
+            errors.append(f"state placement {placement.state_id} references unknown state object")
+    for edge in list(norm.schedule_graph_edges or []):
+        if str(edge.edge_type or "") == "reload_before_use":
+            src_node = next((item for item in (norm.schedule_graph_nodes or []) if str(item.node_id) == str(edge.src)), None)
+            dst_node = next((item for item in (norm.schedule_graph_nodes or []) if str(item.node_id) == str(edge.dst)), None)
+            if src_node is None or dst_node is None or str(src_node.node_type) != "reload":
+                errors.append("reload_before_use edges must originate from reload nodes")
+            if dst_node is None or str(dst_node.node_type) not in {"backward_input", "forward"}:
+                errors.append("reload_before_use edges must target compute nodes")
+    global_strategy = norm.global_strategy_plan or GlobalStrategyPlanSpec()
+    rewrite_plan = norm.rewrite_plan or RewriteExecutionPlanSpec()
+    if int(global_strategy.stage_count or 1) != stage_count:
+        errors.append("global_strategy_plan.stage_count must match number of partition stages")
+    if int(global_strategy.pp_degree or 1) != int(norm.parallel.pp_degree):
+        errors.append("global_strategy_plan.pp_degree must match parallel.pp_degree")
+    if int(global_strategy.vpp_degree or 1) != int(norm.parallel.vpp_degree):
+        errors.append("global_strategy_plan.vpp_degree must match parallel.vpp_degree")
+    supported_overlap_channels = {"p2p", "reload", "tp_comm", "optimizer_tail"}
+    illegal_channels = sorted(set(global_strategy.overlap_enabled_channels or []) - supported_overlap_channels)
+    if illegal_channels:
+        errors.append(
+            f"global_strategy_plan.overlap_enabled_channels contains unsupported values: {','.join(illegal_channels)}"
+        )
+    known_group_ids = set(group_ids)
+    for group_id, stage_id in dict(global_strategy.layer_group_to_stage or {}).items():
+        if str(group_id) not in known_group_ids:
+            errors.append(f"global_strategy_plan references unknown layer_group_id={group_id}")
+            continue
+        if int(stage_id) < 0 or int(stage_id) >= stage_count:
+            errors.append(f"global_strategy_plan maps layer_group_id={group_id} to out-of-range stage={stage_id}")
+    memory_budget_mb = max(float(norm.constraints.memory_budget_gb or norm.cluster.device_memory_gb or 32.0), 1.0) * 1024.0
+    for group in list(layer_groups or []):
+        if str(group.group_id) not in set(global_strategy.activation_offload_enabled_groups or []):
+            continue
+        if float(group.activation_size_mb or 0.0) > memory_budget_mb:
+            errors.append(f"activation_offload_enabled_groups exceeds stage memory headroom for group={group.group_id}")
+    if norm.telemetry_budget is not None and int(norm.telemetry_budget.max_events_per_rank) > 200000:
+        errors.append("telemetry_budget.max_events_per_rank exceeds supported limit")
+    if norm.telemetry_budget is not None and int(norm.telemetry_budget.max_trace_mb) > 2048:
+        errors.append("telemetry_budget.max_trace_mb exceeds supported limit")
+    if norm.window_reconfig is not None:
+        allowed = set(norm.window_reconfig.allowed_patch_categories or [])
+        illegal = sorted(allowed - {"partition", "schedule", "memory", "overlap"})
+        if illegal:
+            errors.append(f"window_reconfig.allowed_patch_categories contains unsupported values: {','.join(illegal)}")
+        allowed_categories = set(norm.window_reconfig.allowed_patch_categories or [])
+        rewrite_category_map = {
+            "reload_shift": "memory",
+            "adaptive_chunking": "overlap",
+            "local_verticalization": "schedule",
+        }
+        for action in list(rewrite_plan.rewrite_actions or []):
+            rewrite_category = rewrite_category_map.get(str(action.rewrite_type), "schedule")
+            if rewrite_category not in allowed_categories:
+                errors.append(
+                    f"rewrite action {action.rewrite_type} is not allowed by window_reconfig.allowed_patch_categories"
+                )
+            if str(action.rewrite_type) == "adaptive_chunking" and str(action.direction) == "finer" and float(action.magnitude or 0.0) > 8.0:
+                errors.append("adaptive_chunking finer magnitude exceeds supported runtime/budget limit")
+    if list(norm.stage_local_vpp or []) and len(list(norm.stage_local_vpp or [])) != stage_count:
+        errors.append("stage_local_vpp length must match number of partition stages")
+    if not errors:
+        if any(str(item.node_type) == "reload" for item in (norm.schedule_graph_nodes or [])):
+            diagnosis.append("reload_before_use_active")
+        if any(str(item.node_type) == "offload" for item in (norm.schedule_graph_nodes or [])):
+            diagnosis.append("offload_schedule_active")
+        if any(str(item.node_type) == "comm_chunk" for item in (norm.schedule_graph_nodes or [])):
+            diagnosis.append("comm_chunk_schedule_active")
+    return errors, diagnosis
+
+
 def _schedule_detail_report(program: MegatronProgram, runtime_schedule_family: str) -> Dict[str, Any]:
     schedule_ir = (program.schedule_ir or ScheduleIRSpec()).normalized()
     effective = {
@@ -251,6 +479,9 @@ def _schedule_detail_report(program: MegatronProgram, runtime_schedule_family: s
         "weight_version_policy": str(schedule_ir.weight_version_policy),
         "virtual_stage_grouping": list(schedule_ir.virtual_stage_grouping),
         "stage_semantics": _stage_semantic_summary(schedule_ir),
+        "layer_group_count": int(len(program.layer_groups or [])),
+        "schedule_graph_node_count": int(len(program.schedule_graph_nodes or [])),
+        "schedule_graph_edge_count": int(len(program.schedule_graph_edges or [])),
     }
     if schedule_ir.schedule_grid is not None:
         effective["schedule_grid"] = {
@@ -262,6 +493,12 @@ def _schedule_detail_report(program: MegatronProgram, runtime_schedule_family: s
         effective["derived_actions"] = {
             "count": int(len(schedule_ir.derived_actions or [])),
             "kinds": sorted({str(item.action_type) for item in (schedule_ir.derived_actions or [])}),
+        }
+    if program.state_plan is not None:
+        effective["state_plan"] = {
+            "object_count": int(len(program.state_plan.objects or [])),
+            "placement_count": int(len(program.state_plan.placements or [])),
+            "reload_prefetch_window": int(program.state_plan.reload_prefetch_window),
         }
     return {
         "requested": schedule_ir.to_dict(),
@@ -1177,6 +1414,11 @@ def check_program(
             errors.append("partition_optimization.stage_layer_counts must sum to model.num_layers")
     if partition_optimization.stage_local_vpp_vector and len(partition_optimization.stage_local_vpp_vector) != norm.partition.num_stages:
         errors.append("partition_optimization.stage_local_vpp_vector length must match number of partition stages")
+    stateful_errors, stateful_diagnosis = _validate_stateful_plan(norm)
+    if stateful_errors:
+        errors.extend(stateful_errors)
+    if stateful_diagnosis:
+        diagnosis.extend(stateful_diagnosis)
 
     if int(norm.parallel.vpp_degree) != int(norm.layout.vpp_degree):
         errors.append("parallel.vpp_degree must match layout.vpp_degree")
@@ -1387,12 +1629,20 @@ def check_program(
     overlap_detail = _overlap_detail_report(norm, backend_family)
     memory_detail = _memory_detail_report(norm, profile_context["backend_caps"])
     partition_detail = _partition_detail_report(norm)
+    stateful_plan_payload = _stateful_plan_diagnostics(norm)
+    schedule_detail["effective"]["stateful_plan"] = copy.deepcopy(stateful_plan_payload)
     config_resolution = _config_resolution_report(
         schedule_detail=schedule_detail,
         overlap_detail=overlap_detail,
         memory_detail=memory_detail,
         partition_detail=partition_detail,
     )
+    config_resolution["stateful_plan"] = copy.deepcopy(stateful_plan_payload)
+    memory_detail["effective"]["stateful_plan"] = {
+        "offload_budget_mb": float((norm.state_plan.offload_budget_mb if norm.state_plan is not None else 0.0) or 0.0),
+        "reload_prefetch_window": int((norm.state_plan.reload_prefetch_window if norm.state_plan is not None else 0) or 0),
+    }
+    partition_detail["effective"]["stage_local_vpp"] = [int(item) for item in (norm.stage_local_vpp or [])]
 
     return ProgramLegalityReport(
         is_valid=not errors,
@@ -1737,6 +1987,8 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     machine_profile = profile_context["machine_profile"]
     backend_caps = profile_context["backend_caps"]
     memory_estimate = estimate_program_memory(norm)
+    stateful_plan = _stateful_plan_payload(norm)
+    stateful_diagnostics = _stateful_plan_diagnostics(norm)
     compile_notes = _profile_compile_notes(norm, backend_caps=backend_caps, machine_profile=machine_profile)
     compile_notes.append(
         "estimated memory pressure="
@@ -1748,6 +2000,42 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
             "estimated composite cost="
             f"{float((legality.cost_model or {}).get('total_score', 0.0)):.2f}"
         )
+    compile_notes.extend(_stateful_compile_notes(norm))
+    compile_notes.append(
+        "critical_path_risk="
+        + ("high" if float((legality.cost_model or {}).get("stall_score", 0.0)) >= 2.0 else "moderate")
+    )
+    compile_notes.append(
+        "reload_tail_risk="
+        + (
+            "high"
+            if float(((stateful_diagnostics.get("reload_plan") or {}).get("node_count") or 0)) > max(int(norm.parallel.pp_degree), 1)
+            else "low"
+        )
+    )
+    compile_notes.append(
+        "offload_interference_risk="
+        + (
+            "medium"
+            if bool((stateful_diagnostics.get("offload_plan") or {}).get("enabled"))
+            and memory_estimate.pressure_score < 1.05
+            else "low"
+        )
+    )
+    compile_notes.append(
+        "comm_chunk_overfragmentation="
+        + (
+            "high"
+            if str(((stateful_diagnostics.get("comm_chunk_plan") or {}).get("level") or "")) == "fine"
+            and int((stateful_diagnostics.get("comm_chunk_plan") or {}).get("node_count") or 0)
+            > max(int(len(norm.layer_groups or [])) * 2, 4)
+            else "low"
+        )
+    )
+    compile_notes.append(
+        "memory_headroom_risk="
+        + ("high" if str(memory_estimate.risk_level) in {"high", "oom_likely"} else "low")
+    )
 
     env: Dict[str, str] = {
         "RUN_TARGET": str(norm.cluster.target),
@@ -1836,6 +2124,27 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     env["SCHEDULE_PARTITION_HINTS"] = json.dumps(partition_optimization.to_dict(), ensure_ascii=False)
     env["SCHEDULE_GRID_SPEC"] = json.dumps(materialized_schedule_grid.to_dict(), ensure_ascii=False)
     env["SCHEDULE_ACTION_SPECS"] = json.dumps([item.to_dict() for item in derived_actions], ensure_ascii=False)
+    env["ENABLE_STATEFUL_SCHEDULE"] = "1"
+    env["SCHEDULE_NODE_SPECS"] = json.dumps(stateful_plan.get("schedule_graph_nodes") or [], ensure_ascii=False)
+    env["SCHEDULE_EDGE_SPECS"] = json.dumps(stateful_plan.get("schedule_graph_edges") or [], ensure_ascii=False)
+    env["STATE_PLAN"] = json.dumps(stateful_plan.get("state_plan") or {}, ensure_ascii=False)
+    env["GLOBAL_STRATEGY_PLAN"] = json.dumps(stateful_plan.get("global_strategy_plan") or {}, ensure_ascii=False)
+    env["REWRITE_EXECUTION_PLAN"] = json.dumps(stateful_plan.get("rewrite_plan") or {}, ensure_ascii=False)
+    env["OFFLOAD_PLAN"] = json.dumps(stateful_diagnostics.get("offload_plan") or {}, ensure_ascii=False)
+    env["RELOAD_PLAN"] = json.dumps(stateful_diagnostics.get("reload_plan") or {}, ensure_ascii=False)
+    env["COMM_CHUNK_PLAN"] = json.dumps(stateful_diagnostics.get("comm_chunk_plan") or {}, ensure_ascii=False)
+    env["TELEMETRY_BUDGET"] = json.dumps(stateful_plan.get("telemetry_budget") or {}, ensure_ascii=False)
+    env["WINDOW_RECONFIG_PLAN"] = json.dumps(stateful_plan.get("window_reconfig") or {}, ensure_ascii=False)
+    env["WINDOW_FEEDBACK_PLAN"] = json.dumps(
+        WindowFeedbackSpec(
+            window_index=0,
+            policy_signature="",
+            recommended_rewrites=list((norm.rewrite_plan.rewrite_actions if norm.rewrite_plan is not None else []) or []),
+        ).to_dict(),
+        ensure_ascii=False,
+    )
+    if norm.stage_local_vpp:
+        env["STAGE_LOCAL_VPP_VECTOR"] = json.dumps([int(item) for item in norm.stage_local_vpp], ensure_ascii=False)
     if norm.strategy_ir.pipe.warmup_policy:
         env["SCHEDULE_WARMUP_POLICY"] = str(norm.strategy_ir.pipe.warmup_policy)
     if norm.strategy_ir.pipe.cooldown_policy:
@@ -2072,6 +2381,12 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
             "count": int(len(derived_actions or [])),
             "kinds": sorted({str(item.action_type) for item in (derived_actions or [])}),
         }
+        schedule_detail["effective"]["stateful_graph"] = {
+            "layer_group_count": int(len(norm.layer_groups or [])),
+            "node_count": int(len(norm.schedule_graph_nodes or [])),
+            "edge_count": int(len(norm.schedule_graph_edges or [])),
+            "telemetry_level": str((norm.telemetry_budget.level if norm.telemetry_budget is not None else "summary") or "summary"),
+        }
     extra_args = list(strategy.extra_args or [])
     return CompiledProgram(
         strategy=strategy,
@@ -2089,4 +2404,17 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         applied_patch=norm.applied_patch.to_dict() if norm.applied_patch is not None else {},
         schedule_grid=materialized_schedule_grid.to_dict(),
         derived_actions=[item.to_dict() for item in derived_actions],
+        stateful_schedule_nodes=[item.to_dict() for item in (norm.schedule_graph_nodes or [])],
+        stateful_schedule_edges=[item.to_dict() for item in (norm.schedule_graph_edges or [])],
+        state_plan=norm.state_plan.to_dict() if norm.state_plan is not None else {},
+        global_strategy_plan=norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else {},
+        rewrite_plan=norm.rewrite_plan.to_dict() if norm.rewrite_plan is not None else {},
+        telemetry_budget=norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else {},
+        window_reconfig=norm.window_reconfig.to_dict() if norm.window_reconfig is not None else {},
+        window_feedback_plan=WindowFeedbackSpec(
+            window_index=0,
+            policy_signature="",
+            recommended_rewrites=list((norm.rewrite_plan.rewrite_actions if norm.rewrite_plan is not None else []) or []),
+        ).to_dict(),
+        stateful_plan_notes=list(_stateful_compile_notes(norm)),
     )
