@@ -1,10 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import atexit
 import contextlib
 import json
 import os
+import threading
+import time
 from functools import partial
-from typing import Callable, Dict, Iterator, List, Optional, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -45,6 +49,23 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+_PRODUCTION_SCHEDULE_FAMILIES = {"fixed_1f1b", "interleaved", "zero_bubble", "dualpipe_v"}
+_ADAPTER_SCHEDULE_FAMILIES = {"zbv", "v_half", "v_min", "custom"}
+_ALL_SCHEDULE_FAMILIES = _PRODUCTION_SCHEDULE_FAMILIES | _ADAPTER_SCHEDULE_FAMILIES
+_SCHEDULE_RUNTIME_HOOKS = (
+    "before_forward_hook",
+    "after_forward_hook",
+    "before_backward_hook",
+    "after_backward_hook",
+    "before_send_recv_hook",
+    "after_send_recv_hook",
+    "before_optimizer_tail_hook",
+    "memory_action_hook",
+)
+_SCHEDULE_ACTION_RUNNER_SINGLETON: Optional["ScheduleActionRunner"] = None
+_SCHEDULE_ACTION_RUNNER_LOCK = threading.Lock()
 
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
@@ -405,6 +426,30 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
+    runtime_runner = get_schedule_action_runner()
+    runtime_runner.set_context(
+        phase=str(runtime_runner.current_context().get("phase") or "steady"),
+        microbatch_id=current_microbatch if current_microbatch is not None else runtime_runner.current_context().get("microbatch_id", -1),
+        vchunk_id=vp_stage if vp_stage is not None else runtime_runner.current_context().get("vchunk_id", 0),
+        lane_id=0,
+    )
+    invoke_schedule_runtime_hook(
+        "before_forward_hook",
+        {
+            "microbatch_id": current_microbatch,
+            "vchunk_id": vp_stage,
+            "is_last_stage": bool(is_last_stage),
+        },
+    )
+    runtime_token = runtime_runner.begin_action(
+        "FWD",
+        microbatch_id=current_microbatch,
+        vchunk_id=vp_stage,
+        phase=str(runtime_runner.current_context().get("phase") or "steady"),
+        lane_id=0,
+        metadata={"is_last_stage": bool(is_last_stage)},
+    )
+
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
@@ -444,6 +489,21 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+    runtime_runner.end_action(
+        runtime_token,
+        metadata={
+            "num_tokens": int(num_tokens) if num_tokens is not None else 0,
+            "is_last_stage": bool(is_last_stage),
+        },
+    )
+    invoke_schedule_runtime_hook(
+        "after_forward_hook",
+        {
+            "microbatch_id": current_microbatch,
+            "vchunk_id": vp_stage,
+            "num_tokens": int(num_tokens) if num_tokens is not None else 0,
+        },
+    )
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -457,6 +517,23 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     with respect to stage's output tensor.
 
     Returns gradient of loss with respect to input tensor (None if first stage)."""
+
+    runtime_runner = get_schedule_action_runner()
+    current_context = runtime_runner.current_context()
+    invoke_schedule_runtime_hook(
+        "before_backward_hook",
+        {
+            "microbatch_id": current_context.get("microbatch_id"),
+            "vchunk_id": current_context.get("vchunk_id"),
+        },
+    )
+    runtime_token = runtime_runner.begin_action(
+        "BWD_ACT",
+        microbatch_id=current_context.get("microbatch_id"),
+        vchunk_id=current_context.get("vchunk_id"),
+        phase=str(current_context.get("phase") or "steady"),
+        lane_id=0,
+    )
 
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
@@ -509,6 +586,20 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    runtime_runner.end_action(
+        runtime_token,
+        metadata={
+            "had_output_grad": bool(output_tensor_grad and output_tensor_grad[0] is not None),
+        },
+    )
+    invoke_schedule_runtime_hook(
+        "after_backward_hook",
+        {
+            "microbatch_id": current_context.get("microbatch_id"),
+            "vchunk_id": current_context.get("vchunk_id"),
+        },
+    )
 
     return input_tensor_grad
 
@@ -600,6 +691,9 @@ def forward_backward_no_pipelining(
     force_all_reduce: Optional[bool] = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
+
+    runtime_runner = get_schedule_action_runner()
+    runtime_runner.set_phase("steady")
 
     if pg_collection is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -725,6 +819,16 @@ def forward_backward_no_pipelining(
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
+        invoke_schedule_runtime_hook(
+            "before_optimizer_tail_hook",
+            {"op_name": "finalize_model_grads"},
+        )
+        finalize_token = runtime_runner.begin_action(
+            "WGRAD_OPT",
+            phase="cooldown",
+            lane_id=0,
+            metadata={"op_name": "finalize_model_grads"},
+        )
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
         config.finalize_model_grads_func(
@@ -733,6 +837,7 @@ def forward_backward_no_pipelining(
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+        runtime_runner.end_action(finalize_token, metadata={"op_name": "finalize_model_grads"})
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
@@ -746,6 +851,8 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    runtime_runner.flush()
 
     return forward_data_store
 
@@ -772,6 +879,17 @@ def clear_embedding_activation_buffer(config, model, is_last_stage):
 def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_group):
     """Finish embedding wgrad compute."""
     if is_last_stage and config.defer_embedding_wgrad_compute:
+        runtime_runner = get_schedule_action_runner()
+        invoke_schedule_runtime_hook(
+            "before_optimizer_tail_hook",
+            {"op_name": "finish_embedding_wgrad_compute"},
+        )
+        runtime_token = runtime_runner.begin_action(
+            "WGRAD_OPT",
+            phase=str(runtime_runner.current_context().get("phase") or "cooldown"),
+            lane_id=0,
+            metadata={"op_name": "finish_embedding_wgrad_compute"},
+        )
         embedding_activation_buffer = embedding_module.embedding_activation_buffer
         grad_output_buffer = embedding_module.grad_output_buffer
         weight = (
@@ -783,6 +901,7 @@ def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_g
         drain_embedding_wgrad_compute(
             config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
         )
+        runtime_runner.end_action(runtime_token, metadata={"op_name": "finish_embedding_wgrad_compute"})
 
 
 def get_pp_rank_microbatches(
@@ -935,6 +1054,113 @@ def _parse_stage_chunk_priority_hints(raw: str, num_model_chunks: int) -> Dict[i
     return parsed
 
 
+def _parse_json_hint_dict(raw: str) -> Dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _parse_int_vector_hint(raw: str) -> List[int]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    if isinstance(payload, list):
+        parsed: List[int] = []
+        for item in payload:
+            try:
+                parsed.append(max(int(item), 1))
+            except Exception:
+                continue
+        return parsed
+    parsed: List[int] = []
+    for token in text.replace("|", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed.append(max(int(token), 1))
+        except Exception:
+            continue
+    return parsed
+
+
+def _parse_schedule_grid_spec(raw: str) -> Dict[str, Any]:
+    payload = _parse_json_hint_dict(raw)
+    if not payload:
+        return {}
+    try:
+        payload["lanes"] = max(int(payload.get("lanes", 1) or 1), 1)
+        payload["time_slots"] = max(int(payload.get("time_slots", 0) or 0), 0)
+        payload["stage_count"] = max(int(payload.get("stage_count", 1) or 1), 1)
+        payload["vstage_count"] = max(int(payload.get("vstage_count", 1) or 1), 1)
+        payload["microbatch_count"] = max(int(payload.get("microbatch_count", 1) or 1), 1)
+        payload["family"] = str(payload.get("family", "fixed_1f1b") or "fixed_1f1b").strip()
+        payload["weight_version_policy"] = str(payload.get("weight_version_policy", "default") or "default").strip()
+        payload["constraints"] = dict(payload.get("constraints") or {})
+        payload["notes"] = [str(item) for item in (payload.get("notes") or []) if str(item).strip()]
+    except Exception:
+        return {}
+    parsed_cells: List[Dict[str, Any]] = []
+    for item in list(payload.get("cells") or []):
+        if not isinstance(item, dict):
+            continue
+        parsed_cells.append(
+            {
+                "kind": str(item.get("kind") or "BUBBLE").strip().upper(),
+                "stage_id": max(int(item.get("stage_id", 0) or 0), 0),
+                "lane_id": max(int(item.get("lane_id", 0) or 0), 0),
+                "microbatch_id": int(item.get("microbatch_id", -1) or -1),
+                "vchunk_id": max(int(item.get("vchunk_id", 0) or 0), 0),
+                "time_slot": max(int(item.get("time_slot", 0) or 0), 0),
+                "stream_or_channel": str(item.get("stream_or_channel") or "").strip() or None,
+                "weight_version_tag": str(item.get("weight_version_tag") or "").strip() or None,
+            }
+        )
+    payload["cells"] = parsed_cells
+    return payload
+
+
+def _parse_schedule_action_specs(raw: str) -> List[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    parsed: List[Dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        parsed.append(
+            {
+                "action_type": str(item.get("action_type") or "WAIT").strip().upper(),
+                "stage_id": max(int(item.get("stage_id", 0) or 0), 0),
+                "lane_id": max(int(item.get("lane_id", 0) or 0), 0),
+                "microbatch_id": max(int(item.get("microbatch_id", 0) or 0), 0),
+                "vchunk_id": max(int(item.get("vchunk_id", 0) or 0), 0),
+                "time_slot": max(int(item.get("time_slot", 0) or 0), 0),
+                "duration_hint": max(float(item.get("duration_hint", 0.0) or 0.0), 0.0),
+                "dependency_ids": [str(dep) for dep in list(item.get("dependency_ids") or []) if str(dep).strip()],
+                "memory_delta": float(item.get("memory_delta", 0.0) or 0.0),
+                "stream_or_channel": str(item.get("stream_or_channel") or "").strip() or None,
+                "weight_version_tag": str(item.get("weight_version_tag") or "").strip() or None,
+            }
+        )
+    return parsed
+
+
 def _parse_stage_family_hints(raw: str) -> Dict[int, Dict[str, str]]:
     parsed: Dict[int, Dict[str, str]] = {}
     text = str(raw or "").strip()
@@ -965,12 +1191,651 @@ def _parse_stage_family_hints(raw: str) -> Dict[int, Dict[str, str]]:
     return parsed
 
 
+def _parse_stage_semantic_hints(raw: str) -> Dict[int, Dict[str, str]]:
+    parsed: Dict[int, Dict[str, str]] = {}
+    payload = _parse_json_hint_dict(raw)
+    if payload:
+        for key, value in payload.items():
+            try:
+                stage_id = int(key)
+            except Exception:
+                continue
+            if not isinstance(value, dict):
+                continue
+            parsed[int(stage_id)] = {
+                str(item_key): str(item_value)
+                for item_key, item_value in dict(value).items()
+                if str(item_key).strip() and str(item_value).strip()
+            }
+        return parsed
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    try:
+        payload_list = json.loads(text)
+    except Exception:
+        return parsed
+    if not isinstance(payload_list, list):
+        return parsed
+    for item in payload_list:
+        if not isinstance(item, dict):
+            continue
+        try:
+            stage_id = int(item.get("stage_id"))
+        except Exception:
+            continue
+        parsed[int(stage_id)] = {
+            str(item_key): str(item_value)
+            for item_key, item_value in dict(item).items()
+            if str(item_key).strip()
+            and str(item_key) != "stage_id"
+            and str(item_value).strip()
+        }
+    return parsed
+
+
+def _parse_schedule_runtime_hints() -> Dict[str, Any]:
+    return {
+        "family": str(os.environ.get("SCHEDULE_FAMILY", "") or "").strip(),
+        "dispatch_order": str(os.environ.get("SCHEDULE_DISPATCH_ORDER", "") or "").strip(),
+        "lane_policy": str(os.environ.get("SCHEDULE_LANE_POLICY", "") or "").strip(),
+        "group_size_vector": _parse_int_vector_hint(os.environ.get("SCHEDULE_GROUP_SIZE_VECTOR", "")),
+        "schedule_grid_spec": _parse_schedule_grid_spec(os.environ.get("SCHEDULE_GRID_SPEC", "")),
+        "schedule_action_specs": _parse_schedule_action_specs(os.environ.get("SCHEDULE_ACTION_SPECS", "")),
+        "stage_semantic_hints": _parse_stage_semantic_hints(os.environ.get("SCHEDULE_STAGE_SEMANTIC_HINTS", "")),
+        "overlap_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_OVERLAP_HINTS", "")),
+        "memory_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_MEMORY_HINTS", "")),
+        "partition_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_PARTITION_HINTS", "")),
+        "supported_families": sorted(_ALL_SCHEDULE_FAMILIES),
+        "available_hooks": list(_SCHEDULE_RUNTIME_HOOKS),
+    }
+
+
 def _get_local_stage_family_hint() -> Dict[str, str]:
     pp_rank, _ = _pipeline_parallel_location()
     if pp_rank is None:
         return {}
     parsed = _parse_stage_family_hints(os.environ.get("SCHEDULE_STAGE_FAMILY_HINTS", ""))
-    return dict(parsed.get(int(pp_rank)) or {})
+    merged = dict(parsed.get(int(pp_rank)) or {})
+    runtime_hints = _parse_schedule_runtime_hints()
+    semantic_hints = dict(runtime_hints.get("stage_semantic_hints") or {})
+    local_semantic = semantic_hints.get(int(pp_rank))
+    if isinstance(local_semantic, dict):
+        for key, value in dict(local_semantic).items():
+            token = str(value or "").strip()
+            if token:
+                merged[str(key)] = token
+    overlap_hints = dict(runtime_hints.get("overlap_hints") or {})
+    memory_hints = dict(runtime_hints.get("memory_hints") or {})
+    partition_hints = dict(runtime_hints.get("partition_hints") or {})
+    if "enable_p2p_overlap" in overlap_hints:
+        merged.setdefault(
+            "p2p_policy",
+            "overlap" if bool(overlap_hints.get("enable_p2p_overlap")) else "serial",
+        )
+    if bool(overlap_hints.get("enable_optimizer_tail_overlap")):
+        merged.setdefault("optimizer_runtime_mode", "tail_guarded_overlap")
+    checkpoint_policy = str(memory_hints.get("checkpoint_policy") or "").strip()
+    if checkpoint_policy:
+        merged.setdefault("checkpoint_policy", checkpoint_policy)
+    offload_policy = str(memory_hints.get("offload_policy") or "").strip()
+    if offload_policy:
+        merged.setdefault("memory_policy_mode", offload_policy)
+    reload_policy = str(memory_hints.get("reload_policy") or "").strip()
+    if reload_policy:
+        merged.setdefault("reload_policy", reload_policy)
+    prefetch_policy = str(memory_hints.get("prefetch_policy") or "").strip()
+    if prefetch_policy:
+        merged.setdefault("prefetch_policy", prefetch_policy)
+    partition_mode = str(partition_hints.get("partition_mode") or "").strip()
+    if partition_mode:
+        merged.setdefault("partition_mode", partition_mode)
+    return merged
+
+
+def _resolve_local_group_size(default_group_size: int) -> int:
+    group_size_vector = [
+        max(int(item), 1)
+        for item in list(_parse_schedule_runtime_hints().get("group_size_vector") or [])
+    ]
+    if not group_size_vector:
+        return max(int(default_group_size or 1), 1)
+    pp_rank, _ = _pipeline_parallel_location()
+    if pp_rank is None:
+        return int(group_size_vector[0])
+    if int(pp_rank) < len(group_size_vector):
+        return int(group_size_vector[int(pp_rank)])
+    return int(group_size_vector[-1])
+
+
+def get_schedule_runtime_policy() -> Dict[str, Any]:
+    policy = _parse_schedule_runtime_hints()
+    local_stage_hint = _get_local_stage_family_hint()
+    pp_rank, _ = _pipeline_parallel_location()
+    policy["local_stage_index"] = int(pp_rank) if pp_rank is not None else None
+    policy["local_stage_hint"] = dict(local_stage_hint or {})
+    return policy
+
+
+def get_schedule_family_registry() -> Dict[str, Dict[str, Any]]:
+    registry: Dict[str, Dict[str, Any]] = {}
+    for family in sorted(_ALL_SCHEDULE_FAMILIES):
+        if family == "fixed_1f1b":
+            warmup_rule = "fill_pipeline"
+            steady_rule = "1f1b"
+            cooldown_rule = "drain_pipeline"
+        elif family == "interleaved":
+            warmup_rule = "fill_interleaved"
+            steady_rule = "grouped_interleave"
+            cooldown_rule = "drain_interleaved"
+        elif family in {"zero_bubble", "zbv", "v_half", "v_min"}:
+            warmup_rule = "bubble_fill"
+            steady_rule = "zero_bubble_proxy"
+            cooldown_rule = "optimizer_tail_hide"
+        elif family == "dualpipe_v":
+            warmup_rule = "dualpipe_fill"
+            steady_rule = "dualpipe_overlap"
+            cooldown_rule = "dualpipe_drain"
+        else:
+            warmup_rule = "custom"
+            steady_rule = "custom"
+            cooldown_rule = "custom"
+        registry[family] = {
+            "family": family,
+            "warmup_rule": warmup_rule,
+            "steady_rule": steady_rule,
+            "cooldown_rule": cooldown_rule,
+            "weight_version_policy": "delayed_wgrad" if family in {"zero_bubble", "zbv", "v_half", "v_min", "dualpipe_v"} else "default",
+            "family_specific_constraints": [],
+            "execution_mode": "production" if family in _PRODUCTION_SCHEDULE_FAMILIES else "adapter",
+        }
+    return registry
+
+
+def get_schedule_action_view() -> Dict[str, Any]:
+    policy = get_schedule_runtime_policy()
+    grid_spec = dict(policy.get("schedule_grid_spec") or {})
+    action_specs = list(policy.get("schedule_action_specs") or [])
+    return {
+        "family": str(policy.get("family") or ""),
+        "grid_spec": grid_spec,
+        "action_specs": action_specs,
+        "action_count": int(len(action_specs)),
+        "available_hooks": list(policy.get("available_hooks") or []),
+    }
+
+
+def invoke_schedule_runtime_hook(hook_name: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    event = dict(payload or {})
+    token = str(hook_name or "").strip()
+    if token not in _SCHEDULE_RUNTIME_HOOKS:
+        event["status"] = "unknown_hook"
+        return event
+    policy = get_schedule_runtime_policy()
+    event["status"] = "ready"
+    event["hook_name"] = token
+    event["schedule_family"] = str(policy.get("family") or "")
+    event["dispatch_order"] = str(policy.get("dispatch_order") or "")
+    event["lane_policy"] = str(policy.get("lane_policy") or "")
+    event["stage_semantics"] = dict(policy.get("local_stage_hint") or {})
+    event["overlap_hints"] = dict(policy.get("overlap_hints") or {})
+    event["memory_hints"] = dict(policy.get("memory_hints") or {})
+    event["partition_hints"] = dict(policy.get("partition_hints") or {})
+    event["schedule_grid_spec"] = dict(policy.get("schedule_grid_spec") or {})
+    event["schedule_action_specs"] = list(policy.get("schedule_action_specs") or [])
+    return event
+
+
+class ScheduleActionRunner:
+    """Runtime-facing action tracker for schedule-driven execution.
+
+    The current Megatron execution loops are still mostly schedule-template based.
+    This runner bridges the new ScheduleGridSpec / ScheduleActionSpec contract into
+    runtime-observed telemetry so we can progressively migrate toward a full
+    action-driven executor without losing execution visibility in the meantime.
+    """
+
+    def __init__(self) -> None:
+        self.policy = get_schedule_runtime_policy()
+        self.action_view = get_schedule_action_view()
+        self.stage_id = self.policy.get("local_stage_index")
+        self.family = str(self.policy.get("family") or "fixed_1f1b")
+        self.trace_dir = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_DIR") or "").strip()
+        self.rank = self._resolve_global_rank()
+        self._trace_start = time.perf_counter()
+        self._context: Dict[str, Any] = {
+            "phase": "steady",
+            "microbatch_id": -1,
+            "vchunk_id": 0,
+            "lane_id": 0,
+        }
+        self._events: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._flushed = False
+        self._expected_local_actions = self._filter_local_actions()
+        self._metrics: Dict[str, float] = {
+            "comm_ms": 0.0,
+            "reload_stall_ms": 0.0,
+            "offload_overlap_success_ratio": 0.0,
+            "observed_action_count": 0.0,
+        }
+
+    def _resolve_global_rank(self) -> int:
+        env_rank = os.environ.get("RANK")
+        if env_rank is not None:
+            try:
+                return int(str(env_rank).strip())
+            except Exception:
+                pass
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                return int(torch.distributed.get_rank())
+        except Exception:
+            pass
+        if self.stage_id is not None:
+            return int(self.stage_id)
+        return 0
+
+    def _filter_local_actions(self) -> List[Dict[str, Any]]:
+        action_specs = list(self.action_view.get("action_specs") or [])
+        if self.stage_id is None:
+            return [dict(item) for item in action_specs]
+        return [
+            dict(item)
+            for item in action_specs
+            if int(item.get("stage_id") or 0) == int(self.stage_id)
+        ]
+
+    def _actions_by_phase(self) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {"warmup": [], "steady": [], "cooldown": []}
+        grid_spec = dict(self.action_view.get("grid_spec") or {})
+        cells = [
+            dict(item)
+            for item in list(grid_spec.get("cells") or [])
+            if self.stage_id is None or int(item.get("stage_id") or 0) == int(self.stage_id)
+        ]
+        cell_index: Dict[tuple[int, int, int, int, str], Dict[str, Any]] = {}
+        for cell in cells:
+            key = (
+                int(cell.get("time_slot") or 0),
+                int(cell.get("lane_id") or 0),
+                int(cell.get("microbatch_id") or 0),
+                int(cell.get("vchunk_id") or 0),
+                str(cell.get("kind") or "BUBBLE").upper(),
+            )
+            cell_index[key] = dict(cell)
+        for action in list(self._expected_local_actions or []):
+            slot = int(action.get("time_slot") or 0)
+            lane_id = int(action.get("lane_id") or 0)
+            microbatch_id = int(action.get("microbatch_id") or 0)
+            vchunk_id = int(action.get("vchunk_id") or 0)
+            action_type = str(action.get("action_type") or "WAIT").upper()
+            phase = "steady"
+            if action_type == "WAIT":
+                matched = cell_index.get((slot, lane_id, microbatch_id, vchunk_id, "BUBBLE"))
+                if matched is not None:
+                    phase = str(matched.get("phase") or "steady")
+            else:
+                matched = cell_index.get((slot, lane_id, microbatch_id, vchunk_id, action_type))
+                if matched is not None:
+                    phase = str(matched.get("phase") or "steady")
+            grouped.setdefault(phase, []).append(dict(action))
+        for phase in list(grouped.keys()):
+            grouped[phase] = sorted(
+                grouped[phase],
+                key=lambda item: (
+                    int(item.get("time_slot") or 0),
+                    int(item.get("lane_id") or 0),
+                    int(item.get("microbatch_id") or 0),
+                    int(item.get("vchunk_id") or 0),
+                    str(item.get("action_type") or ""),
+                ),
+            )
+        return grouped
+
+    def _planned_grid_trace(self) -> Dict[str, Any]:
+        grid_spec = dict(self.action_view.get("grid_spec") or {})
+        if not grid_spec:
+            return {}
+        cells = [
+            dict(item)
+            for item in list(grid_spec.get("cells") or [])
+            if self.stage_id is None or int(item.get("stage_id") or 0) == int(self.stage_id)
+        ]
+        return {
+            "format": "pipeline_grid_trace",
+            "source": "schedule_action_plan",
+            "family": str(grid_spec.get("family") or self.family),
+            "lanes": int(grid_spec.get("lanes") or 1),
+            "time_slots": int(grid_spec.get("time_slots") or 0),
+            "stage_count": 1,
+            "vstage_count": int(grid_spec.get("vstage_count") or 1),
+            "microbatch_count": int(grid_spec.get("microbatch_count") or 1),
+            "weight_version_policy": str(grid_spec.get("weight_version_policy") or "default"),
+            "constraints": dict(grid_spec.get("constraints") or {}),
+            "cells": sorted(
+                cells,
+                key=lambda item: (
+                    int(item.get("lane_id") or 0),
+                    int(item.get("time_slot") or 0),
+                    str(item.get("kind") or ""),
+                ),
+            ),
+            "notes": ["planned local stage grid from ScheduleGridSpec"],
+        }
+
+    def _observed_grid_trace(self) -> Dict[str, Any]:
+        with self._lock:
+            events = [dict(item) for item in self._events]
+        if not events:
+            return {}
+        positive_durations = [
+            max(float(item.get("duration_ms") or 0.0), 0.0)
+            for item in events
+            if float(item.get("duration_ms") or 0.0) > 0.0
+        ]
+        slot_ms = min(positive_durations) if positive_durations else 1.0
+        slot_ms = max(float(slot_ms), 1e-6)
+        lanes = max((int(item.get("lane_id") or 0) for item in events), default=0) + 1
+        max_end_slot = 0
+        cells: List[Dict[str, Any]] = []
+        occupied: set[tuple[int, int]] = set()
+        for event in events:
+            lane_id = int(event.get("lane_id") or 0)
+            start_slot = max(int(round(float(event.get("start_ms") or 0.0) / slot_ms)), 0)
+            span_slots = max(int(round(float(event.get("duration_ms") or 0.0) / slot_ms)), 1)
+            kind = str(event.get("action_type") or "WAIT").upper()
+            if kind == "WAIT":
+                kind = "BUBBLE"
+            for slot in range(start_slot, start_slot + span_slots):
+                occupied.add((lane_id, slot))
+                cells.append(
+                    {
+                        "stage_id": int(event.get("stage_id") or 0),
+                        "lane_id": lane_id,
+                        "time_slot": int(slot),
+                        "kind": kind,
+                        "microbatch_id": int(event.get("microbatch_id") or 0),
+                        "vchunk_id": int(event.get("vchunk_id") or 0),
+                        "phase": str(event.get("phase") or "steady"),
+                        "evidence_source": "runtime_observed",
+                    }
+                )
+            max_end_slot = max(max_end_slot, start_slot + span_slots)
+        for lane_id in range(max(lanes, 1)):
+            for slot in range(max(max_end_slot, 1)):
+                if (lane_id, slot) in occupied:
+                    continue
+                cells.append(
+                    {
+                        "stage_id": int(self.stage_id) if self.stage_id is not None else 0,
+                        "lane_id": int(lane_id),
+                        "time_slot": int(slot),
+                        "kind": "BUBBLE",
+                        "microbatch_id": -1,
+                        "vchunk_id": 0,
+                        "phase": "steady",
+                        "evidence_source": "runtime_observed",
+                    }
+                )
+        return {
+            "format": "pipeline_grid_trace",
+            "source": "runtime_observed",
+            "family": self.family,
+            "lanes": max(lanes, 1),
+            "time_slots": max(max_end_slot, 1),
+            "stage_count": 1,
+            "vstage_count": 1,
+            "microbatch_count": max((int(item.get("microbatch_id") or -1) for item in events), default=-1) + 1,
+            "weight_version_policy": str((self.action_view.get("grid_spec") or {}).get("weight_version_policy") or "default"),
+            "constraints": {"slot_ms": round(float(slot_ms), 4)},
+            "cells": sorted(
+                cells,
+                key=lambda item: (
+                    int(item.get("lane_id") or 0),
+                    int(item.get("time_slot") or 0),
+                    str(item.get("kind") or ""),
+                ),
+            ),
+            "notes": ["observed local stage grid synthesized from runtime action events"],
+        }
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.trace_dir)
+
+    def set_context(self, **kwargs: Any) -> None:
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if key in {"microbatch_id", "vchunk_id", "lane_id", "stage_id"}:
+                try:
+                    self._context[key] = int(value)
+                except Exception:
+                    self._context[key] = value
+            else:
+                self._context[key] = value
+
+    def set_phase(self, phase: str) -> None:
+        token = str(phase or "").strip() or "steady"
+        self._context["phase"] = token
+
+    def current_context(self) -> Dict[str, Any]:
+        return dict(self._context)
+
+    def begin_action(
+        self,
+        action_type: str,
+        *,
+        microbatch_id: Optional[int] = None,
+        vchunk_id: Optional[int] = None,
+        phase: Optional[str] = None,
+        lane_id: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        kind = str(action_type or "").strip().upper() or "BUBBLE"
+        if lane_id is None:
+            lane_id = 1 if kind in {"COMM", "OFFLOAD", "RELOAD"} else 0
+        token = {
+            "action_type": kind,
+            "stage_id": int(self.stage_id) if self.stage_id is not None else int(self._context.get("stage_id") or 0),
+            "lane_id": int(lane_id),
+            "microbatch_id": int(microbatch_id if microbatch_id is not None else self._context.get("microbatch_id", -1)),
+            "vchunk_id": int(vchunk_id if vchunk_id is not None else self._context.get("vchunk_id", 0)),
+            "phase": str(phase or self._context.get("phase") or "steady"),
+            "metadata": dict(metadata or {}),
+            "_started_at": time.perf_counter(),
+        }
+        return token
+
+    def end_action(self, token: Optional[Dict[str, Any]], *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        if token is None:
+            return
+        ended_at = time.perf_counter()
+        started_at = float(token.pop("_started_at", ended_at))
+        start_ms = max((started_at - self._trace_start) * 1000.0, 0.0)
+        end_ms = max((ended_at - self._trace_start) * 1000.0, start_ms)
+        event = {
+            "stage_id": int(token.get("stage_id") or 0),
+            "lane_id": int(token.get("lane_id") or 0),
+            "microbatch_id": int(token.get("microbatch_id") or -1),
+            "vchunk_id": int(token.get("vchunk_id") or 0),
+            "phase": str(token.get("phase") or "steady"),
+            "action_type": str(token.get("action_type") or "BUBBLE"),
+            "start_ms": round(start_ms, 4),
+            "end_ms": round(end_ms, 4),
+            "duration_ms": round(max(end_ms - start_ms, 0.0), 4),
+            "metadata": {**dict(token.get("metadata") or {}), **dict(metadata or {})},
+            "evidence_source": "runtime_observed",
+        }
+        with self._lock:
+            self._events.append(event)
+            self._metrics["observed_action_count"] += 1.0
+            if event["action_type"] == "COMM":
+                self._metrics["comm_ms"] += float(event["duration_ms"])
+            elif event["action_type"] == "WAIT":
+                self._metrics["wait_ms"] += float(event["duration_ms"])
+            elif event["action_type"] == "RELOAD":
+                self._metrics["reload_stall_ms"] += float(event["duration_ms"])
+            elif event["action_type"] == "OFFLOAD":
+                overlap_mode = str((event.get("metadata") or {}).get("overlap_mode") or "").strip().lower()
+                if overlap_mode in {"async", "overlapped", "nonblocking"}:
+                    success_count = self._metrics.get("offload_overlap_success_count", 0.0) + 1.0
+                    total_count = self._metrics.get("offload_overlap_total_count", 0.0) + 1.0
+                    self._metrics["offload_overlap_success_count"] = success_count
+                    self._metrics["offload_overlap_total_count"] = total_count
+
+    def build_trace_payload(self) -> Dict[str, Any]:
+        with self._lock:
+            events = sorted(
+                [dict(item) for item in self._events],
+                key=lambda item: (
+                    float(item.get("start_ms") or 0.0),
+                    int(item.get("stage_id") or 0),
+                    int(item.get("lane_id") or 0),
+                ),
+            )
+            metrics = dict(self._metrics)
+        total_overlap = float(metrics.get("offload_overlap_total_count") or 0.0)
+        metrics["offload_overlap_success_ratio"] = (
+            float(metrics.get("offload_overlap_success_count") or 0.0) / total_overlap
+            if total_overlap > 0.0
+            else 0.0
+        )
+        action_type_counts: Dict[str, int] = {}
+        for event in events:
+            token = str(event.get("action_type") or "WAIT").upper()
+            action_type_counts[token] = int(action_type_counts.get(token, 0)) + 1
+        action_type_duration_breakdown: Dict[str, float] = {}
+        for event in events:
+            token = str(event.get("action_type") or "WAIT").upper()
+            action_type_duration_breakdown[token] = float(action_type_duration_breakdown.get(token, 0.0)) + float(
+                event.get("duration_ms") or 0.0
+            )
+        max_end_ms = max((float(item.get("end_ms") or 0.0) for item in events), default=0.0)
+        local_stage_hint = dict(self.policy.get("local_stage_hint") or {})
+        planned_grid_trace = self._planned_grid_trace()
+        observed_grid_trace = self._observed_grid_trace()
+        planned_slot_count = sum(
+            1
+            for item in list(planned_grid_trace.get("cells") or [])
+            if str(item.get("kind") or "").upper() != "BUBBLE"
+        )
+        observed_slot_count = sum(
+            1
+            for item in list(observed_grid_trace.get("cells") or [])
+            if str(item.get("kind") or "").upper() != "BUBBLE"
+        )
+        metrics["planned_action_count"] = int(len(self._expected_local_actions))
+        metrics["planned_slot_count"] = int(planned_slot_count)
+        metrics["observed_slot_count"] = int(observed_slot_count)
+        metrics["planned_vs_observed_event_count_delta"] = int(len(events) - len(self._expected_local_actions))
+        metrics["planned_vs_observed_slot_delta"] = int(observed_slot_count - planned_slot_count)
+        metrics["action_type_duration_breakdown"] = {
+            str(key): round(float(value), 4) for key, value in sorted(action_type_duration_breakdown.items())
+        }
+        return {
+            "format": "schedule_runtime_event_trace",
+            "timing_basis": "runtime_observed",
+            "family": self.family,
+            "rank": int(self.rank),
+            "stage_id": int(self.stage_id) if self.stage_id is not None else None,
+            "stage_semantics": local_stage_hint,
+            "action_plan": {
+                "action_count": int(len(self._expected_local_actions)),
+                "actions": list(self._expected_local_actions),
+                "actions_by_phase": self._actions_by_phase(),
+            },
+            "metrics": metrics,
+            "summary": {
+                "projected_timeline_span_ms": round(float(max_end_ms), 4),
+                "available_hooks": list(self.policy.get("available_hooks") or []),
+                "action_type_counts": action_type_counts,
+            },
+            "planned_grid_trace": planned_grid_trace,
+            "observed_grid_trace": observed_grid_trace,
+            "events": events,
+        }
+
+    def flush(self) -> Optional[str]:
+        if not self.enabled:
+            return None
+        with self._lock:
+            if self._flushed and self._events:
+                return None
+            self._flushed = True
+        trace_dir = Path(self.trace_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"rank{int(self.rank):03d}"
+        if self.stage_id is not None:
+            suffix += f"_stage{int(self.stage_id):03d}"
+        path = trace_dir / f"schedule_runtime_trace_{suffix}.json"
+        path.write_text(
+            json.dumps(self.build_trace_payload(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return str(path)
+
+
+class _ScheduleRuntimeCommunicatorProxy:
+    def __init__(self, communicator: Any, runner: ScheduleActionRunner) -> None:
+        self._communicator = communicator
+        self._runner = runner
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._communicator, name)
+        if not callable(attr) or not (name.startswith("send_") or name.startswith("recv_")):
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            invoke_schedule_runtime_hook("before_send_recv_hook", {"op_name": name})
+            token = self._runner.begin_action(
+                "COMM",
+                phase=self._runner.current_context().get("phase"),
+                metadata={"op_name": name},
+            )
+            try:
+                return attr(*args, **kwargs)
+            finally:
+                self._runner.end_action(token, metadata={"op_name": name})
+                invoke_schedule_runtime_hook("after_send_recv_hook", {"op_name": name})
+
+        return _wrapped
+
+
+def get_schedule_action_runner(force_reset: bool = False) -> ScheduleActionRunner:
+    global _SCHEDULE_ACTION_RUNNER_SINGLETON
+    with _SCHEDULE_ACTION_RUNNER_LOCK:
+        if force_reset or _SCHEDULE_ACTION_RUNNER_SINGLETON is None:
+            _SCHEDULE_ACTION_RUNNER_SINGLETON = ScheduleActionRunner()
+        return _SCHEDULE_ACTION_RUNNER_SINGLETON
+
+
+def _instrument_p2p_communicator_for_schedule_runtime(
+    communicator: Any,
+    runner: ScheduleActionRunner,
+) -> Any:
+    if communicator is None or not runner.enabled:
+        return communicator
+    if isinstance(communicator, _ScheduleRuntimeCommunicatorProxy):
+        return communicator
+    return _ScheduleRuntimeCommunicatorProxy(communicator, runner)
+
+
+def _flush_schedule_action_runner() -> None:
+    global _SCHEDULE_ACTION_RUNNER_SINGLETON
+    runner = _SCHEDULE_ACTION_RUNNER_SINGLETON
+    if runner is None:
+        return
+    try:
+        runner.flush()
+    except Exception:
+        return
+
+
+atexit.register(_flush_schedule_action_runner)
 
 
 def _parse_window_override_hints(raw: str) -> List[Dict[str, str]]:
@@ -1745,8 +2610,10 @@ def _phase_uses_combined_overlap(phase: str, default_enabled: bool = True) -> bo
 
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
-    local_stage_hint = _get_local_stage_family_hint()
+    runtime_policy = get_schedule_runtime_policy()
+    local_stage_hint = dict(runtime_policy.get("local_stage_hint") or {})
     template = str(os.environ.get("SCHEDULE_TEMPLATE", "fixed_1f1b") or "fixed_1f1b").strip()
+    schedule_family = str(runtime_policy.get("family") or "").strip()
     dispatch_order = str(os.environ.get("DISPATCH_ORDER", "default") or "default").strip()
     warmup_policy = str(
         os.environ.get("SCHEDULE_WARMUP_POLICY", "default") or "default"
@@ -1758,10 +2625,24 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
         os.environ.get("SCHEDULE_FLUSH_ORDER_POLICY", "default") or "default"
     ).strip()
     explicit_flush_ids = str(os.environ.get("SCHEDULE_FLUSH_MICROBATCHES", "") or "").strip()
+    if schedule_family in _ALL_SCHEDULE_FAMILIES:
+        if schedule_family == "interleaved":
+            template = "interleaved"
+        elif schedule_family in {"zero_bubble", "zbv", "v_half", "v_min"} and dispatch_order in {"", "default"}:
+            dispatch_order = "zero_bubble_proxy"
+        elif schedule_family == "dualpipe_v" and dispatch_order in {"", "default"}:
+            dispatch_order = "balanced_round_robin"
+        template = str(schedule_family or template).strip()
     template = str(local_stage_hint.get("preferred_template") or template).strip()
-    dispatch_order = str(local_stage_hint.get("dispatch_order") or dispatch_order).strip()
+    dispatch_order = str(
+        runtime_policy.get("dispatch_order")
+        or local_stage_hint.get("dispatch_order")
+        or local_stage_hint.get("local_dispatch_hint")
+        or dispatch_order
+    ).strip()
     warmup_policy = str(local_stage_hint.get("warmup_policy") or warmup_policy).strip()
     cooldown_policy = str(local_stage_hint.get("cooldown_policy") or cooldown_policy).strip()
+    microbatch_group_size_per_vp_stage = _resolve_local_group_size(microbatch_group_size_per_vp_stage)
 
     schedule_table = []
     group_starts = list(range(0, num_microbatches, microbatch_group_size_per_vp_stage))
@@ -1819,6 +2700,7 @@ def forward_backward_pipelining_with_interleaving(
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    runtime_runner = get_schedule_action_runner()
 
     # Convention used in this function:
     # num_microbatches for number of microbatches per pipeline stage;
@@ -1864,6 +2746,10 @@ def forward_backward_pipelining_with_interleaving(
             "Invalid combination of p2p_communicator, pg_collection"
             " provide none or provide all the process groups"
         )
+    p2p_communicator = _instrument_p2p_communicator_for_schedule_runtime(
+        p2p_communicator,
+        runtime_runner,
+    )
 
     assert isinstance(model, list), "interleaved pipeline parallelism expected model chunking"
     assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
@@ -2124,6 +3010,11 @@ def forward_backward_pipelining_with_interleaving(
 
     def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
         """Preprocess for forward_step_helper"""
+        runtime_runner.set_context(
+            microbatch_id=microbatch_id,
+            vchunk_id=model_chunk_id,
+            lane_id=0,
+        )
         # launch param synchronization for next model chunk
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -2209,6 +3100,19 @@ def forward_backward_pipelining_with_interleaving(
 
     def backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id):
         """Preprocess for backward_step_helper"""
+        backward_microbatch_id = -1
+        try:
+            backward_index = max(int(virtual_microbatch_id) - int(num_warmup_microbatches), 0)
+            backward_microbatch_id = int(
+                microbatch_id_table[min(backward_index, max(len(microbatch_id_table) - 1, 0))]
+            )
+        except Exception:
+            backward_microbatch_id = -1
+        runtime_runner.set_context(
+            microbatch_id=backward_microbatch_id,
+            vchunk_id=model_chunk_id,
+            lane_id=0,
+        )
         # launch grad synchronization (default)
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id
@@ -2346,6 +3250,7 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
+    runtime_runner.set_phase("warmup")
     input_tensors[0].append(
         p2p_communicator.recv_forward(
             tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
@@ -2383,6 +3288,12 @@ def forward_backward_pipelining_with_interleaving(
 
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
+        runtime_runner.set_phase("warmup")
+        runtime_runner.set_context(
+            microbatch_id=get_microbatch_id_in_model_chunk(k, forward=True),
+            vchunk_id=cur_model_chunk_id,
+            lane_id=0,
+        )
 
         if warmup_overlap_p2p:
             if (
@@ -2535,9 +3446,16 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run 1F1B in steady state.
     nvtx_range_push(suffix="steady")
+    runtime_runner.set_phase("steady")
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
+        runtime_runner.set_phase("steady")
+        runtime_runner.set_context(
+            microbatch_id=get_microbatch_id_in_model_chunk(forward_k, forward=True),
+            vchunk_id=get_model_chunk_id(forward_k, forward=True),
+            lane_id=0,
+        )
 
         # Decide to checkpoint all layers' activations of the current micro-batch.
         checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
@@ -2752,6 +3670,7 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run cooldown backward passes (flush out pipeline) for the last model chunk.
     nvtx_range_push(suffix="cooldown")
+    runtime_runner.set_phase("cooldown")
     curr_vp_stage = config.virtual_pipeline_model_parallel_size - 1
     if not forward_only:
         if bwd_wait_handles is not None:
@@ -2769,6 +3688,12 @@ def forward_backward_pipelining_with_interleaving(
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
+            runtime_runner.set_phase("cooldown")
+            runtime_runner.set_context(
+                microbatch_id=-1,
+                vchunk_id=cur_model_chunk_id,
+                lane_id=0,
+            )
             if (
                 not (_is_vp_last_stage(vp_stage=cur_model_chunk_id) and is_pp_last_stage(pp_group))
                 and k != 0
@@ -2887,13 +3812,23 @@ def forward_backward_pipelining_with_interleaving(
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-
+        invoke_schedule_runtime_hook(
+            "before_optimizer_tail_hook",
+            {"op_name": "finalize_model_grads"},
+        )
+        finalize_token = runtime_runner.begin_action(
+            "WGRAD_OPT",
+            phase="cooldown",
+            lane_id=0,
+            metadata={"op_name": "finalize_model_grads"},
+        )
         config.finalize_model_grads_func(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+        runtime_runner.end_action(finalize_token, metadata={"op_name": "finalize_model_grads"})
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
@@ -2911,6 +3846,8 @@ def forward_backward_pipelining_with_interleaving(
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
+
+    runtime_runner.flush()
 
     return forward_data_store
 
@@ -2968,6 +3905,7 @@ def forward_backward_pipelining_without_interleaving(
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+    runtime_runner = get_schedule_action_runner()
 
     if isinstance(model, list):
         assert (
@@ -3046,6 +3984,10 @@ def forward_backward_pipelining_without_interleaving(
             )
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+    p2p_communicator = _instrument_p2p_communicator_for_schedule_runtime(
+        p2p_communicator,
+        runtime_runner,
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -3137,6 +4079,8 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+        runtime_runner.set_phase("warmup")
+        runtime_runner.set_context(microbatch_id=i, vchunk_id=0, lane_id=0)
         # Decide to checkpoint all layers' activations of the current micro-batch
         checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
             "warmup",
@@ -3175,6 +4119,8 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
+        runtime_runner.set_phase("steady")
+        runtime_runner.set_context(microbatch_id=num_warmup_microbatches, vchunk_id=0, lane_id=0)
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
@@ -3182,6 +4128,12 @@ def forward_backward_pipelining_without_interleaving(
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
+        runtime_runner.set_phase("steady")
+        runtime_runner.set_context(
+            microbatch_id=i + num_warmup_microbatches,
+            vchunk_id=0,
+            lane_id=0,
+        )
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         checkpoint_activations_microbatch = _resolve_phase_checkpoint_policy(
@@ -3237,6 +4189,7 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
+            runtime_runner.set_context(microbatch_id=i, vchunk_id=0, lane_id=0)
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )
@@ -3254,6 +4207,8 @@ def forward_backward_pipelining_without_interleaving(
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
+            runtime_runner.set_phase("cooldown")
+            runtime_runner.set_context(microbatch_id=i, vchunk_id=0, lane_id=0)
 
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
@@ -3294,12 +4249,23 @@ def forward_backward_pipelining_without_interleaving(
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
+        invoke_schedule_runtime_hook(
+            "before_optimizer_tail_hook",
+            {"op_name": "finalize_model_grads"},
+        )
+        finalize_token = runtime_runner.begin_action(
+            "WGRAD_OPT",
+            phase="cooldown",
+            lane_id=0,
+            metadata={"op_name": "finalize_model_grads"},
+        )
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+        runtime_runner.end_action(finalize_token, metadata={"op_name": "finalize_model_grads"})
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
@@ -3313,5 +4279,7 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    runtime_runner.flush()
 
     return forward_data_store

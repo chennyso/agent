@@ -13,7 +13,7 @@ from megatron_agent.trace_reducer import build_agent_observation
 _PLAN_HASH_SALT = "torchtitan_hybrid_plan_v1"
 _EVIDENCE_HASH_SALT = "torchtitan_hybrid_evidence_v1"
 _SUPPORTED_SHARD_MODES = {"none", "fsdp2", "hsdp"}
-_SUPPORTED_SCHEDULE_KINDS = {"1f1b", "interleaved_1f1b", "zero_bubble"}
+_SUPPORTED_SCHEDULE_KINDS = {"1f1b", "interleaved_1f1b", "zero_bubble", "zbv", "v_half", "v_min", "dualpipe_v"}
 _SUPPORTED_RESHARD_POLICIES = {"default", "never", "always", "node_local"}
 _SUPPORTED_PP_DEGREES = {1, 2, 4}
 _SUPPORTED_VP_DEGREES = {1, 2}
@@ -141,6 +141,10 @@ def _schedule_to_torchtitan_name(kind: str) -> str:
         "1f1b": "1F1B",
         "interleaved_1f1b": "Interleaved1F1B",
         "zero_bubble": "ZBVZeroBubble",
+        "zbv": "ZBVZeroBubble",
+        "v_half": "ZBVHalf",
+        "v_min": "ZBVMin",
+        "dualpipe_v": "DualPipeV",
     }
     normalized = str(kind or "1f1b").strip().lower()
     if normalized not in mapping:
@@ -277,8 +281,10 @@ class TorchTitanHybridPlanIR:
             raise ValueError("vp_degree > 1 requires pp_degree > 1")
         if norm.schedule_kind == "interleaved_1f1b" and int(norm.vp_degree) != 2:
             raise ValueError("interleaved_1f1b requires vp_degree=2")
-        if norm.schedule_kind == "zero_bubble" and int(norm.pp_degree) <= 1:
-            raise ValueError("zero_bubble requires pp_degree > 1")
+        if norm.schedule_kind in {"zero_bubble", "zbv", "v_half", "v_min", "dualpipe_v"} and int(norm.pp_degree) <= 1:
+            raise ValueError(f"{norm.schedule_kind} requires pp_degree > 1")
+        if norm.schedule_kind in {"v_half", "v_min", "dualpipe_v"} and int(norm.vp_degree) <= 1:
+            raise ValueError(f"{norm.schedule_kind} requires vp_degree > 1")
         if norm.reshard_policy == "node_local" and norm.shard_mode != "hsdp":
             raise ValueError("reshard_policy=node_local requires shard_mode=hsdp")
 

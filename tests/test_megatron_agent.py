@@ -67,11 +67,13 @@ from megatron_agent.torchtitan_hybrid import (  # noqa: E402
     verify_torchtitan_hybrid_plan,
 )
 from megatron_agent.config import (  # noqa: E402
+    AgentProposal,
     AgentObservation,
     ExperimentSpec,
     BatchPlanSpec,
     LengthBucketPolicy,
     ProgramBank,
+    ProgramPatchSpec,
     ProgramTemplate,
     ReplanDecision,
     VerifierReport,
@@ -962,6 +964,51 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 self.assertIn("failure_modes", summary)
                 self.assertIn("replan_decision", summary)
                 self.assertIn("motivation_evidence_manifest", summary)
+                self.assertIn("autotune_history", summary)
+                self.assertIn("auto_tune_rounds_requested", summary)
+                self.assertIn("auto_tune_rounds_completed", summary)
+
+    def test_select_autotune_seed_promotes_improved_successful_candidate(self) -> None:
+        baseline = default_dense_program("single_g5")
+        candidate = agent_loop._build_optimizer_aware_pipeline_candidate(
+            baseline,
+            {
+                "runtime_evidence": {
+                    "optimizer_exposed_ratio": 0.24,
+                    "peak_reserved_ratio": 0.80,
+                    "stage_tail_ratio": 0.13,
+                    "tail_step_jitter_ratio": 0.12,
+                }
+            },
+        )
+        self.assertIsNotNone(candidate)
+        current_metrics = {
+            "config_name": "baseline",
+            "returncode": 0,
+            "program_hash": baseline.semantic_hash(),
+            "step_time_ms_p50": 1000.0,
+            "throughput_tokens_per_s": 1000.0,
+            "trace_summary": {"steady_state_step_time_ms_p50": 1000.0},
+        }
+        improved_metrics = {
+            "config_name": "candidate_optimizer_aware_pipeline",
+            "returncode": 0,
+            "program_hash": candidate.semantic_hash(),
+            "step_time_ms_p50": 940.0,
+            "throughput_tokens_per_s": 1080.0,
+            "trace_summary": {"steady_state_step_time_ms_p50": 940.0},
+        }
+        promotion = agent_loop._select_autotune_seed(
+            baseline,
+            current_metrics,
+            [improved_metrics, current_metrics],
+            {
+                baseline.semantic_hash(): baseline,
+                candidate.semantic_hash(): candidate,
+            },
+        )
+        self.assertIsNotNone(promotion)
+        self.assertEqual((promotion or {}).get("program").semantic_hash(), candidate.semantic_hash())
 
     def test_batch_plan_and_program_bank_roundtrip(self) -> None:
         program = default_dense_program("single_g5")
@@ -1503,6 +1550,519 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual([microbatch_id for microbatch_id, _ in schedule_table[-16:-8]], list(range(15, 7, -1)))
         self.assertEqual([microbatch_id for microbatch_id, _ in schedule_table[-8:]], list(range(15, 7, -1)))
 
+    def test_schedule_runtime_policy_parses_structured_env_hints(self) -> None:
+        from megatron.core.pipeline_parallel import schedules as pp_schedules
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCHEDULE_FAMILY": "zero_bubble",
+                "SCHEDULE_DISPATCH_ORDER": "zero_bubble_proxy",
+                "SCHEDULE_LANE_POLICY": "2",
+                "SCHEDULE_GROUP_SIZE_VECTOR": json.dumps([1, 2, 2, 1]),
+                "SCHEDULE_STAGE_SEMANTIC_HINTS": json.dumps(
+                    {"1": {"family": "tail_heavy", "local_dispatch_hint": "tail_boundary_rewrite"}}
+                ),
+                "SCHEDULE_OVERLAP_HINTS": json.dumps({"enable_p2p_overlap": True}),
+                "SCHEDULE_MEMORY_HINTS": json.dumps({"offload_policy": "guarded"}),
+                "SCHEDULE_PARTITION_HINTS": json.dumps({"partition_mode": "nonuniform"}),
+            },
+            clear=False,
+        ):
+            with mock.patch.object(pp_schedules.parallel_state, "model_parallel_is_initialized", return_value=True):
+                with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_rank", return_value=1):
+                    with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_world_size", return_value=4):
+                        policy = pp_schedules.get_schedule_runtime_policy()
+                        hook_payload = pp_schedules.invoke_schedule_runtime_hook(
+                            "before_forward_hook", {"stage_id": 1}
+                        )
+                        local_group_size = pp_schedules._resolve_local_group_size(4)
+
+        self.assertEqual(policy["family"], "zero_bubble")
+        self.assertEqual(policy["dispatch_order"], "zero_bubble_proxy")
+        self.assertEqual(policy["lane_policy"], "2")
+        self.assertEqual(policy["group_size_vector"], [1, 2, 2, 1])
+        self.assertEqual(policy["local_stage_hint"]["family"], "tail_heavy")
+        self.assertEqual(local_group_size, 2)
+        self.assertEqual(hook_payload["status"], "ready")
+        self.assertEqual(hook_payload["schedule_family"], "zero_bubble")
+        self.assertEqual(hook_payload["stage_semantics"]["family"], "tail_heavy")
+
+    def test_compile_program_exports_schedule_grid_and_action_specs(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.schedule_ir.family = "zero_bubble"
+        program.schedule_ir.dispatch_order = "zero_bubble_proxy"
+        program.schedule_ir.microbatch_lanes = 2
+        program.schedule_ir.microbatch_group_size_per_vp_stage = 2
+
+        compiled = compile_program(program)
+        schedule_grid = json.loads(compiled.launcher_env["SCHEDULE_GRID_SPEC"])
+        derived_actions = json.loads(compiled.launcher_env["SCHEDULE_ACTION_SPECS"])
+
+        self.assertEqual(schedule_grid["family"], "zero_bubble")
+        self.assertGreaterEqual(schedule_grid["lanes"], 2)
+        self.assertGreater(schedule_grid["time_slots"], 0)
+        self.assertTrue(any(item.get("kind") == "FWD" for item in schedule_grid["cells"]))
+        self.assertTrue(any(item.get("kind") == "BWD_ACT" for item in schedule_grid["cells"]))
+        self.assertTrue(any(item.get("kind") == "WGRAD_OPT" for item in schedule_grid["cells"]))
+        self.assertTrue(any(item.get("action_type") == "FWD" for item in derived_actions))
+        self.assertTrue(any(item.get("action_type") == "BWD_ACT" for item in derived_actions))
+        self.assertTrue(any(item.get("action_type") == "WAIT" for item in derived_actions))
+
+    def test_runtime_action_view_parses_grid_and_action_specs(self) -> None:
+        from megatron.core.pipeline_parallel import schedules as pp_schedules
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCHEDULE_FAMILY": "dualpipe_v",
+                "SCHEDULE_GRID_SPEC": json.dumps(
+                    {
+                        "lanes": 2,
+                        "time_slots": 6,
+                        "cells": [{"kind": "FWD", "stage_id": 0, "lane_id": 0, "microbatch_id": 0, "vchunk_id": 0, "time_slot": 0}],
+                        "family": "dualpipe_v",
+                        "stage_count": 2,
+                        "vstage_count": 2,
+                        "microbatch_count": 2,
+                        "weight_version_policy": "delayed_wgrad",
+                        "constraints": {"dispatch_order": "balanced_round_robin"},
+                        "notes": ["contract-test"],
+                    }
+                ),
+                "SCHEDULE_ACTION_SPECS": json.dumps(
+                    [
+                        {
+                            "action_type": "FWD",
+                            "stage_id": 0,
+                            "lane_id": 0,
+                            "microbatch_id": 0,
+                            "vchunk_id": 0,
+                            "time_slot": 0,
+                            "duration_hint": 1.0,
+                            "dependency_ids": [],
+                            "memory_delta": 0.0,
+                        }
+                    ]
+                ),
+            },
+            clear=False,
+        ):
+            action_view = pp_schedules.get_schedule_action_view()
+            registry = pp_schedules.get_schedule_family_registry()
+
+        self.assertEqual(action_view["family"], "dualpipe_v")
+        self.assertEqual(action_view["grid_spec"]["family"], "dualpipe_v")
+        self.assertEqual(action_view["action_count"], 1)
+        self.assertIn("dualpipe_v", registry)
+        self.assertEqual(registry["dualpipe_v"]["steady_rule"], "dualpipe_overlap")
+
+    def test_schedule_action_runner_writes_runtime_trace(self) -> None:
+        from megatron.core.pipeline_parallel import schedules as pp_schedules
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SCHEDULE_RUNTIME_TRACE_DIR": tmpdir,
+                    "SCHEDULE_FAMILY": "fixed_1f1b",
+                    "SCHEDULE_ACTION_SPECS": json.dumps(
+                        [
+                            {
+                                "action_type": "FWD",
+                                "stage_id": 1,
+                                "lane_id": 0,
+                                "microbatch_id": 2,
+                                "vchunk_id": 0,
+                                "time_slot": 3,
+                            }
+                        ]
+                    ),
+                },
+                clear=False,
+            ):
+                with mock.patch.object(pp_schedules.parallel_state, "model_parallel_is_initialized", return_value=True):
+                    with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_rank", return_value=1):
+                        with mock.patch.object(pp_schedules.parallel_state, "get_pipeline_model_parallel_world_size", return_value=4):
+                            runner = pp_schedules.get_schedule_action_runner(force_reset=True)
+                            runner.set_phase("steady")
+                            runner.set_context(microbatch_id=2, vchunk_id=0, lane_id=0)
+                            fwd_token = runner.begin_action("FWD", microbatch_id=2, vchunk_id=0, phase="steady")
+                            runner.end_action(fwd_token)
+                            comm_token = runner.begin_action(
+                                "COMM",
+                                microbatch_id=2,
+                                vchunk_id=0,
+                                phase="steady",
+                                lane_id=1,
+                                metadata={"op_name": "send_forward"},
+                            )
+                            runner.end_action(comm_token, metadata={"op_name": "send_forward"})
+                            trace_path = runner.flush()
+
+            self.assertIsNotNone(trace_path)
+            payload = json.loads(Path(str(trace_path)).read_text(encoding="utf-8"))
+            self.assertEqual(payload["format"], "schedule_runtime_event_trace")
+            self.assertEqual(payload["family"], "fixed_1f1b")
+            self.assertEqual(payload["stage_id"], 1)
+            self.assertEqual(len(payload["events"]), 2)
+            self.assertTrue(any(item.get("action_type") == "COMM" for item in payload["events"]))
+            self.assertGreaterEqual(float((payload.get("metrics") or {}).get("comm_ms") or 0.0), 0.0)
+
+    def test_trial_runner_loads_runtime_schedule_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_dir = Path(tmpdir) / "runtime_schedule_traces"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "format": "schedule_runtime_event_trace",
+                "family": "zero_bubble",
+                "stage_id": 0,
+                "events": [{"action_type": "FWD", "stage_id": 0, "microbatch_id": 0, "vchunk_id": 0, "start_ms": 0.0, "end_ms": 1.0, "duration_ms": 1.0}],
+            }
+            (trace_dir / "schedule_runtime_trace_rank000_stage000.json").write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            traces = trial_runner._load_runtime_schedule_traces({"runtime_trace_dir": str(trace_dir)})
+
+        self.assertEqual(len(traces), 1)
+        self.assertEqual(traces[0]["family"], "zero_bubble")
+        self.assertTrue(str(traces[0]["artifact_path"]).endswith(".json"))
+
+    def test_runtime_schedule_traces_feed_visualization_artifacts(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        metrics = {
+            "step_time_ms_p50": 1000.0,
+            "steady_state_step_time_ms_p50": 1000.0,
+            "bubble_ratio": 0.08,
+            "runtime_schedule_traces": [
+                {
+                    "format": "schedule_runtime_event_trace",
+                    "family": "zero_bubble",
+                    "stage_id": 0,
+                    "stage_semantics": {"family": "tail_heavy"},
+                    "metrics": {"comm_ms": 22.0, "reload_stall_ms": 11.0},
+                    "events": [
+                        {
+                            "action_type": "FWD",
+                            "stage_id": 0,
+                            "lane_id": 0,
+                            "microbatch_id": 0,
+                            "vchunk_id": 0,
+                            "phase": "warmup",
+                            "start_ms": 0.0,
+                            "end_ms": 8.0,
+                            "duration_ms": 8.0,
+                        },
+                        {
+                            "action_type": "COMM",
+                            "stage_id": 0,
+                            "lane_id": 1,
+                            "microbatch_id": 0,
+                            "vchunk_id": 0,
+                            "phase": "warmup",
+                            "start_ms": 8.0,
+                            "end_ms": 10.0,
+                            "duration_ms": 2.0,
+                            "metadata": {"op_name": "send_forward"},
+                        },
+                        {
+                            "action_type": "WGRAD_OPT",
+                            "stage_id": 0,
+                            "lane_id": 0,
+                            "microbatch_id": 0,
+                            "vchunk_id": 0,
+                            "phase": "cooldown",
+                            "start_ms": 12.0,
+                            "end_ms": 18.0,
+                            "duration_ms": 6.0,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        observation = build_agent_observation(program, metrics=metrics)
+        artifact = build_trial_artifact(program, observation)
+        visual = dict((artifact.get("visualization_artifacts") or {}))
+        event_trace = dict(visual.get("pipeline_event_trace") or {})
+        grid_trace = dict(visual.get("pipeline_grid_trace") or {})
+        next_step = dict(artifact.get("next_step_hypotheses") or {})
+
+        self.assertEqual(event_trace.get("timing_basis"), "runtime_observed")
+        self.assertEqual((event_trace.get("summary") or {}).get("schedule_template"), "zero_bubble")
+        self.assertTrue(any(item.get("op_kind") == "comm" for item in event_trace.get("events", [])))
+        self.assertTrue(any(item.get("kind") == "WGRAD_OPT" for item in grid_trace.get("cells", [])))
+        self.assertIn("next_schedule_family", next_step)
+        self.assertIn("stop_signal", next_step)
+
+    def test_megatron_program_roundtrip_preserves_new_schedule_ir(self) -> None:
+        from megatron_agent.config import (
+            MemoryIntentSpec,
+            OverlapIntentSpec,
+            PartitionOptimizationSpec,
+            ProgramPatchSpec,
+            ScheduleIRSpec,
+            StageSemanticSpec,
+        )
+
+        program = default_dense_program("single_g5")
+        program.schedule_ir = ScheduleIRSpec(
+            family="zero_bubble",
+            skeleton="zero_bubble",
+            microbatch_lanes=2,
+            microbatch_group_size_per_vp_stage=2,
+            dispatch_order="zero_bubble_proxy",
+            warmup_policy="balanced_fill",
+            steady_state_policy="zero_bubble",
+            cooldown_policy="optimizer_tail_hide",
+            weight_version_policy="delayed_wgrad",
+            virtual_stage_grouping=[1, 1],
+            stage_semantics=[StageSemanticSpec(stage_id=0, family="tail_heavy", prefer_delayed_wgrad=True)],
+            overlap_intents=OverlapIntentSpec(enable_p2p_overlap=True, enable_optimizer_tail_overlap=True),
+            memory_intents=MemoryIntentSpec(checkpoint_policy="selective", offload_policy="guarded"),
+        )
+        program.partition_optimization = PartitionOptimizationSpec(
+            partition_mode="nonuniform",
+            allow_nonuniform_partition=True,
+            stage_layer_counts=[18, 22],
+            stage_local_vpp_vector=[1, 2],
+            preferred_boundary_modules=["attention"],
+        )
+        program.applied_patch = ProgramPatchSpec(
+            patch_id="patch-zero-bubble",
+            patch_family="change_schedule_family",
+            target_scope="schedule",
+            changes={"family": "zero_bubble"},
+        )
+        restored = type(program).from_dict(program.to_dict()).normalized()
+
+        self.assertEqual(restored.schedule_ir.family, "zero_bubble")
+        self.assertEqual(restored.schedule_ir.dispatch_order, "zero_bubble_proxy")
+        self.assertEqual(restored.partition_optimization.partition_mode, "nonuniform")
+        self.assertEqual(restored.partition_optimization.stage_layer_counts, [18, 22])
+        self.assertEqual(restored.applied_patch.patch_family, "change_schedule_family")
+
+    def test_policy_memory_recommend_patch_families_prefers_useful_entries(self) -> None:
+        from megatron_agent.policy_memory import summarize_state_for_memory
+
+        bank = PolicyMemoryBank()
+        target_state = {
+            "model": {"model_track": "dense", "size_bucket": "qwen14b"},
+            "hardware": {"run_target": "single_g5", "backend_family": "megatron"},
+            "policy": {"runtime_schedule_family": "fixed_1f1b", "pp_degree": 4, "vpp_degree": 2},
+            "runtime": {"bubble_ratio": 0.18, "peak_reserved_ratio": 0.88},
+            "bottleneck_signature": "memory_bound",
+        }
+        key = json.dumps(
+            {
+                "model_family": "dense",
+                "size_bucket": "qwen14b",
+                "hardware_profile": "single_g5",
+                "backend_family": "megatron",
+                "bottleneck_signature": "memory_bound",
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        bank.patch_memory[key] = {
+            "schedule_family": "zero_bubble",
+            "useful_patch_families": ["change_schedule_family", "add_offload_policy"],
+            "harmful_patch_families": ["aggressive_vpp_expansion"],
+            "uncertain_patch_families": ["change_partition_boundary"],
+            "pareto_stats": {"attempts": 4, "successes": 3, "best_step_improvement_ms": 120.0, "best_throughput_gain": 0.12},
+            "recent_failure_signatures": ["oom,tail_drag"],
+        }
+
+        guidance = bank.recommend_patch_families(target_state, top_k=3)
+
+        self.assertEqual(guidance["state_summary"], summarize_state_for_memory(target_state))
+        self.assertIn("change_schedule_family", guidance["useful_patch_families"])
+        self.assertIn("aggressive_vpp_expansion", guidance["harmful_patch_families"])
+        self.assertIn("zero_bubble", guidance["schedule_families"])
+        self.assertTrue(bank.should_avoid_patch_family(target_state, "aggressive_vpp_expansion"))
+
+    def test_build_beam_snapshot_prefers_high_value_patch(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        stronger = baseline.normalized()
+        stronger.metadata["program_kind"] = "candidate_stronger"
+        stronger.applied_patch = ProgramPatchSpec(
+            patch_id="p-strong",
+            patch_family="change_schedule_family",
+            target_scope="schedule",
+            changes={"family": "zero_bubble"},
+        )
+        weaker = baseline.normalized()
+        weaker.metadata["program_kind"] = "candidate_weaker"
+        weaker.applied_patch = ProgramPatchSpec(
+            patch_id="p-weak",
+            patch_family="add_offload_policy",
+            target_scope="memory",
+            changes={"offload_policy": "guarded"},
+        )
+        stronger_proposal = AgentProposal(
+            proposal_id="stronger",
+            scope="schedule",
+            program=stronger,
+            priority_rank=5,
+        ).normalized()
+        weaker_proposal = AgentProposal(
+            proposal_id="weaker",
+            scope="memory",
+            program=weaker,
+            priority_rank=9,
+        ).normalized()
+        proposal_nodes = {
+            "stronger": agent_loop.SearchTreeNode(
+                node_id="stronger",
+                depth=1,
+                patch_family="change_schedule_family",
+                visits=3,
+                total_value=1.8,
+                last_result={"score": 0.8, "config_name": "candidate_stronger"},
+            ),
+            "weaker": agent_loop.SearchTreeNode(
+                node_id="weaker",
+                depth=1,
+                patch_family="add_offload_policy",
+                visits=3,
+                total_value=0.2,
+                last_result={"score": 0.1, "config_name": "candidate_weaker"},
+            ),
+        }
+
+        snapshot = agent_loop._build_beam_snapshot(
+            [stronger_proposal, weaker_proposal],
+            proposal_nodes,
+            beam_width=1,
+        )
+
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(str(snapshot[0].get("proposal_id") or ""), "stronger")
+        self.assertEqual(str(snapshot[0].get("patch_family") or ""), "change_schedule_family")
+
+    def test_build_search_tree_root_whole_config_ignores_patch_family_bias(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        schedule_candidate = baseline.normalized()
+        schedule_candidate.metadata["program_kind"] = "candidate_schedule"
+        schedule_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-schedule",
+            patch_family="change_schedule_family",
+            target_scope="schedule",
+            changes={"family": "zero_bubble"},
+        )
+        schedule_candidate.schedule_ir.family = "zero_bubble"
+        memory_candidate = baseline.normalized()
+        memory_candidate.metadata["program_kind"] = "candidate_memory"
+        memory_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-memory",
+            patch_family="add_offload_policy",
+            target_scope="memory",
+            changes={"offload_policy": "guarded"},
+        )
+        memory_candidate.metadata["priority_rank"] = 0
+        schedule_proposal = AgentProposal(
+            proposal_id="candidate_schedule",
+            scope="schedule",
+            program=schedule_candidate,
+            priority_rank=10,
+        ).normalized()
+        memory_proposal = AgentProposal(
+            proposal_id="candidate_memory",
+            scope="memory",
+            program=memory_candidate,
+            priority_rank=10,
+        ).normalized()
+        bank = PolicyMemoryBank()
+        with mock.patch.object(
+            bank,
+            "recommend_patch_families",
+            return_value={
+                "state_summary": {"bottleneck_signature": "bubble_bound"},
+                "useful_patch_families": ["change_schedule_family"],
+                "harmful_patch_families": ["add_offload_policy"],
+            },
+        ):
+            root, _ = agent_loop._build_search_tree_root(
+                search_state={"bottleneck_signature": "bubble_bound"},
+                proposal_pool=[schedule_proposal, memory_proposal],
+                policy_memory_bank=bank,
+                search_unit="whole_config",
+                patch_memory_enabled=False,
+                next_step_hypotheses={"next_schedule_family": "zero_bubble"},
+            )
+
+        self.assertEqual(len(root.children), 2)
+        self.assertAlmostEqual(float(root.children[0].priority), float(root.children[1].priority), places=6)
+        self.assertEqual(list(root.children[0].priority_reason or []), [])
+        self.assertEqual(list(root.children[1].priority_reason or []), [])
+
+    def test_build_search_tree_root_skips_patch_memory_when_disabled(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        proposal = AgentProposal(
+            proposal_id="candidate_schedule",
+            scope="schedule",
+            program=baseline,
+            priority_rank=5,
+        ).normalized()
+        bank = PolicyMemoryBank()
+        with mock.patch.object(bank, "recommend_patch_families", side_effect=AssertionError("should not be called")):
+            root, guidance = agent_loop._build_search_tree_root(
+                search_state={"bottleneck_signature": "bubble_bound"},
+                proposal_pool=[proposal],
+                policy_memory_bank=bank,
+                search_unit="patch",
+                patch_memory_enabled=False,
+                next_step_hypotheses={},
+            )
+
+        self.assertEqual(len(root.children), 1)
+        self.assertEqual(list(guidance.get("useful_patch_families") or []), [])
+
+    def test_build_search_tree_root_applies_next_step_hypothesis_bonus(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        schedule_candidate = baseline.normalized()
+        schedule_candidate.metadata["program_kind"] = "candidate_schedule"
+        schedule_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-schedule",
+            patch_family="change_schedule_family",
+            target_scope="schedule",
+            changes={"family": "zero_bubble"},
+        )
+        schedule_candidate.schedule_ir.family = "zero_bubble"
+        overlap_candidate = baseline.normalized()
+        overlap_candidate.metadata["program_kind"] = "candidate_overlap"
+        overlap_candidate.applied_patch = ProgramPatchSpec(
+            patch_id="patch-overlap",
+            patch_family="enable_p2p_overlap",
+            target_scope="overlap",
+            changes={"enable_p2p_overlap": True},
+        )
+        schedule_proposal = AgentProposal(
+            proposal_id="candidate_schedule",
+            scope="schedule",
+            program=schedule_candidate,
+            priority_rank=10,
+        ).normalized()
+        overlap_proposal = AgentProposal(
+            proposal_id="candidate_overlap",
+            scope="overlap",
+            program=overlap_candidate,
+            priority_rank=10,
+        ).normalized()
+        root, _ = agent_loop._build_search_tree_root(
+            search_state={"bottleneck_signature": "bubble_bound"},
+            proposal_pool=[schedule_proposal, overlap_proposal],
+            policy_memory_bank=PolicyMemoryBank(),
+            search_unit="patch",
+            patch_memory_enabled=False,
+            next_step_hypotheses={"next_schedule_family": "zero_bubble"},
+        )
+
+        self.assertGreater(float(root.children[0].priority), float(root.children[1].priority))
+        self.assertTrue(any("hypothesis_" in str(item) for item in (root.children[0].priority_reason or [])))
+
     def test_stage_memory_gate_rejects_hotspot_candidate(self) -> None:
         program = default_dense_program("single_g5")
         program.constraints.memory_budget_gb = 4.0
@@ -1534,6 +2094,12 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
 
     def test_agent_observation_and_trial_artifact_roundtrip(self) -> None:
         program = default_dense_program("single_g5")
+        program.applied_patch = ProgramPatchSpec(
+            patch_id="patch-memory",
+            patch_family="add_offload_policy",
+            target_scope="memory",
+            changes={"offload_policy": "guarded", "reload_policy": "prefetch"},
+        )
         trace_summary = reduce_trial_trace(
             program,
             runtime_summary={
@@ -1566,9 +2132,16 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 objective="study",
                 program_kinds=["baseline"],
             ),
+            search_unit="patch",
+            patch_memory_enabled=True,
         )
         self.assertEqual(restored.motivation_evidence_manifest[0]["config_name"], "evidence_pp_fixed_pipe")
         self.assertEqual(artifact["experiment"]["experiment_id"], "A_problem_existence")
+        self.assertEqual(str(artifact.get("patch_family") or ""), "add_offload_policy")
+        self.assertEqual(str(artifact.get("patch_category") or ""), "memory")
+        self.assertEqual(int(artifact.get("patch_count") or 0), 2)
+        self.assertEqual(str(artifact.get("search_unit") or ""), "patch")
+        self.assertTrue(bool(artifact.get("patch_memory_enabled")))
         self.assertGreaterEqual(len(artifact["stage_time_distribution"]), 2)
         self.assertIn("bottleneck_breakdown", artifact)
         self.assertIn("search_space_blueprint", artifact)
@@ -1606,6 +2179,238 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertTrue(str(dict(artifact.get("morphable_pipeline_plan") or {}).get("shape_signature") or ""))
         self.assertIn("structure_aware_partition_ir", dict(artifact.get("morphable_pipeline_problem") or {}))
         self.assertIn("selective_vpp_generator", dict(artifact.get("morphable_pipeline_problem") or {}))
+
+    def _write_patch_observation_fixture(self, root: Path) -> Path:
+        run_dir = root / "run_patch_fixture"
+        analysis_root = run_dir / "trial_analysis"
+        analysis_root.mkdir(parents=True, exist_ok=True)
+
+        def _artifact_paths(trial_name: str) -> Dict[str, str]:
+            trial_dir = analysis_root / trial_name
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            compare_path = trial_dir / "compare_pipeline.svg"
+            projection_path = trial_dir / "pipeline_projection.svg"
+            svg_payload = "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='60'><rect width='120' height='60' fill='#f4f4f4'/><text x='8' y='30'>trace</text></svg>"
+            compare_path.write_text(svg_payload, encoding="utf-8")
+            projection_path.write_text(svg_payload, encoding="utf-8")
+            return {
+                "compare_pipeline": str(compare_path),
+                "pipeline_projection": str(projection_path),
+            }
+
+        baseline_metrics = {
+            "trial_id": 0,
+            "config_name": "baseline",
+            "returncode": 0,
+            "oom": False,
+            "throughput_tokens_per_s": 100.0,
+            "step_time_ms_p50": 1000.0,
+            "search_unit": "patch",
+            "patch_memory_enabled": True,
+            "patch_family": "baseline",
+            "patch_category": "schedule",
+            "patch_count": 0,
+            "bottleneck_signature": {"canonical_dominant_label": "bubble_bound"},
+            "trace_summary": {
+                "steady_state_step_time_ms_p50": 1000.0,
+                "bubble_ratio": 0.14,
+                "stage_load_variance": 0.10,
+                "mem_skew_ratio": 0.08,
+                "stage_tail_ratio": 0.07,
+                "optimizer_exposed_ratio": 0.06,
+            },
+            "trial_artifact": {
+                "schedule_template": "fixed_1f1b",
+                "patch_family": "baseline",
+                "patch_category": "schedule",
+                "patch_count": 0,
+                "runtime_trace_summary": {"wait_ms": 12.0, "comm_ms": 20.0},
+            },
+            "analysis_artifact_paths": _artifact_paths("baseline"),
+        }
+        candidate_bubble = {
+            "trial_id": 1,
+            "config_name": "candidate_zero_bubble",
+            "returncode": 0,
+            "oom": False,
+            "throughput_tokens_per_s": 118.0,
+            "step_time_ms_p50": 920.0,
+            "search_unit": "patch",
+            "patch_memory_enabled": True,
+            "patch_family": "change_schedule_family",
+            "patch_category": "schedule",
+            "patch_count": 1,
+            "bottleneck_signature": {"canonical_dominant_label": "bubble_bound"},
+            "trace_summary": {
+                "steady_state_step_time_ms_p50": 920.0,
+                "bubble_ratio": 0.05,
+                "stage_load_variance": 0.04,
+                "mem_skew_ratio": 0.07,
+                "stage_tail_ratio": 0.03,
+                "optimizer_exposed_ratio": 0.04,
+            },
+            "trial_artifact": {
+                "schedule_template": "zero_bubble",
+                "patch_family": "change_schedule_family",
+                "patch_category": "schedule",
+                "patch_count": 1,
+                "runtime_trace_summary": {"wait_ms": 6.0, "comm_ms": 15.0},
+            },
+            "analysis_artifact_paths": _artifact_paths("candidate_zero_bubble"),
+        }
+        candidate_memory = {
+            "trial_id": 2,
+            "config_name": "candidate_offload",
+            "returncode": 0,
+            "oom": False,
+            "throughput_tokens_per_s": 109.0,
+            "step_time_ms_p50": 970.0,
+            "search_unit": "patch",
+            "patch_memory_enabled": True,
+            "patch_family": "add_offload_policy",
+            "patch_category": "memory",
+            "patch_count": 2,
+            "bottleneck_signature": {"canonical_dominant_label": "memory_bound"},
+            "trace_summary": {
+                "steady_state_step_time_ms_p50": 970.0,
+                "bubble_ratio": 0.10,
+                "stage_load_variance": 0.06,
+                "mem_skew_ratio": 0.03,
+                "stage_tail_ratio": 0.05,
+                "optimizer_exposed_ratio": 0.05,
+            },
+            "trial_artifact": {
+                "schedule_template": "interleaved",
+                "patch_family": "add_offload_policy",
+                "patch_category": "memory",
+                "patch_count": 2,
+                "runtime_trace_summary": {"wait_ms": 8.0, "comm_ms": 18.0},
+            },
+            "analysis_artifact_paths": _artifact_paths("candidate_offload"),
+        }
+        summary = {
+            "search_unit": "patch",
+            "patch_memory_enabled": True,
+            "baseline_family": {"runtime_schedule_family": "fixed_1f1b"},
+            "baseline_metrics": baseline_metrics,
+            "bottleneck_signature": {"canonical_dominant_label": "bubble_bound"},
+            "tested_trials": [baseline_metrics, candidate_bubble, candidate_memory],
+        }
+        summary_path = run_dir / "summary_megatron.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        return summary_path
+
+    def test_analyze_patch_observations_outputs_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = self._write_patch_observation_fixture(Path(tmpdir))
+            out_dir = Path(tmpdir) / "analysis"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "analyze_patch_observations.py"),
+                    "--runs",
+                    str(summary_path.parent),
+                    "--out-dir",
+                    str(out_dir),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("patch_observations", result.stdout)
+            self.assertTrue((out_dir / "patch_observations.csv").exists())
+            self.assertTrue((out_dir / "bottleneck_patch_success.csv").exists())
+            self.assertTrue((out_dir / "bottleneck_patch_gain.csv").exists())
+            self.assertTrue((out_dir / "search_ablation.csv").exists())
+            manifest = json.loads((out_dir / "case_study_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(str(manifest.get("format") or ""), "patch_case_study_manifest")
+            self.assertGreaterEqual(len(list(manifest.get("cases") or [])), 2)
+
+    def test_plot_patch_paper_figures_outputs_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = self._write_patch_observation_fixture(Path(tmpdir))
+            analysis_dir = Path(tmpdir) / "analysis"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "analyze_patch_observations.py"),
+                    "--runs",
+                    str(summary_path.parent),
+                    "--out-dir",
+                    str(analysis_dir),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            out_dir = Path(tmpdir) / "figures"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "plot_patch_paper_figures.py"),
+                    "--analysis-dir",
+                    str(analysis_dir),
+                    "--out-dir",
+                    str(out_dir),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("fig_patch_sparsity", result.stdout)
+            for name in (
+                "fig_patch_sparsity.png",
+                "fig_patch_count_hist.png",
+                "fig_bottleneck_patch_success_heatmap.png",
+                "fig_bottleneck_patch_gain_heatmap.png",
+                "fig_search_ablation_curve.png",
+                "fig_case_study_compare.png",
+            ):
+                self.assertTrue((out_dir / name).exists(), name)
+
+    def test_run_patch_paper_ablation_analysis_only_outputs_manifest_tables_and_figures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_root = Path(tmpdir) / "paper_runs"
+            for variant in ("patch", "whole_config", "patch_memory_off"):
+                self._write_patch_observation_fixture(work_root / variant)
+            analysis_dir = work_root / "analysis"
+            figures_dir = analysis_dir / "figures"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "run_patch_paper_ablation.py"),
+                    "--work-root",
+                    str(work_root),
+                    "--analysis-only",
+                    "--analysis-dir",
+                    str(analysis_dir),
+                    "--figures-dir",
+                    str(figures_dir),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("manifest:", result.stdout)
+            self.assertTrue((work_root / "paper_ablation_manifest.json").exists())
+            manifest = json.loads((work_root / "paper_ablation_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(str(manifest.get("format") or ""), "patch_paper_ablation_manifest")
+            variants = list(manifest.get("variants") or [])
+            self.assertEqual(len(variants), 3)
+            whole_config = next(item for item in variants if str(item.get("name") or "") == "whole_config")
+            patch_memory_off = next(item for item in variants if str(item.get("name") or "") == "patch_memory_off")
+            self.assertIn("--search-unit", list(whole_config.get("command") or []))
+            self.assertIn("whole_config", list(whole_config.get("command") or []))
+            self.assertIn("--disable-patch-memory", list(patch_memory_off.get("command") or []))
+            self.assertTrue((analysis_dir / "patch_observations.csv").exists())
+            self.assertTrue((analysis_dir / "search_ablation.csv").exists())
+            self.assertTrue((analysis_dir / "case_study_manifest.json").exists())
+            self.assertTrue((figures_dir / "fig_search_ablation_curve.png").exists())
+            self.assertTrue((figures_dir / "fig_case_study_compare.png").exists())
 
     def test_context_record_includes_perfetto_trace_and_search_space_blueprint(self) -> None:
         program = default_dense_program("single_g5")
@@ -2599,6 +3404,20 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertTrue(any(str(item.get("cluster_role") or "") == "optimizer_sensitive" for item in payload))
         self.assertTrue(any(str(item.get("cluster_role") or "") == "backward_critical" for item in payload))
 
+    def test_check_program_rejects_fine_grained_offload_without_transformer_engine(self) -> None:
+        baseline = default_dense_program("single_g5")
+        baseline.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+        baseline.metadata["runtime_offload_modules"] = ["core_attn"]
+        report = check_program(baseline)
+        self.assertFalse(report.is_valid)
+        self.assertIn("fine_grained_offload_requires_te", list(report.diagnosis or []))
+        self.assertTrue(
+            any(
+                "fine-grained activation offloading requires transformer_engine" in str(item)
+                for item in (report.errors or [])
+            )
+        )
+
     def test_build_summary_payload_includes_feedback_memory_fields(self) -> None:
         baseline = default_dense_program("single_g5")
         rewrite = agent_loop._rewrite_space(baseline, {})
@@ -2626,11 +3445,19 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             policy_memory=memory_bank.to_dict(),
             family_scoreboard=memory_bank.family_scoreboard(),
             trial_reflections=[{"family": "dual_overlap_tail_guarded"}],
+            autotune_history=[{"round_index": 1}],
+            auto_tune_rounds_requested=2,
+            search_unit="whole_config",
+            patch_memory_enabled=False,
         )
         self.assertIn("feedback_search_plan", summary)
         self.assertIn("policy_memory", summary)
         self.assertIn("family_scoreboard", summary)
         self.assertIn("trial_reflections", summary)
+        self.assertEqual(int(summary.get("auto_tune_rounds_requested") or 0), 2)
+        self.assertEqual(int(summary.get("auto_tune_rounds_completed") or 0), 1)
+        self.assertEqual(str(summary.get("search_unit") or ""), "whole_config")
+        self.assertFalse(bool(summary.get("patch_memory_enabled")))
 
     def test_build_optimizer_aware_pipeline_candidate_emits_tail_guarded_execution_semantics(self) -> None:
         baseline = default_dense_program("single_g5")

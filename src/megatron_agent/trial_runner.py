@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
 import os
@@ -27,6 +28,8 @@ from megatron_agent.trace_reducer import (
     build_agent_observation,
     build_trial_artifact,
     classify_bottleneck,
+    infer_program_patch_category,
+    infer_program_patch_count,
     reduce_trial_trace,
 )
 
@@ -119,6 +122,7 @@ def _trial_output_dirs(args: argparse.Namespace, trial_id: int) -> Dict[str, str
     trial_dir = run_root / f"trial_{int(trial_id):03d}"
     return {
         "trial_dir": str(trial_dir),
+        "analysis_dir": str(trial_dir / "analysis"),
         "checkpoint_path": str(trial_dir / "checkpoints"),
         "tensorboard_path": str(trial_dir / "tensorboard"),
         "torch_profile_path": str(trial_dir / "torch_profile"),
@@ -126,6 +130,7 @@ def _trial_output_dirs(args: argparse.Namespace, trial_id: int) -> Dict[str, str
         "chakra_path": str(trial_dir / "chakra"),
         "nsys_path": str(trial_dir / "nsys"),
         "data_cache_path": str(trial_dir / "cache"),
+        "runtime_trace_dir": str(trial_dir / "runtime_schedule_traces"),
     }
 
 
@@ -269,6 +274,7 @@ def _prepare_trial_artifact_dirs(output_dirs: Dict[str, str], observability: Dic
         shutil.rmtree(trial_dir)
     for key in (
         "trial_dir",
+        "analysis_dir",
         "checkpoint_path",
         "tensorboard_path",
         "data_cache_path",
@@ -276,6 +282,7 @@ def _prepare_trial_artifact_dirs(output_dirs: Dict[str, str], observability: Dic
         "torchrun_log_dir",
         "chakra_path",
         "nsys_path",
+        "runtime_trace_dir",
     ):
         path = output_dirs.get(key)
         if path:
@@ -425,7 +432,9 @@ def _run_command_with_logging(
 
 
 def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, Any]) -> Dict[str, str]:
-    artifact_dir = Path(output_dirs["trial_dir"]) / "analysis"
+    artifact_dir = Path(
+        str(output_dirs.get("analysis_dir") or (Path(output_dirs["trial_dir"]) / "analysis"))
+    )
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact = dict(metrics.get("trial_artifact") or {})
     context_record = dict(metrics.get("context_record") or {})
@@ -433,13 +442,16 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
     perfetto_trace = dict(visualization.get("perfetto_trace") or {})
     pipeline_schedule_projection = dict(visualization.get("pipeline_schedule_projection") or {})
     pipeline_event_trace = dict(visualization.get("pipeline_event_trace") or {})
+    pipeline_grid_trace = dict(visualization.get("pipeline_grid_trace") or {})
     pipeline_projection_svg = dict(visualization.get("pipeline_projection_svg") or {})
+    compare_pipeline_svg = dict(visualization.get("compare_pipeline_svg") or {})
     search_space_blueprint = dict(artifact.get("search_space_blueprint") or {})
     bottleneck_breakdown = list(artifact.get("bottleneck_breakdown") or [])
     critical_operator_clusters = list(artifact.get("critical_operator_clusters") or [])
     trial_outcome = dict(metrics.get("trial_outcome") or {})
     trial_reflection = dict(metrics.get("trial_reflection") or {})
     failure_diagnosis = _build_failure_diagnosis(metrics)
+    runtime_schedule_traces = list(metrics.get("runtime_schedule_traces") or [])
 
     outputs = {
         "trial_artifact_json": str(artifact_dir / "trial_artifact.json"),
@@ -447,13 +459,16 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
         "perfetto_trace_json": str(artifact_dir / "perfetto_trace.json"),
         "pipeline_schedule_projection_json": str(artifact_dir / "pipeline_schedule_projection.json"),
         "pipeline_event_trace_json": str(artifact_dir / "pipeline_event_trace.json"),
+        "pipeline_grid_trace_json": str(artifact_dir / "pipeline_grid_trace.json"),
         "pipeline_projection_svg": str(artifact_dir / "pipeline_projection.svg"),
+        "compare_pipeline_svg": str(artifact_dir / "compare_pipeline.svg"),
         "search_space_blueprint_json": str(artifact_dir / "search_space_blueprint.json"),
         "bottleneck_breakdown_json": str(artifact_dir / "bottleneck_breakdown.json"),
         "critical_operator_clusters_json": str(artifact_dir / "critical_operator_clusters.json"),
         "trial_outcome_json": str(artifact_dir / "trial_outcome.json"),
         "trial_reflection_json": str(artifact_dir / "trial_reflection.json"),
         "failure_diagnosis_json": str(artifact_dir / "failure_diagnosis.json"),
+        "runtime_schedule_traces_json": str(artifact_dir / "runtime_schedule_traces.json"),
     }
     Path(outputs["trial_artifact_json"]).write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
     Path(outputs["context_record_json"]).write_text(json.dumps(context_record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -469,9 +484,19 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
             json.dumps(pipeline_event_trace, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    if pipeline_grid_trace:
+        Path(outputs["pipeline_grid_trace_json"]).write_text(
+            json.dumps(pipeline_grid_trace, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     if str(pipeline_projection_svg.get("content") or "").strip():
         Path(outputs["pipeline_projection_svg"]).write_text(
             str(pipeline_projection_svg.get("content") or ""),
+            encoding="utf-8",
+        )
+    if str(compare_pipeline_svg.get("content") or "").strip():
+        Path(outputs["compare_pipeline_svg"]).write_text(
+            str(compare_pipeline_svg.get("content") or ""),
             encoding="utf-8",
         )
     if search_space_blueprint:
@@ -504,7 +529,28 @@ def _write_analysis_artifacts(output_dirs: Dict[str, str], metrics: Dict[str, An
             json.dumps(failure_diagnosis, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    if runtime_schedule_traces:
+        Path(outputs["runtime_schedule_traces_json"]).write_text(
+            json.dumps(runtime_schedule_traces, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     return outputs
+
+
+def _load_runtime_schedule_traces(output_dirs: Dict[str, str]) -> List[Dict[str, Any]]:
+    trace_dir = Path(str(output_dirs.get("runtime_trace_dir") or ""))
+    if not trace_dir.exists():
+        return []
+    traces: List[Dict[str, Any]] = []
+    for path in sorted(trace_dir.glob("schedule_runtime_trace_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("artifact_path", str(path))
+            traces.append(payload)
+    return traces
 
 
 def _build_failure_diagnosis(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1237,6 +1283,7 @@ def _launcher_env_overrides(
             "LOG_INTERVAL": str(int(args.log_interval)),
             "SAVE_INTERVAL": str(int(args.save_interval)),
             "CHECKPOINT_PATH": output_dirs["checkpoint_path"],
+            "SCHEDULE_RUNTIME_TRACE_DIR": output_dirs["runtime_trace_dir"],
             "TENSORBOARD_LOGS_PATH": output_dirs["tensorboard_path"],
             "DATA_CACHE_PATH": output_dirs["data_cache_path"],
             "TRANSFORMER_IMPL": transformer_impl,
@@ -1315,6 +1362,35 @@ def _program_from_strategy(strategy: MegatronStrategy, target: str, model_track:
     return base
 
 
+def _program_patch_family(program: MegatronProgram) -> str:
+    normalized = program.normalized()
+    applied_patch = normalized.applied_patch
+    if applied_patch is not None and str(applied_patch.patch_family or "").strip():
+        return str(applied_patch.patch_family or "").strip()
+    return (
+        str(normalized.metadata.get("patch_family") or "").strip()
+        or str(normalized.metadata.get("program_kind") or "baseline").strip()
+        or "baseline"
+    )
+
+
+def _update_trial_search_metadata(metrics: Dict[str, Any], program: MegatronProgram) -> None:
+    metrics["patch_family"] = _program_patch_family(program)
+    trace_summary = dict(metrics.get("trace_summary") or {})
+    next_step = dict(trace_summary.get("next_step_hypotheses") or {})
+    stop_signal = str(next_step.get("stop_signal") or "").strip()
+    metrics["continue_search_hint"] = stop_signal or "continue_search"
+
+
+def _search_unit_from_args(args: argparse.Namespace) -> str:
+    token = str(getattr(args, "search_unit", "patch") or "patch").strip().lower()
+    return token if token in {"patch", "whole_config"} else "patch"
+
+
+def _patch_memory_enabled_from_args(args: argparse.Namespace) -> bool:
+    return _search_unit_from_args(args) == "patch" and not bool(getattr(args, "disable_patch_memory", False))
+
+
 def run_trial(
     args: argparse.Namespace,
     program_or_strategy: ProgramLike,
@@ -1332,18 +1408,32 @@ def run_trial(
     try:
         compiled = compile_program(program)
     except Exception as exc:
-        return {
+        metrics = {
             "trial_id": int(trial_id),
             "program": program.to_dict(),
             "program_hash": program.semantic_hash(),
+            "candidate_rank": int(program.metadata.get("priority_rank") or 0),
             "returncode": 1,
             "error_msg": f"compile_program failed: {exc}",
             "oom": False,
+            "patch_family": _program_patch_family(program),
+            "patch_category": infer_program_patch_category(program),
+            "patch_count": infer_program_patch_count(program),
+            "search_unit": _search_unit_from_args(args),
+            "patch_memory_enabled": _patch_memory_enabled_from_args(args),
+            "continue_search_hint": "continue_search",
         }
+        return metrics
     metrics: Dict[str, Any] = {
         "trial_id": int(trial_id),
         "program": program.to_dict(),
         "program_hash": program.semantic_hash(),
+        "candidate_rank": int(program.metadata.get("priority_rank") or 0),
+        "patch_family": _program_patch_family(program),
+        "patch_category": infer_program_patch_category(program),
+        "patch_count": infer_program_patch_count(program),
+        "search_unit": _search_unit_from_args(args),
+        "patch_memory_enabled": _patch_memory_enabled_from_args(args),
         "family": compiled.family.to_dict(),
         "legality": compiled.legality.to_dict(),
         "compiled": compiled.to_dict(),
@@ -1362,6 +1452,7 @@ def run_trial(
         metrics["returncode"] = 1
         metrics["error_msg"] = "Program legality check failed"
         metrics["oom"] = False
+        metrics["continue_search_hint"] = "continue_search"
         return metrics
 
     strategy = compiled.strategy if strategy is None else strategy
@@ -1380,6 +1471,7 @@ def run_trial(
         metrics["returncode"] = 1
         metrics["error_msg"] = str(exc)
         metrics["oom"] = False
+        metrics["continue_search_hint"] = "continue_search"
         return metrics
     metrics["trial_context"]["runner_mode"] = runner_mode
     metrics["trial_context"]["launcher_script"] = str(launcher_script) if launcher_script else None
@@ -1400,10 +1492,12 @@ def run_trial(
         "megatron_entry": str(resolved_entry),
         "launcher_script": str(launcher_script) if launcher_script else None,
         "trial_dir": output_dirs["trial_dir"],
+        "analysis_dir": output_dirs["analysis_dir"],
         "checkpoint_path": output_dirs["checkpoint_path"],
         "tensorboard_path": output_dirs["tensorboard_path"],
         "torch_profile_path": observability["torch_profile_path"],
         "torchrun_log_dir": output_dirs["torchrun_log_dir"],
+        "runtime_trace_dir": output_dirs["runtime_trace_dir"],
         "chakra_path": observability["chakra_path"] if bool(observability["profile_collect_chakra"]) else None,
         "memory_snapshot_path": observability["memory_snapshot_path"],
         "nsys_output": observability["nsys_output"],
@@ -1414,6 +1508,11 @@ def run_trial(
     }
     metrics["strategy"] = strategy.to_dict()
     metrics["strategy_hash"] = strategy.semantic_hash()
+    trial_evaluation_level = str(
+        "dry_run" if bool(getattr(args, "dry_run", False)) else getattr(args, "trial_evaluation_level", "benchmark_trial")
+    )
+    metrics["trial_evaluation_level"] = trial_evaluation_level
+    analysis_dir = Path(str((metrics["trial_context"]["resolved_paths"] or {}).get("trial_dir") or "")) / "analysis"
 
     try:
         megatron_cmd = _build_megatron_cmd(args, program, compiled, trial_id=trial_id)
@@ -1430,6 +1529,35 @@ def run_trial(
             "executed_command": executed_command if not launcher_script else launcher_command,
             "launcher_env": launcher_env_overrides,
             "compile_notes": list(compiled.compile_notes),
+            "schedule_detail": copy.deepcopy(compiled.schedule_detail),
+            "partition_detail": copy.deepcopy(compiled.partition_detail),
+            "overlap_detail": copy.deepcopy(compiled.overlap_detail),
+            "memory_detail": copy.deepcopy(compiled.memory_detail),
+            "config_resolution": copy.deepcopy(compiled.config_resolution),
+            "artifact_links": {
+                "program_file": str((metrics["trial_context"]["resolved_paths"] or {}).get("trial_dir") or ""),
+                "launch_plan": log_paths["launch_plan_log"],
+                "stdout_log": log_paths["stdout_log"],
+                "stderr_log": log_paths["stderr_log"],
+                "torchrun_log_dir": output_dirs["torchrun_log_dir"],
+                "runtime_trace_dir": output_dirs["runtime_trace_dir"],
+                "checkpoint_path": output_dirs["checkpoint_path"],
+                "tensorboard_path": output_dirs["tensorboard_path"],
+                "memory_snapshot_path": observability["memory_snapshot_path"],
+                "nsys_output": observability["nsys_output"],
+                "analysis_dir": output_dirs["analysis_dir"],
+                "pipeline_schedule_projection": str(analysis_dir / "pipeline_schedule_projection.json"),
+                "pipeline_event_trace": str(analysis_dir / "pipeline_event_trace.json"),
+                "pipeline_grid_trace": str(analysis_dir / "pipeline_grid_trace.json"),
+                "pipeline_projection_svg": str(analysis_dir / "pipeline_projection.svg"),
+                "compare_pipeline_svg": str(analysis_dir / "compare_pipeline.svg"),
+                "runtime_schedule_traces": str(analysis_dir / "runtime_schedule_traces.json"),
+                "bottleneck_breakdown": str(analysis_dir / "bottleneck_breakdown.json"),
+                "trial_reflection": str(analysis_dir / "trial_reflection.json"),
+                "failure_diagnosis": str(analysis_dir / "failure_diagnosis.json"),
+            },
+            "applied_patch": copy.deepcopy(compiled.applied_patch),
+            "trial_evaluation_level": trial_evaluation_level,
             "resolved_profile": dict(compiled.to_dict().get("resolved_profile") or {}),
             "resolved_backend_caps": resolved_backend_caps,
             "observability": {
@@ -1458,6 +1586,7 @@ def run_trial(
             metrics["dry_run"] = True
             metrics["returncode"] = 0
             metrics["oom"] = False
+            metrics["continue_search_hint"] = "continue_search"
             return metrics
         preflight_error = _preflight_gpu_guard(args)
         if preflight_error:
@@ -1496,6 +1625,7 @@ def run_trial(
         metrics["returncode"] = 1
         metrics["error_msg"] = str(exc)
         metrics["oom"] = False
+        metrics["continue_search_hint"] = "continue_search"
         return metrics
 
     stdout_text = proc.stdout or ""
@@ -1505,6 +1635,7 @@ def run_trial(
     metrics["returncode"] = proc.returncode
     metrics["stdout_tail"] = stdout_text[-2000:]
     metrics["stderr_tail"] = stderr_text[-2000:]
+    metrics["runtime_schedule_traces"] = _load_runtime_schedule_traces(output_dirs)
     print(
         f"[megatron_agent] trial {int(trial_id):03d} finished "
         f"returncode={int(proc.returncode)}",
@@ -1516,6 +1647,34 @@ def run_trial(
         metrics.update(failure_details)
         metrics["error_msg"] = _parse_error(stderr_text, metrics.get("root_cause_excerpt"))
         metrics["oom"] = "CUDA OOM" in metrics["error_msg"]
+        try:
+            parsed = parse_megatron_logs(
+                stdout=stdout_text,
+                stderr=stderr_text,
+                global_batch_size=int(strategy.global_batch_size),
+                seq_len=int(strategy.seq_len),
+            )
+            metrics.update(parsed)
+        except Exception:
+            pass
+        metrics["trace_summary"] = reduce_trial_trace(program, metrics=metrics)
+        _update_trial_search_metadata(metrics, program)
+        observation = build_agent_observation(program, trace_summary=metrics["trace_summary"])
+        metrics["context_record"] = observation.to_dict()
+        metrics["failure_modes"] = list(observation.failure_modes or [])
+        metrics["bottleneck_signature"] = classify_bottleneck(program, metrics["trace_summary"])
+        metrics["trial_artifact"] = build_trial_artifact(
+            program,
+            observation,
+            bottleneck_signature=metrics["bottleneck_signature"],
+            search_unit=_search_unit_from_args(args),
+            patch_memory_enabled=_patch_memory_enabled_from_args(args),
+        )
+        metrics["patch_category"] = str(metrics["trial_artifact"].get("patch_category") or "")
+        metrics["patch_count"] = int(metrics["trial_artifact"].get("patch_count") or 0)
+        metrics["search_unit"] = str(metrics["trial_artifact"].get("search_unit") or _search_unit_from_args(args))
+        metrics["patch_memory_enabled"] = bool(metrics["trial_artifact"].get("patch_memory_enabled"))
+        metrics["analysis_artifact_paths"] = _write_analysis_artifacts(output_dirs, metrics)
         return metrics
 
     parsed = parse_megatron_logs(
@@ -1526,6 +1685,7 @@ def run_trial(
     )
     metrics.update(parsed)
     metrics["trace_summary"] = reduce_trial_trace(program, metrics=metrics)
+    _update_trial_search_metadata(metrics, program)
     observation = build_agent_observation(program, trace_summary=metrics["trace_summary"])
     metrics["context_record"] = observation.to_dict()
     metrics["failure_modes"] = list(observation.failure_modes or [])
@@ -1534,7 +1694,13 @@ def run_trial(
         program,
         observation,
         bottleneck_signature=metrics["bottleneck_signature"],
+        search_unit=_search_unit_from_args(args),
+        patch_memory_enabled=_patch_memory_enabled_from_args(args),
     )
+    metrics["patch_category"] = str(metrics["trial_artifact"].get("patch_category") or "")
+    metrics["patch_count"] = int(metrics["trial_artifact"].get("patch_count") or 0)
+    metrics["search_unit"] = str(metrics["trial_artifact"].get("search_unit") or _search_unit_from_args(args))
+    metrics["patch_memory_enabled"] = bool(metrics["trial_artifact"].get("patch_memory_enabled"))
     metrics["analysis_artifact_paths"] = _write_analysis_artifacts(output_dirs, metrics)
     metrics["oom"] = False
     return metrics
@@ -1590,6 +1756,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--enable-tp-comm-overlap", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--trial-evaluation-level",
+        type=str,
+        choices=["dry_run", "smoke_trial", "benchmark_trial", "full_trial"],
+        default="benchmark_trial",
+    )
     add_observability_args(parser)
     parser.add_argument("--cuda-visible-devices", type=str, default=None)
     parser.add_argument("--allow-busy-gpus", action="store_true")

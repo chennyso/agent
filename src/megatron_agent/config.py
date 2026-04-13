@@ -541,6 +541,521 @@ class ScheduleSpec:
 
 
 @dataclass
+class StageSemanticSpec:
+    stage_id: int = 0
+    family: str = "unspecified"
+    local_dispatch_hint: Optional[str] = None
+    prefer_delayed_wgrad: bool = False
+    prefer_early_reload: bool = False
+    prefer_checkpoint: bool = False
+    prefer_offload: bool = False
+    overlap_aggressiveness: str = "balanced"
+    notes: Optional[str] = None
+
+    def normalized(self) -> "StageSemanticSpec":
+        norm = copy.deepcopy(self)
+        norm.stage_id = max(int(norm.stage_id), 0)
+        norm.family = str(norm.family or "unspecified")
+        if norm.local_dispatch_hint is not None:
+            norm.local_dispatch_hint = str(norm.local_dispatch_hint).strip() or None
+        norm.prefer_delayed_wgrad = bool(norm.prefer_delayed_wgrad)
+        norm.prefer_early_reload = bool(norm.prefer_early_reload)
+        norm.prefer_checkpoint = bool(norm.prefer_checkpoint)
+        norm.prefer_offload = bool(norm.prefer_offload)
+        norm.overlap_aggressiveness = str(norm.overlap_aggressiveness or "balanced")
+        if norm.notes is not None:
+            norm.notes = str(norm.notes).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "stage_id": int(norm.stage_id),
+            "family": norm.family,
+            "local_dispatch_hint": norm.local_dispatch_hint,
+            "prefer_delayed_wgrad": bool(norm.prefer_delayed_wgrad),
+            "prefer_early_reload": bool(norm.prefer_early_reload),
+            "prefer_checkpoint": bool(norm.prefer_checkpoint),
+            "prefer_offload": bool(norm.prefer_offload),
+            "overlap_aggressiveness": norm.overlap_aggressiveness,
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "StageSemanticSpec":
+        return cls(
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            family=str(payload.get("family", "unspecified")),
+            local_dispatch_hint=payload.get("local_dispatch_hint"),
+            prefer_delayed_wgrad=bool(payload.get("prefer_delayed_wgrad", False)),
+            prefer_early_reload=bool(payload.get("prefer_early_reload", False)),
+            prefer_checkpoint=bool(payload.get("prefer_checkpoint", False)),
+            prefer_offload=bool(payload.get("prefer_offload", False)),
+            overlap_aggressiveness=str(payload.get("overlap_aggressiveness", "balanced")),
+            notes=payload.get("notes"),
+        )
+
+
+@dataclass
+class OverlapIntentSpec:
+    enable_p2p_overlap: bool = False
+    enable_grad_reduce_overlap: bool = False
+    enable_param_gather_overlap: bool = False
+    enable_tp_comm_overlap: bool = False
+    enable_optimizer_tail_overlap: bool = False
+    enable_reload_overlap: bool = False
+    priority_frontier_pairs: List[str] = field(default_factory=list)
+    status: str = "direct_now"
+    disabled_reasons: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "OverlapIntentSpec":
+        norm = copy.deepcopy(self)
+        norm.enable_p2p_overlap = bool(norm.enable_p2p_overlap)
+        norm.enable_grad_reduce_overlap = bool(norm.enable_grad_reduce_overlap)
+        norm.enable_param_gather_overlap = bool(norm.enable_param_gather_overlap)
+        norm.enable_tp_comm_overlap = bool(norm.enable_tp_comm_overlap)
+        norm.enable_optimizer_tail_overlap = bool(norm.enable_optimizer_tail_overlap)
+        norm.enable_reload_overlap = bool(norm.enable_reload_overlap)
+        norm.priority_frontier_pairs = [str(item) for item in (norm.priority_frontier_pairs or []) if str(item).strip()]
+        norm.status = str(norm.status or "direct_now")
+        norm.disabled_reasons = [str(item) for item in (norm.disabled_reasons or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "enable_p2p_overlap": bool(norm.enable_p2p_overlap),
+            "enable_grad_reduce_overlap": bool(norm.enable_grad_reduce_overlap),
+            "enable_param_gather_overlap": bool(norm.enable_param_gather_overlap),
+            "enable_tp_comm_overlap": bool(norm.enable_tp_comm_overlap),
+            "enable_optimizer_tail_overlap": bool(norm.enable_optimizer_tail_overlap),
+            "enable_reload_overlap": bool(norm.enable_reload_overlap),
+            "priority_frontier_pairs": list(norm.priority_frontier_pairs),
+            "status": norm.status,
+            "disabled_reasons": list(norm.disabled_reasons),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "OverlapIntentSpec":
+        return cls(
+            enable_p2p_overlap=bool(payload.get("enable_p2p_overlap", False)),
+            enable_grad_reduce_overlap=bool(payload.get("enable_grad_reduce_overlap", False)),
+            enable_param_gather_overlap=bool(payload.get("enable_param_gather_overlap", False)),
+            enable_tp_comm_overlap=bool(payload.get("enable_tp_comm_overlap", False)),
+            enable_optimizer_tail_overlap=bool(payload.get("enable_optimizer_tail_overlap", False)),
+            enable_reload_overlap=bool(payload.get("enable_reload_overlap", False)),
+            priority_frontier_pairs=[str(item) for item in (payload.get("priority_frontier_pairs") or [])],
+            status=str(payload.get("status", "direct_now")),
+            disabled_reasons=[str(item) for item in (payload.get("disabled_reasons") or [])],
+        )
+
+
+@dataclass
+class MemoryIntentSpec:
+    checkpoint_policy: str = "default"
+    recompute_policy: str = "default"
+    offload_policy: str = "none"
+    reload_policy: str = "default"
+    prefetch_policy: str = "default"
+    per_stage_policies: List[Dict[str, Any]] = field(default_factory=list)
+    status: str = "direct_now"
+    notes: Optional[str] = None
+
+    def normalized(self) -> "MemoryIntentSpec":
+        norm = copy.deepcopy(self)
+        norm.checkpoint_policy = str(norm.checkpoint_policy or "default")
+        norm.recompute_policy = str(norm.recompute_policy or "default")
+        norm.offload_policy = str(norm.offload_policy or "none")
+        norm.reload_policy = str(norm.reload_policy or "default")
+        norm.prefetch_policy = str(norm.prefetch_policy or "default")
+        norm.per_stage_policies = [copy.deepcopy(item) for item in (norm.per_stage_policies or []) if isinstance(item, dict)]
+        norm.status = str(norm.status or "direct_now")
+        if norm.notes is not None:
+            norm.notes = str(norm.notes).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "checkpoint_policy": norm.checkpoint_policy,
+            "recompute_policy": norm.recompute_policy,
+            "offload_policy": norm.offload_policy,
+            "reload_policy": norm.reload_policy,
+            "prefetch_policy": norm.prefetch_policy,
+            "per_stage_policies": copy.deepcopy(norm.per_stage_policies),
+            "status": norm.status,
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "MemoryIntentSpec":
+        return cls(
+            checkpoint_policy=str(payload.get("checkpoint_policy", "default")),
+            recompute_policy=str(payload.get("recompute_policy", "default")),
+            offload_policy=str(payload.get("offload_policy", "none")),
+            reload_policy=str(payload.get("reload_policy", "default")),
+            prefetch_policy=str(payload.get("prefetch_policy", "default")),
+            per_stage_policies=[copy.deepcopy(item) for item in (payload.get("per_stage_policies") or [])],
+            status=str(payload.get("status", "direct_now")),
+            notes=payload.get("notes"),
+        )
+
+
+@dataclass
+class PartitionOptimizationSpec:
+    partition_mode: str = "uniform"
+    allow_nonuniform_partition: bool = False
+    stage_layer_counts: List[int] = field(default_factory=list)
+    stage_local_vpp_vector: List[int] = field(default_factory=list)
+    preferred_boundary_modules: List[str] = field(default_factory=list)
+    anti_boundary_modules: List[str] = field(default_factory=list)
+    asymmetry_notes: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "PartitionOptimizationSpec":
+        norm = copy.deepcopy(self)
+        norm.partition_mode = str(norm.partition_mode or "uniform")
+        norm.allow_nonuniform_partition = bool(norm.allow_nonuniform_partition)
+        norm.stage_layer_counts = [max(int(item), 0) for item in (norm.stage_layer_counts or [])]
+        norm.stage_local_vpp_vector = [max(int(item), 1) for item in (norm.stage_local_vpp_vector or [])]
+        norm.preferred_boundary_modules = [str(item) for item in (norm.preferred_boundary_modules or []) if str(item).strip()]
+        norm.anti_boundary_modules = [str(item) for item in (norm.anti_boundary_modules or []) if str(item).strip()]
+        norm.asymmetry_notes = [str(item) for item in (norm.asymmetry_notes or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "partition_mode": norm.partition_mode,
+            "allow_nonuniform_partition": bool(norm.allow_nonuniform_partition),
+            "stage_layer_counts": list(norm.stage_layer_counts),
+            "stage_local_vpp_vector": list(norm.stage_local_vpp_vector),
+            "preferred_boundary_modules": list(norm.preferred_boundary_modules),
+            "anti_boundary_modules": list(norm.anti_boundary_modules),
+            "asymmetry_notes": list(norm.asymmetry_notes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "PartitionOptimizationSpec":
+        return cls(
+            partition_mode=str(payload.get("partition_mode", "uniform")),
+            allow_nonuniform_partition=bool(payload.get("allow_nonuniform_partition", False)),
+            stage_layer_counts=[int(item) for item in (payload.get("stage_layer_counts") or [])],
+            stage_local_vpp_vector=[int(item) for item in (payload.get("stage_local_vpp_vector") or [])],
+            preferred_boundary_modules=[str(item) for item in (payload.get("preferred_boundary_modules") or [])],
+            anti_boundary_modules=[str(item) for item in (payload.get("anti_boundary_modules") or [])],
+            asymmetry_notes=[str(item) for item in (payload.get("asymmetry_notes") or [])],
+        )
+
+
+@dataclass
+class ProgramPatchSpec:
+    patch_id: str = ""
+    base_program_hash: str = ""
+    patch_family: str = "baseline"
+    target_scope: str = "program"
+    changes: Dict[str, Any] = field(default_factory=dict)
+    expected_effects: Dict[str, Any] = field(default_factory=dict)
+    risk_flags: List[str] = field(default_factory=list)
+    derived_program_hash: Optional[str] = None
+
+    def normalized(self) -> "ProgramPatchSpec":
+        norm = copy.deepcopy(self)
+        norm.patch_id = str(norm.patch_id or "")
+        norm.base_program_hash = str(norm.base_program_hash or "")
+        norm.patch_family = str(norm.patch_family or "baseline")
+        norm.target_scope = str(norm.target_scope or "program")
+        norm.changes = copy.deepcopy(norm.changes or {})
+        norm.expected_effects = copy.deepcopy(norm.expected_effects or {})
+        norm.risk_flags = [str(item) for item in (norm.risk_flags or []) if str(item).strip()]
+        if norm.derived_program_hash is not None:
+            norm.derived_program_hash = str(norm.derived_program_hash).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "patch_id": norm.patch_id,
+            "base_program_hash": norm.base_program_hash,
+            "patch_family": norm.patch_family,
+            "target_scope": norm.target_scope,
+            "changes": copy.deepcopy(norm.changes),
+            "expected_effects": copy.deepcopy(norm.expected_effects),
+            "risk_flags": list(norm.risk_flags),
+            "derived_program_hash": norm.derived_program_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ProgramPatchSpec":
+        return cls(
+            patch_id=str(payload.get("patch_id") or ""),
+            base_program_hash=str(payload.get("base_program_hash") or ""),
+            patch_family=str(payload.get("patch_family", "baseline")),
+            target_scope=str(payload.get("target_scope", "program")),
+            changes=copy.deepcopy(payload.get("changes") or {}),
+            expected_effects=copy.deepcopy(payload.get("expected_effects") or {}),
+            risk_flags=[str(item) for item in (payload.get("risk_flags") or [])],
+            derived_program_hash=payload.get("derived_program_hash"),
+        )
+
+
+@dataclass
+class PatchProposal:
+    target_bottleneck: str = ""
+    patch_family: str = "baseline"
+    target_scope: str = "program"
+    expected_effects: Dict[str, Any] = field(default_factory=dict)
+    risk_flags: List[str] = field(default_factory=list)
+    search_priority: int = 0
+    rationale: Optional[str] = None
+
+    def normalized(self) -> "PatchProposal":
+        norm = copy.deepcopy(self)
+        norm.target_bottleneck = str(norm.target_bottleneck or "").strip()
+        norm.patch_family = str(norm.patch_family or "baseline").strip() or "baseline"
+        norm.target_scope = str(norm.target_scope or "program").strip() or "program"
+        norm.expected_effects = copy.deepcopy(norm.expected_effects or {})
+        norm.risk_flags = [str(item).strip() for item in (norm.risk_flags or []) if str(item).strip()]
+        norm.search_priority = int(norm.search_priority or 0)
+        norm.rationale = str(norm.rationale).strip() if norm.rationale is not None else None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "target_bottleneck": norm.target_bottleneck,
+            "patch_family": norm.patch_family,
+            "target_scope": norm.target_scope,
+            "expected_effects": copy.deepcopy(norm.expected_effects),
+            "risk_flags": list(norm.risk_flags),
+            "search_priority": int(norm.search_priority),
+            "rationale": norm.rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "PatchProposal":
+        return cls(
+            target_bottleneck=str(payload.get("target_bottleneck") or ""),
+            patch_family=str(payload.get("patch_family") or "baseline"),
+            target_scope=str(payload.get("target_scope") or "program"),
+            expected_effects=copy.deepcopy(payload.get("expected_effects") or {}),
+            risk_flags=[str(item) for item in (payload.get("risk_flags") or [])],
+            search_priority=int(payload.get("search_priority", 0) or 0),
+            rationale=payload.get("rationale"),
+        )
+
+
+@dataclass
+class ScheduleActionSpec:
+    action_type: str = "WAIT"
+    stage_id: int = 0
+    lane_id: int = 0
+    microbatch_id: int = 0
+    vchunk_id: int = 0
+    time_slot: int = 0
+    duration_hint: float = 0.0
+    dependency_ids: List[str] = field(default_factory=list)
+    memory_delta: float = 0.0
+    stream_or_channel: Optional[str] = None
+    weight_version_tag: Optional[str] = None
+
+    def normalized(self) -> "ScheduleActionSpec":
+        norm = copy.deepcopy(self)
+        norm.action_type = str(norm.action_type or "WAIT").upper()
+        norm.stage_id = max(int(norm.stage_id), 0)
+        norm.lane_id = max(int(norm.lane_id), 0)
+        norm.microbatch_id = max(int(norm.microbatch_id), 0)
+        norm.vchunk_id = max(int(norm.vchunk_id), 0)
+        norm.time_slot = max(int(norm.time_slot), 0)
+        norm.duration_hint = max(float(norm.duration_hint or 0.0), 0.0)
+        norm.dependency_ids = [str(item) for item in (norm.dependency_ids or []) if str(item).strip()]
+        norm.memory_delta = float(norm.memory_delta or 0.0)
+        if norm.stream_or_channel is not None:
+            norm.stream_or_channel = str(norm.stream_or_channel).strip() or None
+        if norm.weight_version_tag is not None:
+            norm.weight_version_tag = str(norm.weight_version_tag).strip() or None
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "action_type": norm.action_type,
+            "stage_id": int(norm.stage_id),
+            "lane_id": int(norm.lane_id),
+            "microbatch_id": int(norm.microbatch_id),
+            "vchunk_id": int(norm.vchunk_id),
+            "time_slot": int(norm.time_slot),
+            "duration_hint": float(norm.duration_hint),
+            "dependency_ids": list(norm.dependency_ids),
+            "memory_delta": float(norm.memory_delta),
+            "stream_or_channel": norm.stream_or_channel,
+            "weight_version_tag": norm.weight_version_tag,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ScheduleActionSpec":
+        return cls(
+            action_type=str(payload.get("action_type", "WAIT")),
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            lane_id=int(payload.get("lane_id", 0) or 0),
+            microbatch_id=int(payload.get("microbatch_id", 0) or 0),
+            vchunk_id=int(payload.get("vchunk_id", 0) or 0),
+            time_slot=int(payload.get("time_slot", 0) or 0),
+            duration_hint=float(payload.get("duration_hint", 0.0) or 0.0),
+            dependency_ids=[str(item) for item in (payload.get("dependency_ids") or [])],
+            memory_delta=float(payload.get("memory_delta", 0.0) or 0.0),
+            stream_or_channel=payload.get("stream_or_channel"),
+            weight_version_tag=payload.get("weight_version_tag"),
+        )
+
+
+@dataclass
+class ScheduleGridSpec:
+    lanes: int = 1
+    time_slots: int = 0
+    cells: List[Dict[str, Any]] = field(default_factory=list)
+    family: str = "fixed_1f1b"
+    stage_count: int = 1
+    vstage_count: int = 1
+    microbatch_count: int = 1
+    weight_version_policy: str = "default"
+    constraints: Dict[str, Any] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "ScheduleGridSpec":
+        norm = copy.deepcopy(self)
+        norm.lanes = max(int(norm.lanes), 1)
+        norm.time_slots = max(int(norm.time_slots), 0)
+        norm.cells = [copy.deepcopy(item) for item in (norm.cells or []) if isinstance(item, dict)]
+        norm.family = str(norm.family or "fixed_1f1b")
+        norm.stage_count = max(int(norm.stage_count), 1)
+        norm.vstage_count = max(int(norm.vstage_count), 1)
+        norm.microbatch_count = max(int(norm.microbatch_count), 1)
+        norm.weight_version_policy = str(norm.weight_version_policy or "default")
+        norm.constraints = copy.deepcopy(norm.constraints or {})
+        norm.notes = [str(item) for item in (norm.notes or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "lanes": int(norm.lanes),
+            "time_slots": int(norm.time_slots),
+            "cells": copy.deepcopy(norm.cells),
+            "family": norm.family,
+            "stage_count": int(norm.stage_count),
+            "vstage_count": int(norm.vstage_count),
+            "microbatch_count": int(norm.microbatch_count),
+            "weight_version_policy": norm.weight_version_policy,
+            "constraints": copy.deepcopy(norm.constraints),
+            "notes": list(norm.notes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ScheduleGridSpec":
+        return cls(
+            lanes=int(payload.get("lanes", 1) or 1),
+            time_slots=int(payload.get("time_slots", 0) or 0),
+            cells=[copy.deepcopy(item) for item in (payload.get("cells") or [])],
+            family=str(payload.get("family", "fixed_1f1b")),
+            stage_count=int(payload.get("stage_count", 1) or 1),
+            vstage_count=int(payload.get("vstage_count", 1) or 1),
+            microbatch_count=int(payload.get("microbatch_count", 1) or 1),
+            weight_version_policy=str(payload.get("weight_version_policy", "default")),
+            constraints=copy.deepcopy(payload.get("constraints") or {}),
+            notes=[str(item) for item in (payload.get("notes") or [])],
+        )
+
+
+@dataclass
+class ScheduleIRSpec:
+    family: str = "fixed_1f1b"
+    skeleton: str = "fixed_1f1b"
+    microbatch_lanes: int = 1
+    microbatch_group_size_per_vp_stage: Optional[int] = None
+    dispatch_order: str = "default"
+    warmup_policy: str = "default"
+    steady_state_policy: str = "default"
+    cooldown_policy: str = "default"
+    weight_version_policy: str = "default"
+    virtual_stage_grouping: List[int] = field(default_factory=list)
+    runtime_requirements: Dict[str, Any] = field(default_factory=dict)
+    stage_semantics: List[StageSemanticSpec] = field(default_factory=list)
+    overlap_intents: OverlapIntentSpec = field(default_factory=OverlapIntentSpec)
+    memory_intents: MemoryIntentSpec = field(default_factory=MemoryIntentSpec)
+    execution_hints: Dict[str, Any] = field(default_factory=dict)
+    schedule_grid: Optional[ScheduleGridSpec] = None
+    derived_actions: List[ScheduleActionSpec] = field(default_factory=list)
+
+    def normalized(self) -> "ScheduleIRSpec":
+        norm = copy.deepcopy(self)
+        norm.family = str(norm.family or "fixed_1f1b")
+        norm.skeleton = str(norm.skeleton or norm.family or "fixed_1f1b")
+        norm.microbatch_lanes = max(int(norm.microbatch_lanes), 1)
+        if norm.microbatch_group_size_per_vp_stage is not None:
+            norm.microbatch_group_size_per_vp_stage = max(int(norm.microbatch_group_size_per_vp_stage), 1)
+        norm.dispatch_order = str(norm.dispatch_order or "default")
+        norm.warmup_policy = str(norm.warmup_policy or "default")
+        norm.steady_state_policy = str(norm.steady_state_policy or "default")
+        norm.cooldown_policy = str(norm.cooldown_policy or "default")
+        norm.weight_version_policy = str(norm.weight_version_policy or "default")
+        norm.virtual_stage_grouping = [max(int(item), 1) for item in (norm.virtual_stage_grouping or [])]
+        norm.runtime_requirements = copy.deepcopy(norm.runtime_requirements or {})
+        norm.stage_semantics = [item.normalized() for item in (norm.stage_semantics or [])]
+        norm.overlap_intents = norm.overlap_intents.normalized()
+        norm.memory_intents = norm.memory_intents.normalized()
+        norm.execution_hints = copy.deepcopy(norm.execution_hints or {})
+        norm.schedule_grid = norm.schedule_grid.normalized() if norm.schedule_grid is not None else None
+        norm.derived_actions = [item.normalized() for item in (norm.derived_actions or [])]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "family": norm.family,
+            "skeleton": norm.skeleton,
+            "microbatch_lanes": int(norm.microbatch_lanes),
+            "microbatch_group_size_per_vp_stage": norm.microbatch_group_size_per_vp_stage,
+            "dispatch_order": norm.dispatch_order,
+            "warmup_policy": norm.warmup_policy,
+            "steady_state_policy": norm.steady_state_policy,
+            "cooldown_policy": norm.cooldown_policy,
+            "weight_version_policy": norm.weight_version_policy,
+            "virtual_stage_grouping": list(norm.virtual_stage_grouping),
+            "runtime_requirements": copy.deepcopy(norm.runtime_requirements),
+            "stage_semantics": [item.to_dict() for item in norm.stage_semantics],
+            "overlap_intents": norm.overlap_intents.to_dict(),
+            "memory_intents": norm.memory_intents.to_dict(),
+            "execution_hints": copy.deepcopy(norm.execution_hints),
+            "schedule_grid": norm.schedule_grid.to_dict() if norm.schedule_grid is not None else None,
+            "derived_actions": [item.to_dict() for item in norm.derived_actions],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ScheduleIRSpec":
+        return cls(
+            family=str(payload.get("family", "fixed_1f1b")),
+            skeleton=str(payload.get("skeleton", "fixed_1f1b")),
+            microbatch_lanes=int(payload.get("microbatch_lanes", 1) or 1),
+            microbatch_group_size_per_vp_stage=payload.get("microbatch_group_size_per_vp_stage"),
+            dispatch_order=str(payload.get("dispatch_order", "default")),
+            warmup_policy=str(payload.get("warmup_policy", "default")),
+            steady_state_policy=str(payload.get("steady_state_policy", "default")),
+            cooldown_policy=str(payload.get("cooldown_policy", "default")),
+            weight_version_policy=str(payload.get("weight_version_policy", "default")),
+            virtual_stage_grouping=[int(item) for item in (payload.get("virtual_stage_grouping") or [])],
+            runtime_requirements=copy.deepcopy(payload.get("runtime_requirements") or {}),
+            stage_semantics=[StageSemanticSpec.from_dict(item) for item in (payload.get("stage_semantics") or [])],
+            overlap_intents=OverlapIntentSpec.from_dict(payload.get("overlap_intents") or {}),
+            memory_intents=MemoryIntentSpec.from_dict(payload.get("memory_intents") or {}),
+            execution_hints=copy.deepcopy(payload.get("execution_hints") or {}),
+            schedule_grid=ScheduleGridSpec.from_dict(payload.get("schedule_grid") or {})
+            if payload.get("schedule_grid") is not None
+            else None,
+            derived_actions=[ScheduleActionSpec.from_dict(item) for item in (payload.get("derived_actions") or [])],
+        )
+
+
+@dataclass
 class BatchPlanSpec:
     micro_batch_size: int = 1
     global_batch_size: int = 16
@@ -1369,6 +1884,11 @@ class MegatronProgram:
     schedule: ScheduleSpec = field(default_factory=ScheduleSpec)
     batch_plan: BatchPlanSpec = field(default_factory=BatchPlanSpec)
     strategy_ir: StrategyIRSpec = field(default_factory=StrategyIRSpec)
+    schedule_ir: Optional[ScheduleIRSpec] = None
+    partition_optimization: Optional[PartitionOptimizationSpec] = None
+    applied_patch: Optional[ProgramPatchSpec] = None
+    baseline_family: Optional[str] = None
+    policy_objective: Optional[str] = None
     constraints: ConstraintSpec = field(default_factory=ConstraintSpec)
     search_space: SearchSpaceSpec = field(default_factory=SearchSpaceSpec)
     length_bucket_policies: List[LengthBucketPolicy] = field(default_factory=list)
@@ -1388,6 +1908,16 @@ class MegatronProgram:
         norm.schedule = norm.schedule.normalized()
         norm.batch_plan = norm.batch_plan.normalized()
         norm.strategy_ir = norm.strategy_ir.normalized()
+        if norm.schedule_ir is not None:
+            norm.schedule_ir = norm.schedule_ir.normalized()
+        if norm.partition_optimization is not None:
+            norm.partition_optimization = norm.partition_optimization.normalized()
+        if norm.applied_patch is not None:
+            norm.applied_patch = norm.applied_patch.normalized()
+        if norm.baseline_family is not None:
+            norm.baseline_family = str(norm.baseline_family).strip() or None
+        if norm.policy_objective is not None:
+            norm.policy_objective = str(norm.policy_objective).strip() or None
         norm.constraints = norm.constraints.normalized()
         norm.search_space = norm.search_space.normalized()
         norm.length_bucket_policies = [item.normalized() for item in (norm.length_bucket_policies or [])]
@@ -1402,6 +1932,35 @@ class MegatronProgram:
             norm.metadata["target_tokens_per_step"] = int(norm.batch_plan.target_tokens_per_step)
         if not norm.strategy_ir.apipe or not norm.strategy_ir.placement or not norm.strategy_ir.local_parallel:
             norm.strategy_ir = _derive_strategy_ir(norm)
+        derived_schedule_ir = _derive_schedule_ir(norm)
+        if norm.schedule_ir is None:
+            norm.schedule_ir = derived_schedule_ir
+        elif _legacy_schedule_fields_override_schedule_ir(norm, norm.schedule_ir):
+            norm.schedule_ir = derived_schedule_ir
+        else:
+            norm.schedule_ir = norm.schedule_ir.normalized()
+        derived_partition_optimization = _derive_partition_optimization(norm)
+        if norm.partition_optimization is None:
+            norm.partition_optimization = derived_partition_optimization
+        elif _legacy_partition_fields_override_partition_optimization(
+            norm,
+            norm.partition_optimization,
+            derived_partition_optimization,
+        ):
+            norm.partition_optimization = derived_partition_optimization
+        else:
+            norm.partition_optimization = norm.partition_optimization.normalized()
+        if norm.applied_patch is None:
+            norm.applied_patch = _derive_program_patch(norm)
+        else:
+            norm.applied_patch = norm.applied_patch.normalized()
+        if norm.baseline_family is None:
+            norm.baseline_family = str((norm.metadata or {}).get("baseline_family") or norm.schedule_ir.family or norm.schedule.template)
+        if norm.policy_objective is None:
+            norm.policy_objective = str(
+                (norm.metadata or {}).get("policy_objective") or "maximize_throughput_under_memory_and_legality_constraints"
+            )
+        _backfill_legacy_policy_fields(norm)
         return norm
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1417,6 +1976,13 @@ class MegatronProgram:
             "schedule": norm.schedule.to_dict(),
             "batch_plan": norm.batch_plan.to_dict(),
             "strategy_ir": norm.strategy_ir.to_dict(),
+            "schedule_ir": norm.schedule_ir.to_dict() if norm.schedule_ir is not None else None,
+            "partition_optimization": norm.partition_optimization.to_dict()
+            if norm.partition_optimization is not None
+            else None,
+            "applied_patch": norm.applied_patch.to_dict() if norm.applied_patch is not None else None,
+            "baseline_family": norm.baseline_family,
+            "policy_objective": norm.policy_objective,
             "constraints": norm.constraints.to_dict(),
             "search_space": norm.search_space.to_dict(),
             "length_bucket_policies": [item.to_dict() for item in norm.length_bucket_policies],
@@ -1454,6 +2020,17 @@ class MegatronProgram:
                 }
             ),
             strategy_ir=StrategyIRSpec.from_dict(payload.get("strategy_ir") or {}),
+            schedule_ir=ScheduleIRSpec.from_dict(payload.get("schedule_ir") or {})
+            if payload.get("schedule_ir") is not None
+            else None,
+            partition_optimization=PartitionOptimizationSpec.from_dict(payload.get("partition_optimization") or {})
+            if payload.get("partition_optimization") is not None
+            else None,
+            applied_patch=ProgramPatchSpec.from_dict(payload.get("applied_patch") or {})
+            if payload.get("applied_patch") is not None
+            else None,
+            baseline_family=payload.get("baseline_family"),
+            policy_objective=payload.get("policy_objective"),
             constraints=ConstraintSpec.from_dict(payload.get("constraints") or {}),
             search_space=SearchSpaceSpec.from_dict(payload.get("search_space") or {}),
             length_bucket_policies=[
@@ -1766,6 +2343,314 @@ class ExperimentSpec:
             program_kinds=[str(item) for item in (payload.get("program_kinds") or [])],
             notes=payload.get("notes"),
         )
+
+
+def _derive_stage_semantics(program: MegatronProgram) -> List[StageSemanticSpec]:
+    metadata = copy.deepcopy(program.metadata or {})
+    stage_tags = list(metadata.get("runtime_stage_tags") or [])
+    if stage_tags:
+        out: List[StageSemanticSpec] = []
+        for item in stage_tags:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                StageSemanticSpec(
+                    stage_id=int(item.get("stage_id", item.get("stage_index", 0)) or 0),
+                    family=str(item.get("family", item.get("stage_family", "unspecified"))),
+                    local_dispatch_hint=item.get("local_dispatch_hint") or item.get("dispatch_hint"),
+                    prefer_delayed_wgrad=bool(item.get("prefer_delayed_wgrad", False)),
+                    prefer_early_reload=bool(item.get("prefer_early_reload", False)),
+                    prefer_checkpoint=bool(item.get("prefer_checkpoint", False)),
+                    prefer_offload=bool(item.get("prefer_offload", False)),
+                    overlap_aggressiveness=str(item.get("overlap_aggressiveness", "balanced")),
+                    notes=item.get("notes"),
+                ).normalized()
+            )
+        if out:
+            return out
+    out = []
+    local_policies = list(metadata.get("stage_local_memory_policy") or [])
+    for stage_index, stage in enumerate(program.partition.stages):
+        local_policy = local_policies[stage_index] if stage_index < len(local_policies) and isinstance(local_policies[stage_index], dict) else {}
+        special_tokens = set(stage.special_tokens or [])
+        family = "memory_hot" if bool(local_policy) else "tail_heavy" if stage_index == len(program.partition.stages) - 1 else "unspecified"
+        if "E" in special_tokens or "L" in special_tokens:
+            family = "comm_hot"
+        out.append(
+            StageSemanticSpec(
+                stage_id=stage_index,
+                family=family,
+                local_dispatch_hint=local_policy.get("dispatch_hint"),
+                prefer_delayed_wgrad=bool(local_policy.get("prefer_delayed_wgrad", False)),
+                prefer_early_reload=bool(local_policy.get("prefer_early_reload", False)),
+                prefer_checkpoint=bool(local_policy.get("checkpoint", False)),
+                prefer_offload=bool(local_policy.get("offload", False)),
+                overlap_aggressiveness=str(local_policy.get("overlap_aggressiveness", "balanced")),
+                notes=str(local_policy.get("notes") or "") or None,
+            ).normalized()
+        )
+    return out
+
+
+def _derive_overlap_intents(program: MegatronProgram) -> OverlapIntentSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    priority_pairs: List[str] = []
+    optimizer_mode = str(metadata.get("runtime_optimizer_policy_mode") or "").strip()
+    if optimizer_mode:
+        priority_pairs.append(f"optimizer_tail:{optimizer_mode}")
+    if metadata.get("runtime_enable_overlap_grad_reduce"):
+        priority_pairs.append("backward->grad_reduce")
+    if metadata.get("runtime_enable_overlap_param_gather"):
+        priority_pairs.append("optimizer_tail->param_gather")
+    return OverlapIntentSpec(
+        enable_p2p_overlap=bool(metadata.get("runtime_enable_p2p_overlap") or metadata.get("runtime_enable_dualpipe_overlap")),
+        enable_grad_reduce_overlap=bool(metadata.get("runtime_enable_overlap_grad_reduce")),
+        enable_param_gather_overlap=bool(metadata.get("runtime_enable_overlap_param_gather")),
+        enable_tp_comm_overlap=bool(metadata.get("runtime_enable_tp_comm_overlap")),
+        enable_optimizer_tail_overlap=bool(optimizer_mode),
+        enable_reload_overlap=bool(metadata.get("runtime_enable_reload_overlap")),
+        priority_frontier_pairs=priority_pairs,
+        status=str(metadata.get("overlap_intent_status") or "direct_now"),
+        disabled_reasons=[str(item) for item in (metadata.get("overlap_disabled_reasons") or [])],
+    ).normalized()
+
+
+def _derive_memory_intents(program: MegatronProgram) -> MemoryIntentSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    per_stage = list(metadata.get("stage_local_memory_policy") or [])
+    return MemoryIntentSpec(
+        checkpoint_policy=str(
+            metadata.get("schedule_warmup_checkpoint_policy")
+            or metadata.get("schedule_steady_checkpoint_policy")
+            or metadata.get("checkpoint_policy")
+            or "default"
+        ),
+        recompute_policy=str(
+            metadata.get("runtime_recompute_policy")
+            or ("selective" if metadata.get("runtime_enable_recompute_activations") else "default")
+        ),
+        offload_policy=str(
+            metadata.get("runtime_offload_policy")
+            or ("fine_grained" if metadata.get("runtime_enable_fine_grained_activation_offloading") else "none")
+        ),
+        reload_policy=str(metadata.get("runtime_reload_policy") or "default"),
+        prefetch_policy=str(metadata.get("runtime_prefetch_policy") or "default"),
+        per_stage_policies=[copy.deepcopy(item) for item in per_stage if isinstance(item, dict)],
+        status=str(metadata.get("memory_intent_status") or "direct_now"),
+        notes=str(metadata.get("memory_intent_notes") or "") or None,
+    ).normalized()
+
+
+def _derive_schedule_ir(program: MegatronProgram) -> ScheduleIRSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    family = str(metadata.get("runtime_schedule_family") or program.schedule.template or program.schedule.skeleton or "fixed_1f1b")
+    stage_local_vpp = list(metadata.get("stage_local_vpp_vector") or [])
+    runtime_requirements = {
+        "execution_backend": str(metadata.get("execution_backend") or metadata.get("planner_backend") or ""),
+        "sandbox_only": bool(metadata.get("sandbox_only", False)),
+        "metadata_only": bool(metadata.get("metadata_only", False)),
+        "supports_window_overrides": bool(metadata.get("runtime_window_overrides")),
+        "supports_operator_cluster_overrides": bool(metadata.get("runtime_operator_cluster_overrides")),
+    }
+    execution_hints = {
+        "window_overrides": copy.deepcopy(metadata.get("runtime_window_overrides") or []),
+        "operator_cluster_overrides": copy.deepcopy(metadata.get("runtime_operator_cluster_overrides") or []),
+        "stage_local_vpp_vector": [int(item) for item in stage_local_vpp],
+        "program_kind": str(metadata.get("program_kind") or "program"),
+    }
+    return ScheduleIRSpec(
+        family=family,
+        skeleton=str(program.schedule.skeleton or family),
+        microbatch_lanes=max(int(program.parallel.vpp_degree), 1),
+        microbatch_group_size_per_vp_stage=program.schedule.microbatch_group_size_per_vp_stage,
+        dispatch_order=str(program.schedule.dispatch_order or "default"),
+        warmup_policy=str(program.strategy_ir.pipe.warmup_policy or metadata.get("schedule_warmup_policy") or "default"),
+        steady_state_policy=str(program.strategy_ir.pipe.microbatch_order or "default"),
+        cooldown_policy=str(program.strategy_ir.pipe.cooldown_policy or metadata.get("schedule_cooldown_policy") or "default"),
+        weight_version_policy=str(metadata.get("weight_version_policy") or "default"),
+        virtual_stage_grouping=[int(item) for item in stage_local_vpp if int(item) > 0],
+        runtime_requirements=runtime_requirements,
+        stage_semantics=_derive_stage_semantics(program),
+        overlap_intents=_derive_overlap_intents(program),
+        memory_intents=_derive_memory_intents(program),
+        execution_hints=execution_hints,
+    ).normalized()
+
+
+def _derive_partition_optimization(program: MegatronProgram) -> PartitionOptimizationSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    stage_layer_counts = [int(stage.decoder_layers) for stage in (program.partition.stages or [])]
+    stage_local_vpp = list(metadata.get("stage_local_vpp_vector") or [])
+    allow_nonuniform = bool(program.search_space.allow_nonuniform_partition or len(set(stage_layer_counts or [0])) > 1)
+    boundary_modules: List[str] = []
+    anti_boundary_modules: List[str] = []
+    boundary_focus = str(metadata.get("boundary_semantic_focus") or "").strip()
+    if boundary_focus:
+        boundary_modules.append(boundary_focus)
+    if str(program.model.track or "") == "moe":
+        boundary_modules.append("experts")
+    anti_boundary = str(metadata.get("anti_boundary_module") or "").strip()
+    if anti_boundary:
+        anti_boundary_modules.append(anti_boundary)
+    return PartitionOptimizationSpec(
+        partition_mode="nonuniform" if allow_nonuniform else "uniform",
+        allow_nonuniform_partition=allow_nonuniform,
+        stage_layer_counts=stage_layer_counts,
+        stage_local_vpp_vector=[int(item) for item in stage_local_vpp if int(item) > 0],
+        preferred_boundary_modules=boundary_modules,
+        anti_boundary_modules=anti_boundary_modules,
+        asymmetry_notes=[str(item) for item in (metadata.get("partition_asymmetry_notes") or [])],
+    ).normalized()
+
+
+def _derive_program_patch(program: MegatronProgram) -> ProgramPatchSpec:
+    metadata = copy.deepcopy(program.metadata or {})
+    patch_payload = metadata.get("applied_patch")
+    if isinstance(patch_payload, dict):
+        return ProgramPatchSpec.from_dict(patch_payload).normalized()
+    program_kind = str(metadata.get("program_kind") or "baseline")
+    is_baseline = program_kind in {"baseline", "program"}
+    lightweight_hash = _stable_hash(
+        {
+            "program_kind": program_kind,
+            "pp_degree": int(program.parallel.pp_degree),
+            "vpp_degree": int(program.parallel.vpp_degree),
+            "schedule_template": str(program.schedule.template),
+            "dispatch_order": str(program.schedule.dispatch_order),
+        },
+        "program_patch_v1",
+    )
+    return ProgramPatchSpec(
+        patch_id=str(metadata.get("patch_id") or f"{program_kind}:{lightweight_hash[:8]}"),
+        base_program_hash=str(metadata.get("base_program_hash") or ""),
+        patch_family=str(metadata.get("patch_family") or ("baseline" if is_baseline else program_kind)),
+        target_scope=str(metadata.get("patch_scope") or "program"),
+        changes=copy.deepcopy(metadata.get("patch_changes") or {}),
+        expected_effects=copy.deepcopy(metadata.get("patch_expected_effects") or {}),
+        risk_flags=[str(item) for item in (metadata.get("patch_risk_flags") or [])],
+        derived_program_hash=str(metadata.get("derived_program_hash") or "") or None,
+    ).normalized()
+
+
+def _schedule_ir_diverged(current: ScheduleIRSpec, derived: ScheduleIRSpec) -> bool:
+    lhs = current.normalized().to_dict()
+    rhs = derived.normalized().to_dict()
+    keys = (
+        "family",
+        "skeleton",
+        "microbatch_lanes",
+        "microbatch_group_size_per_vp_stage",
+        "dispatch_order",
+        "warmup_policy",
+        "steady_state_policy",
+        "cooldown_policy",
+        "weight_version_policy",
+        "virtual_stage_grouping",
+        "stage_semantics",
+        "overlap_intents",
+        "memory_intents",
+        "execution_hints",
+    )
+    return any(copy.deepcopy(lhs.get(key)) != copy.deepcopy(rhs.get(key)) for key in keys)
+
+
+def _partition_optimization_diverged(
+    current: PartitionOptimizationSpec,
+    derived: PartitionOptimizationSpec,
+) -> bool:
+    lhs = current.normalized().to_dict()
+    rhs = derived.normalized().to_dict()
+    return lhs != rhs
+
+
+def _legacy_schedule_fields_override_schedule_ir(
+    program: MegatronProgram,
+    current: ScheduleIRSpec,
+) -> bool:
+    current_norm = current.normalized()
+    schedule = program.schedule.normalized()
+    pipe = program.strategy_ir.pipe.normalized()
+    override_signals = 0
+    if str(schedule.dispatch_order or "").strip() not in {"", "default"} and str(schedule.dispatch_order) != str(current_norm.dispatch_order):
+        override_signals += 1
+    if str(schedule.template or "").strip() not in {"", "fixed_1f1b"} and str(schedule.template) != str(current_norm.family):
+        override_signals += 1
+    if int(schedule.microbatch_group_size_per_vp_stage or 1) != int(current_norm.microbatch_group_size_per_vp_stage or 1):
+        if int(schedule.microbatch_group_size_per_vp_stage or 1) > 1:
+            override_signals += 1
+    if str(pipe.warmup_policy or "").strip() not in {"", "default"} and str(pipe.warmup_policy) != str(current_norm.warmup_policy):
+        override_signals += 1
+    if str(pipe.cooldown_policy or "").strip() not in {"", "default"} and str(pipe.cooldown_policy) != str(current_norm.cooldown_policy):
+        override_signals += 1
+    return bool(override_signals > 0)
+
+
+def _legacy_partition_fields_override_partition_optimization(
+    program: MegatronProgram,
+    current: PartitionOptimizationSpec,
+    derived: PartitionOptimizationSpec,
+) -> bool:
+    current_norm = current.normalized()
+    metadata = copy.deepcopy(program.metadata or {})
+    stage_layer_counts = [int(stage.decoder_layers) for stage in (program.partition.stages or [])]
+    stage_local_vpp_vector = [int(item) for item in list(metadata.get("stage_local_vpp_vector") or []) if int(item) > 0]
+    override_signals = 0
+    if (
+        stage_local_vpp_vector
+        and stage_local_vpp_vector != list(current_norm.stage_local_vpp_vector or [])
+    ):
+        override_signals += 1
+    if len(stage_layer_counts) == len(current_norm.stage_layer_counts or []) and len(stage_layer_counts) > 1:
+        if stage_layer_counts != list(current_norm.stage_layer_counts or []) and len(set(stage_layer_counts)) > 1:
+            override_signals += 1
+    if bool(program.search_space.allow_nonuniform_partition) and not bool(current_norm.allow_nonuniform_partition):
+        override_signals += 1
+    if (
+        derived.normalized().to_dict() == current_norm.to_dict()
+        and override_signals <= 0
+    ):
+        return False
+    return bool(override_signals > 0)
+
+
+def _backfill_legacy_policy_fields(program: MegatronProgram) -> None:
+    schedule_ir = program.schedule_ir.normalized() if program.schedule_ir is not None else _derive_schedule_ir(program)
+    partition_optimization = (
+        program.partition_optimization.normalized()
+        if program.partition_optimization is not None
+        else _derive_partition_optimization(program)
+    )
+    program.schedule.skeleton = str(schedule_ir.skeleton or program.schedule.skeleton or "fixed_1f1b")
+    if not str(program.schedule.template or "").strip() or program.schedule.template == "fixed_1f1b":
+        program.schedule.template = str(schedule_ir.family or program.schedule.template or "fixed_1f1b")
+    program.schedule.dispatch_order = str(schedule_ir.dispatch_order or program.schedule.dispatch_order or "default")
+    if schedule_ir.microbatch_group_size_per_vp_stage is not None:
+        program.schedule.microbatch_group_size_per_vp_stage = int(schedule_ir.microbatch_group_size_per_vp_stage)
+    program.strategy_ir.pipe.template = str(schedule_ir.family or program.strategy_ir.pipe.template or "fixed_1f1b")
+    program.strategy_ir.pipe.microbatch_order = str(schedule_ir.dispatch_order or program.strategy_ir.pipe.microbatch_order or "default")
+    program.strategy_ir.pipe.steady_state_group_size = schedule_ir.microbatch_group_size_per_vp_stage
+    program.strategy_ir.pipe.warmup_policy = str(schedule_ir.warmup_policy or program.strategy_ir.pipe.warmup_policy or "default")
+    program.strategy_ir.pipe.cooldown_policy = str(schedule_ir.cooldown_policy or program.strategy_ir.pipe.cooldown_policy or "default")
+    if partition_optimization.stage_local_vpp_vector:
+        program.metadata["stage_local_vpp_vector"] = list(partition_optimization.stage_local_vpp_vector)
+    if partition_optimization.preferred_boundary_modules:
+        program.metadata["boundary_semantic_focus"] = str(partition_optimization.preferred_boundary_modules[0])
+    if partition_optimization.anti_boundary_modules:
+        program.metadata["anti_boundary_module"] = str(partition_optimization.anti_boundary_modules[0])
+    if partition_optimization.asymmetry_notes:
+        program.metadata["partition_asymmetry_notes"] = list(partition_optimization.asymmetry_notes)
+    if partition_optimization.partition_mode == "nonuniform":
+        program.search_space.allow_nonuniform_partition = True
+    stage_layer_counts = list(partition_optimization.stage_layer_counts or [])
+    if stage_layer_counts and len(stage_layer_counts) == len(program.partition.stages or []):
+        for stage, decoder_layers in zip(program.partition.stages, stage_layer_counts):
+            stage.decoder_layers = int(decoder_layers)
+    program.metadata["baseline_family"] = str(program.baseline_family or schedule_ir.family)
+    program.metadata["policy_objective"] = str(
+        program.policy_objective or "maximize_throughput_under_memory_and_legality_constraints"
+    )
+    if program.applied_patch is not None:
+        program.metadata["applied_patch"] = program.applied_patch.to_dict()
 
 
 def _derive_strategy_ir(program: MegatronProgram) -> StrategyIRSpec:

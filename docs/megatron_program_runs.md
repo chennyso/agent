@@ -284,3 +284,177 @@ Run the matching command on node 1 with `--node-rank 1`.
 - The launcher now honors `USE_BF16` / `USE_FP16` compiled from the program instead of always forcing bf16.
 - `summary_megatron.json` now includes `candidate_manifest`, `compile_success_rate`, `family_outside_ratio`, `stage_load_variance`, `observed_comm_ratio`, and `baseline_vs_best`.
 - The current workflow stays at program/control-plane level. It does not enable runtime PG rebuild, heterogeneous apipe execution, or submesh execution.
+
+## 7. Paper-Closure Ablation Workflow
+
+This is the earliest complete workflow for the paper-priority loop. It does not attempt a full runtime rewrite. Instead, it uses the current patch-aware search, runtime-observed traces, structured artifacts, and the new multi-run aggregation scripts to answer four paper questions directly:
+
+1. Are high-gain candidates usually sparse patch refinements?
+2. Do different bottlenecks prefer different patch families?
+3. Does `search_unit=patch` reach near-best results faster than `search_unit=whole_config`?
+4. Does patch memory reduce repeated harmful trials?
+
+### One-shot ablation driver
+
+Use the new driver to run three aligned experiments under the same candidate space:
+
+- `patch`
+- `whole_config`
+- `patch_memory_off`
+
+The driver writes a manifest, launches the three runs, aggregates all `summary_megatron.json` files, and renders paper figures.
+
+```bash
+python ./scripts/run_patch_paper_ablation.py \
+  --work-root ./runs/paper_patch_loop \
+  --analysis-dir ./runs/paper_patch_loop/analysis \
+  --figures-dir ./runs/paper_patch_loop/analysis/figures \
+  --case-study-topk 2 \
+  -- \
+  --run-target single_g5 \
+  --model-track dense \
+  --candidate-limit 6 \
+  --auto-tune-rounds 2 \
+  --megatron-root "$MEGATRON_ROOT" \
+  --launcher-script "$LAUNCHER_SCRIPT" \
+  --run-root ./runs_megatron
+```
+
+The forwarded arguments after `--` are passed through to `python -m megatron_agent.agent_loop` for all three variants.
+
+Expected run layout:
+
+- `./runs/paper_patch_loop/patch`
+- `./runs/paper_patch_loop/whole_config`
+- `./runs/paper_patch_loop/patch_memory_off`
+- `./runs/paper_patch_loop/paper_ablation_manifest.json`
+- `./runs/paper_patch_loop/analysis/patch_observations.csv`
+- `./runs/paper_patch_loop/analysis/search_ablation.csv`
+- `./runs/paper_patch_loop/analysis/case_study_manifest.json`
+- `./runs/paper_patch_loop/analysis/figures/fig_search_ablation_curve.png`
+
+### Dry-run the paper loop
+
+If you want the exact commands first, use `--dry-run`. The manifest is still written.
+
+```bash
+python ./scripts/run_patch_paper_ablation.py \
+  --work-root ./runs/paper_patch_loop \
+  --dry-run \
+  -- \
+  --run-target single_g5 \
+  --model-track dense \
+  --candidate-limit 6 \
+  --auto-tune-rounds 2
+```
+
+### Re-analyze existing experiments only
+
+If the three run directories already contain `summary_megatron.json`, you can skip training and regenerate tables plus figures:
+
+```bash
+python ./scripts/run_patch_paper_ablation.py \
+  --work-root ./runs/paper_patch_loop \
+  --analysis-only
+```
+
+If the analysis tables already exist and you only want to redraw figures:
+
+```bash
+python ./scripts/run_patch_paper_ablation.py \
+  --work-root ./runs/paper_patch_loop \
+  --plots-only
+```
+
+### Manual aggregation and figure rendering
+
+If you prefer explicit step-by-step commands instead of the driver, run:
+
+```bash
+python ./scripts/analyze_patch_observations.py \
+  --runs \
+    ./runs/paper_patch_loop/patch \
+    ./runs/paper_patch_loop/whole_config \
+    ./runs/paper_patch_loop/patch_memory_off \
+  --out-dir ./runs/paper_patch_loop/analysis \
+  --case-study-topk 2
+```
+
+```bash
+python ./scripts/plot_patch_paper_figures.py \
+  --analysis-dir ./runs/paper_patch_loop/analysis \
+  --out-dir ./runs/paper_patch_loop/analysis/figures
+```
+
+### Search controls used by the paper loop
+
+The paper workflow relies on two new knobs in `agent_loop.py`:
+
+- `--search-unit patch`
+  Keeps `ProgramPatchSpec` as the search unit, enables patch-family priority, local refinement continuity, and patch memory recommend/avoid signals.
+- `--search-unit whole_config`
+  Uses the same candidate generator and verifier pipeline, but disables patch-family priority and treats proposals as whole configurations for the search ablation.
+- `--disable-patch-memory`
+  Turns off `recommend_patch_families`, `should_avoid_patch_family`, `record_trial_feedback`, and `policy_memory.json` updates for the patch-memory ablation.
+
+### What to inspect in each run
+
+Each `summary_megatron.json` now records:
+
+- `search_unit`
+- `patch_memory_enabled`
+- `search_tree_history`
+- `trial_reflections`
+- `tested_trials[*].patch_family`
+- `tested_trials[*].patch_category`
+- `tested_trials[*].patch_count`
+
+Each trial analysis directory should contain:
+
+- `pipeline_schedule_projection.json`
+- `pipeline_event_trace.json`
+- `pipeline_grid_trace.json`
+- `bottleneck_breakdown.json`
+- `trial_reflection.json`
+- `failure_diagnosis.json`
+- `pipeline_projection.svg`
+- `compare_pipeline.svg`
+
+### Observation tables produced for the paper
+
+`patch_observations.csv` is the flat trial table used for scatter plots and case filtering. Key columns:
+
+- `search_unit`
+- `patch_memory_enabled`
+- `patch_family`
+- `patch_category`
+- `patch_count`
+- `bottleneck_label`
+- `step_gain_ratio`
+- `throughput_gain_ratio`
+- `bubble_ratio`
+- `stage_skew_ratio`
+- `memory_skew_ratio`
+- `tail_ratio`
+- `optimizer_exposed_ratio`
+
+`bottleneck_patch_success.csv` answers which patch families work under which bottlenecks.
+
+`bottleneck_patch_gain.csv` answers which patch families deliver the largest gains under which bottlenecks.
+
+`search_ablation.csv` is the direct patch-aware versus whole-config versus patch-memory-off comparison.
+
+`case_study_manifest.json` chooses top bubble-bound and memory-bound examples and points to their baseline/candidate artifacts.
+
+### Figure files
+
+The figure script writes:
+
+- `fig_patch_sparsity.png`
+- `fig_patch_count_hist.png`
+- `fig_bottleneck_patch_success_heatmap.png`
+- `fig_bottleneck_patch_gain_heatmap.png`
+- `fig_search_ablation_curve.png`
+- `fig_case_study_compare.png`
+
+These are designed to be paper-ready intermediate assets, not just debugging plots.

@@ -27,6 +27,33 @@ _MEMORY_RE = re.compile(
 )
 _TIMER_RE = re.compile(r"^\s+([A-Za-z0-9_\-/\.]+)\s*\.+:\s*\(([0-9.]+),\s*([0-9.]+)\)", re.MULTILINE)
 
+_PATCH_FAMILY_CATEGORY_MAP: Dict[str, str] = {
+    "change_stage_boundary": "partition",
+    "enable_nonuniform_partition": "partition",
+    "tail_aware_stage_local_vpp": "partition",
+    "preserve_partition": "partition",
+    "change_schedule_family": "schedule",
+    "preserve_schedule_policy": "schedule",
+    "add_offload_policy": "memory",
+    "checkpoint_boundary_joint": "memory",
+    "tune_reload_prefetch": "memory",
+    "preserve_memory_policy": "memory",
+    "enable_p2p_overlap": "overlap",
+    "enable_reload_overlap": "overlap",
+    "enable_optimizer_tail_overlap": "overlap",
+    "preserve_overlap_policy": "overlap",
+}
+_SCHEDULE_FAMILY_TOKENS = {
+    "fixed_1f1b",
+    "interleaved",
+    "zero_bubble",
+    "dualpipe_v",
+    "zbv",
+    "v_half",
+    "v_min",
+    "custom",
+}
+
 
 def _safe_float(value: Any) -> Optional[float]:
     try:
@@ -35,6 +62,65 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def infer_program_patch_family(program: MegatronProgram) -> str:
+    norm = program.normalized()
+    patch = norm.applied_patch
+    if patch is not None and str(patch.patch_family or "").strip():
+        return str(patch.patch_family or "").strip()
+    return (
+        str(norm.metadata.get("patch_family") or "").strip()
+        or str(norm.metadata.get("program_kind") or "baseline").strip()
+        or "baseline"
+    )
+
+
+def classify_patch_category(patch_family: str, target_scope: str = "program") -> str:
+    family = str(patch_family or "").strip()
+    scope = str(target_scope or "program").strip().lower()
+    if family in _PATCH_FAMILY_CATEGORY_MAP:
+        return str(_PATCH_FAMILY_CATEGORY_MAP[family])
+    family_lower = family.lower()
+    if family in _SCHEDULE_FAMILY_TOKENS or "schedule" in family_lower:
+        return "schedule"
+    if any(token in family_lower for token in ("partition", "boundary", "vpp", "layout", "stage_local")):
+        return "partition"
+    if any(token in family_lower for token in ("memory", "offload", "reload", "checkpoint", "recompute", "prefetch")):
+        return "memory"
+    if any(token in family_lower for token in ("overlap", "comm", "p2p", "optimizer", "gather", "reduce")):
+        return "overlap"
+    if scope in {"partition", "layout"}:
+        return "partition"
+    if scope in {"schedule", "pipe"}:
+        return "schedule"
+    if scope in {"memory", "checkpoint", "offload"}:
+        return "memory"
+    if scope in {"overlap", "communication"}:
+        return "overlap"
+    return "schedule"
+
+
+def infer_program_patch_category(program: MegatronProgram) -> str:
+    norm = program.normalized()
+    patch = norm.applied_patch
+    target_scope = str((patch.target_scope if patch is not None else None) or "program")
+    return classify_patch_category(infer_program_patch_family(norm), target_scope=target_scope)
+
+
+def infer_program_patch_count(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    patch = norm.applied_patch
+    if patch is None:
+        return 0
+    changes = patch.changes
+    if isinstance(changes, dict):
+        return int(len([key for key in changes.keys()]))
+    if isinstance(changes, list):
+        return int(len(changes))
+    if changes is None:
+        return 0
+    return 1
 
 
 def _median(values: Sequence[float]) -> Optional[float]:
@@ -1319,6 +1405,508 @@ def _build_pipeline_event_trace(
         "phase_windows": phase_windows,
         "lane_summaries": lane_summaries,
         "events": sorted(events, key=lambda item: (float(item.get("start_ms") or 0.0), int(item.get("stage_id") or 0))),
+    }
+
+
+def _build_runtime_pipeline_event_trace(
+    program: MegatronProgram,
+    runtime_schedule_traces: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    traces = [dict(item) for item in list(runtime_schedule_traces or []) if isinstance(item, dict)]
+    if not traces:
+        return {}
+    all_events: List[Dict[str, Any]] = []
+    lane_summaries: List[Dict[str, Any]] = []
+    event_durations: List[float] = []
+    schedule_family = ""
+
+    def _normalize_runtime_event(event: Dict[str, Any], default_stage_id: int) -> Dict[str, Any]:
+        action_type = str(event.get("action_type") or event.get("kind") or "BUBBLE").strip().upper()
+        microbatch_id = int(event.get("microbatch_id") or -1)
+        vchunk_id = int(event.get("vchunk_id") or 0)
+        if action_type == "FWD":
+            op_kind = "fwd"
+            label = f"F{microbatch_id}:{vchunk_id}" if microbatch_id >= 0 else f"F:{vchunk_id}"
+        elif action_type == "BWD_ACT":
+            op_kind = "bwd"
+            label = f"B{microbatch_id}:{vchunk_id}" if microbatch_id >= 0 else f"B:{vchunk_id}"
+        elif action_type == "WGRAD_OPT":
+            op_kind = "bwd"
+            label = f"W{microbatch_id}:{vchunk_id}" if microbatch_id >= 0 else f"W:{vchunk_id}"
+        elif action_type == "COMM":
+            op_kind = "comm"
+            label = str(((event.get("metadata") or {}).get("op_name") or "")).strip()
+        elif action_type == "OFFLOAD":
+            op_kind = "offload"
+            label = "OFFLOAD"
+        elif action_type == "RELOAD":
+            op_kind = "reload"
+            label = "RELOAD"
+        else:
+            op_kind = "idle"
+            label = ""
+        duration_ms = max(float(event.get("duration_ms") or 0.0), 0.0)
+        if duration_ms > 0.0:
+            event_durations.append(duration_ms)
+        return {
+            "stage_id": int(event.get("stage_id") or default_stage_id),
+            "lane_id": int(event.get("lane_id") or 0),
+            "microbatch_id": microbatch_id,
+            "chunk_id": vchunk_id,
+            "phase": str(event.get("phase") or "steady"),
+            "op_kind": op_kind,
+            "start_ms": round(float(event.get("start_ms") or 0.0), 4),
+            "duration_ms": round(duration_ms, 4),
+            "end_ms": round(float(event.get("end_ms") or (float(event.get("start_ms") or 0.0) + duration_ms)), 4),
+            "color": "",
+            "label": label,
+            "evidence_source": "runtime_observed",
+            "metadata": dict(event.get("metadata") or {}),
+        }
+
+    seen_stage_ids: set[int] = set()
+    for trace in traces:
+        schedule_family = schedule_family or str(trace.get("family") or "")
+        stage_id = int(trace.get("stage_id") or 0)
+        seen_stage_ids.add(stage_id)
+        stage_semantics = dict(trace.get("stage_semantics") or {})
+        lane_summaries.append(
+            {
+                "stage_id": stage_id,
+                "role": str(stage_semantics.get("family") or "normal"),
+                "stage_tags": [str(stage_semantics.get("family") or "normal")],
+                "local_virtual_chunks": max(int(program.parallel.vpp_degree), 1),
+                "peak_reserved_gib": 0.0,
+                "evidence_source": "runtime_observed",
+            }
+        )
+        for event in list(trace.get("events") or []):
+            all_events.append(_normalize_runtime_event(dict(event), stage_id))
+    if not all_events:
+        return {}
+    total_span_ms = max(float(item.get("end_ms") or 0.0) for item in all_events)
+    positive_microbatches = [int(item.get("microbatch_id") or -1) for item in all_events if int(item.get("microbatch_id") or -1) >= 0]
+    microbatch_count = (max(positive_microbatches) + 1) if positive_microbatches else max(int(program.batch_plan.grad_accum_steps or 1), 1)
+    slot_ms = _median(event_durations) or (total_span_ms / max(len(all_events), 1)) or 1.0
+    warmup_end = max((float(item.get("end_ms") or 0.0) for item in all_events if str(item.get("phase") or "") == "warmup"), default=0.0)
+    steady_end = max(
+        (
+            float(item.get("end_ms") or 0.0)
+            for item in all_events
+            if str(item.get("phase") or "") in {"warmup", "steady"}
+        ),
+        default=warmup_end,
+    )
+    phase_windows = [
+        {"name": "warmup", "start_ms": 0.0, "end_ms": round(warmup_end, 4)},
+        {"name": "steady", "start_ms": round(warmup_end, 4), "end_ms": round(steady_end, 4)},
+        {"name": "cooldown", "start_ms": round(steady_end, 4), "end_ms": round(total_span_ms, 4)},
+    ]
+    return {
+        "format": "pipeline_event_trace",
+        "timing_basis": "runtime_observed",
+        "summary": {
+            "schedule_template": schedule_family or str(program.schedule.template or "fixed_1f1b"),
+            "pp_degree": max(int(program.parallel.pp_degree), len(seen_stage_ids) or 1),
+            "vpp_degree": max(int(program.parallel.vpp_degree), 1),
+            "estimated_microbatches": max(int(microbatch_count), 1),
+            "slot_ms": round(float(slot_ms), 4),
+            "projected_timeline_span_ms": round(float(total_span_ms), 4),
+        },
+        "phase_windows": phase_windows,
+        "lane_summaries": sorted(lane_summaries, key=lambda item: int(item.get("stage_id") or 0)),
+        "events": sorted(
+            all_events,
+            key=lambda item: (
+                float(item.get("start_ms") or 0.0),
+                int(item.get("stage_id") or 0),
+                int(item.get("lane_id") or 0),
+            ),
+        ),
+    }
+
+
+def _runtime_trace_metrics(runtime_schedule_traces: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    traces = [dict(item) for item in list(runtime_schedule_traces or []) if isinstance(item, dict)]
+    if not traces:
+        return {}
+    comm_ms = 0.0
+    wait_ms = 0.0
+    reload_stall_ms = 0.0
+    planned_events = 0
+    observed_events = 0
+    planned_slots = 0
+    observed_slots = 0
+    action_type_duration_breakdown: Dict[str, float] = {}
+    overlap_ratios: List[float] = []
+    for trace in traces:
+        metrics = dict(trace.get("metrics") or {})
+        comm_ms += float(metrics.get("comm_ms") or 0.0)
+        wait_ms += float(metrics.get("wait_ms") or 0.0)
+        reload_stall_ms += float(metrics.get("reload_stall_ms") or 0.0)
+        planned_events += int(metrics.get("planned_action_count") or 0)
+        observed_events += int(metrics.get("observed_action_count") or 0)
+        planned_slots += int(metrics.get("planned_slot_count") or 0)
+        observed_slots += int(metrics.get("observed_slot_count") or 0)
+        for key, value in dict(metrics.get("action_type_duration_breakdown") or {}).items():
+            action_type_duration_breakdown[str(key)] = float(action_type_duration_breakdown.get(str(key), 0.0)) + float(value or 0.0)
+        ratio = metrics.get("offload_overlap_success_ratio")
+        if ratio is not None:
+            try:
+                overlap_ratios.append(float(ratio))
+            except Exception:
+                pass
+    return {
+        "runtime_comm_ms": round(comm_ms, 4),
+        "runtime_wait_ms": round(wait_ms, 4),
+        "reload_stall_ms": round(reload_stall_ms, 4),
+        "planned_vs_observed_event_count_delta": int(observed_events - planned_events),
+        "planned_vs_observed_slot_delta": int(observed_slots - planned_slots),
+        "action_type_duration_breakdown": {
+            str(key): round(float(value), 4) for key, value in sorted(action_type_duration_breakdown.items())
+        },
+        "offload_overlap_success_ratio": round(_median(overlap_ratios) or 0.0, 4),
+    }
+
+
+def _build_runtime_pipeline_grid_trace(
+    program: MegatronProgram,
+    runtime_schedule_traces: Sequence[Dict[str, Any]],
+    event_trace: Dict[str, Any],
+) -> Dict[str, Any]:
+    traces = [dict(item) for item in list(runtime_schedule_traces or []) if isinstance(item, dict)]
+    observed_grids = [
+        dict(item.get("observed_grid_trace") or {})
+        for item in traces
+        if isinstance(item.get("observed_grid_trace"), dict) and dict(item.get("observed_grid_trace") or {}).get("cells")
+    ]
+    if not observed_grids:
+        return _build_pipeline_grid_trace(program, event_trace)
+    stage_ids = [int(item.get("stage_id") or 0) for item in traces if item.get("stage_id") is not None]
+    cells: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {key: 0 for key in ("FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD", "BUBBLE")}
+    lane_summaries: List[Dict[str, Any]] = []
+    max_lanes = 1
+    max_time_slots = 1
+    for trace, grid in zip(traces, observed_grids):
+        stage_id = int(trace.get("stage_id") or 0)
+        max_lanes = max(max_lanes, int(grid.get("lanes") or 1))
+        max_time_slots = max(max_time_slots, int(grid.get("time_slots") or 1))
+        stage_semantics = dict(trace.get("stage_semantics") or {})
+        lane_summaries.append(
+            {
+                "stage_id": stage_id,
+                "role": str(stage_semantics.get("family") or "normal"),
+                "stage_tags": [str(stage_semantics.get("family") or "normal")],
+                "local_virtual_chunks": max(int(program.parallel.vpp_degree), 1),
+                "peak_reserved_gib": 0.0,
+                "evidence_source": "runtime_observed",
+            }
+        )
+        for cell in list(grid.get("cells") or []):
+            payload = dict(cell)
+            payload["stage_id"] = stage_id
+            payload.setdefault("evidence_source", "runtime_observed")
+            kind = str(payload.get("kind") or "BUBBLE").upper()
+            if kind not in counts:
+                kind = "BUBBLE"
+                payload["kind"] = kind
+            counts[kind] = int(counts.get(kind, 0)) + 1
+            cells.append(payload)
+    return {
+        "format": "pipeline_grid_trace",
+        "source": "runtime_observed",
+        "family": str((event_trace.get("summary") or {}).get("schedule_template") or program.schedule.template or "fixed_1f1b"),
+        "lanes": int(max_lanes),
+        "time_slots": int(max_time_slots),
+        "stage_count": max(len(set(stage_ids)), 1),
+        "vstage_count": max(int(program.parallel.vpp_degree), 1),
+        "microbatch_count": max(int((event_trace.get("summary") or {}).get("estimated_microbatches") or 1), 1),
+        "weight_version_policy": str((program.schedule_ir.weight_version_policy if program.schedule_ir is not None else "default") or "default"),
+        "constraints": dict((event_trace.get("summary") or {})),
+        "lane_summaries": sorted(lane_summaries, key=lambda item: int(item.get("stage_id") or 0)),
+        "counts": counts,
+        "cells": sorted(
+            cells,
+            key=lambda item: (
+                int(item.get("stage_id") or 0),
+                int(item.get("lane_id") or 0),
+                int(item.get("time_slot") or 0),
+                str(item.get("kind") or ""),
+            ),
+        ),
+        "notes": [
+            "runtime-observed grid synthesized from rank-local ScheduleActionRunner payloads",
+        ],
+    }
+
+
+def _build_next_step_hypotheses(
+    program: MegatronProgram,
+    runtime_evidence: Dict[str, Any],
+    bottleneck_signature: Dict[str, Any],
+) -> Dict[str, Any]:
+    norm = program.normalized()
+    dominant = str(
+        (bottleneck_signature or {}).get("canonical_dominant_label")
+        or (bottleneck_signature or {}).get("dominant_label")
+        or "mixed_bound"
+    )
+    bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime_evidence.get("peak_reserved_ratio") or 0.0)
+    comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    reload_stall_ratio = float(runtime_evidence.get("reload_stall_ratio") or 0.0)
+    interleaved = int(norm.parallel.vpp_degree) > 1 or bool(norm.metadata.get("pipeline_layout"))
+
+    next_schedule_family = str(norm.schedule.template or "fixed_1f1b")
+    next_partition_patch_family = "preserve_partition"
+    next_memory_patch_family = "preserve_memory_policy"
+    next_overlap_patch_family = "preserve_overlap_policy"
+    stop_signal = "continue_search"
+
+    if dominant == "bubble_bound":
+        next_schedule_family = "zero_bubble" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
+        next_partition_patch_family = "change_stage_boundary"
+        next_memory_patch_family = "checkpoint_boundary_joint" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
+        next_overlap_patch_family = "enable_p2p_overlap"
+    elif dominant == "memory_bound":
+        next_schedule_family = next_schedule_family if interleaved else "interleaved"
+        next_partition_patch_family = "enable_nonuniform_partition"
+        next_memory_patch_family = "add_offload_policy"
+        next_overlap_patch_family = "enable_reload_overlap"
+    elif dominant == "comm_bound":
+        next_schedule_family = "interleaved" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
+        next_partition_patch_family = "change_stage_boundary"
+        next_memory_patch_family = "preserve_memory_policy"
+        next_overlap_patch_family = "enable_p2p_overlap"
+    elif dominant == "tail_bound":
+        next_schedule_family = "dualpipe_v" if interleaved else "interleaved"
+        next_partition_patch_family = "tail_aware_stage_local_vpp"
+        next_memory_patch_family = "preserve_memory_policy"
+        next_overlap_patch_family = "enable_optimizer_tail_overlap"
+    elif dominant == "reload_bound":
+        next_schedule_family = next_schedule_family
+        next_partition_patch_family = "preserve_partition"
+        next_memory_patch_family = "tune_reload_prefetch"
+        next_overlap_patch_family = "enable_reload_overlap"
+    elif dominant == "optimizer_bound":
+        next_schedule_family = next_schedule_family
+        next_partition_patch_family = "preserve_partition"
+        next_memory_patch_family = "preserve_memory_policy"
+        next_overlap_patch_family = "enable_optimizer_tail_overlap"
+    else:
+        next_schedule_family = "dualpipe_v" if interleaved and bubble_ratio >= 0.10 else next_schedule_family
+        next_partition_patch_family = "change_stage_boundary" if bubble_ratio >= 0.10 else "preserve_partition"
+        next_memory_patch_family = "add_offload_policy" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
+        next_overlap_patch_family = "enable_p2p_overlap" if comm_exposure_ratio >= 0.12 else "preserve_overlap_policy"
+
+    if peak_reserved_ratio >= 0.98:
+        stop_signal = "memory_saturation"
+    elif comm_exposure_ratio >= 0.30 and bubble_ratio <= 0.05:
+        stop_signal = "comm_hard_bound"
+    elif bubble_ratio <= 0.04 and peak_reserved_ratio <= 0.78 and optimizer_exposed_ratio <= 0.12 and reload_stall_ratio <= 0.05:
+        stop_signal = "candidate_convergence"
+
+    return {
+        "next_schedule_family": str(next_schedule_family),
+        "next_partition_patch_family": str(next_partition_patch_family),
+        "next_memory_patch_family": str(next_memory_patch_family),
+        "next_overlap_patch_family": str(next_overlap_patch_family),
+        "stop_signal": str(stop_signal),
+    }
+
+
+def _grid_kind_for_event(event: Dict[str, Any]) -> str:
+    op_kind = str(event.get("op_kind") or "").strip().lower()
+    if op_kind == "fwd":
+        return "FWD"
+    if op_kind == "bwd":
+        label = str(event.get("label") or "").strip().upper()
+        return "WGRAD_OPT" if label.startswith("W") else "BWD_ACT"
+    if op_kind == "comm":
+        return "COMM"
+    if op_kind == "offload":
+        return "OFFLOAD"
+    if op_kind == "reload":
+        return "RELOAD"
+    return "BUBBLE"
+
+
+def _build_pipeline_grid_trace(
+    program: MegatronProgram,
+    event_trace: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary = dict(event_trace.get("summary") or {})
+    events = list(event_trace.get("events") or [])
+    lane_summaries = list(event_trace.get("lane_summaries") or [])
+    if not events or not lane_summaries:
+        return {}
+    slot_ms = max(float(summary.get("slot_ms") or 0.0), 1e-6)
+    time_slots = 0
+    for item in events:
+        start_slot = max(int(round(float(item.get("start_ms") or 0.0) / slot_ms)), 0)
+        span_slots = max(int(round(float(item.get("duration_ms") or 0.0) / slot_ms)), 1)
+        time_slots = max(time_slots, start_slot + span_slots)
+    stage_ids = [int(item.get("stage_id") or 0) for item in lane_summaries]
+    cells: List[Dict[str, Any]] = []
+    primary_occupancy: Dict[int, set[int]] = {stage_id: set() for stage_id in stage_ids}
+    counts: Dict[str, int] = {key: 0 for key in ("FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD", "BUBBLE")}
+    palette = {
+        "FWD": "#4C78A8",
+        "BWD_ACT": "#F58518",
+        "WGRAD_OPT": "#E45756",
+        "COMM": "#B279A2",
+        "OFFLOAD": "#8C6D31",
+        "RELOAD": "#54A24B",
+        "BUBBLE": "#D9D9D9",
+    }
+    for item in events:
+        stage_id = int(item.get("stage_id") or 0)
+        kind = _grid_kind_for_event(item)
+        lane_id = 1 if kind in {"COMM", "OFFLOAD", "RELOAD"} else 0
+        start_slot = max(int(round(float(item.get("start_ms") or 0.0) / slot_ms)), 0)
+        span_slots = max(int(round(float(item.get("duration_ms") or 0.0) / slot_ms)), 1)
+        for slot in range(start_slot, start_slot + span_slots):
+            cells.append(
+                {
+                    "stage_id": stage_id,
+                    "lane_id": lane_id,
+                    "time_slot": int(slot),
+                    "kind": kind,
+                    "label": str(item.get("label") or ""),
+                    "microbatch_id": int(item.get("microbatch_id") or 0),
+                    "vchunk_id": int(item.get("chunk_id") or 0),
+                    "evidence_source": str(item.get("evidence_source") or "observed"),
+                    "color": palette[kind],
+                }
+            )
+            counts[kind] = counts.get(kind, 0) + 1
+            if lane_id == 0 and kind != "BUBBLE":
+                primary_occupancy.setdefault(stage_id, set()).add(int(slot))
+    for stage_id in stage_ids:
+        occupied = primary_occupancy.setdefault(stage_id, set())
+        for slot in range(max(time_slots, 1)):
+            if slot in occupied:
+                continue
+            cells.append(
+                {
+                    "stage_id": int(stage_id),
+                    "lane_id": 0,
+                    "time_slot": int(slot),
+                    "kind": "BUBBLE",
+                    "label": "",
+                    "microbatch_id": -1,
+                    "vchunk_id": -1,
+                    "evidence_source": "derived",
+                    "color": palette["BUBBLE"],
+                }
+            )
+            counts["BUBBLE"] = counts.get("BUBBLE", 0) + 1
+    return {
+        "format": "pipeline_grid_trace",
+        "source": "pipeline_event_trace",
+        "family": str(summary.get("schedule_template") or program.schedule.template or "fixed_1f1b"),
+        "lanes": 2,
+        "time_slots": int(max(time_slots, 1)),
+        "stage_count": len(stage_ids),
+        "vstage_count": max(int(summary.get("vpp_degree") or 1), 1),
+        "microbatch_count": max(int(summary.get("estimated_microbatches") or 1), 1),
+        "weight_version_policy": str((program.schedule_ir.weight_version_policy if program.schedule_ir is not None else "default") or "default"),
+        "constraints": {
+            "slot_ms": round(slot_ms, 4),
+            "projected_timeline_span_ms": round(float(summary.get("projected_timeline_span_ms") or 0.0), 4),
+        },
+        "lane_summaries": lane_summaries,
+        "counts": counts,
+        "cells": sorted(cells, key=lambda item: (int(item.get("stage_id") or 0), int(item.get("lane_id") or 0), int(item.get("time_slot") or 0))),
+        "notes": [
+            "lane 0 is compute-primary and bubble occupancy",
+            "lane 1 is overlap-capable communication or memory-action overlay",
+        ],
+    }
+
+
+def _build_compare_pipeline_svg(grid_trace: Dict[str, Any]) -> Dict[str, Any]:
+    cells = list(grid_trace.get("cells") or [])
+    lane_summaries = list(grid_trace.get("lane_summaries") or [])
+    if not cells or not lane_summaries:
+        return {}
+    time_slots = max(int(grid_trace.get("time_slots") or 0), 1)
+    lanes = max(int(grid_trace.get("lanes") or 1), 1)
+    stage_count = max(int(grid_trace.get("stage_count") or len(lane_summaries)), 1)
+    slot_w = 18
+    cell_h = 16
+    row_gap = 6
+    stage_gap = 10
+    label_w = 112
+    chart_w = time_slots * slot_w
+    width = label_w + chart_w + 220
+    height = 78 + stage_count * (lanes * (cell_h + row_gap) + stage_gap) + 42
+    colors = {
+        "FWD": "#4C78A8",
+        "BWD_ACT": "#F58518",
+        "WGRAD_OPT": "#E45756",
+        "COMM": "#B279A2",
+        "OFFLOAD": "#8C6D31",
+        "RELOAD": "#54A24B",
+        "BUBBLE": "#D9D9D9",
+    }
+    lines: List[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        "<style>",
+        "text { font-family: Consolas, 'Courier New', monospace; fill: #1f1f1f; }",
+        ".title { font-size: 15px; font-weight: 700; }",
+        ".sub { font-size: 11px; fill: #555; }",
+        ".label { font-size: 11px; }",
+        ".metric { font-size: 10px; fill: #444; }",
+        "</style>",
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
+        f'<text class="title" x="16" y="24">Pipeline Grid Compare :: {escape(str(grid_trace.get("family") or "unknown"))}</text>',
+        f'<text class="sub" x="16" y="42">Single-trial grid view for baseline-vs-candidate diagnosis; explicit cell kinds make bubble/comm/offload visible.</text>',
+    ]
+    chart_x = label_w
+    chart_y = 58
+    lane_offset = {0: 0, 1: cell_h + row_gap}
+    stage_index = {int(item.get("stage_id") or 0): idx for idx, item in enumerate(lane_summaries)}
+    for stage_id, idx in stage_index.items():
+        base_y = chart_y + idx * (lanes * (cell_h + row_gap) + stage_gap)
+        lane = lane_summaries[idx]
+        lines.append(f'<text class="label" x="16" y="{base_y + 13}">Stage {stage_id}</text>')
+        lines.append(f'<text class="metric" x="16" y="{base_y + 27}">{escape(str(lane.get("role") or "normal"))}</text>')
+        for lane_id in range(lanes):
+            lane_y = base_y + lane_offset.get(lane_id, 0)
+            lines.append(f'<rect x="{chart_x}" y="{lane_y}" width="{chart_w}" height="{cell_h}" fill="#fafafa" stroke="#dcdcdc"/>')
+    for cell in cells:
+        stage_id = int(cell.get("stage_id") or 0)
+        if stage_id not in stage_index:
+            continue
+        lane_id = int(cell.get("lane_id") or 0)
+        base_y = chart_y + stage_index[stage_id] * (lanes * (cell_h + row_gap) + stage_gap)
+        y = base_y + lane_offset.get(lane_id, 0)
+        x = chart_x + int(cell.get("time_slot") or 0) * slot_w
+        kind = str(cell.get("kind") or "BUBBLE")
+        color = str(cell.get("color") or colors.get(kind, "#cccccc"))
+        lines.append(f'<rect x="{x}" y="{y}" width="{slot_w - 1}" height="{cell_h - 1}" fill="{color}" stroke="#ffffff" stroke-width="0.4"/>')
+    counts = dict(grid_trace.get("counts") or {})
+    summary_x = chart_x + chart_w + 18
+    summary_y = chart_y + 8
+    lines.append(f'<text class="label" x="{summary_x}" y="{summary_y}">Current Trial Summary</text>')
+    for idx, key in enumerate(["FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD", "BUBBLE"]):
+        y = summary_y + 18 + idx * 16
+        lines.append(f'<rect x="{summary_x}" y="{y - 9}" width="10" height="10" fill="{colors[key]}"/>')
+        lines.append(f'<text class="metric" x="{summary_x + 14}" y="{y}">{escape(key)}: {int(counts.get(key) or 0)}</text>')
+    legend_y = height - 18
+    legend_x = 16
+    for key in ["FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD", "BUBBLE"]:
+        lines.append(f'<rect x="{legend_x}" y="{legend_y - 10}" width="10" height="10" fill="{colors[key]}"/>')
+        lines.append(f'<text class="metric" x="{legend_x + 14}" y="{legend_y}">{escape(key)}</text>')
+        legend_x += 104
+    lines.append("</svg>")
+    return {
+        "format": "svg_inline",
+        "content": "\n".join(lines),
+        "source": "pipeline_grid_trace",
     }
 
 
@@ -3326,6 +3914,8 @@ def _build_context_from_trace(
     merged: Dict[str, Any],
 ) -> Dict[str, Any]:
     norm = program.normalized()
+    runtime_schedule_traces = list(merged.get("runtime_schedule_traces") or [])
+    runtime_trace_metrics = _runtime_trace_metrics(runtime_schedule_traces)
     backend_context = _detect_backend_context(norm, merged)
     bubble_ratio = float(trace_summary.get("bubble_ratio") or 0.0)
     cross_node_ratio = float(trace_summary.get("cross_node_exposed_ratio") or 0.0)
@@ -3423,6 +4013,15 @@ def _build_context_from_trace(
         "backend_family": str(backend_context.get("backend_family") or "megatron_core"),
         "schedule_template": str(norm.schedule.template),
     }
+    if runtime_trace_metrics:
+        runtime_evidence["runtime_comm_ms"] = float(runtime_trace_metrics.get("runtime_comm_ms") or 0.0)
+        runtime_evidence["reload_stall_ms"] = float(runtime_trace_metrics.get("reload_stall_ms") or 0.0)
+        runtime_evidence["offload_overlap_success_ratio"] = float(
+            runtime_trace_metrics.get("offload_overlap_success_ratio") or 0.0
+        )
+        if float(runtime_evidence.get("comm_exposure_ratio") or 0.0) <= 0.0 and steady_state_p50 > 0.0:
+            runtime_evidence["comm_exposure_ratio"] = float(runtime_evidence.get("runtime_comm_ms") or 0.0) / max(steady_state_p50, 1.0)
+        runtime_evidence["reload_stall_ratio"] = float(runtime_evidence.get("reload_stall_ms") or 0.0) / max(steady_state_p50, 1.0)
     local_window_observability = _build_local_window_observability(norm, stage_evidence, runtime_evidence)
     runtime_evidence.update(local_window_observability)
     evidence_record = {
@@ -3476,6 +4075,11 @@ def _build_context_from_trace(
         },
         bottleneck_signature=bottleneck_signature,
     )
+    next_step_hypotheses = _build_next_step_hypotheses(
+        norm,
+        runtime_evidence,
+        bottleneck_signature,
+    )
     bottleneck_breakdown = _build_bottleneck_breakdown(stage_evidence, subgraph_evidence, runtime_evidence)
     stage_cost_model = _derive_stage_costs(norm, stage_evidence, runtime_evidence)
     boundary_semantics = _build_boundary_semantics(norm, stage_evidence, runtime_evidence)
@@ -3523,8 +4127,17 @@ def _build_context_from_trace(
     search_space_blueprint = _search_space_blueprint(norm, runtime_evidence, backend_context, bottleneck_signature)
     perfetto_trace = _build_perfetto_trace(norm, stage_evidence, subgraph_evidence, runtime_evidence)
     pipeline_schedule_projection = _build_pipeline_schedule_projection(norm, stage_evidence, runtime_evidence, backend_context)
-    pipeline_event_trace = _build_pipeline_event_trace(norm, pipeline_schedule_projection)
+    pipeline_event_trace = (
+        _build_runtime_pipeline_event_trace(norm, runtime_schedule_traces)
+        or _build_pipeline_event_trace(norm, pipeline_schedule_projection)
+    )
+    pipeline_grid_trace = _build_runtime_pipeline_grid_trace(
+        norm,
+        runtime_schedule_traces,
+        pipeline_event_trace,
+    )
     pipeline_projection_svg = _build_pipeline_projection_svg(pipeline_schedule_projection, pipeline_event_trace)
+    compare_pipeline_svg = _build_compare_pipeline_svg(pipeline_grid_trace)
     return {
         "hardware_context": hardware_context,
         "backend_context": backend_context,
@@ -3547,17 +4160,21 @@ def _build_context_from_trace(
             "critical_operator_clusters": critical_operator_clusters,
             "runtime_branch_plan": runtime_branch_plan,
             "search_space_blueprint": search_space_blueprint,
+            "next_step_hypotheses": next_step_hypotheses,
             "visualization_artifacts": {
                 "perfetto_trace": perfetto_trace,
                 "pipeline_schedule_projection": pipeline_schedule_projection,
                 "pipeline_event_trace": pipeline_event_trace,
+                "pipeline_grid_trace": pipeline_grid_trace,
                 "pipeline_projection_svg": pipeline_projection_svg,
+                "compare_pipeline_svg": compare_pipeline_svg,
                 "viewer_hint": "perfetto_trace can be opened directly in Perfetto for a synthetic nsys-like stage timeline.",
             },
         },
         "failure_modes": failure_modes,
         "derived_bottlenecks": derived_bottlenecks,
         "optimization_hints": optimization_hints,
+        "next_step_hypotheses": next_step_hypotheses,
     }
 
 
@@ -3663,16 +4280,26 @@ def build_trial_artifact(
     context_record: Dict[str, Any] | AgentObservation,
     bottleneck_signature: Optional[Dict[str, Any]] = None,
     experiment: Optional[ExperimentSpec] = None,
+    search_unit: Optional[str] = None,
+    patch_memory_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     observation = (
         context_record.normalized()
         if isinstance(context_record, AgentObservation)
         else AgentObservation.from_dict(context_record or {}).normalized()
     )
+    patch_family = infer_program_patch_family(program)
+    patch_category = infer_program_patch_category(program)
+    patch_count = infer_program_patch_count(program)
     runtime = dict(observation.runtime_evidence or {})
     evidence = dict(observation.evidence_record or {})
     return {
         "program_kind": str(program.metadata.get("program_kind") or "program"),
+        "patch_family": patch_family,
+        "patch_category": patch_category,
+        "patch_count": int(patch_count),
+        "search_unit": str(search_unit or "patch"),
+        "patch_memory_enabled": bool(True if patch_memory_enabled is None else patch_memory_enabled),
         "backend_context": dict(observation.backend_context or {}),
         "schedule_template": str(program.schedule.template),
         "length_bucket": str(observation.workload_context.get("length_bucket") or "default"),
@@ -3695,7 +4322,16 @@ def build_trial_artifact(
         "morphable_pipeline_plan": dict(evidence.get("morphable_pipeline_plan") or {}),
         "critical_operator_clusters": list(evidence.get("critical_operator_clusters") or []),
         "runtime_branch_plan": dict(evidence.get("runtime_branch_plan") or {}),
+        "next_step_hypotheses": dict(evidence.get("next_step_hypotheses") or {}),
         "visualization_artifacts": dict(evidence.get("visualization_artifacts") or {}),
+        "runtime_trace_summary": {
+            "wait_ms": float(runtime.get("runtime_wait_ms") or 0.0),
+            "comm_ms": float(runtime.get("runtime_comm_ms") or 0.0),
+            "reload_stall_ms": float(runtime.get("reload_stall_ms") or 0.0),
+            "planned_vs_observed_event_count_delta": int(runtime.get("planned_vs_observed_event_count_delta") or 0),
+            "planned_vs_observed_slot_delta": int(runtime.get("planned_vs_observed_slot_delta") or 0),
+            "action_type_duration_breakdown": dict(runtime.get("action_type_duration_breakdown") or {}),
+        },
         "search_space_blueprint": dict(evidence.get("search_space_blueprint") or {}),
         "decomposition": {
             "bubble_ratio": float(runtime.get("bubble_ratio") or 0.0),
@@ -3825,27 +4461,29 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
     tail_ratio = _safe_float(runtime_payload.get("stage_tail_ratio")) or 0.0
     comm_exposure_ratio = _safe_float(runtime_payload.get("comm_exposure_ratio")) or 0.0
     mem_skew_ratio = _safe_float(runtime_payload.get("mem_skew_ratio")) or 0.0
+    reload_stall_ratio = _safe_float(runtime_payload.get("reload_stall_ratio")) or 0.0
+    optimizer_exposed_ratio = _safe_float(runtime_payload.get("optimizer_exposed_ratio")) or 0.0
     seq_len = int(norm.metadata.get("seq_len", 1024) or 1024)
     failure_modes = [str(item.get("label")) for item in (trace_summary.get("failure_modes") or [])]
     derived_labels = [str(item.get("label")) for item in (trace_summary.get("derived_bottlenecks") or [])]
 
-    labels: List[str] = []
+    legacy_labels: List[str] = []
     if tp_proxy >= 3.0 and int(norm.parallel.tp_degree) >= 4:
-        labels.append("tp_overpartitioned")
+        legacy_labels.append("tp_overpartitioned")
     if stage_load_variance >= 0.03 or bubble_ratio >= 0.12:
-        labels.append("stage_imbalanced")
+        legacy_labels.append("stage_imbalanced")
     if tail_ratio >= 0.12:
-        labels.append("tail_heavy")
+        legacy_labels.append("tail_heavy")
     if comm_exposure_ratio >= 0.12:
-        labels.append("comm_exposed")
+        legacy_labels.append("comm_exposed")
     if mem_skew_ratio >= 0.12:
-        labels.append("memory_skew")
+        legacy_labels.append("memory_skew")
     if seq_len >= 2048 and int(norm.parallel.cp_degree) == 1:
-        labels.append("long_context_attention_heavy")
+        legacy_labels.append("long_context_attention_heavy")
     if peak_reserved_ratio > 0 and peak_reserved_ratio < 0.75:
-        labels.append("memory_underfilled")
+        legacy_labels.append("memory_underfilled")
     if bool(trace_summary.get("oom")) or peak_reserved_ratio >= 0.90:
-        labels.append("memory_bound")
+        legacy_labels.append("memory_bound")
     for label in failure_modes + derived_labels:
         if label in {"tp_overpartitioned", "memory_hotspot", "compute_imbalance", "communication_drag", "schedule_coupling", "tail_heavy", "memory_skew", "comm_exposed", "topology_mismatch"}:
             mapped = {
@@ -3858,22 +4496,56 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
                 "comm_exposed": "comm_exposed",
                 "topology_mismatch": "comm_exposed",
             }.get(label, label)
-            if mapped not in labels:
-                labels.append(mapped)
+            if mapped not in legacy_labels:
+                legacy_labels.append(mapped)
+
+    canonical_labels: List[str] = []
+    if bool(trace_summary.get("oom")) or peak_reserved_ratio >= 0.90 or mem_skew_ratio >= 0.16:
+        canonical_labels.append("memory_bound")
+    if bubble_ratio >= 0.12 or stage_load_variance >= 0.03:
+        canonical_labels.append("bubble_bound")
+    if tail_ratio >= 0.12:
+        canonical_labels.append("tail_bound")
+    if comm_exposure_ratio >= 0.12 or (tp_proxy >= 3.0 and int(norm.parallel.tp_degree) >= 4):
+        canonical_labels.append("comm_bound")
+    if reload_stall_ratio >= 0.08:
+        canonical_labels.append("reload_bound")
+    if optimizer_exposed_ratio >= 0.18:
+        canonical_labels.append("optimizer_bound")
+    if len(canonical_labels) > 1:
+        canonical_labels.append("mixed_bound")
+    if not canonical_labels:
+        canonical_labels = ["bubble_bound"] if bubble_ratio > 0.0 else ["mixed_bound"]
 
     priority = [
         "memory_bound",
+        "optimizer_bound",
+        "reload_bound",
+        "comm_bound",
+        "tail_bound",
+        "bubble_bound",
+        "mixed_bound",
+    ]
+    canonical_dominant = next((label for label in priority if label in canonical_labels), "mixed_bound")
+    legacy_priority = [
+        "tp_overpartitioned",
+        "memory_bound",
+        "stage_imbalanced",
         "tail_heavy",
         "comm_exposed",
-        "tp_overpartitioned",
-        "stage_imbalanced",
+        "memory_skew",
         "long_context_attention_heavy",
         "memory_underfilled",
+        "balanced",
     ]
-    dominant = next((label for label in priority if label in labels), "balanced")
+    legacy_labels = legacy_labels or ["balanced"]
+    dominant = next((label for label in legacy_priority if label in legacy_labels), legacy_labels[0])
     return {
         "dominant_label": dominant,
-        "labels": labels or ["balanced"],
+        "labels": legacy_labels,
+        "canonical_dominant_label": canonical_dominant,
+        "canonical_labels": canonical_labels,
+        "legacy_labels": legacy_labels,
         "supporting_metrics": {
             "tp_overpartition_proxy": tp_proxy,
             "bubble_ratio": bubble_ratio,
@@ -3882,6 +4554,8 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
             "stage_tail_ratio": tail_ratio,
             "comm_exposure_ratio": comm_exposure_ratio,
             "mem_skew_ratio": mem_skew_ratio,
+            "reload_stall_ratio": reload_stall_ratio,
+            "optimizer_exposed_ratio": optimizer_exposed_ratio,
         },
     }
 

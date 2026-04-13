@@ -54,7 +54,10 @@ def summarize_state_for_memory(search_state: Optional[Dict[str, Any]]) -> Dict[s
     return {
         "model_track": str(model.get("model_track") or "dense"),
         "model_name": str(model.get("model_name") or ""),
+        "size_bucket": str(model.get("size_bucket") or model.get("model_name") or ""),
         "run_target": str(hardware.get("run_target") or ""),
+        "hardware_profile": str(hardware.get("hardware_profile") or hardware.get("run_target") or ""),
+        "backend_family": str(hardware.get("backend_family") or policy.get("backend_family") or ""),
         "world_size": int(hardware.get("world_size") or 0),
         "pp_degree": int(policy.get("pp_degree") or 1),
         "vpp_degree": int(policy.get("vpp_degree") or 1),
@@ -69,6 +72,7 @@ def summarize_state_for_memory(search_state: Optional[Dict[str, Any]]) -> Dict[s
         "active_labels": _clean_string_list(search_state.get("active_labels") or []),
         "triggered_families": _clean_string_list(search_state.get("triggered_families") or []),
         "runtime_schedule_family": str(policy.get("runtime_schedule_family") or ""),
+        "bottleneck_signature": str(search_state.get("bottleneck_signature") or ""),
     }
 
 
@@ -330,6 +334,7 @@ class PolicyMemoryBank:
     cases: List[PolicyCase] = field(default_factory=list)
     family_scores: Dict[str, FamilyScore] = field(default_factory=dict)
     threshold_calibration: ThresholdCalibration = field(default_factory=ThresholdCalibration)
+    patch_memory: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     max_cases: int = 256
 
     def normalized(self) -> "PolicyMemoryBank":
@@ -341,6 +346,11 @@ class PolicyMemoryBank:
         }
         if not isinstance(norm.threshold_calibration, ThresholdCalibration):
             norm.threshold_calibration = ThresholdCalibration.from_dict(norm.threshold_calibration or {})
+        norm.patch_memory = {
+            str(key): copy.deepcopy(value)
+            for key, value in dict(norm.patch_memory or {}).items()
+            if isinstance(value, dict)
+        }
         norm.max_cases = max(int(norm.max_cases or 256), 1)
         return norm
 
@@ -350,6 +360,7 @@ class PolicyMemoryBank:
             "cases": [case.to_dict() for case in norm.cases],
             "family_scores": {str(key): value.to_dict() for key, value in norm.family_scores.items()},
             "threshold_calibration": norm.threshold_calibration.to_dict(),
+            "patch_memory": copy.deepcopy(norm.patch_memory),
             "max_cases": int(norm.max_cases),
         }
 
@@ -362,6 +373,11 @@ class PolicyMemoryBank:
                 for key, value in dict(payload.get("family_scores") or {}).items()
             },
             threshold_calibration=ThresholdCalibration.from_dict(payload.get("threshold_calibration") or {}),
+            patch_memory={
+                str(key): copy.deepcopy(value)
+                for key, value in dict(payload.get("patch_memory") or {}).items()
+                if isinstance(value, dict)
+            },
             max_cases=_safe_int(payload.get("max_cases"), 256),
         )
 
@@ -395,9 +411,50 @@ class PolicyMemoryBank:
             score.record(case.outcome, case.reflection)
             norm.family_scores[family] = score
         norm.threshold_calibration.observe(state_summary)
+        patch_family = str((case.local_policy or {}).get("patch_family") or family or "")
+        bottleneck_signature = str(state_summary.get("bottleneck_signature") or "")
+        patch_key = json.dumps(
+            {
+                "model_family": str(state_summary.get("model_track") or "dense"),
+                "size_bucket": str(state_summary.get("size_bucket") or state_summary.get("model_name") or ""),
+                "hardware_profile": str(state_summary.get("hardware_profile") or state_summary.get("run_target") or ""),
+                "backend_family": str(state_summary.get("backend_family") or ""),
+                "bottleneck_signature": bottleneck_signature,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        entry = copy.deepcopy(norm.patch_memory.get(patch_key) or {})
+        entry.setdefault("schedule_family", str(state_summary.get("runtime_schedule_family") or family or ""))
+        entry.setdefault("useful_patch_families", [])
+        entry.setdefault("harmful_patch_families", [])
+        entry.setdefault("uncertain_patch_families", [])
+        entry.setdefault("pareto_stats", {"attempts": 0, "successes": 0, "best_step_improvement_ms": 0.0, "best_throughput_gain": 0.0})
+        entry.setdefault("recent_failure_signatures", [])
+        if patch_family:
+            if case.outcome.success and (_safe_float(case.outcome.step_improvement_ms) > 0.0 or _safe_float(case.outcome.throughput_gain) > 0.0):
+                if patch_family not in entry["useful_patch_families"]:
+                    entry["useful_patch_families"].append(patch_family)
+            elif case.outcome.oom or case.outcome.launch_failure or not case.outcome.success:
+                if patch_family not in entry["harmful_patch_families"]:
+                    entry["harmful_patch_families"].append(patch_family)
+                if case.reflection.failure_sources:
+                    entry["recent_failure_signatures"].append(",".join(case.reflection.failure_sources))
+            elif patch_family not in entry["uncertain_patch_families"]:
+                entry["uncertain_patch_families"].append(patch_family)
+        pareto = dict(entry.get("pareto_stats") or {})
+        pareto["attempts"] = int(pareto.get("attempts") or 0) + 1
+        if case.outcome.success:
+            pareto["successes"] = int(pareto.get("successes") or 0) + 1
+        pareto["best_step_improvement_ms"] = max(_safe_float(pareto.get("best_step_improvement_ms")), _safe_float(case.outcome.step_improvement_ms))
+        pareto["best_throughput_gain"] = max(_safe_float(pareto.get("best_throughput_gain")), _safe_float(case.outcome.throughput_gain))
+        entry["pareto_stats"] = pareto
+        entry["recent_failure_signatures"] = list(entry["recent_failure_signatures"])[-8:]
+        norm.patch_memory[patch_key] = entry
         self.cases = norm.cases
         self.family_scores = norm.family_scores
         self.threshold_calibration = norm.threshold_calibration
+        self.patch_memory = norm.patch_memory
 
     def retrieve_cases(
         self,
@@ -441,3 +498,99 @@ class PolicyMemoryBank:
             reverse=True,
         )
         return entries
+
+    def recommend_patch_families(
+        self,
+        search_state: Optional[Dict[str, Any]],
+        *,
+        top_k: int = 6,
+    ) -> Dict[str, Any]:
+        target = summarize_state_for_memory(search_state)
+        ranked: List[Dict[str, Any]] = []
+        for raw_key, raw_value in dict(self.patch_memory or {}).items():
+            try:
+                key_payload = json.loads(str(raw_key))
+            except Exception:
+                continue
+            if not isinstance(key_payload, dict) or not isinstance(raw_value, dict):
+                continue
+            candidate_state = {
+                "model_track": str(key_payload.get("model_family") or ""),
+                "size_bucket": str(key_payload.get("size_bucket") or ""),
+                "hardware_profile": str(key_payload.get("hardware_profile") or ""),
+                "backend_family": str(key_payload.get("backend_family") or ""),
+                "bottleneck_signature": str(key_payload.get("bottleneck_signature") or ""),
+                "run_target": str(key_payload.get("hardware_profile") or ""),
+            }
+            similarity = _state_similarity(target, candidate_state)
+            pareto = dict(raw_value.get("pareto_stats") or {})
+            attempts = max(int(pareto.get("attempts") or 0), 1)
+            successes = int(pareto.get("successes") or 0)
+            success_ratio = float(successes) / float(attempts)
+            ranked.append(
+                {
+                    "similarity": float(similarity),
+                    "success_ratio": float(success_ratio),
+                    "schedule_family": str(raw_value.get("schedule_family") or ""),
+                    "useful_patch_families": _clean_string_list(raw_value.get("useful_patch_families") or []),
+                    "harmful_patch_families": _clean_string_list(raw_value.get("harmful_patch_families") or []),
+                    "uncertain_patch_families": _clean_string_list(raw_value.get("uncertain_patch_families") or []),
+                    "recent_failure_signatures": _clean_string_list(raw_value.get("recent_failure_signatures") or []),
+                    "pareto_stats": pareto,
+                    "state_key": copy.deepcopy(key_payload),
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                float(item.get("similarity") or 0.0),
+                float(item.get("success_ratio") or 0.0),
+                float((item.get("pareto_stats") or {}).get("best_throughput_gain") or 0.0),
+                float((item.get("pareto_stats") or {}).get("best_step_improvement_ms") or 0.0),
+            ),
+            reverse=True,
+        )
+        useful: List[str] = []
+        harmful: List[str] = []
+        uncertain: List[str] = []
+        schedule_families: List[str] = []
+        failure_signatures: List[str] = []
+        for entry in ranked[: max(int(top_k), 0)]:
+            schedule_family = str(entry.get("schedule_family") or "").strip()
+            if schedule_family and schedule_family not in schedule_families:
+                schedule_families.append(schedule_family)
+            for family in _clean_string_list(entry.get("useful_patch_families") or []):
+                if family not in useful:
+                    useful.append(family)
+            for family in _clean_string_list(entry.get("harmful_patch_families") or []):
+                if family not in harmful:
+                    harmful.append(family)
+            for family in _clean_string_list(entry.get("uncertain_patch_families") or []):
+                if family not in uncertain:
+                    uncertain.append(family)
+            for signature in _clean_string_list(entry.get("recent_failure_signatures") or []):
+                if signature not in failure_signatures:
+                    failure_signatures.append(signature)
+        return {
+            "state_summary": target,
+            "matched_entries": ranked[: max(int(top_k), 0)],
+            "schedule_families": schedule_families,
+            "useful_patch_families": useful,
+            "harmful_patch_families": harmful,
+            "uncertain_patch_families": [family for family in uncertain if family not in useful and family not in harmful],
+            "recent_failure_signatures": failure_signatures[:8],
+        }
+
+    def should_avoid_patch_family(
+        self,
+        search_state: Optional[Dict[str, Any]],
+        patch_family: str,
+        *,
+        top_k: int = 6,
+    ) -> bool:
+        token = str(patch_family or "").strip()
+        if not token:
+            return False
+        guidance = self.recommend_patch_families(search_state, top_k=top_k)
+        harmful = set(_clean_string_list(guidance.get("harmful_patch_families") or []))
+        useful = set(_clean_string_list(guidance.get("useful_patch_families") or []))
+        return token in harmful and token not in useful

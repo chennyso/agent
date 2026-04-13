@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +23,8 @@ from megatron_agent.config import (
     ReplanDecision,
     MachineProfile,
     MegatronProgram,
+    PatchProposal,
+    ProgramPatchSpec,
     SearchSpaceSpec,
     VerifierReport,
     default_backend_caps,
@@ -40,6 +44,7 @@ from megatron_agent.feedback_optimizer import (
     reorder_agent_proposals_with_feedback,
 )
 from megatron_agent.policy_memory import PolicyMemoryBank
+from megatron_agent.policy_memory import summarize_state_for_memory
 from megatron_agent.programs import (
     assess_vpp_comm_tradeoff,
     check_program,
@@ -51,8 +56,9 @@ from megatron_agent.programs import (
 from megatron_agent.trace_reducer import (
     build_agent_observation,
     build_context_record,
-    build_trial_artifact,
     build_program_bank,
+    build_trial_artifact,
+    classify_patch_category,
     classify_bottleneck,
     detect_failure_modes,
     reduce_trial_trace,
@@ -71,6 +77,372 @@ from megatron_agent.trial_runner import (
 
 def _progress(message: str) -> None:
     print(f"[megatron_agent] {message}", flush=True)
+
+
+@dataclass
+class SearchTreeNode:
+    node_id: str
+    depth: int
+    state_summary: Dict[str, Any] = field(default_factory=dict)
+    patch_sequence: List[Dict[str, Any]] = field(default_factory=list)
+    patch_family: str = ""
+    visits: int = 0
+    total_value: float = 0.0
+    priority: float = 0.0
+    priority_reason: List[str] = field(default_factory=list)
+    children: List["SearchTreeNode"] = field(default_factory=list)
+    last_result: Dict[str, Any] = field(default_factory=dict)
+
+    def mean_value(self) -> float:
+        return float(self.total_value) / float(self.visits) if int(self.visits) > 0 else 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "depth": int(self.depth),
+            "state_summary": copy.deepcopy(self.state_summary),
+            "patch_sequence": copy.deepcopy(self.patch_sequence),
+            "patch_family": self.patch_family,
+            "visits": int(self.visits),
+            "total_value": round(float(self.total_value), 6),
+            "mean_value": round(self.mean_value(), 6),
+            "priority": round(float(self.priority), 6),
+            "priority_reason": list(self.priority_reason or []),
+            "last_result": copy.deepcopy(self.last_result),
+            "children": [child.to_dict() for child in (self.children or [])],
+        }
+
+
+def _proposal_patch_family_token(proposal: Optional[Any]) -> str:
+    if proposal is None:
+        return ""
+    if isinstance(proposal, PatchProposal):
+        return str(proposal.patch_family or "").strip()
+    program = getattr(proposal, "program", None)
+    if program is not None:
+        patch = getattr(program, "applied_patch", None)
+        if patch is not None:
+            return str(getattr(patch, "patch_family", "") or "").strip()
+        metadata = dict(getattr(program, "metadata", {}) or {})
+        token = str(metadata.get("patch_family") or "").strip()
+        if token:
+            return token
+    return str(getattr(proposal, "patch_family", "") or "").strip()
+
+
+def _proposal_target_scope_token(proposal: Optional[Any]) -> str:
+    if proposal is None:
+        return "program"
+    if isinstance(proposal, PatchProposal):
+        return str(proposal.target_scope or "program").strip() or "program"
+    program = getattr(proposal, "program", None)
+    if program is not None and getattr(program, "applied_patch", None) is not None:
+        return str(program.applied_patch.target_scope or "program").strip() or "program"
+    return "program"
+
+
+def _proposal_priority_value(proposal: Optional[Any]) -> int:
+    try:
+        return int(getattr(proposal, "priority_rank", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _search_unit(args: argparse.Namespace) -> str:
+    token = str(getattr(args, "search_unit", "patch") or "patch").strip().lower()
+    return token if token in {"patch", "whole_config"} else "patch"
+
+
+def _patch_memory_enabled(args: argparse.Namespace) -> bool:
+    return _search_unit(args) == "patch" and not bool(getattr(args, "disable_patch_memory", False))
+
+
+def _proposal_patch_category(proposal: Optional[Any]) -> str:
+    target_scope = _proposal_target_scope_token(proposal)
+    return classify_patch_category(_proposal_patch_family_token(proposal), target_scope=target_scope)
+
+
+def _proposal_schedule_family(proposal: Optional[Any]) -> str:
+    program = getattr(proposal, "program", None)
+    if program is None:
+        return ""
+    norm = program.normalized()
+    return str(norm.schedule_ir.family or norm.schedule.template or "").strip()
+
+
+def _proposal_hypothesis_bonus(
+    proposal: Optional[Any],
+    next_step_hypotheses: Optional[Dict[str, Any]],
+) -> Tuple[float, List[str]]:
+    hypotheses = dict(next_step_hypotheses or {})
+    if not hypotheses:
+        return 0.0, []
+    patch_family = _proposal_patch_family_token(proposal)
+    patch_category = _proposal_patch_category(proposal)
+    schedule_family = _proposal_schedule_family(proposal)
+    bonus = 0.0
+    reasons: List[str] = []
+    schedule_target = str(hypotheses.get("next_schedule_family") or "").strip()
+    if schedule_target:
+        if schedule_family == schedule_target and patch_category == "schedule":
+            bonus += 0.30
+            reasons.append(f"hypothesis_exact:schedule:{schedule_target}")
+        elif patch_category == "schedule":
+            bonus += 0.15
+            reasons.append(f"hypothesis_category:schedule:{schedule_target}")
+    for key, category in (
+        ("next_partition_patch_family", "partition"),
+        ("next_memory_patch_family", "memory"),
+        ("next_overlap_patch_family", "overlap"),
+    ):
+        family_target = str(hypotheses.get(key) or "").strip()
+        if not family_target or family_target.startswith("preserve_"):
+            continue
+        if patch_family == family_target:
+            bonus += 0.30
+            reasons.append(f"hypothesis_exact:{category}:{family_target}")
+        elif patch_category == category:
+            bonus += 0.15
+            reasons.append(f"hypothesis_category:{category}:{family_target}")
+    return bonus, reasons
+
+
+def _build_patch_proposal_from_agent_proposal(
+    proposal: Optional[Any],
+    *,
+    target_bottleneck: str,
+) -> PatchProposal:
+    patch_family = _proposal_patch_family_token(proposal) or "baseline"
+    target_scope = _proposal_target_scope_token(proposal)
+    program = getattr(proposal, "program", None)
+    patch = getattr(program, "applied_patch", None) if program is not None else None
+    expected_effects = {}
+    risk_flags: List[str] = []
+    if patch is not None:
+        expected_effects = copy.deepcopy(getattr(patch, "expected_effects", {}) or {})
+        risk_flags = [str(item) for item in (getattr(patch, "risk_flags", []) or []) if str(item).strip()]
+    if not expected_effects and program is not None:
+        expected_effects = copy.deepcopy(dict((getattr(program, "metadata", {}) or {}).get("patch_expected_effects") or {}))
+    if not risk_flags and program is not None:
+        risk_flags = [str(item) for item in (dict((getattr(program, "metadata", {}) or {}).get("patch_risk_flags") or {}).keys()) if str(item).strip()]
+    return PatchProposal(
+        target_bottleneck=str(target_bottleneck or ""),
+        patch_family=patch_family,
+        target_scope=target_scope,
+        expected_effects=expected_effects,
+        risk_flags=risk_flags,
+        search_priority=_proposal_priority_value(proposal),
+        rationale=str(getattr(proposal, "rationale", "") or "").strip() or None,
+    ).normalized()
+
+
+def _uct_child_score(child: SearchTreeNode, *, parent_visits: int, exploration_weight: float = 1.4) -> float:
+    exploitation = child.mean_value()
+    prior_bonus = float(child.priority)
+    if int(child.visits) <= 0:
+        return float("inf") if prior_bonus >= 0.0 else 1e6 + prior_bonus
+    exploration = float(exploration_weight) * math.sqrt(
+        max(math.log(max(int(parent_visits), 1) + 1.0), 0.0) / float(int(child.visits))
+    )
+    return exploitation + exploration + prior_bonus
+
+
+def _build_search_tree_root(
+    *,
+    search_state: Dict[str, Any],
+    proposal_pool: List[Any],
+    policy_memory_bank: PolicyMemoryBank,
+    search_unit: str = "patch",
+    patch_memory_enabled: bool = True,
+    next_step_hypotheses: Optional[Dict[str, Any]] = None,
+) -> Tuple[SearchTreeNode, Dict[str, Any]]:
+    if bool(patch_memory_enabled) and str(search_unit or "patch") == "patch":
+        guidance = policy_memory_bank.recommend_patch_families(search_state, top_k=6)
+    else:
+        guidance = {
+            "state_summary": summarize_state_for_memory(search_state),
+            "useful_patch_families": [],
+            "harmful_patch_families": [],
+            "uncertain_patch_families": [],
+            "schedule_families": [],
+        }
+    root = SearchTreeNode(
+        node_id="root",
+        depth=0,
+        state_summary=copy.deepcopy(guidance.get("state_summary") or summarize_state_for_memory(search_state)),
+        patch_sequence=[],
+        patch_family="root",
+        visits=1,
+        total_value=0.0,
+        priority=0.0,
+        children=[],
+    )
+    useful = set(str(item) for item in (guidance.get("useful_patch_families") or []))
+    harmful = set(str(item) for item in (guidance.get("harmful_patch_families") or []))
+    for index, proposal in enumerate(proposal_pool, start=1):
+        patch_proposal = _build_patch_proposal_from_agent_proposal(
+            proposal,
+            target_bottleneck=str((guidance.get("state_summary") or {}).get("bottleneck_signature") or ""),
+        )
+        priority = max(0.0, 1.0 - (float(patch_proposal.search_priority) / 32.0))
+        priority_reason: List[str] = []
+        if str(search_unit or "patch") == "patch":
+            if bool(patch_memory_enabled) and patch_proposal.patch_family in harmful:
+                priority -= 0.40
+                priority_reason.append(f"patch_memory_harmful:{patch_proposal.patch_family}")
+            else:
+                if bool(patch_memory_enabled) and patch_proposal.patch_family in useful:
+                    priority += 0.35
+                    priority_reason.append(f"patch_memory_useful:{patch_proposal.patch_family}")
+                hypothesis_bonus, hypothesis_reasons = _proposal_hypothesis_bonus(proposal, next_step_hypotheses)
+                priority += float(hypothesis_bonus)
+                priority_reason.extend(list(hypothesis_reasons))
+        child = SearchTreeNode(
+            node_id=f"child_{index:02d}",
+            depth=1,
+            state_summary=copy.deepcopy(root.state_summary),
+            patch_sequence=[patch_proposal.to_dict()],
+            patch_family=patch_proposal.patch_family,
+            priority=priority,
+            priority_reason=priority_reason,
+        )
+        root.children.append(child)
+    return root, guidance
+
+
+def _build_pareto_front_snapshot(tested: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    ranked = _rank_trials([copy.deepcopy(item) for item in (tested or [])])
+    snapshot: List[Dict[str, Any]] = []
+    for item in ranked[: max(int(limit), 0)]:
+        trace_summary = dict(item.get("trace_summary") or {})
+        snapshot.append(
+            {
+                "config_name": str(item.get("config_name") or ""),
+                "selection_score": _safe_float(item.get("selection_score")),
+                "step_time_ms_p50": _trial_step_time_ms(item),
+                "throughput_tokens_per_s": _trial_throughput_tokens(item),
+                "peak_reserved_ratio": _safe_float(trace_summary.get("peak_reserved_ratio")),
+                "bubble_ratio": _safe_float(trace_summary.get("bubble_ratio")),
+                "bottleneck_signature": copy.deepcopy(item.get("bottleneck_signature") or {}),
+            }
+        )
+    return snapshot
+
+
+def _extract_next_step_hypotheses(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(metrics, dict):
+        return {}
+    trace_summary = dict(metrics.get("trace_summary") or {})
+    hypotheses = trace_summary.get("next_step_hypotheses")
+    if not isinstance(hypotheses, dict):
+        trial_artifact = dict(metrics.get("trial_artifact") or {})
+        hypotheses = dict(trial_artifact.get("next_step_hypotheses") or {})
+    return {str(key): copy.deepcopy(value) for key, value in dict(hypotheses or {}).items()}
+
+
+def _build_beam_snapshot(
+    proposal_pool: List[AgentProposal],
+    proposal_nodes: Dict[str, SearchTreeNode],
+    *,
+    beam_width: int = 3,
+) -> List[Dict[str, Any]]:
+    scored_entries: List[Tuple[float, Dict[str, Any]]] = []
+    for proposal in list(proposal_pool or []):
+        proposal_id = str(proposal.proposal_id or "")
+        node = proposal_nodes.get(proposal_id, SearchTreeNode(node_id=proposal_id or "missing", depth=1))
+        last_result = dict(node.last_result or {})
+        program = proposal.program.normalized()
+        uct_score = _uct_child_score(node, parent_visits=max(int(node.visits), 1))
+        search_score = _safe_float(last_result.get("score"))
+        if search_score is None:
+            search_score = _safe_float(uct_score)
+        scored_entries.append(
+            (
+                float(search_score or -1e9),
+                {
+                    "proposal_id": proposal_id,
+                    "program_kind": str(program.metadata.get("program_kind") or ""),
+                    "patch_family": _proposal_patch_family_token(proposal),
+                    "patch_category": _proposal_patch_category(proposal),
+                    "target_scope": _proposal_target_scope_token(proposal),
+                    "priority_rank": int(proposal.priority_rank or 0),
+                    "source": str(proposal.source or "heuristic"),
+                    "search_score": _safe_float(search_score),
+                    "uct_score": _safe_float(uct_score),
+                    "visits": int(node.visits or 0),
+                    "mean_value": _safe_float(node.mean_value()),
+                    "priority_reason": list(node.priority_reason or []),
+                    "last_result": copy.deepcopy(last_result),
+                },
+            )
+        )
+    scored_entries.sort(key=lambda item: item[0], reverse=True)
+    return [entry for _, entry in scored_entries[: max(int(beam_width), 0)]]
+
+
+def _prepare_proposal_pool_for_search(
+    proposal_pool: List[AgentProposal],
+    rejected_candidates: List[Dict[str, Any]],
+    *,
+    search_state: Dict[str, Any],
+    policy_memory_bank: PolicyMemoryBank,
+    search_unit: str,
+    patch_memory_enabled: bool,
+    next_step_hypotheses: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[AgentProposal], List[Dict[str, Any]], SearchTreeNode, Dict[str, Any], Dict[str, SearchTreeNode], List[Dict[str, Any]]]:
+    filtered_proposals: List[AgentProposal] = []
+    updated_rejections: List[Dict[str, Any]] = [copy.deepcopy(item) for item in (rejected_candidates or [])]
+    if bool(patch_memory_enabled) and str(search_unit or "patch") == "patch":
+        for proposal in proposal_pool:
+            patch_family = _proposal_patch_family_token(proposal)
+            if patch_family and policy_memory_bank.should_avoid_patch_family(search_state, patch_family):
+                updated_rejections.append(
+                    {
+                        "proposal": proposal.to_dict(),
+                        "reason": {
+                            "code": "patch_memory_avoid",
+                            "rejection_reason": "patch memory marks this patch family as repeatedly harmful for the current state",
+                        },
+                    }
+                )
+                continue
+            filtered_proposals.append(proposal)
+    else:
+        filtered_proposals = list(proposal_pool or [])
+    search_root, patch_memory_guidance = _build_search_tree_root(
+        search_state=search_state,
+        proposal_pool=filtered_proposals,
+        policy_memory_bank=policy_memory_bank,
+        search_unit=search_unit,
+        patch_memory_enabled=patch_memory_enabled,
+        next_step_hypotheses=next_step_hypotheses,
+    )
+    proposal_nodes: Dict[str, SearchTreeNode] = {}
+    for proposal, child in zip(filtered_proposals, search_root.children):
+        proposal_nodes[str(proposal.proposal_id or child.node_id)] = child
+    ranked_proposals = sorted(
+        filtered_proposals,
+        key=lambda proposal: _uct_child_score(
+            proposal_nodes.get(str(proposal.proposal_id or ""), SearchTreeNode(node_id="missing", depth=1)),
+            parent_visits=max(int(search_root.visits), 1),
+        ),
+        reverse=True,
+    )
+    hypothesis_priority_hits: List[Dict[str, Any]] = []
+    for proposal in ranked_proposals:
+        proposal_id = str(proposal.proposal_id or "")
+        node = proposal_nodes.get(proposal_id)
+        reasons = [str(item) for item in list((node.priority_reason if node is not None else []) or []) if str(item).startswith("hypothesis_")]
+        if reasons:
+            hypothesis_priority_hits.append(
+                {
+                    "proposal_id": proposal_id,
+                    "patch_family": _proposal_patch_family_token(proposal),
+                    "patch_category": _proposal_patch_category(proposal),
+                    "reasons": reasons,
+                }
+            )
+    return ranked_proposals, updated_rejections, search_root, patch_memory_guidance, proposal_nodes, hypothesis_priority_hits
 
 
 def _llm_supervisor_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
@@ -469,7 +841,16 @@ def _apply_llm_supervisor(
 
 
 def _clone_program(program: MegatronProgram) -> MegatronProgram:
-    return MegatronProgram.from_dict(program.to_dict())
+    clone = MegatronProgram.from_dict(program.to_dict())
+    # Candidate builders still mutate legacy schedule/metadata fields directly.
+    # Clear derived policy IR so normalize() can regenerate it from the edited
+    # legacy fields instead of backfilling stale cloned values.
+    clone.schedule_ir = None
+    clone.partition_optimization = None
+    clone.applied_patch = None
+    clone.baseline_family = None
+    clone.policy_objective = None
+    return clone
 
 
 def _data_parallel_size(program: MegatronProgram) -> int:
@@ -1460,6 +1841,9 @@ def _annotate_candidate_runtime_evidence(
     context_record: Dict[str, Any],
 ) -> MegatronProgram:
     annotated = _sync_batch_plan_metadata(candidate)
+    program_kind = str(annotated.metadata.get("program_kind") or "candidate")
+    patch_family = str(annotated.metadata.get("patch_family") or program_kind)
+    patch_scope = str(annotated.metadata.get("patch_scope") or "program")
     for key in (
         "tail_partition_score",
         "tail_partition_objective",
@@ -1533,6 +1917,25 @@ def _annotate_candidate_runtime_evidence(
         if bool(tradeoff.get("should_veto")):
             annotated.metadata["vpp_veto_reason"] = str(tradeoff.get("reason") or "comm-exposure-aware VPP veto")
     annotated.metadata["evidence_score"] = round(float(evidence_score), 4)
+    annotated.metadata["patch_family"] = patch_family
+    annotated.metadata["patch_scope"] = patch_scope
+    annotated.metadata["patch_changes"] = copy.deepcopy(annotated.metadata.get("patch_changes") or {})
+    annotated.metadata["patch_expected_effects"] = copy.deepcopy(
+        annotated.metadata.get("patch_expected_effects")
+        or {"target_bottleneck": str(((context_record or {}).get("bottleneck_signature") or {}).get("dominant_label") or "")}
+    )
+    annotated.applied_patch = ProgramPatchSpec(
+        patch_id=str(annotated.metadata.get("patch_id") or f"{program_kind}:{annotated.semantic_hash()[:8]}"),
+        base_program_hash=str(baseline.semantic_hash()),
+        patch_family=patch_family,
+        target_scope=patch_scope,
+        changes=copy.deepcopy(annotated.metadata.get("patch_changes") or {}),
+        expected_effects=copy.deepcopy(annotated.metadata.get("patch_expected_effects") or {}),
+        risk_flags=[str(item) for item in (annotated.metadata.get("patch_risk_flags") or [])],
+        derived_program_hash=str(annotated.semantic_hash()),
+    ).normalized()
+    annotated.baseline_family = str(baseline.schedule_ir.family if baseline.schedule_ir is not None else baseline.schedule.template)
+    annotated.policy_objective = "maximize_throughput_under_memory_and_legality_constraints"
     return enrich_program_with_runtime_policy_metadata(annotated).normalized()
 
 
@@ -1800,6 +2203,82 @@ def _rank_trials(tested: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(tested, key=lambda item: float(item.get("selection_score", float("-inf"))), reverse=True)
 
 
+def _trial_step_time_ms(trial: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not trial:
+        return None
+    trace_summary = dict(trial.get("trace_summary") or {})
+    return _safe_float(
+        trace_summary.get("steady_state_step_time_ms_p50")
+        or trial.get("step_time_ms_p50")
+    )
+
+
+def _trial_throughput_tokens(trial: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not trial:
+        return None
+    return _safe_float(
+        trial.get("throughput_tokens_per_s")
+        or trial.get("throughput_effective_tokens_per_s")
+    )
+
+
+def _trial_is_successful(trial: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(trial, dict):
+        return False
+    return int(trial.get("returncode") or 0) == 0 and not bool(trial.get("oom"))
+
+
+def _trial_improves_over_reference(
+    candidate: Optional[Dict[str, Any]],
+    reference: Optional[Dict[str, Any]],
+    *,
+    min_step_gain_ratio: float = 0.01,
+    min_throughput_gain_ratio: float = 0.01,
+) -> bool:
+    if not _trial_is_successful(candidate) or not _trial_is_successful(reference):
+        return False
+    candidate_step = _trial_step_time_ms(candidate)
+    reference_step = _trial_step_time_ms(reference)
+    candidate_tp = _trial_throughput_tokens(candidate)
+    reference_tp = _trial_throughput_tokens(reference)
+
+    if candidate_step is not None and reference_step is not None and reference_step > 0.0:
+        if candidate_step <= reference_step * (1.0 - float(min_step_gain_ratio)):
+            return True
+    if candidate_tp is not None and reference_tp is not None and reference_tp > 0.0:
+        if candidate_tp >= reference_tp * (1.0 + float(min_throughput_gain_ratio)):
+            return True
+    return False
+
+
+def _select_autotune_seed(
+    current_program: MegatronProgram,
+    current_metrics: Optional[Dict[str, Any]],
+    ranked_trials: List[Dict[str, Any]],
+    programs_by_hash: Dict[str, MegatronProgram],
+) -> Optional[Dict[str, Any]]:
+    if current_metrics is None:
+        return None
+    current_hash = str(current_program.semantic_hash())
+    for trial in ranked_trials:
+        if not _trial_is_successful(trial):
+            continue
+        trial_hash = str(trial.get("program_hash") or "")
+        if not trial_hash or trial_hash == current_hash:
+            continue
+        promoted = programs_by_hash.get(trial_hash)
+        if promoted is None:
+            continue
+        if not _trial_improves_over_reference(trial, current_metrics):
+            continue
+        return {
+            "program": promoted,
+            "metrics": trial,
+            "reason": "better step-time/throughput result promoted as next-round seed",
+        }
+    return None
+
+
 def _build_baseline_vs_best(
     baseline: MegatronProgram,
     baseline_metrics: Optional[Dict[str, Any]],
@@ -1884,6 +2363,7 @@ def _export_programs(
                 "family": family,
                 "legality": legality,
                 "verifier_report": verifier_report,
+                "applied_patch": copy.deepcopy((program.applied_patch.to_dict() if program.applied_patch is not None else {})),
                 "compile_success": compile_success,
                 "compile_error": compile_error,
             }
@@ -2410,6 +2890,10 @@ def _build_summary_payload(
     policy_memory: Optional[Dict[str, Any]] = None,
     family_scoreboard: Optional[List[Dict[str, Any]]] = None,
     trial_reflections: Optional[List[Dict[str, Any]]] = None,
+    autotune_history: Optional[List[Dict[str, Any]]] = None,
+    auto_tune_rounds_requested: int = 1,
+    search_unit: str = "patch",
+    patch_memory_enabled: bool = True,
 ) -> Dict[str, Any]:
     candidate_entries = _candidate_entries(candidate_manifest)
     compile_success_rate = None
@@ -2425,6 +2909,8 @@ def _build_summary_payload(
 
     summary = {
         "mode": "program_synthesis_export_only" if export_only else "program_synthesis_executor",
+        "search_unit": str(search_unit or "patch"),
+        "patch_memory_enabled": bool(patch_memory_enabled),
         "programs_dir": str(programs_dir),
         "runtime_summary": runtime_summary,
         "runtime_signature": runtime_signature,
@@ -2461,6 +2947,10 @@ def _build_summary_payload(
         "policy_memory": dict(policy_memory or {}),
         "family_scoreboard": list(family_scoreboard or []),
         "trial_reflections": list(trial_reflections or []),
+        "autotune_history": list(autotune_history or []),
+        "search_tree_history": list(autotune_history or []),
+        "auto_tune_rounds_requested": int(max(auto_tune_rounds_requested, 1)),
+        "auto_tune_rounds_completed": int(len(list(autotune_history or []))),
         "recommended_execution_order": [entry["config_name"] for entry in candidate_manifest],
         "program_bank": program_bank.to_dict(),
         "candidate_generation_count": len(candidate_entries),
@@ -2497,6 +2987,11 @@ def _profile_context(program: MegatronProgram) -> Tuple[MachineProfile, BackendC
     machine_profile = (program.machine_profile or default_machine_profile(str(program.cluster.target))).normalized()
     backend_caps = (program.backend_caps or default_backend_caps("local")).normalized()
     return machine_profile, backend_caps
+
+
+def _supports_fine_grained_activation_offloading(program: MegatronProgram) -> bool:
+    _, backend_caps = _profile_context(program)
+    return str(backend_caps.transformer_impl or "").strip().lower() == "transformer_engine"
 
 
 def _profile_prefers_small_tp(profile: MachineProfile) -> bool:
@@ -3814,7 +4309,7 @@ def _build_stage_local_vpp_shape_candidate(
         candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
         candidate.metadata["schedule_steady_checkpoint_policy"] = "guarded_selective"
         candidate.metadata["runtime_checkpoint_boundary_mode"] = "stage_local_vpp_guarded"
-    if runtime_offload_modules:
+    if runtime_offload_modules and _supports_fine_grained_activation_offloading(candidate):
         candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
         candidate.metadata["runtime_offload_modules"] = list(dict.fromkeys(runtime_offload_modules))
         candidate.metadata["runtime_memory_policy_mode"] = "stage_local_vpp_memory_guarded"
@@ -3914,7 +4409,7 @@ def _build_stage_local_memory_policy_candidate(
             runtime_policy.get("warmup_combined_policy") or "serial"
         )
         touched = True
-    if runtime_offload_modules:
+    if runtime_offload_modules and _supports_fine_grained_activation_offloading(candidate):
         candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = bool(
             runtime_policy.get("fine_grained_activation_offloading", True)
         )
@@ -4017,8 +4512,9 @@ def _build_offload_first_refinement_candidate(
         candidate.schedule.microbatch_group_size_per_vp_stage = None
 
     candidate.metadata["stage_local_memory_policy"] = selected_policies
-    candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
-    candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
+    if runtime_offload_modules and _supports_fine_grained_activation_offloading(candidate):
+        candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
+        candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
     candidate.metadata["runtime_recompute_granularity"] = "selective"
     candidate.metadata["runtime_enable_recompute_activations"] = True
     candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
@@ -4331,7 +4827,7 @@ def _build_checkpoint_boundary_refinement_candidate(
     candidate.metadata["runtime_enable_recompute_activations"] = True
     candidate.metadata["runtime_recompute_granularity"] = "selective"
     candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
-    if runtime_offload_modules:
+    if runtime_offload_modules and _supports_fine_grained_activation_offloading(candidate):
         candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
         candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
     candidate.metadata["schedule_warmup_checkpoint_policy"] = "full"
@@ -4473,7 +4969,7 @@ def _build_morphable_pipeline_candidate(
             candidate.metadata["runtime_recompute_granularity"] = "selective"
             candidate.metadata["runtime_enable_recompute_activations"] = True
             candidate.metadata["runtime_recompute_modules"] = runtime_recompute_modules
-        if runtime_offload_modules:
+        if runtime_offload_modules and _supports_fine_grained_activation_offloading(candidate):
             candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = True
             candidate.metadata["runtime_offload_modules"] = runtime_offload_modules
         if any(str(item.get("checkpoint_policy") or "") for item in ordered_families):
@@ -4517,7 +5013,7 @@ def _build_morphable_pipeline_candidate(
             candidate.metadata["schedule_warmup_combined_policy"] = str(
                 runtime_memory_policy.get("warmup_combined_policy") or "serial"
             )
-        if offload_modules:
+        if offload_modules and _supports_fine_grained_activation_offloading(candidate):
             candidate.metadata["runtime_enable_fine_grained_activation_offloading"] = bool(
                 runtime_memory_policy.get("fine_grained_activation_offloading", True)
             )
@@ -4873,7 +5369,10 @@ def _build_runtime_branch_candidates(
     return candidates
 
 
-def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSpaceSpec) -> Tuple[bool, str]:
+def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSpaceSpec) -> Tuple[bool, Dict[str, Any]]:
+    def _reject(message: str, *, code: str) -> Tuple[bool, Dict[str, Any]]:
+        return False, {"code": str(code), "rejection_reason": str(message)}
+
     program_kind = str(program.metadata.get("program_kind") or "")
     is_single_node_pp_split = program_kind == "candidate_single_node_pp_split"
     is_sequence_parallel_toggle = program_kind == "candidate_sequence_parallel_toggle"
@@ -4884,68 +5383,100 @@ def _candidate_allowed_by_space(program: MegatronProgram, search_space: SearchSp
     )
     uses_torchtitan_schedule = str(program.schedule.template or "") in {"torchtitan_zero_bubble", "torchtitan_dualpipev"}
     uses_morphable_pipeline = str(program.metadata.get("program_kind") or "") == "candidate_morphable_pipeline"
+    runtime_family = str(
+        (program.metadata.get("runtime_schedule_family") or "")
+        or ((program.schedule_ir.family if program.schedule_ir is not None else "") or "")
+    ).strip()
+    semantic_runtime_template = runtime_family.startswith("dual_overlap_")
     if search_space.max_tp_size is not None and int(program.parallel.tp_degree) > int(search_space.max_tp_size):
-        return False, f"tp_degree={program.parallel.tp_degree} exceeds search-space max_tp_size={search_space.max_tp_size}"
+        return _reject(
+            f"tp_degree={program.parallel.tp_degree} exceeds search-space max_tp_size={search_space.max_tp_size}",
+            code="max_tp_size",
+        )
     if search_space.max_pp_size is not None and int(program.parallel.pp_degree) > int(search_space.max_pp_size):
-        return False, f"pp_degree={program.parallel.pp_degree} exceeds search-space max_pp_size={search_space.max_pp_size}"
+        return _reject(
+            f"pp_degree={program.parallel.pp_degree} exceeds search-space max_pp_size={search_space.max_pp_size}",
+            code="max_pp_size",
+        )
     if search_space.max_ep_size is not None and int(program.parallel.ep_degree) > int(search_space.max_ep_size):
-        return False, f"ep_degree={program.parallel.ep_degree} exceeds search-space max_ep_size={search_space.max_ep_size}"
+        return _reject(
+            f"ep_degree={program.parallel.ep_degree} exceeds search-space max_ep_size={search_space.max_ep_size}",
+            code="max_ep_size",
+        )
     if search_space.max_cp_size is not None and int(program.parallel.cp_degree) > int(search_space.max_cp_size):
-        return False, f"cp_degree={program.parallel.cp_degree} exceeds search-space max_cp_size={search_space.max_cp_size}"
+        return _reject(
+            f"cp_degree={program.parallel.cp_degree} exceeds search-space max_cp_size={search_space.max_cp_size}",
+            code="max_cp_size",
+        )
     if search_space.max_vpp_size is not None and int(program.parallel.vpp_degree) > int(search_space.max_vpp_size):
-        return False, f"vpp_degree={program.parallel.vpp_degree} exceeds search-space max_vpp_size={search_space.max_vpp_size}"
+        return _reject(
+            f"vpp_degree={program.parallel.vpp_degree} exceeds search-space max_vpp_size={search_space.max_vpp_size}",
+            code="max_vpp_size",
+        )
     candidate_micro_batch = max(int(program.metadata.get("micro_batch_size", 1) or 1), 1)
     if search_space.max_micro_batch_size is not None and candidate_micro_batch > int(search_space.max_micro_batch_size):
-        return (
-            False,
+        return _reject(
             f"micro_batch_size={candidate_micro_batch} exceeds search-space max_micro_batch_size={search_space.max_micro_batch_size}",
+            code="max_micro_batch_size",
         )
     memory_estimate = estimate_program_memory(program)
     if (
         search_space.max_estimated_memory_pressure is not None
         and float(memory_estimate.pressure_score) > float(search_space.max_estimated_memory_pressure)
     ):
-        return (
-            False,
+        return _reject(
             "estimated memory pressure "
             f"{memory_estimate.pressure_score:.2f} exceeds search-space ceiling "
             f"{float(search_space.max_estimated_memory_pressure):.2f}",
+            code="memory_pressure",
         )
     if is_dual_plane_candidate and not search_space.allow_dual_plane:
-        return False, "dual-plane mapping is not allowed in the current search space"
+        return _reject("dual-plane mapping is not allowed in the current search space", code="dual_plane_disallowed")
     if not search_space.allow_stage_aware_schedule and program.schedule.skeleton != "fixed_1f1b":
-        return False, "stage-aware schedule is not allowed in the current search space"
+        return _reject("stage-aware schedule is not allowed in the current search space", code="stage_aware_disallowed")
     if uses_hybrid_shard and not search_space.allow_hybrid_shard:
-        return False, "hybrid shard candidates are not allowed in the current search space"
+        return _reject("hybrid shard candidates are not allowed in the current search space", code="hybrid_shard_disallowed")
     if uses_torchtitan_schedule and not search_space.allow_torchtitan_schedule_sandbox:
-        return False, "torchtitan schedule sandbox is not allowed in the current search space"
+        return _reject("torchtitan schedule sandbox is not allowed in the current search space", code="torchtitan_sandbox_disallowed")
     if uses_morphable_pipeline and not search_space.allow_morphable_pipeline:
-        return False, "morphable pipeline candidates are not allowed in the current search space"
+        return _reject("morphable pipeline candidates are not allowed in the current search space", code="morphable_pipeline_disallowed")
     if program.schedule.skeleton not in set(search_space.allowed_schedule_skeletons):
-        return False, f"schedule skeleton {program.schedule.skeleton} is outside allowed search-space skeletons"
-    if program.schedule.template not in set(search_space.allowed_schedule_templates):
-        return False, f"schedule template {program.schedule.template} is outside allowed search-space templates"
+        return _reject(
+            f"schedule skeleton {program.schedule.skeleton} is outside allowed search-space skeletons",
+            code="schedule_skeleton_disallowed",
+        )
+    if program.schedule.template not in set(search_space.allowed_schedule_templates) and not semantic_runtime_template:
+        return _reject(
+            f"schedule template {program.schedule.template} is outside allowed search-space templates",
+            code="schedule_template_disallowed",
+        )
     if not search_space.allow_asymmetric_vpp and int(program.parallel.vpp_degree) > 1:
-        return False, "asymmetric VPP is not allowed in the current search space"
+        return _reject("asymmetric VPP is not allowed in the current search space", code="asymmetric_vpp_disallowed")
     if search_space.max_shard_group_size is not None:
         for local in (program.strategy_ir.local_parallel or []):
             if local.shard_group_size is not None and int(local.shard_group_size) > int(search_space.max_shard_group_size):
-                return False, f"shard_group_size={local.shard_group_size} exceeds search-space max_shard_group_size={search_space.max_shard_group_size}"
+                return _reject(
+                    f"shard_group_size={local.shard_group_size} exceeds search-space max_shard_group_size={search_space.max_shard_group_size}",
+                    code="max_shard_group_size",
+                )
     if search_space.max_replicate_group_size is not None:
         for local in (program.strategy_ir.local_parallel or []):
             if local.replicate_group_size is not None and int(local.replicate_group_size) > int(search_space.max_replicate_group_size):
-                return False, f"replicate_group_size={local.replicate_group_size} exceeds search-space max_replicate_group_size={search_space.max_replicate_group_size}"
+                return _reject(
+                    f"replicate_group_size={local.replicate_group_size} exceeds search-space max_replicate_group_size={search_space.max_replicate_group_size}",
+                    code="max_replicate_group_size",
+                )
     if is_single_node_pp_split and not search_space.allow_single_node_pp_split:
-        return False, "single-node PP split is not allowed in the current search space"
+        return _reject("single-node PP split is not allowed in the current search space", code="single_node_pp_split_disallowed")
     if is_sequence_parallel_toggle and not search_space.allow_sequence_parallel_toggle:
-        return False, "sequence parallel toggle is not allowed in the current search space"
+        return _reject("sequence parallel toggle is not allowed in the current search space", code="sequence_parallel_toggle_disallowed")
     if bool(program.parallel.sp_enabled) and int(program.parallel.tp_degree) <= 1:
-        return False, "sequence parallel requires tp_degree > 1"
+        return _reject("sequence parallel requires tp_degree > 1", code="sequence_parallel_tp_requirement")
     if not search_space.allow_nonuniform_partition:
         stage_layers = [int(stage.decoder_layers) for stage in program.partition.stages]
         if len(set(stage_layers)) > 1 and not (is_single_node_pp_split and search_space.allow_single_node_pp_split):
-            return False, "nonuniform partition is not allowed in the current search space"
-    return True, "allowed"
+            return _reject("nonuniform partition is not allowed in the current search space", code="nonuniform_partition_disallowed")
+    return True, {"code": "allowed", "rejection_reason": "allowed"}
 
 
 def _build_skeleton_candidates(
@@ -5357,6 +5888,356 @@ def _second_stage_runtime_inputs(
     return trial_runtime_summary, trial_context, second_stage_replan, second_stage_bottleneck
 
 
+def _execute_autotune_round(
+    args: argparse.Namespace,
+    *,
+    round_index: int,
+    seed_program: MegatronProgram,
+    seed_metrics: Dict[str, Any],
+    programs_dir: Path,
+    llm_config: Dict[str, Any],
+    policy_memory_bank: PolicyMemoryBank,
+    trial_id_start: int,
+    trial_reflections: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    (
+        round_runtime_summary,
+        round_context_record,
+        round_replan_decision,
+        round_bottleneck_signature,
+    ) = _second_stage_runtime_inputs(
+        seed_program,
+        seed_metrics,
+        dict(seed_metrics.get("context_record") or {}),
+    )
+    rewrite = _rewrite_space(seed_program, round_runtime_summary)
+    seed_program.search_space = rewrite.normalized()
+    evidence_programs = _build_evidence_matrix(
+        seed_program,
+        rewrite,
+        round_runtime_summary,
+        round_context_record,
+    )
+    proposal_pool, rejected_candidates = _synthesize_proposals(
+        seed_program,
+        rewrite=rewrite,
+        runtime_summary=round_runtime_summary,
+        context_record=round_context_record,
+        replan_decision=round_replan_decision,
+        candidate_limit=int(args.candidate_limit),
+        llm_config=llm_config,
+        policy_memory_bank=policy_memory_bank,
+    )
+    feedback_search_plan = build_feedback_search_plan(
+        seed_program,
+        round_context_record,
+        replan_decision=round_replan_decision,
+        proposals=proposal_pool,
+        memory_bank=policy_memory_bank,
+        top_k_families=2,
+    )
+    strategy_template_library = _build_verified_strategy_template_library(
+        seed_program,
+        proposal_pool,
+        round_context_record,
+    )
+    template_selection_decision = _select_verified_strategy_template(
+        strategy_template_library,
+        round_context_record,
+    )
+    search_state = dict((feedback_search_plan or {}).get("search_state") or {})
+    search_state.setdefault(
+        "bottleneck_signature",
+        str(
+            (round_bottleneck_signature or {}).get("canonical_dominant_label")
+            or (round_bottleneck_signature or {}).get("dominant_label")
+            or ""
+        ),
+    )
+    proposal_pool, rejected_candidates, search_root, patch_memory_guidance, proposal_nodes, hypothesis_priority_hits = _prepare_proposal_pool_for_search(
+        proposal_pool,
+        rejected_candidates,
+        search_state=search_state,
+        policy_memory_bank=policy_memory_bank,
+        search_unit=_search_unit(args),
+        patch_memory_enabled=_patch_memory_enabled(args),
+        next_step_hypotheses=_extract_next_step_hypotheses(seed_metrics),
+    )
+    candidates = [proposal.program for proposal in proposal_pool]
+    if bool(args.selector_only):
+        selected_kind = str(template_selection_decision.get("selected_program_kind") or "")
+        if selected_kind:
+            selected_candidates = [
+                program for program in candidates if str(program.metadata.get("program_kind") or "") == selected_kind
+            ]
+            if selected_candidates:
+                candidates = selected_candidates[:1]
+                proposal_pool = [
+                    proposal
+                    for proposal in proposal_pool
+                    if str(proposal.program.metadata.get("program_kind") or "") == selected_kind
+                ]
+    experiment_specs = _build_experiment_specs(seed_program, evidence_programs, candidates)
+    round_programs_dir = programs_dir / f"round_{int(round_index):02d}"
+    candidate_manifest = _export_programs(
+        seed_program,
+        candidates,
+        round_programs_dir,
+        context_record=round_context_record,
+        previous_program=seed_program,
+    )
+    evidence_manifest: List[Dict[str, Any]] = []
+    for index, program in enumerate(evidence_programs):
+        program_kind = str(program.metadata.get("program_kind") or f"evidence_{index:02d}")
+        verifier_report = verify_program(program, observation=round_context_record, previous_program=seed_program)
+        evidence_manifest.append(
+            {
+                "config_name": program_kind,
+                "program_hash": program.semantic_hash(),
+                "family": classify_program_family(program).to_dict(),
+                "legality": dict(verifier_report.legality or {}),
+                "verifier_report": verifier_report.to_dict(),
+                "experiment_ids": [
+                    spec.experiment_id for spec in experiment_specs if program_kind in set(spec.program_kinds)
+                ],
+            }
+        )
+
+    tested_round: List[Dict[str, Any]] = []
+    paper_artifacts: List[Dict[str, Any]] = []
+    family_outside_trials: List[Dict[str, Any]] = []
+    active_search_state = dict((feedback_search_plan or {}).get("search_state") or {})
+    proposal_by_kind = {
+        str(proposal.proposal_id): proposal.normalized()
+        for proposal in proposal_pool
+    }
+
+    trial_queue: List[Tuple[str, str, MegatronProgram, Optional[ExperimentSpec], Optional[AgentProposal]]] = []
+    for program in evidence_programs:
+        kind = str(program.metadata.get("program_kind") or "evidence")
+        run_name = f"round_{int(round_index):02d}__{kind}"
+        trial_queue.append(
+            (
+                run_name,
+                kind,
+                program,
+                next((spec for spec in experiment_specs if kind in set(spec.program_kinds)), None),
+                None,
+            )
+        )
+    for candidate in candidates:
+        kind = str(candidate.metadata.get("program_kind") or "candidate")
+        run_name = f"round_{int(round_index):02d}__{kind}"
+        trial_queue.append(
+            (
+                run_name,
+                kind,
+                candidate,
+                next((spec for spec in experiment_specs if kind in set(spec.program_kinds)), None),
+                proposal_by_kind.get(kind),
+            )
+        )
+
+    _progress(
+        f"starting auto-tune round {int(round_index)} "
+        f"seed={str(seed_program.metadata.get('program_kind') or 'baseline')} "
+        f"candidates={len(candidates)} evidence={len(evidence_programs)}"
+    )
+    next_trial_id = int(trial_id_start)
+    for queue_index, (run_name, _, candidate, experiment_spec, proposal) in enumerate(trial_queue, start=1):
+        _progress(
+            f"auto-tune round {int(round_index)} "
+            f"trial {queue_index}/{len(trial_queue)} starting: {run_name}"
+        )
+        metrics = run_trial(args, candidate, trial_id=next_trial_id)
+        next_trial_id += 1
+        metrics["config_name"] = run_name
+        metrics["trace_summary"] = reduce_trial_trace(candidate, metrics=metrics)
+        metrics["bottleneck_signature"] = classify_bottleneck(candidate, metrics["trace_summary"])
+        candidate_observation = _make_agent_observation(
+            candidate,
+            trace_summary=metrics["trace_summary"],
+            motivation_evidence_manifest=evidence_manifest,
+        )
+        metrics["context_record"] = candidate_observation.to_dict()
+        metrics["trial_artifact"] = build_trial_artifact(
+            candidate,
+            candidate_observation,
+            bottleneck_signature=metrics["bottleneck_signature"],
+            experiment=experiment_spec,
+            search_unit=_search_unit(args),
+            patch_memory_enabled=_patch_memory_enabled(args),
+        )
+        metrics["patch_category"] = str(metrics["trial_artifact"].get("patch_category") or "")
+        metrics["patch_count"] = int(metrics["trial_artifact"].get("patch_count") or 0)
+        metrics["search_unit"] = str(metrics["trial_artifact"].get("search_unit") or _search_unit(args))
+        metrics["patch_memory_enabled"] = bool(metrics["trial_artifact"].get("patch_memory_enabled"))
+        if proposal is not None:
+            outcome = build_trial_outcome(candidate, metrics, baseline_metrics=seed_metrics)
+            reflection = reflect_on_trial(
+                active_search_state,
+                proposal,
+                outcome,
+                baseline_metrics=seed_metrics,
+            )
+            if bool(_patch_memory_enabled(args)):
+                record_trial_feedback(
+                    policy_memory_bank,
+                    active_search_state,
+                    proposal,
+                    outcome,
+                    reflection,
+                )
+            metrics["trial_outcome"] = outcome.to_dict()
+            reflection_payload = reflection.to_dict()
+            reflection_payload["runtime_trace_summary"] = dict(
+                (metrics.get("trial_artifact") or {}).get("runtime_trace_summary") or {}
+            )
+            metrics["trial_reflection"] = reflection_payload
+            trial_reflections.append(copy.deepcopy(reflection_payload))
+            node = proposal_nodes.get(str(proposal.proposal_id or ""))
+            if node is not None:
+                score = 0.0
+                candidate_step = _trial_step_time_ms(metrics)
+                reference_step = _trial_step_time_ms(seed_metrics)
+                candidate_tp = _trial_throughput_tokens(metrics)
+                reference_tp = _trial_throughput_tokens(seed_metrics)
+                if _trial_is_successful(metrics):
+                    score += 0.25
+                    if (
+                        candidate_step is not None
+                        and reference_step is not None
+                        and reference_step > 0.0
+                    ):
+                        score += max((reference_step - candidate_step) / reference_step, 0.0)
+                    if (
+                        candidate_tp is not None
+                        and reference_tp is not None
+                        and reference_tp > 0.0
+                    ):
+                        score += max((candidate_tp - reference_tp) / reference_tp, 0.0)
+                else:
+                    score -= 0.50
+                    if bool(metrics.get("oom")):
+                        score -= 0.35
+                node.visits += 1
+                node.total_value += float(score)
+                node.last_result = {
+                    "config_name": str(metrics.get("config_name") or ""),
+                    "returncode": int(metrics.get("returncode") or 0),
+                    "score": round(float(score), 6),
+                    "step_time_ms_p50": candidate_step,
+                    "throughput_tokens_per_s": candidate_tp,
+                }
+                search_root.visits += 1
+                search_root.total_value += float(score)
+        write_analysis_artifacts_for_trial(args, next_trial_id - 1, metrics)
+        tested_round.append(metrics)
+        paper_artifacts.append(dict(metrics.get("trial_artifact") or {}))
+        if bool((metrics.get("family") or {}).get("is_family_outside")):
+            family_outside_trials.append(metrics)
+        _progress(
+            f"auto-tune round {int(round_index)} "
+            f"trial {queue_index}/{len(trial_queue)} finished: {run_name} "
+            f"returncode={int(metrics.get('returncode') or 0)} "
+            f"step_time_ms_p50={metrics.get('step_time_ms_p50')} "
+            f"throughput={metrics.get('throughput_tokens_per_s') or metrics.get('throughput_effective_tokens_per_s')}"
+        )
+
+    seed_reference = copy.deepcopy(seed_metrics or {})
+    seed_reference["config_name"] = f"round_{int(round_index):02d}__seed"
+    seed_reference["program_hash"] = seed_program.semantic_hash()
+    seed_reference.setdefault("trace_summary", reduce_trial_trace(seed_program, metrics=seed_metrics))
+    round_ranked = _rank_trials([seed_reference] + tested_round)
+    round_programs_by_hash = {
+        program.semantic_hash(): program for program in [seed_program] + evidence_programs + candidates
+    }
+    promotion = _select_autotune_seed(seed_program, seed_reference, round_ranked, round_programs_by_hash)
+    best_round_metrics = promotion["metrics"] if promotion is not None else seed_reference
+    best_round_program = promotion["program"] if promotion is not None else seed_program
+    best_patch_family = str(
+        ((best_round_program.applied_patch or ProgramPatchSpec()).patch_family or "")
+        or str((best_round_program.metadata or {}).get("patch_family") or "")
+        or str(best_round_program.metadata.get("program_kind") or "baseline")
+    )
+    next_step_hypotheses = _extract_next_step_hypotheses(best_round_metrics)
+    continue_search_hint = str(next_step_hypotheses.get("stop_signal") or "continue_search")
+    beam_snapshot = _build_beam_snapshot(
+        proposal_pool,
+        proposal_nodes,
+        beam_width=min(max(len(proposal_pool), 1), 3),
+    )
+    local_refinement_candidates: List[str] = []
+    for entry in beam_snapshot:
+        patch_family = str(entry.get("patch_family") or "").strip()
+        if patch_family and patch_family not in local_refinement_candidates:
+            local_refinement_candidates.append(patch_family)
+    early_stop_reason = (
+        continue_search_hint
+        if continue_search_hint != "continue_search"
+        else (
+            "gain_plateau"
+            if best_round_program.semantic_hash() == seed_program.semantic_hash()
+            else "promoted_candidate"
+        )
+    )
+    history_entry = {
+        "round_index": int(round_index),
+        "root_state": copy.deepcopy(search_root.state_summary),
+        "seed_program_kind": str(seed_program.metadata.get("program_kind") or "baseline"),
+        "seed_program_hash": seed_program.semantic_hash(),
+        "seed_step_time_ms_p50": _trial_step_time_ms(seed_reference),
+        "seed_throughput_tokens_per_s": _trial_throughput_tokens(seed_reference),
+        "expanded_patch_families": [str(child.patch_family or "") for child in search_root.children],
+        "selected_path": [best_patch_family] if best_patch_family else [],
+        "beam_snapshot": beam_snapshot,
+        "beam_width": min(max(len(proposal_pool), 1), 3),
+        "local_refinement_candidates": local_refinement_candidates,
+        "candidate_manifest": candidate_manifest,
+        "evidence_manifest": evidence_manifest,
+        "rejected_candidates": rejected_candidates,
+        "rejected_reasons": [copy.deepcopy(item) for item in (rejected_candidates or [])],
+        "feedback_search_plan": dict(feedback_search_plan or {}),
+        "patch_memory_guidance": copy.deepcopy(patch_memory_guidance),
+        "search_unit": _search_unit(args),
+        "patch_memory_enabled": bool(_patch_memory_enabled(args)),
+        "hypothesis_priority_hits": hypothesis_priority_hits,
+        "strategy_template_library": list(strategy_template_library or []),
+        "template_selection_decision": dict(template_selection_decision or {}),
+        "search_tree": search_root.to_dict(),
+        "pareto_front_snapshots": _build_pareto_front_snapshot([seed_reference] + tested_round),
+        "best_program_kind": str(best_round_program.metadata.get("program_kind") or "baseline"),
+        "best_program_hash": best_round_program.semantic_hash(),
+        "best_config_name": str(best_round_metrics.get("config_name") or ""),
+        "best_step_time_ms_p50": _trial_step_time_ms(best_round_metrics),
+        "best_throughput_tokens_per_s": _trial_throughput_tokens(best_round_metrics),
+        "improved_over_seed": bool(best_round_program.semantic_hash() != seed_program.semantic_hash()),
+        "next_step_hypotheses": copy.deepcopy(next_step_hypotheses),
+        "continue_search_hint": continue_search_hint,
+        "promotion_reason": str((promotion or {}).get("reason") or "no better candidate found"),
+        "promotion_path": [
+            str(seed_program.metadata.get("program_kind") or "baseline"),
+            str(best_round_program.metadata.get("program_kind") or "baseline"),
+        ],
+        "early_stop_reason": early_stop_reason,
+    }
+    return {
+        "tested": tested_round,
+        "paper_artifacts": paper_artifacts,
+        "family_outside_trials": family_outside_trials,
+        "next_trial_id": next_trial_id,
+        "candidate_manifest": candidate_manifest,
+        "evidence_manifest": evidence_manifest,
+        "feedback_search_plan": feedback_search_plan,
+        "strategy_template_library": strategy_template_library,
+        "template_selection_decision": template_selection_decision,
+        "history_entry": history_entry,
+        "best_program": best_round_program,
+        "best_metrics": best_round_metrics,
+        "programs_by_hash": round_programs_by_hash,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Megatron program synthesis bring-up runner.")
     parser.add_argument("--workdir", type=str, default="./runs_megatron_programs")
@@ -5364,6 +6245,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--programs-dir", type=str, default=None)
     parser.add_argument("--runtime-summary", type=str, default=None)
     parser.add_argument("--candidate-limit", type=int, default=4)
+    parser.add_argument("--auto-tune-rounds", type=int, default=1)
+    parser.add_argument("--search-unit", type=str, choices=["patch", "whole_config"], default="patch")
+    parser.add_argument("--disable-patch-memory", action="store_true")
     parser.add_argument("--enable-llm-supervisor", action="store_true")
     parser.add_argument("--llm-endpoint", type=str, default="http://10.100.1.93:12365/v1/chat/completions")
     parser.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
@@ -5458,7 +6342,8 @@ def main() -> None:
     family_scoreboard_path = workdir / "family_scoreboard.json"
     trial_reflections_path = workdir / "trial_reflections.json"
     threshold_calibration_path = workdir / "threshold_calibration.json"
-    policy_memory_bank = PolicyMemoryBank.load(policy_memory_path)
+    patch_memory_active = _patch_memory_enabled(args)
+    policy_memory_bank = PolicyMemoryBank.load(policy_memory_path) if patch_memory_active else PolicyMemoryBank()
 
     runtime_summary = _load_runtime_summary(args.runtime_summary)
     llm_config = {
@@ -5511,6 +6396,24 @@ def main() -> None:
         strategy_template_library,
         context_record,
     )
+    search_state = dict((feedback_search_plan or {}).get("search_state") or {})
+    search_state.setdefault(
+        "bottleneck_signature",
+        str(
+            (bottleneck_signature or {}).get("canonical_dominant_label")
+            or (bottleneck_signature or {}).get("dominant_label")
+            or ""
+        ),
+    )
+    proposal_pool, rejected_candidates, initial_search_root, patch_memory_guidance, initial_proposal_nodes, initial_hypothesis_priority_hits = _prepare_proposal_pool_for_search(
+        proposal_pool,
+        rejected_candidates,
+        search_state=search_state,
+        policy_memory_bank=policy_memory_bank,
+        search_unit=_search_unit(args),
+        patch_memory_enabled=_patch_memory_enabled(args),
+        next_step_hypotheses=dict((context_record.get("evidence_record") or {}).get("next_step_hypotheses") or {}),
+    )
     candidates = [proposal.program for proposal in proposal_pool]
     if bool(args.selector_only):
         selected_kind = str(template_selection_decision.get("selected_program_kind") or "")
@@ -5535,18 +6438,7 @@ def main() -> None:
         length_bucket=str(runtime_signature.get("length_bucket") or "default"),
         bottleneck_signature=bottleneck_signature,
     )
-    ordered_programs: List[MegatronProgram] = []
-    kind_to_program = {
-        str(program.metadata.get("program_kind") or "program"): program
-        for program in [baseline] + evidence_programs + candidates
-    }
-    for template in ordered_templates:
-        program = kind_to_program.get(template.name)
-        if program is None or program is baseline or program in evidence_programs:
-            continue
-        ordered_programs.append(program)
-    ordered_candidates = ordered_programs + [program for program in candidates if program not in ordered_programs]
-    candidates = ordered_candidates[: int(args.candidate_limit)]
+    candidates = candidates[: int(args.candidate_limit)]
     proposal_by_kind = {proposal.proposal_id: proposal for proposal in proposal_pool}
     candidate_manifest = _export_programs(
         baseline,
@@ -5592,6 +6484,10 @@ def main() -> None:
     second_stage_bottleneck_signature: Optional[Dict[str, Any]] = None
     second_stage_feedback_search_plan: Optional[Dict[str, Any]] = None
     trial_reflections: List[Dict[str, Any]] = []
+    autotune_history: List[Dict[str, Any]] = []
+    known_programs_by_hash: Dict[str, MegatronProgram] = {
+        program.semantic_hash(): program for program in [baseline] + evidence_programs + candidates
+    }
 
     if not args.export_only:
         _progress("starting baseline trial")
@@ -5613,7 +6509,13 @@ def main() -> None:
                 ),
                 None,
             ),
+            search_unit=_search_unit(args),
+            patch_memory_enabled=_patch_memory_enabled(args),
         )
+        baseline_metrics["patch_category"] = str(baseline_metrics["trial_artifact"].get("patch_category") or "")
+        baseline_metrics["patch_count"] = int(baseline_metrics["trial_artifact"].get("patch_count") or 0)
+        baseline_metrics["search_unit"] = str(baseline_metrics["trial_artifact"].get("search_unit") or _search_unit(args))
+        baseline_metrics["patch_memory_enabled"] = bool(baseline_metrics["trial_artifact"].get("patch_memory_enabled"))
         write_analysis_artifacts_for_trial(args, 0, baseline_metrics)
         tested.append(baseline_metrics)
         paper_artifacts.append(dict(baseline_metrics.get("trial_artifact") or {}))
@@ -5667,6 +6569,24 @@ def main() -> None:
                     strategy_template_library,
                     second_stage_context_record,
                 )
+                second_stage_search_state = dict((second_stage_feedback_search_plan or {}).get("search_state") or {})
+                second_stage_search_state.setdefault(
+                    "bottleneck_signature",
+                    str(
+                        (second_stage_bottleneck_signature or {}).get("canonical_dominant_label")
+                        or (second_stage_bottleneck_signature or {}).get("dominant_label")
+                        or ""
+                    ),
+                )
+                proposal_pool, rejected_candidates, initial_search_root, patch_memory_guidance, initial_proposal_nodes, initial_hypothesis_priority_hits = _prepare_proposal_pool_for_search(
+                    proposal_pool,
+                    rejected_candidates,
+                    search_state=second_stage_search_state,
+                    policy_memory_bank=policy_memory_bank,
+                    search_unit=_search_unit(args),
+                    patch_memory_enabled=_patch_memory_enabled(args),
+                    next_step_hypotheses=dict((second_stage_context_record.get("evidence_record") or {}).get("next_step_hypotheses") or {}),
+                )
                 candidates = [proposal.program for proposal in proposal_pool]
                 if bool(args.selector_only):
                     selected_kind = str(template_selection_decision.get("selected_program_kind") or "")
@@ -5691,6 +6611,9 @@ def main() -> None:
                     context_record=second_stage_context_record,
                     previous_program=baseline,
                 )
+                known_programs_by_hash = {
+                    program.semantic_hash(): program for program in [baseline] + evidence_programs + candidates
+                }
                 _progress(
                     "second-stage replan refreshed candidates "
                     f"count={len(candidates)} selected_template={template_selection_decision.get('selected_template_id')}"
@@ -5741,7 +6664,13 @@ def main() -> None:
                 candidate_observation,
                 bottleneck_signature=metrics["bottleneck_signature"],
                 experiment=experiment_spec,
+                search_unit=_search_unit(args),
+                patch_memory_enabled=_patch_memory_enabled(args),
             )
+            metrics["patch_category"] = str(metrics["trial_artifact"].get("patch_category") or "")
+            metrics["patch_count"] = int(metrics["trial_artifact"].get("patch_count") or 0)
+            metrics["search_unit"] = str(metrics["trial_artifact"].get("search_unit") or _search_unit(args))
+            metrics["patch_memory_enabled"] = bool(metrics["trial_artifact"].get("patch_memory_enabled"))
             proposal = proposal_by_kind.get(str(config_name))
             if proposal is not None:
                 outcome = build_trial_outcome(
@@ -5755,27 +6684,33 @@ def main() -> None:
                     outcome,
                     baseline_metrics=baseline_metrics,
                 )
-                record_trial_feedback(
-                    policy_memory_bank,
-                    active_search_state,
-                    proposal,
-                    outcome,
-                    reflection,
-                )
+                if bool(_patch_memory_enabled(args)):
+                    record_trial_feedback(
+                        policy_memory_bank,
+                        active_search_state,
+                        proposal,
+                        outcome,
+                        reflection,
+                    )
                 metrics["trial_outcome"] = outcome.to_dict()
-                metrics["trial_reflection"] = reflection.to_dict()
-                trial_reflections.append(reflection.to_dict())
-                policy_memory_bank.save(policy_memory_path)
-                family_scoreboard_path.write_text(
-                    json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
-                    encoding="utf-8",
+                reflection_payload = reflection.to_dict()
+                reflection_payload["runtime_trace_summary"] = dict(
+                    (metrics.get("trial_artifact") or {}).get("runtime_trace_summary") or {}
                 )
+                metrics["trial_reflection"] = reflection_payload
+                trial_reflections.append(copy.deepcopy(reflection_payload))
+                if bool(_patch_memory_enabled(args)):
+                    policy_memory_bank.save(policy_memory_path)
+                    family_scoreboard_path.write_text(
+                        json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    threshold_calibration_path.write_text(
+                        json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
                 trial_reflections_path.write_text(
                     json.dumps(trial_reflections, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                threshold_calibration_path.write_text(
-                    json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
             write_analysis_artifacts_for_trial(args, index, metrics)
@@ -5795,10 +6730,155 @@ def main() -> None:
         selected_hash = str(best_metrics.get("program_hash") or baseline.semantic_hash()) if best_metrics is not None else baseline.semantic_hash()
         all_programs = [baseline] + evidence_programs + candidates
         best_program = next((program for program in all_programs if program.semantic_hash() == selected_hash), baseline)
+        initial_next_step = _extract_next_step_hypotheses(best_metrics)
+        initial_continue_search_hint = str(initial_next_step.get("stop_signal") or "continue_search")
+        autotune_history.append(
+            {
+                "round_index": 1,
+                "root_state": copy.deepcopy((feedback_search_plan or {}).get("search_state") or {}),
+                "seed_program_kind": str(baseline.metadata.get("program_kind") or "baseline"),
+                "seed_program_hash": baseline.semantic_hash(),
+                "seed_step_time_ms_p50": _trial_step_time_ms(baseline_metrics),
+                "seed_throughput_tokens_per_s": _trial_throughput_tokens(baseline_metrics),
+                "expanded_patch_families": [
+                    _proposal_patch_family_token(proposal)
+                    for proposal in proposal_pool
+                    if _proposal_patch_family_token(proposal)
+                ],
+                "selected_path": [],
+                "beam_snapshot": [
+                    {
+                        "proposal_id": str(proposal.proposal_id or ""),
+                        "program_kind": str(proposal.program.metadata.get("program_kind") or ""),
+                        "patch_family": _proposal_patch_family_token(proposal),
+                        "target_scope": _proposal_target_scope_token(proposal),
+                        "priority_rank": int(proposal.priority_rank or 0),
+                    }
+                    for proposal in proposal_pool[: min(len(proposal_pool), 3)]
+                ],
+                "beam_width": min(len(proposal_pool), 3),
+                "local_refinement_candidates": [
+                    _proposal_patch_family_token(proposal)
+                    for proposal in proposal_pool[: min(len(proposal_pool), 3)]
+                    if _proposal_patch_family_token(proposal)
+                ],
+                "search_unit": _search_unit(args),
+                "patch_memory_enabled": bool(_patch_memory_enabled(args)),
+                "hypothesis_priority_hits": list(initial_hypothesis_priority_hits or []),
+                "candidate_manifest": candidate_manifest,
+                "evidence_manifest": evidence_manifest,
+                "rejected_candidates": rejected_candidates,
+                "feedback_search_plan": dict(feedback_search_plan or {}),
+                "patch_memory_guidance": copy.deepcopy(patch_memory_guidance),
+                "strategy_template_library": list(strategy_template_library or []),
+                "template_selection_decision": dict(template_selection_decision or {}),
+                "search_tree": initial_search_root.to_dict(),
+                "pareto_front_snapshots": _build_pareto_front_snapshot(tested),
+                "best_program_kind": str(best_program.metadata.get("program_kind") or "baseline"),
+                "best_program_hash": best_program.semantic_hash(),
+                "best_config_name": str((best_metrics or {}).get("config_name") or ""),
+                "best_step_time_ms_p50": _trial_step_time_ms(best_metrics),
+                "best_throughput_tokens_per_s": _trial_throughput_tokens(best_metrics),
+                "improved_over_seed": bool(best_program.semantic_hash() != baseline.semantic_hash()),
+                "next_step_hypotheses": copy.deepcopy(initial_next_step),
+                "continue_search_hint": initial_continue_search_hint,
+                "promotion_reason": (
+                    "initial round selected an improved strategy"
+                    if best_program.semantic_hash() != baseline.semantic_hash()
+                    else "baseline remained best after initial round"
+                ),
+                "promotion_path": [
+                    str(baseline.metadata.get("program_kind") or "baseline"),
+                    str(best_program.metadata.get("program_kind") or "baseline"),
+                ],
+                "early_stop_reason": (
+                    initial_continue_search_hint
+                    if initial_continue_search_hint != "continue_search"
+                    else (
+                        "baseline_retained"
+                        if best_program.semantic_hash() == baseline.semantic_hash()
+                        else "promoted_candidate"
+                    )
+                ),
+            }
+        )
         _progress(
             "trial ranking complete "
             f"best={str((best_program.metadata if best_program else {}).get('program_kind') or 'baseline')}"
         )
+        if (
+            int(max(getattr(args, "auto_tune_rounds", 1), 1)) > 1
+            and best_program is not None
+            and best_metrics is not None
+            and initial_continue_search_hint == "continue_search"
+        ):
+            round_seed_program = best_program
+            round_seed_metrics = best_metrics
+            next_trial_id = len(tested)
+            for round_index in range(2, int(max(getattr(args, "auto_tune_rounds", 1), 1)) + 1):
+                round_result = _execute_autotune_round(
+                    args,
+                    round_index=round_index,
+                    seed_program=round_seed_program,
+                    seed_metrics=round_seed_metrics,
+                    programs_dir=programs_dir,
+                    llm_config=llm_config,
+                    policy_memory_bank=policy_memory_bank,
+                    trial_id_start=next_trial_id,
+                    trial_reflections=trial_reflections,
+                )
+                next_trial_id = int(round_result["next_trial_id"])
+                tested.extend(list(round_result.get("tested") or []))
+                paper_artifacts.extend(list(round_result.get("paper_artifacts") or []))
+                family_outside_trials.extend(list(round_result.get("family_outside_trials") or []))
+                autotune_history.append(dict(round_result.get("history_entry") or {}))
+                known_programs_by_hash.update(dict(round_result.get("programs_by_hash") or {}))
+                round_best_program = round_result.get("best_program") or round_seed_program
+                round_best_metrics = round_result.get("best_metrics") or round_seed_metrics
+                round_continue_search_hint = str(
+                    dict(round_result.get("history_entry") or {}).get("continue_search_hint") or "continue_search"
+                )
+                if round_best_program.semantic_hash() == round_seed_program.semantic_hash():
+                    _progress(
+                        f"auto-tune stopped after round {round_index}: no candidate improved over current seed"
+                    )
+                    break
+                if round_continue_search_hint != "continue_search":
+                    _progress(
+                        f"auto-tune stopped after round {round_index}: search controller emitted {round_continue_search_hint}"
+                    )
+                    round_seed_program = round_best_program
+                    round_seed_metrics = round_best_metrics
+                    break
+                round_seed_program = round_best_program
+                round_seed_metrics = round_best_metrics
+                if bool(_patch_memory_enabled(args)):
+                    policy_memory_bank.save(policy_memory_path)
+                    family_scoreboard_path.write_text(
+                        json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                trial_reflections_path.write_text(
+                    json.dumps(trial_reflections, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                if bool(_patch_memory_enabled(args)):
+                    threshold_calibration_path.write_text(
+                        json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+            ranked_trials = _rank_trials(tested)
+            best_metrics = ranked_trials[0] if ranked_trials else baseline_metrics
+            selected_hash = (
+                str(best_metrics.get("program_hash") or baseline.semantic_hash())
+                if best_metrics is not None
+                else baseline.semantic_hash()
+            )
+            best_program = known_programs_by_hash.get(selected_hash, round_seed_program)
+        elif int(max(getattr(args, "auto_tune_rounds", 1), 1)) > 1 and initial_continue_search_hint != "continue_search":
+            _progress(
+                f"auto-tune skipped additional rounds: search controller emitted {initial_continue_search_hint}"
+            )
     else:
         ranked_trials = []
         paper_artifacts = [
@@ -5810,6 +6890,8 @@ def main() -> None:
                     (spec for spec in experiment_specs if str(program.metadata.get("program_kind") or "baseline") in set(spec.program_kinds)),
                     None,
                 ),
+                search_unit=_search_unit(args),
+                patch_memory_enabled=_patch_memory_enabled(args),
             )
             for program in [baseline] + evidence_programs + candidates
         ]
@@ -5864,19 +6946,25 @@ def main() -> None:
         policy_memory=policy_memory_bank.to_dict(),
         family_scoreboard=policy_memory_bank.family_scoreboard(),
         trial_reflections=trial_reflections,
+        autotune_history=autotune_history,
+        auto_tune_rounds_requested=int(max(getattr(args, "auto_tune_rounds", 1), 1)),
+        search_unit=_search_unit(args),
+        patch_memory_enabled=_patch_memory_enabled(args),
     )
     summary_path = workdir / "summary_megatron.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    policy_memory_bank.save(policy_memory_path)
-    family_scoreboard_path.write_text(
-        json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if bool(_patch_memory_enabled(args)):
+        policy_memory_bank.save(policy_memory_path)
+        family_scoreboard_path.write_text(
+            json.dumps(policy_memory_bank.family_scoreboard(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     trial_reflections_path.write_text(json.dumps(trial_reflections, indent=2, ensure_ascii=False), encoding="utf-8")
-    threshold_calibration_path.write_text(
-        json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if bool(_patch_memory_enabled(args)):
+        threshold_calibration_path.write_text(
+            json.dumps(policy_memory_bank.threshold_calibration.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     print(f"[megatron_agent] summary written to {summary_path}")
 
 

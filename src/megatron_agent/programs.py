@@ -17,8 +17,15 @@ from megatron_agent.config import (
     MegatronParallelSpec,
     MegatronProgram,
     MegatronStrategy,
+    MemoryIntentSpec,
     ModelSpec,
+    OverlapIntentSpec,
     PartitionSpec,
+    PartitionOptimizationSpec,
+    ProgramPatchSpec,
+    ScheduleActionSpec,
+    ScheduleGridSpec,
+    ScheduleIRSpec,
     ScheduleSpec,
     VerifierReport,
     default_backend_caps,
@@ -29,12 +36,25 @@ from megatron_agent.config import (
 _DEFAULT_SCHEDULE_FAMILIES = {"fixed_1f1b"}
 _SUPPORTED_SCHEDULE_TEMPLATES = {
     "fixed_1f1b",
+    "interleaved",
     "interleaved_grouped_g2",
     "interleaved_grouped_g4",
     "pp4_frontload",
     "pp4_middle_relief",
+    "zero_bubble",
+    "zbv",
+    "v_half",
+    "v_min",
+    "dualpipe_v",
+    "custom",
     "torchtitan_zero_bubble",
     "torchtitan_dualpipev",
+}
+_SEMANTIC_RUNTIME_FAMILIES = {
+    "dual_overlap_optimizer_hide",
+    "dual_overlap_tail_guarded",
+    "dual_overlap_memory_safe",
+    "dual_overlap_stage_asymmetric",
 }
 
 
@@ -63,6 +83,11 @@ class ProgramLegalityReport:
     stage_memory: List[Dict[str, Any]] = field(default_factory=list)
     cost_model: Dict[str, Any] = field(default_factory=dict)
     diagnosis: List[str] = field(default_factory=list)
+    schedule_detail: Dict[str, Any] = field(default_factory=dict)
+    overlap_detail: Dict[str, Any] = field(default_factory=dict)
+    memory_detail: Dict[str, Any] = field(default_factory=dict)
+    partition_detail: Dict[str, Any] = field(default_factory=dict)
+    config_resolution: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -75,6 +100,11 @@ class ProgramLegalityReport:
             "stage_memory": list(self.stage_memory),
             "cost_model": dict(self.cost_model),
             "diagnosis": list(self.diagnosis),
+            "schedule_detail": copy.deepcopy(self.schedule_detail),
+            "overlap_detail": copy.deepcopy(self.overlap_detail),
+            "memory_detail": copy.deepcopy(self.memory_detail),
+            "partition_detail": copy.deepcopy(self.partition_detail),
+            "config_resolution": copy.deepcopy(self.config_resolution),
         }
 
 
@@ -87,6 +117,14 @@ class CompiledProgram:
     legality: ProgramLegalityReport = field(default_factory=lambda: ProgramLegalityReport(is_valid=True))
     compile_notes: List[str] = field(default_factory=list)
     resolved_profile: Dict[str, Any] = field(default_factory=dict)
+    schedule_detail: Dict[str, Any] = field(default_factory=dict)
+    overlap_detail: Dict[str, Any] = field(default_factory=dict)
+    memory_detail: Dict[str, Any] = field(default_factory=dict)
+    partition_detail: Dict[str, Any] = field(default_factory=dict)
+    config_resolution: Dict[str, Any] = field(default_factory=dict)
+    applied_patch: Dict[str, Any] = field(default_factory=dict)
+    schedule_grid: Dict[str, Any] = field(default_factory=dict)
+    derived_actions: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +134,14 @@ class CompiledProgram:
             "family": self.family.to_dict(),
             "legality": self.legality.to_dict(),
             "compile_notes": list(self.compile_notes),
+            "schedule_detail": copy.deepcopy(self.schedule_detail),
+            "overlap_detail": copy.deepcopy(self.overlap_detail),
+            "memory_detail": copy.deepcopy(self.memory_detail),
+            "partition_detail": copy.deepcopy(self.partition_detail),
+            "config_resolution": copy.deepcopy(self.config_resolution),
+            "applied_patch": copy.deepcopy(self.applied_patch),
+            "schedule_grid": copy.deepcopy(self.schedule_grid),
+            "derived_actions": copy.deepcopy(self.derived_actions),
             "resolved_profile": {
                 "machine_profile": self.resolved_profile.get("machine_profile").to_dict()
                 if self.resolved_profile.get("machine_profile") is not None
@@ -175,6 +221,377 @@ class CostModelEstimate:
         }
 
 
+def _stage_semantic_summary(schedule_ir: ScheduleIRSpec) -> List[Dict[str, Any]]:
+    return [
+        {
+            "stage_id": int(item.stage_id),
+            "family": str(item.family),
+            "local_dispatch_hint": item.local_dispatch_hint,
+            "prefer_delayed_wgrad": bool(item.prefer_delayed_wgrad),
+            "prefer_early_reload": bool(item.prefer_early_reload),
+            "prefer_checkpoint": bool(item.prefer_checkpoint),
+            "prefer_offload": bool(item.prefer_offload),
+            "overlap_aggressiveness": str(item.overlap_aggressiveness),
+        }
+        for item in (schedule_ir.stage_semantics or [])
+    ]
+
+
+def _schedule_detail_report(program: MegatronProgram, runtime_schedule_family: str) -> Dict[str, Any]:
+    schedule_ir = (program.schedule_ir or ScheduleIRSpec()).normalized()
+    effective = {
+        "family": str(runtime_schedule_family or schedule_ir.family or program.schedule.template),
+        "skeleton": str(schedule_ir.skeleton or program.schedule.skeleton),
+        "dispatch_order": str(schedule_ir.dispatch_order or program.schedule.dispatch_order),
+        "microbatch_lanes": int(schedule_ir.microbatch_lanes),
+        "microbatch_group_size_per_vp_stage": schedule_ir.microbatch_group_size_per_vp_stage,
+        "warmup_policy": str(schedule_ir.warmup_policy),
+        "steady_state_policy": str(schedule_ir.steady_state_policy),
+        "cooldown_policy": str(schedule_ir.cooldown_policy),
+        "weight_version_policy": str(schedule_ir.weight_version_policy),
+        "virtual_stage_grouping": list(schedule_ir.virtual_stage_grouping),
+        "stage_semantics": _stage_semantic_summary(schedule_ir),
+    }
+    if schedule_ir.schedule_grid is not None:
+        effective["schedule_grid"] = {
+            "lanes": int(schedule_ir.schedule_grid.lanes),
+            "time_slots": int(schedule_ir.schedule_grid.time_slots),
+            "cell_count": int(len(schedule_ir.schedule_grid.cells or [])),
+        }
+    if schedule_ir.derived_actions:
+        effective["derived_actions"] = {
+            "count": int(len(schedule_ir.derived_actions or [])),
+            "kinds": sorted({str(item.action_type) for item in (schedule_ir.derived_actions or [])}),
+        }
+    return {
+        "requested": schedule_ir.to_dict(),
+        "normalized": schedule_ir.to_dict(),
+        "effective": effective,
+        "disabled_reasons": [],
+        "metadata_only_flags": [],
+    }
+
+
+def _estimated_microbatch_count(program: MegatronProgram) -> int:
+    norm = program.normalized()
+    if norm.batch_plan.grad_accum_steps is not None:
+        return max(int(norm.batch_plan.grad_accum_steps), 1)
+    micro_batch_size = max(int(norm.batch_plan.micro_batch_size), 1)
+    global_batch_size = max(int(norm.batch_plan.global_batch_size), micro_batch_size)
+    return max(int(global_batch_size // micro_batch_size), 1)
+
+
+def _materialize_schedule_grid(
+    program: MegatronProgram,
+    *,
+    runtime_schedule_family: str,
+) -> ScheduleGridSpec:
+    norm = program.normalized()
+    schedule_ir = (norm.schedule_ir or ScheduleIRSpec()).normalized()
+    family = str(runtime_schedule_family or schedule_ir.family or norm.schedule.template or "fixed_1f1b")
+    stage_count = max(int(norm.parallel.pp_degree), 1)
+    vstage_count = max(int(norm.parallel.vpp_degree), 1)
+    microbatch_count = _estimated_microbatch_count(norm)
+    lanes = max(int(schedule_ir.microbatch_lanes), 1)
+    warmup_span = max(stage_count - 1, 0)
+    steady_span = max(microbatch_count, 1)
+    cooldown_span = max(stage_count - 1, 0)
+    total_slots = warmup_span + steady_span + cooldown_span + max(vstage_count - 1, 0) + 2
+    offload_policy = str(schedule_ir.memory_intents.offload_policy or "none").strip().lower()
+    reload_policy = str(schedule_ir.memory_intents.reload_policy or "none").strip().lower()
+    enable_comm = bool(
+        schedule_ir.overlap_intents.enable_p2p_overlap
+        or schedule_ir.overlap_intents.enable_grad_reduce_overlap
+        or schedule_ir.overlap_intents.enable_param_gather_overlap
+    )
+    cells: List[Dict[str, Any]] = []
+    for microbatch_id in range(microbatch_count):
+        for stage_id in range(stage_count):
+            base_slot = microbatch_id + stage_id
+            forward_slot = base_slot
+            backward_slot = warmup_span + steady_span + (microbatch_count - 1 - microbatch_id) + (stage_count - 1 - stage_id)
+            wgrad_slot = backward_slot
+            if family in {"fixed_1f1b", "interleaved"}:
+                wgrad_slot = backward_slot + 1
+            elif family in {"zero_bubble", "zbv", "v_half", "v_min", "dualpipe_v"}:
+                wgrad_slot = max(backward_slot - 1, 0) if str(schedule_ir.weight_version_policy) in {"delayed_wgrad", "zero_bubble"} else backward_slot
+            cells.append(
+                {
+                    "kind": "FWD",
+                    "stage_id": int(stage_id),
+                    "lane_id": 0,
+                    "microbatch_id": int(microbatch_id),
+                    "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                    "time_slot": int(forward_slot),
+                    "family": family,
+                }
+            )
+            cells.append(
+                {
+                    "kind": "BWD_ACT",
+                    "stage_id": int(stage_id),
+                    "lane_id": 0,
+                    "microbatch_id": int(microbatch_id),
+                    "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                    "time_slot": int(backward_slot),
+                    "family": family,
+                }
+            )
+            cells.append(
+                {
+                    "kind": "WGRAD_OPT",
+                    "stage_id": int(stage_id),
+                    "lane_id": 0,
+                    "microbatch_id": int(microbatch_id),
+                    "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                    "time_slot": int(max(wgrad_slot, 0)),
+                    "family": family,
+                    "weight_version_tag": str(schedule_ir.weight_version_policy or "default"),
+                }
+            )
+            if enable_comm:
+                cells.append(
+                    {
+                        "kind": "COMM",
+                        "stage_id": int(stage_id),
+                        "lane_id": 1 if lanes > 1 else 0,
+                        "microbatch_id": int(microbatch_id),
+                        "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                        "time_slot": int(forward_slot),
+                        "family": family,
+                        "stream_or_channel": "p2p",
+                    }
+                )
+            if offload_policy not in {"", "none", "off", "default"}:
+                cells.append(
+                    {
+                        "kind": "OFFLOAD",
+                        "stage_id": int(stage_id),
+                        "lane_id": 1 if lanes > 1 else 0,
+                        "microbatch_id": int(microbatch_id),
+                        "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                        "time_slot": int(forward_slot + 1),
+                        "family": family,
+                        "stream_or_channel": "memory",
+                    }
+                )
+            if reload_policy not in {"", "none", "off", "default"}:
+                cells.append(
+                    {
+                        "kind": "RELOAD",
+                        "stage_id": int(stage_id),
+                        "lane_id": 1 if lanes > 1 else 0,
+                        "microbatch_id": int(microbatch_id),
+                        "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                        "time_slot": int(max(backward_slot - 1, 0)),
+                        "family": family,
+                        "stream_or_channel": "memory",
+                    }
+                )
+    bubble_slots: List[Dict[str, Any]] = []
+    for stage_id in range(stage_count):
+        occupied = {
+            (int(cell.get("lane_id") or 0), int(cell.get("time_slot") or 0))
+            for cell in cells
+            if int(cell.get("stage_id") or 0) == int(stage_id)
+        }
+        for lane_id in range(lanes):
+            for time_slot in range(total_slots):
+                if (lane_id, time_slot) in occupied:
+                    continue
+                bubble_slots.append(
+                    {
+                        "kind": "BUBBLE",
+                        "stage_id": int(stage_id),
+                        "lane_id": int(lane_id),
+                        "microbatch_id": -1,
+                        "vchunk_id": int(stage_id % max(vstage_count, 1)),
+                        "time_slot": int(time_slot),
+                        "family": family,
+                    }
+                )
+    cells.extend(bubble_slots)
+    return ScheduleGridSpec(
+        lanes=lanes,
+        time_slots=total_slots,
+        cells=sorted(
+            cells,
+            key=lambda item: (
+                int(item.get("time_slot") or 0),
+                int(item.get("stage_id") or 0),
+                int(item.get("lane_id") or 0),
+                str(item.get("kind") or ""),
+            ),
+        ),
+        family=family,
+        stage_count=stage_count,
+        vstage_count=vstage_count,
+        microbatch_count=microbatch_count,
+        weight_version_policy=str(schedule_ir.weight_version_policy or "default"),
+        constraints={
+            "dispatch_order": str(schedule_ir.dispatch_order or norm.schedule.dispatch_order),
+            "warmup_policy": str(schedule_ir.warmup_policy),
+            "steady_state_policy": str(schedule_ir.steady_state_policy),
+            "cooldown_policy": str(schedule_ir.cooldown_policy),
+            "microbatch_group_size_per_vp_stage": schedule_ir.microbatch_group_size_per_vp_stage,
+            "stage_local_vpp_vector": list((norm.partition_optimization or PartitionOptimizationSpec()).normalized().stage_local_vpp_vector),
+        },
+        notes=[
+            "grid is a schedule lowering view used for runtime contract, event export, and future action-runner execution",
+        ],
+    ).normalized()
+
+
+def _derive_schedule_actions(grid: ScheduleGridSpec) -> List[ScheduleActionSpec]:
+    actions: List[ScheduleActionSpec] = []
+    dependency_map: Dict[tuple[int, int, str], str] = {}
+    for index, cell in enumerate(list(grid.normalized().cells or [])):
+        kind = str(cell.get("kind") or "BUBBLE").upper()
+        if kind == "BUBBLE":
+            action_type = "WAIT"
+        elif kind in {"FWD", "BWD_ACT", "WGRAD_OPT", "COMM", "OFFLOAD", "RELOAD"}:
+            action_type = kind
+        else:
+            action_type = "WAIT"
+        stage_id = int(cell.get("stage_id") or 0)
+        microbatch_id = max(int(cell.get("microbatch_id", -1) or -1), -1)
+        action_id = f"a{index:04d}"
+        dependency_ids: List[str] = []
+        if microbatch_id >= 0 and action_type == "BWD_ACT":
+            forward_id = dependency_map.get((stage_id, microbatch_id, "FWD"))
+            if forward_id:
+                dependency_ids.append(forward_id)
+        if microbatch_id >= 0 and action_type == "WGRAD_OPT":
+            backward_id = dependency_map.get((stage_id, microbatch_id, "BWD_ACT"))
+            if backward_id:
+                dependency_ids.append(backward_id)
+        action = ScheduleActionSpec(
+            action_type=action_type,
+            stage_id=stage_id,
+            lane_id=int(cell.get("lane_id") or 0),
+            microbatch_id=max(microbatch_id, 0),
+            vchunk_id=int(cell.get("vchunk_id") or 0),
+            time_slot=int(cell.get("time_slot") or 0),
+            duration_hint=1.0 if action_type != "WAIT" else 0.0,
+            dependency_ids=dependency_ids,
+            memory_delta=0.0 if action_type not in {"OFFLOAD", "RELOAD"} else (-1.0 if action_type == "OFFLOAD" else 1.0),
+            stream_or_channel=str(cell.get("stream_or_channel") or "").strip() or None,
+            weight_version_tag=cell.get("weight_version_tag"),
+        ).normalized()
+        actions.append(action)
+        dependency_map[(stage_id, microbatch_id, action_type)] = action_id
+    return actions
+
+
+def _overlap_detail_report(program: MegatronProgram, backend_family: str) -> Dict[str, Any]:
+    schedule_ir = (program.schedule_ir or ScheduleIRSpec()).normalized()
+    overlap = schedule_ir.overlap_intents.normalized()
+    disabled: List[str] = list(overlap.disabled_reasons)
+    metadata_only: List[str] = []
+    if overlap.enable_tp_comm_overlap and int(program.parallel.tp_degree) <= 1:
+        disabled.append("tp_comm_overlap_requires_tp_gt_1")
+    if overlap.enable_reload_overlap and str(schedule_ir.memory_intents.offload_policy or "none") in {"none", "off"}:
+        disabled.append("reload_overlap_requires_reload_or_offload_policy")
+    if overlap.enable_optimizer_tail_overlap and backend_family != "megatron_core":
+        metadata_only.append("optimizer_tail_overlap")
+    return {
+        "requested": overlap.to_dict(),
+        "normalized": overlap.to_dict(),
+        "effective": {**overlap.to_dict(), "backend_family": backend_family},
+        "disabled_reasons": disabled,
+        "metadata_only_flags": metadata_only,
+    }
+
+
+def _memory_detail_report(program: MegatronProgram, backend_caps: BackendCaps) -> Dict[str, Any]:
+    schedule_ir = (program.schedule_ir or ScheduleIRSpec()).normalized()
+    memory = schedule_ir.memory_intents.normalized()
+    disabled: List[str] = []
+    metadata_only: List[str] = []
+    transformer_impl = str(backend_caps.transformer_impl or "").strip().lower()
+    if memory.offload_policy not in {"none", "off", "default"} and transformer_impl != "transformer_engine":
+        disabled.append("fine_grained_offload_requires_transformer_engine")
+        metadata_only.append("offload_policy")
+    if memory.prefetch_policy not in {"default", "none"} and memory.offload_policy in {"none", "off"}:
+        disabled.append("prefetch_requires_offload_or_reload_policy")
+    return {
+        "requested": memory.to_dict(),
+        "normalized": memory.to_dict(),
+        "effective": {**memory.to_dict(), "transformer_impl": str(backend_caps.transformer_impl)},
+        "disabled_reasons": disabled,
+        "metadata_only_flags": metadata_only,
+    }
+
+
+def _partition_detail_report(program: MegatronProgram) -> Dict[str, Any]:
+    partition_opt = (program.partition_optimization or PartitionOptimizationSpec()).normalized()
+    stage_ranges: List[List[int]] = []
+    cursor = 0
+    for stage in (program.partition.stages or []):
+        layers = max(int(stage.decoder_layers), 0)
+        end = cursor + max(layers - 1, 0)
+        stage_ranges.append([int(cursor), int(end)])
+        cursor += layers
+    effective = partition_opt.to_dict()
+    effective.update(
+        {
+            "stage_ranges": stage_ranges,
+            "stage_to_node": list(program.layout.stage_to_node or []),
+            "pp_degree": int(program.parallel.pp_degree),
+            "vpp_degree": int(program.parallel.vpp_degree),
+        }
+    )
+    return {
+        "requested": partition_opt.to_dict(),
+        "normalized": partition_opt.to_dict(),
+        "effective": effective,
+        "disabled_reasons": [],
+        "metadata_only_flags": [],
+    }
+
+
+def _config_resolution_report(
+    *,
+    schedule_detail: Dict[str, Any],
+    overlap_detail: Dict[str, Any],
+    memory_detail: Dict[str, Any],
+    partition_detail: Dict[str, Any],
+) -> Dict[str, Any]:
+    downgraded_fields: List[str] = []
+    reasons: List[str] = []
+    for key, detail in (
+        ("schedule_detail", schedule_detail),
+        ("overlap_detail", overlap_detail),
+        ("memory_detail", memory_detail),
+        ("partition_detail", partition_detail),
+    ):
+        disabled = list(detail.get("disabled_reasons") or [])
+        metadata_only = list(detail.get("metadata_only_flags") or [])
+        if disabled or metadata_only:
+            downgraded_fields.append(key)
+            reasons.extend(disabled + metadata_only)
+    return {
+        "requested": {
+            "schedule_detail": copy.deepcopy(schedule_detail.get("requested") or {}),
+            "overlap_detail": copy.deepcopy(overlap_detail.get("requested") or {}),
+            "memory_detail": copy.deepcopy(memory_detail.get("requested") or {}),
+            "partition_detail": copy.deepcopy(partition_detail.get("requested") or {}),
+        },
+        "normalized": {
+            "schedule_detail": copy.deepcopy(schedule_detail.get("normalized") or {}),
+            "overlap_detail": copy.deepcopy(overlap_detail.get("normalized") or {}),
+            "memory_detail": copy.deepcopy(memory_detail.get("normalized") or {}),
+            "partition_detail": copy.deepcopy(partition_detail.get("normalized") or {}),
+        },
+        "effective": {
+            "schedule_detail": copy.deepcopy(schedule_detail.get("effective") or {}),
+            "overlap_detail": copy.deepcopy(overlap_detail.get("effective") or {}),
+            "memory_detail": copy.deepcopy(memory_detail.get("effective") or {}),
+            "partition_detail": copy.deepcopy(partition_detail.get("effective") or {}),
+        },
+        "downgraded_fields": downgraded_fields,
+        "reasons": reasons,
+    }
 
 
 def _resolved_profile_context(program: MegatronProgram) -> Dict[str, Any]:
@@ -714,6 +1131,8 @@ def check_program(
     runtime_operator_cluster_overrides = _normalized_runtime_operator_cluster_overrides(
         (norm.metadata or {}).get("runtime_operator_cluster_overrides")
     )
+    schedule_ir = (norm.schedule_ir or ScheduleIRSpec()).normalized()
+    partition_optimization = (norm.partition_optimization or PartitionOptimizationSpec()).normalized()
     diagnosis: List[str] = []
 
     if norm.constraints.requires_runtime_pg_rebuild:
@@ -751,6 +1170,13 @@ def check_program(
             f"partition total decoder layers={norm.partition.total_decoder_layers} "
             f"must equal model.num_layers={int(norm.model.num_layers)}"
         )
+    if partition_optimization.stage_layer_counts:
+        if len(partition_optimization.stage_layer_counts) != norm.partition.num_stages:
+            errors.append("partition_optimization.stage_layer_counts length must match number of partition stages")
+        elif sum(int(item) for item in partition_optimization.stage_layer_counts) != int(norm.model.num_layers):
+            errors.append("partition_optimization.stage_layer_counts must sum to model.num_layers")
+    if partition_optimization.stage_local_vpp_vector and len(partition_optimization.stage_local_vpp_vector) != norm.partition.num_stages:
+        errors.append("partition_optimization.stage_local_vpp_vector length must match number of partition stages")
 
     if int(norm.parallel.vpp_degree) != int(norm.layout.vpp_degree):
         errors.append("parallel.vpp_degree must match layout.vpp_degree")
@@ -779,8 +1205,15 @@ def check_program(
         total_virtual = int(norm.parallel.pp_degree) * int(norm.parallel.vpp_degree)
         if int(norm.model.num_layers) % total_virtual != 0:
             errors.append(f"model.num_layers={norm.model.num_layers} must be divisible by pp*vpp={total_virtual}")
-    if norm.schedule.template not in _SUPPORTED_SCHEDULE_TEMPLATES:
+    requested_family = str(schedule_ir.family or norm.schedule.template or "fixed_1f1b")
+    if norm.schedule.template not in _SUPPORTED_SCHEDULE_TEMPLATES and requested_family not in _SEMANTIC_RUNTIME_FAMILIES:
         errors.append(f"unsupported schedule template: {norm.schedule.template}")
+    if str(schedule_ir.weight_version_policy or "default") not in {"default", "single", "dual", "optimizer_tail_guarded"}:
+        errors.append(f"unsupported weight_version_policy: {schedule_ir.weight_version_policy}")
+    if requested_family in {"zbv", "v_half", "v_min"} and backend_family != "torchtitan":
+        errors.append(f"schedule family {requested_family} currently requires execution_backend=torchtitan sandbox")
+    if requested_family in {"dualpipe_v", "zero_bubble"} and int(norm.parallel.pp_degree) <= 1:
+        errors.append(f"schedule family {requested_family} requires pp_degree > 1")
     if (
         norm.schedule.template in {"torchtitan_zero_bubble", "torchtitan_dualpipev"}
         and backend_family != "torchtitan"
@@ -845,6 +1278,25 @@ def check_program(
             diagnosis.append("optimizer_overlap_memory_risk")
             errors.append(
                 "optimizer-aware runtime rejected because predicted memory pressure plus overlap overhead exceeds the safe budget"
+            )
+    fine_grained_activation_offloading = bool(
+        (norm.metadata or {}).get("runtime_enable_fine_grained_activation_offloading", False)
+    )
+    runtime_offload_modules = [
+        str(item).strip()
+        for item in list((norm.metadata or {}).get("runtime_offload_modules") or [])
+        if str(item).strip()
+    ]
+    if fine_grained_activation_offloading:
+        if str(profile_context["backend_caps"].transformer_impl or "").strip().lower() != "transformer_engine":
+            diagnosis.append("fine_grained_offload_requires_te")
+            errors.append(
+                "fine-grained activation offloading requires transformer_engine backend support"
+            )
+        if not runtime_offload_modules:
+            diagnosis.append("fine_grained_offload_missing_modules")
+            errors.append(
+                "fine-grained activation offloading requires at least one runtime offload module"
             )
     if runtime_window_overrides:
         interleaved_pipeline = _program_uses_interleaved_pipeline(norm)
@@ -924,9 +1376,23 @@ def check_program(
     if bool(vpp_tradeoff.get("should_veto")):
         diagnosis.append("comm_exposure_vpp_veto")
         errors.append(str(vpp_tradeoff.get("reason") or "comm-exposure-aware VPP veto"))
+    if schedule_ir.stage_semantics and backend_family not in {"megatron_core", "torchtitan"}:
+        errors.append("stage semantic override exceeds backend/runtime support")
 
     if rejected:
         errors.extend(rejected)
+
+    runtime_schedule_family = _infer_runtime_schedule_family(norm)
+    schedule_detail = _schedule_detail_report(norm, runtime_schedule_family)
+    overlap_detail = _overlap_detail_report(norm, backend_family)
+    memory_detail = _memory_detail_report(norm, profile_context["backend_caps"])
+    partition_detail = _partition_detail_report(norm)
+    config_resolution = _config_resolution_report(
+        schedule_detail=schedule_detail,
+        overlap_detail=overlap_detail,
+        memory_detail=memory_detail,
+        partition_detail=partition_detail,
+    )
 
     return ProgramLegalityReport(
         is_valid=not errors,
@@ -938,6 +1404,11 @@ def check_program(
         stage_memory=[item.to_dict() for item in stage_memory_estimates],
         cost_model=cost_model.to_dict(),
         diagnosis=diagnosis,
+        schedule_detail=schedule_detail,
+        overlap_detail=overlap_detail,
+        memory_detail=memory_detail,
+        partition_detail=partition_detail,
+        config_resolution=config_resolution,
     )
 
 
@@ -1259,6 +1730,9 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     family = classify_program_family(norm)
     legality = check_program(norm)
     strategy = program_to_strategy(norm)
+    schedule_ir = (norm.schedule_ir or ScheduleIRSpec()).normalized()
+    partition_optimization = (norm.partition_optimization or PartitionOptimizationSpec()).normalized()
+    materialized_schedule_grid = (schedule_ir.schedule_grid or _materialize_schedule_grid(norm, runtime_schedule_family="")).normalized() if schedule_ir.schedule_grid is not None else None
     profile_context = _resolved_profile_context(norm)
     machine_profile = profile_context["machine_profile"]
     backend_caps = profile_context["backend_caps"]
@@ -1333,8 +1807,35 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     if norm.schedule.dispatch_order:
         env["DISPATCH_ORDER"] = str(norm.schedule.dispatch_order)
     runtime_schedule_family = _infer_runtime_schedule_family(norm)
+    if materialized_schedule_grid is None:
+        materialized_schedule_grid = _materialize_schedule_grid(norm, runtime_schedule_family=runtime_schedule_family)
+    derived_actions = schedule_ir.derived_actions or _derive_schedule_actions(materialized_schedule_grid)
     if runtime_schedule_family:
         env["SCHEDULE_POLICY_FAMILY"] = runtime_schedule_family
+    env["SCHEDULE_FAMILY"] = str(schedule_ir.family or runtime_schedule_family or norm.schedule.template)
+    env["SCHEDULE_DISPATCH_ORDER"] = str(schedule_ir.dispatch_order or norm.schedule.dispatch_order)
+    env["SCHEDULE_LANE_POLICY"] = str(int(schedule_ir.microbatch_lanes))
+    if schedule_ir.microbatch_group_size_per_vp_stage is not None:
+        group_size_vector = list(schedule_ir.virtual_stage_grouping or [])
+        if not group_size_vector:
+            group_size_vector = [
+                int(schedule_ir.microbatch_group_size_per_vp_stage)
+                for _ in range(max(int(norm.parallel.pp_degree), 1))
+            ]
+        env["SCHEDULE_GROUP_SIZE_VECTOR"] = json.dumps(
+            group_size_vector,
+            ensure_ascii=False,
+        )
+    if schedule_ir.stage_semantics:
+        env["SCHEDULE_STAGE_SEMANTIC_HINTS"] = json.dumps(
+            [item.to_dict() for item in schedule_ir.stage_semantics],
+            ensure_ascii=False,
+        )
+    env["SCHEDULE_OVERLAP_HINTS"] = json.dumps(schedule_ir.overlap_intents.to_dict(), ensure_ascii=False)
+    env["SCHEDULE_MEMORY_HINTS"] = json.dumps(schedule_ir.memory_intents.to_dict(), ensure_ascii=False)
+    env["SCHEDULE_PARTITION_HINTS"] = json.dumps(partition_optimization.to_dict(), ensure_ascii=False)
+    env["SCHEDULE_GRID_SPEC"] = json.dumps(materialized_schedule_grid.to_dict(), ensure_ascii=False)
+    env["SCHEDULE_ACTION_SPECS"] = json.dumps([item.to_dict() for item in derived_actions], ensure_ascii=False)
     if norm.strategy_ir.pipe.warmup_policy:
         env["SCHEDULE_WARMUP_POLICY"] = str(norm.strategy_ir.pipe.warmup_policy)
     if norm.strategy_ir.pipe.cooldown_policy:
@@ -1560,6 +2061,17 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     for index, node in enumerate(norm.layout.stage_to_node):
         env[f"STAGE_{index}_NODE"] = str(node)
 
+    schedule_detail = copy.deepcopy(legality.schedule_detail)
+    if isinstance(schedule_detail.get("effective"), dict):
+        schedule_detail["effective"]["schedule_grid"] = {
+            "lanes": int(materialized_schedule_grid.lanes),
+            "time_slots": int(materialized_schedule_grid.time_slots),
+            "cell_count": int(len(materialized_schedule_grid.cells or [])),
+        }
+        schedule_detail["effective"]["derived_actions"] = {
+            "count": int(len(derived_actions or [])),
+            "kinds": sorted({str(item.action_type) for item in (derived_actions or [])}),
+        }
     extra_args = list(strategy.extra_args or [])
     return CompiledProgram(
         strategy=strategy,
@@ -1569,4 +2081,12 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         legality=legality,
         compile_notes=compile_notes,
         resolved_profile=profile_context,
+        schedule_detail=schedule_detail,
+        overlap_detail=copy.deepcopy(legality.overlap_detail),
+        memory_detail=copy.deepcopy(legality.memory_detail),
+        partition_detail=copy.deepcopy(legality.partition_detail),
+        config_resolution=copy.deepcopy(legality.config_resolution),
+        applied_patch=norm.applied_patch.to_dict() if norm.applied_patch is not None else {},
+        schedule_grid=materialized_schedule_grid.to_dict(),
+        derived_actions=[item.to_dict() for item in derived_actions],
     )
