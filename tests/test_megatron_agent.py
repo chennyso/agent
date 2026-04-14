@@ -4389,6 +4389,48 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             [0, 1],
         )
 
+    def test_build_launcher_env_materializes_large_structured_payloads_to_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "trial_runner.py",
+                    "--program-file",
+                    str(Path(tmpdir) / "program.json"),
+                    "--output",
+                    str(Path(tmpdir) / "out.json"),
+                    "--megatron-root",
+                    tmpdir,
+                    "--launcher-script",
+                    "",
+                    "--run-root",
+                    str(Path(tmpdir) / "runs"),
+                ],
+            ):
+                args = trial_runner.parse_args()
+            program = default_dense_program("single_g5").normalized()
+            compiled = compile_program(program)
+            with mock.patch.object(trial_runner, "_validate_cuda_toolchain", return_value={}):
+                launcher_env = trial_runner._build_launcher_env(args, program, compiled, trial_id=0)
+
+            self.assertNotIn("STATE_PLAN", launcher_env)
+            self.assertNotIn("SCHEDULE_NODE_SPECS", launcher_env)
+            self.assertIn("STATE_PLAN_FILE", launcher_env)
+            self.assertIn("SCHEDULE_NODE_SPECS_FILE", launcher_env)
+            state_plan_path = Path(str(launcher_env["STATE_PLAN_FILE"]))
+            node_specs_path = Path(str(launcher_env["SCHEDULE_NODE_SPECS_FILE"]))
+            self.assertTrue(state_plan_path.exists())
+            self.assertTrue(node_specs_path.exists())
+            self.assertEqual(
+                json.loads(state_plan_path.read_text(encoding="utf-8")),
+                json.loads(compiled.launcher_env["STATE_PLAN"]),
+            )
+            self.assertEqual(
+                json.loads(node_specs_path.read_text(encoding="utf-8")),
+                json.loads(compiled.launcher_env["SCHEDULE_NODE_SPECS"]),
+            )
+
     def test_verify_program_marks_recommendation_only_runtime_repair_as_deprioritized(self) -> None:
         program = default_dense_program("single_g5").normalized()
         program.rewrite_plan = RewriteExecutionPlanSpec(

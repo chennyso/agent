@@ -1111,6 +1111,19 @@ def _parse_json_hint_list(raw: str) -> List[Dict[str, Any]]:
     return [dict(item) for item in payload if isinstance(item, dict)]
 
 
+def _read_env_or_file(var_name: str) -> str:
+    direct = str(os.environ.get(var_name, "") or "").strip()
+    if direct:
+        return direct
+    payload_file = str(os.environ.get(f"{var_name}_FILE", "") or "").strip()
+    if not payload_file:
+        return ""
+    try:
+        return Path(payload_file).read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 def _dedupe_json_dict_list(items: Any) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -1562,20 +1575,20 @@ def _parse_stage_semantic_hints(raw: str) -> Dict[int, Dict[str, str]]:
 
 def _parse_schedule_runtime_hints() -> Dict[str, Any]:
     runtime_repair_actions = _parse_runtime_repair_action_contracts(
-        os.environ.get("RUNTIME_REPAIR_ACTIONS", "")
+        _read_env_or_file("RUNTIME_REPAIR_ACTIONS")
     )
     runtime_repair_recommendations = _parse_runtime_repair_action_contracts(
-        os.environ.get("RUNTIME_REPAIR_RECOMMENDATIONS", "")
+        _read_env_or_file("RUNTIME_REPAIR_RECOMMENDATIONS")
     )
-    runtime_repair_summary = _parse_json_hint_dict(os.environ.get("RUNTIME_REPAIR_SUMMARY", ""))
+    runtime_repair_summary = _parse_json_hint_dict(_read_env_or_file("RUNTIME_REPAIR_SUMMARY"))
     runtime_repair_score_weights = _parse_json_hint_dict(
-        os.environ.get("RUNTIME_REPAIR_SCORE_WEIGHTS", "")
+        _read_env_or_file("RUNTIME_REPAIR_SCORE_WEIGHTS")
     )
     runtime_repair_policy_table = _parse_json_hint_dict(
-        os.environ.get("RUNTIME_REPAIR_POLICY_TABLE", "")
+        _read_env_or_file("RUNTIME_REPAIR_POLICY_TABLE")
     )
     runtime_repair_aggregated = _aggregate_runtime_repair_contracts(runtime_repair_actions)
-    telemetry_budget = _parse_json_hint_dict(os.environ.get("TELEMETRY_BUDGET", ""))
+    telemetry_budget = _parse_json_hint_dict(_read_env_or_file("TELEMETRY_BUDGET"))
     if not isinstance(telemetry_budget, dict):
         telemetry_budget = {}
     explicit_level = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_LEVEL", "") or "").strip()
@@ -1607,17 +1620,17 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
             "sampled_windows": 2,
             "emit_compare_svg": False,
         }
-    state_plan = _parse_json_hint_dict(os.environ.get("STATE_PLAN", ""))
-    offload_plan = _parse_json_hint_dict(os.environ.get("OFFLOAD_PLAN", ""))
-    reload_plan = _parse_json_hint_dict(os.environ.get("RELOAD_PLAN", ""))
-    comm_chunk_plan = _parse_json_hint_dict(os.environ.get("COMM_CHUNK_PLAN", ""))
-    overlap_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_OVERLAP_HINTS", ""))
-    memory_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_MEMORY_HINTS", ""))
-    partition_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_PARTITION_HINTS", ""))
+    state_plan = _parse_json_hint_dict(_read_env_or_file("STATE_PLAN"))
+    offload_plan = _parse_json_hint_dict(_read_env_or_file("OFFLOAD_PLAN"))
+    reload_plan = _parse_json_hint_dict(_read_env_or_file("RELOAD_PLAN"))
+    comm_chunk_plan = _parse_json_hint_dict(_read_env_or_file("COMM_CHUNK_PLAN"))
+    overlap_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_OVERLAP_HINTS"))
+    memory_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_MEMORY_HINTS"))
+    partition_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_PARTITION_HINTS"))
     state_plan.update(dict(runtime_repair_aggregated.get("state_plan_patch") or {}))
 
     explicit_state_migration_hints = _parse_json_hint_list(
-        os.environ.get("SCHEDULE_STATE_MIGRATION_HINTS", "")
+        _read_env_or_file("SCHEDULE_STATE_MIGRATION_HINTS")
     )
     state_migration_hints = _normalize_runtime_state_migration_hints(
         [
@@ -1651,6 +1664,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
             _dedupe_json_dict_list(
                 [
                     *_parse_json_hint_list(os.environ.get("SCHEDULE_WINDOW_OVERRIDE_HINTS", "")),
+                    *_parse_json_hint_list(_read_env_or_file("SCHEDULE_WINDOW_OVERRIDE_HINTS")),
                     *list(runtime_repair_aggregated.get("window_overrides") or []),
                 ]
             ),
@@ -1663,6 +1677,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
             _dedupe_json_dict_list(
                 [
                     *_parse_json_hint_list(os.environ.get("SCHEDULE_OPERATOR_CLUSTER_HINTS", "")),
+                    *_parse_json_hint_list(_read_env_or_file("SCHEDULE_OPERATOR_CLUSTER_HINTS")),
                     *list(runtime_repair_aggregated.get("operator_cluster_overrides") or []),
                 ]
             ),
@@ -1737,7 +1752,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
         memory_hints["status"] = "runtime_repair"
 
     stage_semantic_hints = _merge_stage_semantic_maps(
-        _parse_stage_semantic_hints(os.environ.get("SCHEDULE_STAGE_SEMANTIC_HINTS", "")),
+        _parse_stage_semantic_hints(_read_env_or_file("SCHEDULE_STAGE_SEMANTIC_HINTS")),
         _runtime_state_migration_semantics_by_stage(state_migration_hints),
     )
     return {
@@ -1745,10 +1760,10 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
         "dispatch_order": str(os.environ.get("SCHEDULE_DISPATCH_ORDER", "") or "").strip(),
         "lane_policy": str(os.environ.get("SCHEDULE_LANE_POLICY", "") or "").strip(),
         "group_size_vector": _parse_int_vector_hint(os.environ.get("SCHEDULE_GROUP_SIZE_VECTOR", "")),
-        "schedule_grid_spec": _parse_schedule_grid_spec(os.environ.get("SCHEDULE_GRID_SPEC", "")),
-        "schedule_action_specs": _parse_schedule_action_specs(os.environ.get("SCHEDULE_ACTION_SPECS", "")),
-        "schedule_node_specs": _parse_json_hint_list(os.environ.get("SCHEDULE_NODE_SPECS", "")),
-        "schedule_edge_specs": _parse_json_hint_list(os.environ.get("SCHEDULE_EDGE_SPECS", "")),
+        "schedule_grid_spec": _parse_schedule_grid_spec(_read_env_or_file("SCHEDULE_GRID_SPEC")),
+        "schedule_action_specs": _parse_schedule_action_specs(_read_env_or_file("SCHEDULE_ACTION_SPECS")),
+        "schedule_node_specs": _parse_json_hint_list(_read_env_or_file("SCHEDULE_NODE_SPECS")),
+        "schedule_edge_specs": _parse_json_hint_list(_read_env_or_file("SCHEDULE_EDGE_SPECS")),
         "runtime_repair_summary": runtime_repair_summary,
         "runtime_repair_score_weights": runtime_repair_score_weights,
         "runtime_repair_policy_table": runtime_repair_policy_table,
@@ -1758,7 +1773,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
         "offload_plan": offload_plan,
         "reload_plan": reload_plan,
         "comm_chunk_plan": comm_chunk_plan,
-        "window_reconfig_plan": _parse_json_hint_dict(os.environ.get("WINDOW_RECONFIG_PLAN", "")),
+        "window_reconfig_plan": _parse_json_hint_dict(_read_env_or_file("WINDOW_RECONFIG_PLAN")),
         "telemetry_budget": telemetry_budget,
         "stage_semantic_hints": stage_semantic_hints,
         "state_migration_hints": state_migration_hints,

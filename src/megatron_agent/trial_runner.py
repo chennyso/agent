@@ -103,33 +103,33 @@ def _parse_cuda_visible_devices(raw: Optional[str], nproc: int) -> List[int]:
 
 def _resolve_megatron_entry(root: Optional[str], entry: str) -> Path:
     if os.path.isabs(entry):
-        return Path(entry)
+        return Path(entry).resolve()
     if root:
-        root_path = Path(root)
+        root_path = Path(root).resolve()
         entry_path = Path(entry)
         if entry_path.parts and entry_path.parts[0] == root_path.name:
             trimmed_parts = entry_path.parts[1:]
-            return root_path / Path(*trimmed_parts) if trimmed_parts else root_path
-        return root_path / entry_path
+            return (root_path / Path(*trimmed_parts)).resolve() if trimmed_parts else root_path
+        return (root_path / entry_path).resolve()
     env_root = os.environ.get("MEGATRON_LM_ROOT")
     if env_root:
-        return Path(env_root) / entry
-    return Path(entry)
+        return (Path(env_root).resolve() / entry).resolve()
+    return Path(entry).resolve()
 
 
 def _resolve_launcher_script(root: Optional[str], launcher_script: Optional[str]) -> Optional[Path]:
     if not launcher_script:
         return None
     if os.path.isabs(launcher_script):
-        return Path(launcher_script)
+        return Path(launcher_script).resolve()
     if root:
-        root_path = Path(root)
+        root_path = Path(root).resolve()
         script_path = Path(launcher_script)
         if script_path.parts and script_path.parts[0] == root_path.name:
             trimmed_parts = script_path.parts[1:]
-            return root_path / Path(*trimmed_parts) if trimmed_parts else root_path
-        return root_path / script_path
-    return Path(launcher_script)
+            return (root_path / Path(*trimmed_parts)).resolve() if trimmed_parts else root_path
+        return (root_path / script_path).resolve()
+    return Path(launcher_script).resolve()
 
 
 def _default_run_root(args: argparse.Namespace) -> Path:
@@ -1347,6 +1347,49 @@ def _parse_json_env_list(raw: Any) -> List[Dict[str, Any]]:
     return [dict(item) for item in payload if isinstance(item, dict)]
 
 
+_FILE_BACKED_LAUNCHER_ENV_KEYS: Dict[str, str] = {
+    "RUNTIME_REPAIR_SUMMARY": "runtime_repair_summary.json",
+    "RUNTIME_REPAIR_SCORE_WEIGHTS": "runtime_repair_score_weights.json",
+    "RUNTIME_REPAIR_POLICY_TABLE": "runtime_repair_policy_table.json",
+    "RUNTIME_REPAIR_ACTIONS": "runtime_repair_actions.json",
+    "RUNTIME_REPAIR_RECOMMENDATIONS": "runtime_repair_recommendations.json",
+    "SCHEDULE_STAGE_SEMANTIC_HINTS": "schedule_stage_semantic_hints.json",
+    "SCHEDULE_OVERLAP_HINTS": "schedule_overlap_hints.json",
+    "SCHEDULE_MEMORY_HINTS": "schedule_memory_hints.json",
+    "SCHEDULE_PARTITION_HINTS": "schedule_partition_hints.json",
+    "SCHEDULE_GRID_SPEC": "schedule_grid_spec.json",
+    "SCHEDULE_ACTION_SPECS": "schedule_action_specs.json",
+    "SCHEDULE_NODE_SPECS": "schedule_node_specs.json",
+    "SCHEDULE_EDGE_SPECS": "schedule_edge_specs.json",
+    "SCHEDULE_STATE_MIGRATION_HINTS": "schedule_state_migration_hints.json",
+    "SCHEDULE_WINDOW_OVERRIDE_HINTS": "schedule_window_override_hints.json",
+    "SCHEDULE_OPERATOR_CLUSTER_HINTS": "schedule_operator_cluster_hints.json",
+    "STATE_PLAN": "state_plan.json",
+    "GLOBAL_STRATEGY_PLAN": "global_strategy_plan.json",
+    "REWRITE_EXECUTION_PLAN": "rewrite_execution_plan.json",
+    "OFFLOAD_PLAN": "offload_plan.json",
+    "RELOAD_PLAN": "reload_plan.json",
+    "COMM_CHUNK_PLAN": "comm_chunk_plan.json",
+    "WINDOW_RECONFIG_PLAN": "window_reconfig_plan.json",
+    "WINDOW_FEEDBACK_PLAN": "window_feedback_plan.json",
+}
+
+
+def _materialize_file_backed_launcher_env(env: Dict[str, str], trial_dir: str) -> Dict[str, str]:
+    materialized = dict(env or {})
+    payload_dir = Path(trial_dir) / "launcher_env_payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    for key, filename in _FILE_BACKED_LAUNCHER_ENV_KEYS.items():
+        raw_value = str(materialized.get(key) or "").strip()
+        if not raw_value:
+            continue
+        payload_path = payload_dir / filename
+        payload_path.write_text(raw_value, encoding="utf-8")
+        materialized.pop(key, None)
+        materialized[f"{key}_FILE"] = str(payload_path)
+    return materialized
+
+
 def _dedupe_json_dict_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -1891,7 +1934,7 @@ def _build_launcher_env(
     env = os.environ.copy()
     env.update(_validate_cuda_toolchain())
     env.update(_launcher_env_overrides(args, program, compiled, trial_id, output_dirs=output_dirs))
-    return env
+    return _materialize_file_backed_launcher_env(env, output_dirs["trial_dir"])
 
 
 def _launcher_env_overrides(

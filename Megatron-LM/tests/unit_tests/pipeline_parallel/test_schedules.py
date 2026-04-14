@@ -2,6 +2,8 @@
 
 import json
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -444,6 +446,34 @@ def test_runtime_repair_chunk_priority_hints_drive_structure_metadata(monkeypatc
         {"chunk_id": 0, "compute_weight": 0, "criticality": 0},
         {"chunk_id": 1, "compute_weight": 1, "criticality": 0},
     ]
+
+
+def test_schedule_runtime_policy_reads_file_backed_structured_payloads(monkeypatch, mocker):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_plan_path = Path(tmpdir) / "state_plan.json"
+        node_specs_path = Path(tmpdir) / "schedule_node_specs.json"
+        reconfig_path = Path(tmpdir) / "window_reconfig_plan.json"
+        state_plan_path.write_text(json.dumps({"objects": [{"state_id": "act.0"}]}), encoding="utf-8")
+        node_specs_path.write_text(json.dumps([{"state_id": "act.0", "stage_id": 0}]), encoding="utf-8")
+        reconfig_path.write_text(
+            json.dumps({"window_steps": 4, "allowed_patch_categories": ["memory"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("STATE_PLAN_FILE", str(state_plan_path))
+        monkeypatch.setenv("SCHEDULE_NODE_SPECS_FILE", str(node_specs_path))
+        monkeypatch.setenv("WINDOW_RECONFIG_PLAN_FILE", str(reconfig_path))
+        monkeypatch.delenv("STATE_PLAN", raising=False)
+        monkeypatch.delenv("SCHEDULE_NODE_SPECS", raising=False)
+        monkeypatch.delenv("WINDOW_RECONFIG_PLAN", raising=False)
+        mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+        mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=0)
+        mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+        policy = schedule.get_schedule_runtime_policy()
+
+    assert policy["state_plan"]["objects"][0]["state_id"] == "act.0"
+    assert policy["schedule_node_specs"][0]["state_id"] == "act.0"
+    assert policy["window_reconfig_plan"]["window_steps"] == 4
 
 
 def test_schedule_state_migration_hints_feed_local_stage_semantics(monkeypatch, mocker):
