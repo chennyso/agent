@@ -662,6 +662,106 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
     target_stage_ids = [int(item) for item in (hypotheses.get("target_stages") or []) if _safe_int(item) is not None]
     target_layer_groups = [str(item) for item in (hypotheses.get("target_layer_groups") or []) if str(item).strip()]
     target_state_ids = [str(item) for item in (hypotheses.get("target_state_objects") or []) if str(item).strip()]
+    diagnostic_labels = [str(item).strip().lower() for item in (hypotheses.get("diagnostic_labels") or []) if str(item).strip()]
+    runtime = dict(trace_summary.get("runtime_evidence") or {})
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or trace_summary.get("peak_reserved_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or trace_summary.get("optimizer_exposed_ratio") or 0.0)
+    cpu_offload_tail_ratio = float(runtime.get("cpu_offload_tail_ratio") or hypotheses.get("cpu_offload_tail_ratio") or 0.0)
+    reward_delta = float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0)
+
+    def _estimated_action_scores(
+        rewrite_type: str,
+        *,
+        risk_flags: Optional[List[str]] = None,
+        extra_labels: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
+        labels = set(diagnostic_labels)
+        labels.update(str(item).strip().lower() for item in (extra_labels or []) if str(item).strip())
+        match = 0.18
+        compatibility = 0.20
+        rollback_risk = 0.10 + (0.12 if list(risk_flags or []) else 0.0)
+        expected_mfu_gain = max(reward_delta, 0.0)
+        memory_margin = min(max(1.0 - peak_reserved_ratio, 0.0), 1.0)
+        rewrite_type = str(rewrite_type or "").strip().lower()
+
+        if target_stage_ids:
+            compatibility += 0.12
+        if target_layer_groups:
+            compatibility += 0.10
+        if target_state_ids:
+            compatibility += 0.08
+
+        if rewrite_type in {"tail_optimizer_relief", "overlap_window_switch"} and ("optimizer_bound" in labels or optimizer_exposed_ratio >= 0.18):
+            match += 0.42
+            expected_mfu_gain = max(expected_mfu_gain, 0.05 + 0.35 * optimizer_exposed_ratio)
+        if rewrite_type in {"offload_timing_shift", "cpu_offload_scope_switch"} and ("cpu_offload_tail" in labels or cpu_offload_tail_ratio >= 0.18):
+            match += 0.44
+            expected_mfu_gain = max(expected_mfu_gain, 0.06 + 0.30 * cpu_offload_tail_ratio)
+            memory_margin = min(memory_margin + 0.10, 1.0)
+        if rewrite_type == "tp_sp_recomposition" and "tp_without_sp" in labels:
+            match += 0.46
+            expected_mfu_gain = max(expected_mfu_gain, 0.08)
+            memory_margin = min(memory_margin + 0.04, 1.0)
+        if rewrite_type in {"schedule_family_switch", "pp_family_exploration"} and "bubble_bound" in labels:
+            match += 0.34
+            expected_mfu_gain = max(expected_mfu_gain, 0.04 + 0.20 * float(runtime.get("bubble_ratio") or trace_summary.get("bubble_ratio") or 0.0))
+        if rewrite_type in {"selective_reload_prefetch", "reload_shift"} and ("reload_bound" in labels or "memory_bound" in labels):
+            match += 0.32
+            expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.15 * float(runtime.get("reload_stall_ratio") or 0.0))
+            memory_margin = min(memory_margin + 0.08, 1.0)
+        if rewrite_type in {"adaptive_chunking", "chunk_priority_rewrite"} and "comm_bound" in labels:
+            match += 0.30
+            expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.18 * float(runtime.get("comm_exposure_ratio") or trace_summary.get("comm_exposure_ratio") or 0.0))
+
+        if peak_reserved_ratio >= 0.90 and rewrite_type in {"schedule_family_switch", "pp_family_exploration", "overlap_window_switch"}:
+            rollback_risk += 0.12
+        if cpu_offload_tail_ratio >= 0.18 and rewrite_type == "overlap_window_switch":
+            rollback_risk += 0.10
+
+        counterfactual_score = (
+            0.34 * min(match, 1.0)
+            + 0.22 * min(compatibility, 1.0)
+            + 0.22 * max(expected_mfu_gain, 0.0)
+            + 0.18 * min(memory_margin, 1.0)
+            - 0.24 * min(rollback_risk, 1.0)
+        )
+        return {
+            "bottleneck_match_score": min(max(match, 0.0), 1.0),
+            "target_compatibility_score": min(max(compatibility, 0.0), 1.0),
+            "rollback_risk": min(max(rollback_risk, 0.0), 1.0),
+            "expected_mfu_gain": max(expected_mfu_gain, 0.0),
+            "memory_safety_margin": min(max(memory_margin, 0.0), 1.0),
+            "counterfactual_score": min(max(counterfactual_score, -1.0), 1.0),
+        }
+
+    for item in list(hypotheses.get("next_runtime_repair_actions") or []):
+        if not isinstance(item, dict):
+            continue
+        scores = _estimated_action_scores(
+            str(item.get("rewrite_type") or "reload_shift"),
+            risk_flags=[str(flag) for flag in (item.get("risk_flags") or []) if str(flag).strip()],
+            extra_labels=[str(flag) for flag in (item.get("diagnostic_labels") or []) if str(flag).strip()],
+        )
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type=str(item.get("rewrite_type") or "reload_shift"),
+                target_stage_ids=[int(value) for value in (item.get("target_stage_ids") or target_stage_ids or []) if _safe_int(value) is not None],
+                target_layer_group_ids=[str(value) for value in (item.get("target_layer_group_ids") or target_layer_groups or []) if str(value).strip()],
+                target_state_ids=[str(value) for value in (item.get("target_state_ids") or target_state_ids or []) if str(value).strip()],
+                direction=str(item.get("direction") or "hold"),
+                magnitude=float(item.get("magnitude", 1.0) or 1.0),
+                expected_gain=float(item.get("expected_gain", reward_delta) or 0.0),
+                diagnostic_labels=[str(value) for value in (item.get("diagnostic_labels") or diagnostic_labels) if str(value).strip()],
+                strategy_source=str(item.get("strategy_source") or hypotheses.get("repair_dsl_version") or "trace_reducer"),
+                llm_rationale=item.get("llm_rationale"),
+                risk_flags=[str(flag) for flag in (item.get("risk_flags") or []) if str(flag).strip()],
+                **scores,
+            ).normalized()
+        )
+
+    if actions:
+        return actions
+
     local_verticalization_targets = [
         str(item)
         for item in (hypotheses.get("local_verticalization_targets") or target_layer_groups[:2] or [])
@@ -671,6 +771,7 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
     overlap_family = str(hypotheses.get("next_overlap_patch_family") or "").strip()
     schedule_family = str(hypotheses.get("next_partition_patch_family") or "").strip()
     if memory_family in {"reload_shift_patch", "activation_reload_shift_patch", "reload_prefetch_patch"}:
+        scores = _estimated_action_scores("reload_shift", risk_flags=["rollback_watch"] if bool((trace_summary.get("policy_outcome_summary") or {}).get("demotion_action")) else [])
         actions.append(
             RewriteActionSpec(
                 rewrite_type="reload_shift",
@@ -680,10 +781,14 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
                 direction=str(hypotheses.get("reload_shift_direction") or "hold"),
                 magnitude=1.0,
                 expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
                 risk_flags=["rollback_watch"] if bool((trace_summary.get("policy_outcome_summary") or {}).get("demotion_action")) else [],
+                **scores,
             ).normalized()
         )
     if overlap_family in {"adaptive_chunking_patch", "comm_chunk_patch", "overlap_policy_patch"}:
+        scores = _estimated_action_scores("adaptive_chunking", risk_flags=["comm_interference_guard"])
         actions.append(
             RewriteActionSpec(
                 rewrite_type="adaptive_chunking",
@@ -693,12 +798,16 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
                 direction=str(hypotheses.get("comm_chunk_direction") or "preserve"),
                 magnitude=1.0,
                 expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
                 risk_flags=["comm_interference_guard"],
+                **scores,
             ).normalized()
         )
     if schedule_family in {"local_verticalization_patch", "critical_path_relief_patch"} or (
         not actions and local_verticalization_targets
     ):
+        scores = _estimated_action_scores("local_verticalization", risk_flags=["memory_headroom_guard"])
         actions.append(
             RewriteActionSpec(
                 rewrite_type="local_verticalization",
@@ -708,7 +817,10 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
                 direction="enable",
                 magnitude=float(min(len(local_verticalization_targets), 2) or 1),
                 expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
                 risk_flags=["memory_headroom_guard"],
+                **scores,
             ).normalized()
         )
     if not actions and program.rewrite_plan is not None:
@@ -1201,6 +1313,278 @@ def _env_csv_tokens(env: Dict[str, str], key: str) -> List[str]:
     return tokens
 
 
+def _parse_json_env_dict(raw: Any) -> Dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _parse_json_env_list(raw: Any) -> List[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def _dedupe_json_dict_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(copy.deepcopy(item))
+    return deduped
+
+
+def _parse_stage_chunk_priority_env(raw: Any) -> Dict[str, List[int]]:
+    parsed: Dict[str, List[int]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    for stage_entry in text.split(";"):
+        stage_entry = stage_entry.strip()
+        if not stage_entry or ":" not in stage_entry:
+            continue
+        stage_token, hints_token = stage_entry.split(":", 1)
+        stage_key = str(stage_token).strip()
+        if not stage_key:
+            continue
+        hints: List[int] = []
+        for raw_hint in hints_token.split(","):
+            try:
+                hints.append(int(str(raw_hint).strip()))
+            except Exception:
+                continue
+        if hints:
+            parsed[stage_key] = list(dict.fromkeys(hints))
+    return parsed
+
+
+def _encode_stage_chunk_priority_env(priority_hints: Dict[str, Any]) -> str:
+    encoded: List[str] = []
+    for raw_stage_id, raw_hints in dict(priority_hints or {}).items():
+        stage_key = str(raw_stage_id).strip()
+        if not stage_key:
+            continue
+        parsed_hints: List[str] = []
+        for item in list(raw_hints or []):
+            try:
+                parsed_hints.append(str(int(item)))
+            except Exception:
+                continue
+        if parsed_hints:
+            encoded.append(f"{stage_key}:{','.join(parsed_hints)}")
+    return ";".join(encoded)
+
+
+def _normalize_runtime_repair_contract_env(env: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(env or {})
+    runtime_repair_actions = _parse_json_env_list(merged.get("RUNTIME_REPAIR_ACTIONS"))
+    if not runtime_repair_actions:
+        return merged
+
+    aggregated: Dict[str, Any] = {
+        "state_migration_hints": _parse_json_env_list(merged.get("SCHEDULE_STATE_MIGRATION_HINTS")),
+        "window_overrides": [],
+        "operator_cluster_overrides": [],
+        "chunk_priority_hints": _parse_stage_chunk_priority_env(merged.get("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS")),
+        "overlap_channels": [],
+        "optimizer_runtime": {},
+        "memory_intents": {},
+        "state_plan_patch": {},
+    }
+    for action_contract in runtime_repair_actions:
+        lowering = dict(action_contract.get("compile_lowering") or {})
+        aggregated["state_migration_hints"].extend(list(lowering.get("state_migration_hints") or []))
+        aggregated["window_overrides"].extend(list(lowering.get("window_overrides") or []))
+        aggregated["operator_cluster_overrides"].extend(list(lowering.get("operator_cluster_overrides") or []))
+        aggregated["overlap_channels"].extend(
+            [str(item).strip() for item in list(lowering.get("overlap_channels") or []) if str(item).strip()]
+        )
+        aggregated["memory_intents"].update(dict(lowering.get("memory_intents") or {}))
+        aggregated["state_plan_patch"].update(dict(lowering.get("state_plan_patch") or {}))
+        if dict(lowering.get("optimizer_runtime") or {}):
+            aggregated["optimizer_runtime"].update(dict(lowering.get("optimizer_runtime") or {}))
+        for raw_stage_id, raw_hints in dict(lowering.get("chunk_priority_hints") or {}).items():
+            stage_key = str(raw_stage_id).strip()
+            if not stage_key:
+                continue
+            existing = list(aggregated["chunk_priority_hints"].get(stage_key) or [])
+            parsed_hints = list(existing)
+            for item in list(raw_hints or []):
+                try:
+                    parsed_hints.append(int(item))
+                except Exception:
+                    continue
+            if parsed_hints:
+                aggregated["chunk_priority_hints"][stage_key] = list(dict.fromkeys(parsed_hints))
+
+    aggregated["state_migration_hints"] = _dedupe_json_dict_list(list(aggregated["state_migration_hints"] or []))
+    aggregated["window_overrides"] = _dedupe_json_dict_list(list(aggregated["window_overrides"] or []))
+    aggregated["operator_cluster_overrides"] = _dedupe_json_dict_list(list(aggregated["operator_cluster_overrides"] or []))
+    overlap_channels = sorted(
+        {
+            str(item).strip()
+            for item in list(aggregated.get("overlap_channels") or [])
+            if str(item).strip()
+        }
+    )
+
+    state_plan = _parse_json_env_dict(merged.get("STATE_PLAN"))
+    state_plan.update(dict(aggregated.get("state_plan_patch") or {}))
+    if aggregated["state_migration_hints"]:
+        state_plan["runtime_state_migration_hints"] = copy.deepcopy(aggregated["state_migration_hints"])
+    state_plan["runtime_repair_action_types"] = [
+        str((item.get("action") or {}).get("rewrite_type") or "")
+        for item in runtime_repair_actions
+        if str((item.get("action") or {}).get("rewrite_type") or "").strip()
+    ]
+    if state_plan:
+        merged["STATE_PLAN"] = json.dumps(state_plan, sort_keys=True, separators=(",", ":"))
+
+    offload_plan = _parse_json_env_dict(merged.get("OFFLOAD_PLAN"))
+    offload_plan["runtime_state_migration_hints"] = [
+        copy.deepcopy(item)
+        for item in aggregated["state_migration_hints"]
+        if str(item.get("action") or "").strip() == "offload_timing_shift"
+    ]
+    if offload_plan:
+        merged["OFFLOAD_PLAN"] = json.dumps(offload_plan, sort_keys=True, separators=(",", ":"))
+
+    reload_plan = _parse_json_env_dict(merged.get("RELOAD_PLAN"))
+    if "reload_prefetch_window" in state_plan:
+        try:
+            reload_plan["prefetch_window"] = int(state_plan.get("reload_prefetch_window") or 0)
+        except Exception:
+            pass
+    reload_plan["runtime_state_migration_hints"] = [
+        copy.deepcopy(item)
+        for item in aggregated["state_migration_hints"]
+        if str(item.get("action") or "").strip() == "selective_reload_prefetch"
+    ]
+    if reload_plan:
+        merged["RELOAD_PLAN"] = json.dumps(reload_plan, sort_keys=True, separators=(",", ":"))
+
+    comm_chunk_plan = _parse_json_env_dict(merged.get("COMM_CHUNK_PLAN"))
+    if dict(aggregated.get("chunk_priority_hints") or {}):
+        comm_chunk_plan["runtime_chunk_priority_hints"] = copy.deepcopy(dict(aggregated["chunk_priority_hints"]))
+    if overlap_channels:
+        comm_chunk_plan["runtime_overlap_channels"] = list(overlap_channels)
+    if comm_chunk_plan:
+        merged["COMM_CHUNK_PLAN"] = json.dumps(comm_chunk_plan, sort_keys=True, separators=(",", ":"))
+
+    memory_hints = _parse_json_env_dict(merged.get("SCHEDULE_MEMORY_HINTS"))
+    memory_hints.update(dict(aggregated.get("memory_intents") or {}))
+    if aggregated["state_migration_hints"]:
+        per_stage_policies = [
+            copy.deepcopy(item)
+            for item in list(memory_hints.get("per_stage_policies") or [])
+            if isinstance(item, dict)
+        ]
+        for hint in aggregated["state_migration_hints"]:
+            per_stage_policies.append(
+                {
+                    "action": str(hint.get("action") or ""),
+                    "target_stage_ids": [int(item) for item in list(hint.get("target_stage_ids") or []) if _safe_int(item) is not None],
+                    "target_state_ids": [str(item) for item in list(hint.get("target_state_ids") or []) if str(item).strip()],
+                    "direction": str(hint.get("direction") or ""),
+                    "offset_slots": int(_safe_int(hint.get("offset_slots"), 0) or 0),
+                    "prefetch_distance_slots": int(_safe_int(hint.get("prefetch_distance_slots"), 0) or 0),
+                }
+            )
+        memory_hints["per_stage_policies"] = _dedupe_json_dict_list(per_stage_policies)
+        memory_hints["status"] = "runtime_repair"
+    if memory_hints:
+        merged["SCHEDULE_MEMORY_HINTS"] = json.dumps(memory_hints, sort_keys=True, separators=(",", ":"))
+
+    overlap_hints = _parse_json_env_dict(merged.get("SCHEDULE_OVERLAP_HINTS"))
+    if "reload" in overlap_channels:
+        overlap_hints["enable_reload_overlap"] = True
+    if "optimizer_tail" in overlap_channels:
+        overlap_hints["enable_optimizer_tail_overlap"] = True
+        overlap_hints["enable_grad_reduce_overlap"] = True
+        overlap_hints["enable_param_gather_overlap"] = True
+    if overlap_channels:
+        frontier_pairs = [str(item) for item in list(overlap_hints.get("priority_frontier_pairs") or []) if str(item).strip()]
+        frontier_pairs.extend([f"channel:{item}" for item in overlap_channels])
+        overlap_hints["priority_frontier_pairs"] = list(dict.fromkeys(frontier_pairs))
+        overlap_hints["status"] = "runtime_repair"
+    if overlap_hints:
+        merged["SCHEDULE_OVERLAP_HINTS"] = json.dumps(overlap_hints, sort_keys=True, separators=(",", ":"))
+
+    if aggregated["state_migration_hints"]:
+        merged["SCHEDULE_STATE_MIGRATION_HINTS"] = json.dumps(
+            aggregated["state_migration_hints"],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if aggregated["window_overrides"]:
+        existing_window_overrides = _parse_json_env_list(merged.get("SCHEDULE_WINDOW_OVERRIDE_HINTS"))
+        merged["SCHEDULE_WINDOW_OVERRIDE_HINTS"] = json.dumps(
+            _dedupe_json_dict_list(existing_window_overrides + list(aggregated["window_overrides"])),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if aggregated["operator_cluster_overrides"]:
+        existing_operator_overrides = _parse_json_env_list(merged.get("SCHEDULE_OPERATOR_CLUSTER_HINTS"))
+        merged["SCHEDULE_OPERATOR_CLUSTER_HINTS"] = json.dumps(
+            _dedupe_json_dict_list(existing_operator_overrides + list(aggregated["operator_cluster_overrides"])),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if dict(aggregated.get("chunk_priority_hints") or {}):
+        merged["SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS"] = _encode_stage_chunk_priority_env(
+            aggregated["chunk_priority_hints"]
+        )
+
+    optimizer_runtime = dict(aggregated.get("optimizer_runtime") or {})
+    if optimizer_runtime:
+        merged.setdefault(
+            "ENABLE_DISTRIBUTED_OPTIMIZER",
+            "1" if bool(optimizer_runtime.get("enable_distributed_optimizer", True)) else "0",
+        )
+        merged.setdefault(
+            "ENABLE_OVERLAP_GRAD_REDUCE",
+            "1" if bool(optimizer_runtime.get("enable_overlap_grad_reduce", True)) else "0",
+        )
+        merged.setdefault(
+            "ENABLE_OVERLAP_PARAM_GATHER",
+            "1" if bool(optimizer_runtime.get("enable_overlap_param_gather", True)) else "0",
+        )
+        merged.setdefault(
+            "ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP",
+            "1" if bool(optimizer_runtime.get("enable_overlap_param_gather_with_optimizer_step", True)) else "0",
+        )
+        if str(merged.get("SCHEDULE_OPTIMIZER_RUNTIME_MODE") or "").strip() == "":
+            merged["SCHEDULE_OPTIMIZER_RUNTIME_MODE"] = str(optimizer_runtime.get("mode") or "")
+        if str(merged.get("SCHEDULE_OPTIMIZER_TARGET_POLICY") or "").strip() == "":
+            merged["SCHEDULE_OPTIMIZER_TARGET_POLICY"] = str(optimizer_runtime.get("target_policy") or "")
+        if str(merged.get("SCHEDULE_OPTIMIZER_CHUNK_SCOPE") or "").strip() == "":
+            merged["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"] = str(optimizer_runtime.get("chunk_scope") or "")
+        if str(merged.get("SCHEDULE_OPTIMIZER_WINDOW_POLICY") or "").strip() == "":
+            merged["SCHEDULE_OPTIMIZER_WINDOW_POLICY"] = str(optimizer_runtime.get("window_policy") or "")
+
+    return merged
+
+
 def _training_args(
     args: argparse.Namespace,
     program: MegatronProgram,
@@ -1511,7 +1895,7 @@ def _launcher_env_overrides(
     observability = _build_observability_config(args, trial_id=trial_id, output_dirs=output_dirs)
     transformer_impl = _resolve_transformer_impl(args, program)
     sequence_parallel_active = _sequence_parallel_active(args, program, compiled.strategy)
-    env = dict(compiled.launcher_env)
+    env = _normalize_runtime_repair_contract_env(dict(compiled.launcher_env))
     merged_budget = dict(compiled.telemetry_budget or {})
     budget_override = dict(observability.get("telemetry_budget") or {})
     merged_budget.update(

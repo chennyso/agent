@@ -1533,12 +1533,34 @@ class RewriteActionSpec:
     direction: str = "hold"
     magnitude: float = 0.0
     expected_gain: float = 0.0
+    bottleneck_match_score: float = 0.0
+    target_compatibility_score: float = 0.0
+    rollback_risk: float = 0.0
+    expected_mfu_gain: float = 0.0
+    memory_safety_margin: float = 0.0
+    counterfactual_score: float = 0.0
+    diagnostic_labels: List[str] = field(default_factory=list)
+    strategy_source: Optional[str] = None
+    llm_rationale: Optional[str] = None
     risk_flags: List[str] = field(default_factory=list)
 
     def normalized(self) -> "RewriteActionSpec":
         norm = copy.deepcopy(self)
         rewrite_type = str(norm.rewrite_type or "reload_shift").strip().lower()
-        if rewrite_type not in {"reload_shift", "adaptive_chunking", "local_verticalization"}:
+        if rewrite_type not in {
+            "reload_shift",
+            "adaptive_chunking",
+            "local_verticalization",
+            "offload_timing_shift",
+            "selective_reload_prefetch",
+            "overlap_window_switch",
+            "tail_optimizer_relief",
+            "tp_sp_recomposition",
+            "schedule_family_switch",
+            "chunk_priority_rewrite",
+            "cpu_offload_scope_switch",
+            "pp_family_exploration",
+        }:
             rewrite_type = "reload_shift"
         norm.rewrite_type = rewrite_type
         norm.target_stage_ids = sorted({int(item) for item in (norm.target_stage_ids or [])})
@@ -1547,7 +1569,24 @@ class RewriteActionSpec:
         norm.direction = str(norm.direction or "hold").strip().lower() or "hold"
         norm.magnitude = float(norm.magnitude or 0.0)
         norm.expected_gain = float(norm.expected_gain or 0.0)
+        norm.bottleneck_match_score = min(max(float(norm.bottleneck_match_score or 0.0), 0.0), 1.0)
+        norm.target_compatibility_score = min(max(float(norm.target_compatibility_score or 0.0), 0.0), 1.0)
+        norm.rollback_risk = min(max(float(norm.rollback_risk or 0.0), 0.0), 1.0)
+        norm.expected_mfu_gain = max(float(norm.expected_mfu_gain or 0.0), 0.0)
+        norm.memory_safety_margin = min(max(float(norm.memory_safety_margin or 0.0), 0.0), 1.0)
+        norm.counterfactual_score = min(max(float(norm.counterfactual_score or 0.0), -1.0), 1.0)
+        norm.diagnostic_labels = [
+            str(item).strip().lower()
+            for item in (norm.diagnostic_labels or [])
+            if str(item).strip()
+        ]
+        if norm.strategy_source is not None:
+            norm.strategy_source = str(norm.strategy_source).strip() or None
+        if norm.llm_rationale is not None:
+            norm.llm_rationale = str(norm.llm_rationale).strip() or None
         norm.risk_flags = [str(item) for item in (norm.risk_flags or []) if str(item).strip()]
+        if norm.expected_mfu_gain <= 0.0 and norm.expected_gain > 0.0:
+            norm.expected_mfu_gain = float(norm.expected_gain)
         return norm
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1560,6 +1599,15 @@ class RewriteActionSpec:
             "direction": str(norm.direction),
             "magnitude": float(norm.magnitude),
             "expected_gain": float(norm.expected_gain),
+            "bottleneck_match_score": float(norm.bottleneck_match_score),
+            "target_compatibility_score": float(norm.target_compatibility_score),
+            "rollback_risk": float(norm.rollback_risk),
+            "expected_mfu_gain": float(norm.expected_mfu_gain),
+            "memory_safety_margin": float(norm.memory_safety_margin),
+            "counterfactual_score": float(norm.counterfactual_score),
+            "diagnostic_labels": list(norm.diagnostic_labels),
+            "strategy_source": norm.strategy_source,
+            "llm_rationale": norm.llm_rationale,
             "risk_flags": list(norm.risk_flags),
         }
 
@@ -1573,6 +1621,17 @@ class RewriteActionSpec:
             direction=str(payload.get("direction", "hold") or "hold"),
             magnitude=float(payload.get("magnitude", 0.0) or 0.0),
             expected_gain=float(payload.get("expected_gain", 0.0) or 0.0),
+            bottleneck_match_score=float(payload.get("bottleneck_match_score", 0.0) or 0.0),
+            target_compatibility_score=float(payload.get("target_compatibility_score", 0.0) or 0.0),
+            rollback_risk=float(payload.get("rollback_risk", 0.0) or 0.0),
+            expected_mfu_gain=float(
+                payload.get("expected_mfu_gain", payload.get("expected_gain", 0.0)) or 0.0
+            ),
+            memory_safety_margin=float(payload.get("memory_safety_margin", 0.0) or 0.0),
+            counterfactual_score=float(payload.get("counterfactual_score", 0.0) or 0.0),
+            diagnostic_labels=[str(item) for item in (payload.get("diagnostic_labels") or [])],
+            strategy_source=payload.get("strategy_source"),
+            llm_rationale=payload.get("llm_rationale"),
             risk_flags=[str(item) for item in (payload.get("risk_flags") or [])],
         )
 
@@ -2912,34 +2971,40 @@ class AgentObservation:
 @dataclass
 class VerifierReport:
     is_legal: bool = True
+    decision: str = "allow"
     legality: Dict[str, Any] = field(default_factory=dict)
     cost: Dict[str, Any] = field(default_factory=dict)
     diagnosis: List[str] = field(default_factory=list)
     rejection_reason: Optional[str] = None
     switch_cost: float = 0.0
     next_scope_hint: Optional[str] = None
+    runtime_risk: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "is_legal": bool(self.is_legal),
+            "decision": str(self.decision or "allow"),
             "legality": copy.deepcopy(self.legality),
             "cost": copy.deepcopy(self.cost),
             "diagnosis": list(self.diagnosis),
             "rejection_reason": self.rejection_reason,
             "switch_cost": float(self.switch_cost),
             "next_scope_hint": self.next_scope_hint,
+            "runtime_risk": copy.deepcopy(self.runtime_risk),
         }
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "VerifierReport":
         return cls(
             is_legal=bool(payload.get("is_legal", True)),
+            decision=str(payload.get("decision", "allow") or "allow"),
             legality=copy.deepcopy(payload.get("legality") or {}),
             cost=copy.deepcopy(payload.get("cost") or {}),
             diagnosis=[str(item) for item in (payload.get("diagnosis") or [])],
             rejection_reason=payload.get("rejection_reason"),
             switch_cost=float(payload.get("switch_cost", 0.0) or 0.0),
             next_scope_hint=payload.get("next_scope_hint"),
+            runtime_risk=copy.deepcopy(payload.get("runtime_risk") or {}),
         )
 
 
@@ -3444,6 +3509,7 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
     norm = copy.deepcopy(program)
     metadata = copy.deepcopy(norm.metadata or {})
     rewrite_actions: List[RewriteActionSpec] = []
+    repair_assessment = dict(metadata.get("counterfactual_repair_assessment") or {})
     for item in list(metadata.get("rewrite_actions") or []):
         if isinstance(item, dict):
             rewrite_actions.append(RewriteActionSpec.from_dict(item).normalized())
@@ -3464,6 +3530,17 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
             for item in list((norm.metadata or {}).get("runtime_branch_target_stage_ids") or [])
             if str(item).strip()
         ]
+        base_action_kwargs = {
+            "bottleneck_match_score": float(repair_assessment.get("bottleneck_match_score") or 0.0),
+            "target_compatibility_score": float(repair_assessment.get("target_compatibility_score") or 0.0),
+            "rollback_risk": float(repair_assessment.get("rollback_risk") or 0.0),
+            "expected_mfu_gain": float(repair_assessment.get("expected_mfu_gain") or metadata.get("expected_gain") or 0.0),
+            "memory_safety_margin": float(repair_assessment.get("memory_safety_margin") or 0.0),
+            "counterfactual_score": float(repair_assessment.get("counterfactual_score") or 0.0),
+            "diagnostic_labels": [str(item) for item in (repair_assessment.get("dominant_diagnostics") or []) if str(item).strip()],
+            "strategy_source": str(metadata.get("planner_backend") or metadata.get("planner_mode") or "heuristic"),
+            "llm_rationale": metadata.get("llm_repair_rationale") or metadata.get("llm_rationale"),
+        }
         if patch_family in {"reload_shift_patch", "activation_reload_shift_patch", "reload_prefetch_patch"}:
             rewrite_actions.append(
                 RewriteActionSpec(
@@ -3474,6 +3551,7 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
                     direction=str((norm.metadata or {}).get("reload_shift_direction") or "hold"),
                     magnitude=float((norm.metadata or {}).get("reload_shift_magnitude", 1.0) or 1.0),
                     expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
                     risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
                 ).normalized()
             )
@@ -3487,6 +3565,63 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
                     direction=str((norm.metadata or {}).get("comm_chunk_direction") or "preserve"),
                     magnitude=float((norm.metadata or {}).get("comm_chunk_magnitude", 1.0) or 1.0),
                     expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"overlap_policy_patch", "enable_reload_overlap"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="overlap_window_switch",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("comm_chunk_direction") or "enable"),
+                    magnitude=float((norm.metadata or {}).get("comm_chunk_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"tail_relief_patch", "enable_optimizer_tail_overlap"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="tail_optimizer_relief",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction="enable",
+                    magnitude=float((norm.metadata or {}).get("optimizer_tail_relief_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"add_offload_policy", "offload_enable_patch", "activation_offload_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="cpu_offload_scope_switch",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction="expand",
+                    magnitude=float((norm.metadata or {}).get("offload_scope_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"change_schedule_family"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="schedule_family_switch",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("runtime_schedule_family") or norm.schedule.template or "preserve"),
+                    magnitude=1.0,
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
                     risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
                 ).normalized()
             )
@@ -3500,6 +3635,7 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
                     direction=str((norm.metadata or {}).get("local_verticalization_direction") or "enable"),
                     magnitude=float((norm.metadata or {}).get("local_verticalization_magnitude", 1.0) or 1.0),
                     expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
                     risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
                 ).normalized()
             )
