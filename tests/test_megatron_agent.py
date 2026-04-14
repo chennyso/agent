@@ -789,9 +789,20 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 with mock.patch("megatron_agent.trial_runner.shutil.which", return_value=str(bin_dir / "nvcc")):
                     env = trial_runner._runtime_env_defaults()
 
-            self.assertEqual(env["CUDA_HOME"], str(cuda_home))
-            self.assertEqual(env["CUDA_PATH"], str(cuda_home))
-            self.assertEqual(env["CUDACXX"], str(bin_dir / "nvcc"))
+                    self.assertEqual(env["CUDA_HOME"], str(cuda_home))
+                    self.assertEqual(env["CUDA_PATH"], str(cuda_home))
+                    self.assertEqual(env["CUDACXX"], str(bin_dir / "nvcc"))
+
+    def test_resolve_megatron_entry_trims_duplicate_root_prefix(self) -> None:
+        resolved = trial_runner._resolve_megatron_entry("/tmp/Megatron-LM", "Megatron-LM/pretrain_gpt.py")
+        self.assertEqual(resolved, Path("/tmp/Megatron-LM/pretrain_gpt.py"))
+
+    def test_resolve_launcher_script_trims_duplicate_root_prefix(self) -> None:
+        resolved = trial_runner._resolve_launcher_script(
+            "/tmp/Megatron-LM",
+            "Megatron-LM/examples/qwen/train_qwen3_14b_rtx_8gpu.sh",
+        )
+        self.assertEqual(resolved, Path("/tmp/Megatron-LM/examples/qwen/train_qwen3_14b_rtx_8gpu.sh"))
 
     def test_single_g5_dense_dry_run_requires_perf_stack(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

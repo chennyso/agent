@@ -105,7 +105,12 @@ def _resolve_megatron_entry(root: Optional[str], entry: str) -> Path:
     if os.path.isabs(entry):
         return Path(entry)
     if root:
-        return Path(root) / entry
+        root_path = Path(root)
+        entry_path = Path(entry)
+        if entry_path.parts and entry_path.parts[0] == root_path.name:
+            trimmed_parts = entry_path.parts[1:]
+            return root_path / Path(*trimmed_parts) if trimmed_parts else root_path
+        return root_path / entry_path
     env_root = os.environ.get("MEGATRON_LM_ROOT")
     if env_root:
         return Path(env_root) / entry
@@ -118,7 +123,12 @@ def _resolve_launcher_script(root: Optional[str], launcher_script: Optional[str]
     if os.path.isabs(launcher_script):
         return Path(launcher_script)
     if root:
-        return Path(root) / launcher_script
+        root_path = Path(root)
+        script_path = Path(launcher_script)
+        if script_path.parts and script_path.parts[0] == root_path.name:
+            trimmed_parts = script_path.parts[1:]
+            return root_path / Path(*trimmed_parts) if trimmed_parts else root_path
+        return root_path / script_path
     return Path(launcher_script)
 
 
