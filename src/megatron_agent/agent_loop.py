@@ -25,6 +25,7 @@ from megatron_agent.config import (
     MegatronProgram,
     PatchProposal,
     ProgramPatchSpec,
+    RewriteActionSpec,
     SearchSpaceSpec,
     VerifierReport,
     default_backend_caps,
@@ -46,6 +47,7 @@ from megatron_agent.feedback_optimizer import (
 from megatron_agent.policy_memory import PolicyMemoryBank
 from megatron_agent.policy_memory import summarize_state_for_memory
 from megatron_agent.programs import (
+    assess_runtime_repair_bundle,
     assess_vpp_comm_tradeoff,
     check_program,
     classify_program_family,
@@ -493,6 +495,19 @@ def _build_search_tree_root(
                 hypothesis_bonus, hypothesis_reasons = _proposal_hypothesis_bonus(proposal, next_step_hypotheses)
                 priority += float(hypothesis_bonus)
                 priority_reason.extend(list(hypothesis_reasons))
+        proposal_program = getattr(proposal, "program", None)
+        counterfactual_assessment = dict(
+            ((proposal_program.metadata if proposal_program is not None else {}) or {}).get(
+                "counterfactual_repair_assessment"
+            )
+            or {}
+        )
+        counterfactual_score = _safe_float(counterfactual_assessment.get("counterfactual_score"))
+        if counterfactual_score is not None:
+            priority += float(counterfactual_score) * 0.35
+            priority_reason.append(f"counterfactual_score:{float(counterfactual_score):.3f}")
+            for label in list(counterfactual_assessment.get("dominant_diagnostics") or [])[:3]:
+                priority_reason.append(f"counterfactual_diag:{str(label)}")
         child = SearchTreeNode(
             node_id=f"child_{index:02d}",
             depth=1,
@@ -501,6 +516,7 @@ def _build_search_tree_root(
             patch_family=patch_proposal.patch_family,
             priority=priority,
             priority_reason=priority_reason,
+            last_result={"counterfactual_repair_assessment": counterfactual_assessment} if counterfactual_assessment else {},
         )
         root.children.append(child)
     return root, guidance
@@ -534,6 +550,420 @@ def _extract_next_step_hypotheses(metrics: Optional[Dict[str, Any]]) -> Dict[str
         trial_artifact = dict(metrics.get("trial_artifact") or {})
         hypotheses = dict(trial_artifact.get("next_step_hypotheses") or {})
     return {str(key): copy.deepcopy(value) for key, value in dict(hypotheses or {}).items()}
+
+
+_SUPPORTED_RUNTIME_REWRITE_TYPES: List[str] = [
+    "reload_shift",
+    "adaptive_chunking",
+    "local_verticalization",
+    "offload_timing_shift",
+    "selective_reload_prefetch",
+    "overlap_window_switch",
+    "tail_optimizer_relief",
+    "tp_sp_recomposition",
+    "schedule_family_switch",
+    "chunk_priority_rewrite",
+    "cpu_offload_scope_switch",
+    "pp_family_exploration",
+]
+
+
+def _target_stage_ids_from_program(program: MegatronProgram) -> List[int]:
+    norm = program.normalized()
+    stage_ids = [
+        int(item)
+        for item in list((norm.metadata or {}).get("runtime_branch_target_stage_ids") or [])
+        if _safe_int(item) is not None
+    ]
+    if not stage_ids:
+        for item in list((norm.metadata or {}).get("stage_local_memory_policy") or []):
+            stage_id = _safe_int((item or {}).get("stage_id"))
+            if stage_id is not None:
+                stage_ids.append(int(stage_id))
+    if not stage_ids and list(norm.strategy_ir.apipe or []):
+        program_kind = str((norm.metadata or {}).get("program_kind") or "").lower()
+        if any(token in program_kind for token in ("optimizer", "tail", "offload")):
+            stage_ids.append(int(norm.strategy_ir.apipe[-1].stage_index))
+    return sorted(set(stage_ids))
+
+
+def _target_layer_groups_from_program(program: MegatronProgram) -> List[str]:
+    norm = program.normalized()
+    layer_groups = [
+        str(item)
+        for item in list((norm.metadata or {}).get("target_layer_groups") or [])
+        if str(item).strip()
+    ]
+    if not layer_groups and norm.applied_patch is not None:
+        layer_groups = [
+            str(item)
+            for item in list((norm.applied_patch.expected_effects or {}).get("target_layer_groups") or [])
+            if str(item).strip()
+        ]
+    return list(dict.fromkeys(layer_groups))
+
+
+def _target_state_objects_from_program(program: MegatronProgram) -> List[str]:
+    norm = program.normalized()
+    state_objects = [
+        str(item)
+        for item in list((norm.metadata or {}).get("target_state_objects") or [])
+        if str(item).strip()
+    ]
+    if not state_objects and norm.applied_patch is not None:
+        state_objects = [
+            str(item)
+            for item in list((norm.applied_patch.expected_effects or {}).get("target_state_objects") or [])
+            if str(item).strip()
+        ]
+    if not state_objects and bool((norm.metadata or {}).get("runtime_enable_optimizer_cpu_offload", False)):
+        for stage_id in _target_stage_ids_from_program(norm)[:2]:
+            state_objects.append(f"optimizer:stage_{int(stage_id)}")
+    return list(dict.fromkeys(state_objects))
+
+
+def _rewrite_actions_from_program(
+    program: MegatronProgram,
+    *,
+    next_step_hypotheses: Optional[Dict[str, Any]] = None,
+) -> List[RewriteActionSpec]:
+    norm = program.normalized()
+    metadata = dict(norm.metadata or {})
+    actions: List[RewriteActionSpec] = []
+    seen: set[str] = set()
+
+    def _append(action: RewriteActionSpec) -> None:
+        normalized = action.normalized()
+        key = json.dumps(normalized.to_dict(), sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            return
+        seen.add(key)
+        actions.append(normalized)
+
+    for raw in list(metadata.get("rewrite_actions") or []):
+        if isinstance(raw, dict):
+            _append(RewriteActionSpec.from_dict(raw))
+    if norm.rewrite_plan is not None:
+        for item in list(norm.rewrite_plan.rewrite_actions or []):
+            if isinstance(item, RewriteActionSpec):
+                _append(item)
+    for raw in list(metadata.get("llm_repair_actions") or []):
+        if isinstance(raw, dict):
+            _append(RewriteActionSpec.from_dict(raw))
+    if actions:
+        return actions
+
+    hypotheses = dict(next_step_hypotheses or {})
+    program_kind = str(metadata.get("program_kind") or "").strip().lower()
+    schedule_template = str(norm.schedule.template or "fixed_1f1b").strip().lower()
+    stage_ids = _target_stage_ids_from_program(norm)
+    target_layer_groups = _target_layer_groups_from_program(norm)
+    target_state_objects = _target_state_objects_from_program(norm)
+    diagnostic_labels = [
+        str(item).strip().lower()
+        for item in list(hypotheses.get("diagnostic_labels") or [])
+        if str(item).strip()
+    ]
+
+    if "sequence_parallel" in program_kind or (bool(norm.parallel.sp_enabled) and int(norm.parallel.tp_degree) > 1):
+        _append(
+            RewriteActionSpec(
+                rewrite_type="tp_sp_recomposition",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                diagnostic_labels=diagnostic_labels or ["tp_without_sp"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+    if any(token in program_kind for token in ("offload_first", "stage_local_memory_policy", "checkpoint_boundary_refinement")):
+        _append(
+            RewriteActionSpec(
+                rewrite_type="cpu_offload_scope_switch",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                direction="retarget_tail",
+                diagnostic_labels=diagnostic_labels or ["memory_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        _append(
+            RewriteActionSpec(
+                rewrite_type="offload_timing_shift",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                direction="earlier",
+                diagnostic_labels=diagnostic_labels or ["memory_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+    if any(token in program_kind for token in ("optimizer_aware", "tail_aware")):
+        _append(
+            RewriteActionSpec(
+                rewrite_type="tail_optimizer_relief",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups[:1],
+                direction="enable",
+                diagnostic_labels=diagnostic_labels or ["optimizer_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        _append(
+            RewriteActionSpec(
+                rewrite_type="overlap_window_switch",
+                target_stage_ids=stage_ids,
+                direction="optimizer_tail_guarded",
+                diagnostic_labels=diagnostic_labels or ["optimizer_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+    if any(token in program_kind for token in ("morphable_pipeline", "runtime_guided_schedule")) or schedule_template in {"dualpipe_v", "zero_bubble", "zbv", "v_half", "v_min"}:
+        _append(
+            RewriteActionSpec(
+                rewrite_type="schedule_family_switch",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                direction=schedule_template,
+                diagnostic_labels=diagnostic_labels or ["bubble_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        if schedule_template in {"dualpipe_v", "zero_bubble", "zbv", "v_half", "v_min"}:
+            _append(
+                RewriteActionSpec(
+                    rewrite_type="pp_family_exploration",
+                    target_stage_ids=stage_ids,
+                    direction=schedule_template,
+                    diagnostic_labels=diagnostic_labels or ["bubble_bound"],
+                    strategy_source="heuristic_program_inference",
+                )
+            )
+    if any(token in program_kind for token in ("runtime_guided_partition", "nonuniform_partition", "boundary_semantic")):
+        _append(
+            RewriteActionSpec(
+                rewrite_type="local_verticalization",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                direction="enable",
+                diagnostic_labels=diagnostic_labels or ["tail_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+
+    patch_family = str((norm.applied_patch.patch_family if norm.applied_patch is not None else "") or metadata.get("patch_family") or "").strip()
+    patch_to_action = {
+        "reload_shift_patch": "reload_shift",
+        "activation_reload_shift_patch": "reload_shift",
+        "reload_prefetch_patch": "selective_reload_prefetch",
+        "adaptive_chunking_patch": "adaptive_chunking",
+        "comm_chunk_patch": "chunk_priority_rewrite",
+        "overlap_policy_patch": "overlap_window_switch",
+        "tail_relief_patch": "tail_optimizer_relief",
+        "offload_enable_patch": "cpu_offload_scope_switch",
+        "activation_offload_patch": "offload_timing_shift",
+        "change_schedule_family": "schedule_family_switch",
+        "local_verticalization_patch": "local_verticalization",
+        "layer_group_repack": "local_verticalization",
+    }
+    if patch_family in patch_to_action:
+        _append(
+            RewriteActionSpec(
+                rewrite_type=str(patch_to_action.get(patch_family) or "reload_shift"),
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                diagnostic_labels=diagnostic_labels,
+                strategy_source="patch_family_inference",
+            )
+        )
+
+    for raw in list(hypotheses.get("next_runtime_repair_actions") or []):
+        if isinstance(raw, dict):
+            _append(RewriteActionSpec.from_dict(raw))
+    return actions
+
+
+def _proposal_counterfactual_repair_assessment(
+    proposal: AgentProposal,
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Optional[Dict[str, Any]] = None,
+    next_step_hypotheses: Optional[Dict[str, Any]] = None,
+    inferred_actions: Optional[List[RewriteActionSpec]] = None,
+) -> Dict[str, Any]:
+    program = proposal.program.normalized()
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failure_labels = {
+        str(item.get("label") or "").strip().lower()
+        for item in list((context_record or {}).get("failure_modes") or [])
+        if str(item.get("label") or "").strip()
+    }
+    derived_labels = {
+        str(item.get("label") or "").strip().lower()
+        for item in list((context_record or {}).get("derived_bottlenecks") or [])
+        if str(item.get("label") or "").strip()
+    }
+    hypotheses = dict(next_step_hypotheses or {})
+    diagnostic_labels = {
+        str(item).strip().lower()
+        for item in list(hypotheses.get("diagnostic_labels") or [])
+        if str(item).strip()
+    }
+    actions = [item.normalized() for item in (inferred_actions or _rewrite_actions_from_program(program, next_step_hypotheses=hypotheses))]
+    action_types = {str(item.rewrite_type or "").strip().lower() for item in actions}
+    hypothesis_stage_targets = {
+        int(item) for item in list(hypotheses.get("target_stages") or []) if _safe_int(item) is not None
+    }
+    hypothesis_layer_targets = {
+        str(item) for item in list(hypotheses.get("target_layer_groups") or []) if str(item).strip()
+    }
+    hypothesis_state_targets = {
+        str(item) for item in list(hypotheses.get("target_state_objects") or []) if str(item).strip()
+    }
+    preferred_targets = {
+        "target_stage_ids": sorted(hypothesis_stage_targets),
+        "target_layer_group_ids": sorted(hypothesis_layer_targets),
+        "target_state_ids": sorted(hypothesis_state_targets),
+    }
+    assessment = assess_runtime_repair_bundle(
+        actions,
+        program=program,
+        runtime_summary=runtime,
+        extra_diagnostics=sorted(failure_labels | derived_labels | diagnostic_labels),
+        preferred_targets=preferred_targets,
+        replan_scope=str((replan_decision or {}).get("scope") or ""),
+    )
+    if str(proposal.source or "").startswith("llm_"):
+        adjusted_risk = min(max(float(assessment.get("rollback_risk") or 0.0) + 0.02, 0.0), 1.0)
+        weights = dict(assessment.get("score_weights") or {})
+        counterfactual_score = (
+            float(weights.get("bottleneck_match") or 0.0) * float(assessment.get("bottleneck_match_score") or 0.0)
+            + float(weights.get("target_compatibility") or 0.0) * float(assessment.get("target_compatibility_score") or 0.0)
+            + float(weights.get("expected_gain") or 0.0) * float(assessment.get("expected_mfu_gain") or 0.0)
+            + float(weights.get("memory_margin") or 0.0) * float(assessment.get("memory_safety_margin") or 0.0)
+            - float(weights.get("rollback_risk") or 0.0) * adjusted_risk
+        )
+        assessment["rollback_risk"] = round(float(adjusted_risk), 4)
+        assessment["counterfactual_score"] = round(min(max(counterfactual_score, -1.0), 1.0), 4)
+        reasons = [str(item) for item in list(assessment.get("reasons") or []) if str(item).strip()]
+        if "risk:llm_source" not in reasons:
+            reasons.append("risk:llm_source")
+        assessment["reasons"] = reasons
+    return {
+        "proposal_id": str(proposal.proposal_id or ""),
+        "program_kind": str(program.metadata.get("program_kind") or ""),
+        "dominant_diagnostics": list(assessment.get("dominant_diagnostics") or []),
+        "rewrite_action_types": sorted(action_types),
+        "score_weights": copy.deepcopy(dict(assessment.get("score_weights") or {})),
+        "bottleneck_match_score": round(float(assessment.get("bottleneck_match_score") or 0.0), 4),
+        "target_compatibility_score": round(float(assessment.get("target_compatibility_score") or 0.0), 4),
+        "rollback_risk": round(float(assessment.get("rollback_risk") or 0.0), 4),
+        "expected_mfu_gain": round(float(assessment.get("expected_mfu_gain") or 0.0), 4),
+        "memory_safety_margin": round(float(assessment.get("memory_safety_margin") or 0.0), 4),
+        "counterfactual_score": round(float(assessment.get("counterfactual_score") or 0.0), 4),
+        "reasons": [str(item) for item in list(assessment.get("reasons") or []) if str(item).strip()],
+        "rewrite_actions": copy.deepcopy(list(assessment.get("rewrite_actions") or [])),
+    }
+
+
+def _annotate_proposals_with_counterfactual_scores(
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Optional[Dict[str, Any]] = None,
+    next_step_hypotheses: Optional[Dict[str, Any]] = None,
+    preserve_order: bool = False,
+) -> List[AgentProposal]:
+    hypotheses = dict(
+        next_step_hypotheses
+        or dict((context_record.get("evidence_record") or {}).get("next_step_hypotheses") or {})
+    )
+    ranked: List[Tuple[float, int, int, AgentProposal]] = []
+    for index, proposal in enumerate(list(proposals or [])):
+        updated = proposal.normalized()
+        inferred_actions = _rewrite_actions_from_program(updated.program, next_step_hypotheses=hypotheses)
+        assessment = _proposal_counterfactual_repair_assessment(
+            updated,
+            context_record=context_record,
+            replan_decision=replan_decision,
+            next_step_hypotheses=hypotheses,
+            inferred_actions=inferred_actions,
+        )
+        updated.program.metadata["rewrite_actions"] = [item.to_dict() for item in inferred_actions]
+        updated.program.metadata["counterfactual_repair_actions"] = [item.to_dict() for item in inferred_actions]
+        updated.program.metadata["counterfactual_repair_assessment"] = assessment
+        updated.program.metadata["counterfactual_repair_score"] = float(assessment.get("counterfactual_score") or 0.0)
+        updated.program.metadata["counterfactual_repair_diagnostics"] = list(assessment.get("dominant_diagnostics") or [])
+        ranked.append(
+            (
+                float(assessment.get("counterfactual_score") or 0.0),
+                int(updated.priority_rank or 0),
+                index,
+                updated.normalized(),
+            )
+        )
+    if not preserve_order:
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    else:
+        ranked.sort(key=lambda item: item[2])
+    return [item[3] for item in ranked]
+
+
+def _normalize_llm_rewrite_action_map(
+    proposal_by_id: Dict[str, AgentProposal],
+    raw_actions: Optional[Any],
+) -> Dict[str, List[RewriteActionSpec]]:
+    action_map: Dict[str, List[RewriteActionSpec]] = {}
+    if isinstance(raw_actions, dict):
+        for key, value in list(raw_actions.items()):
+            proposal_id = str(key or "").strip()
+            if not proposal_id or proposal_id not in proposal_by_id:
+                continue
+            payloads = value if isinstance(value, list) else [value]
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                action_map.setdefault(proposal_id, []).append(RewriteActionSpec.from_dict(payload).normalized())
+    elif isinstance(raw_actions, list):
+        for payload in list(raw_actions):
+            if not isinstance(payload, dict):
+                continue
+            proposal_id = str(payload.get("proposal_id") or "").strip()
+            if not proposal_id or proposal_id not in proposal_by_id:
+                continue
+            action_payload = {key: value for key, value in payload.items() if str(key) != "proposal_id"}
+            action_map.setdefault(proposal_id, []).append(RewriteActionSpec.from_dict(action_payload).normalized())
+    return action_map
+
+
+def _merge_rewrite_actions_into_program(
+    program: MegatronProgram,
+    actions: List[RewriteActionSpec],
+    *,
+    strategy_source: str,
+    llm_rationale: Optional[str] = None,
+) -> MegatronProgram:
+    candidate = program.normalized()
+    existing = _rewrite_actions_from_program(candidate)
+    merged: List[RewriteActionSpec] = []
+    seen: set[str] = set()
+    for item in list(existing or []) + [entry.normalized() for entry in list(actions or [])]:
+        entry = item.normalized()
+        if llm_rationale and not entry.llm_rationale:
+            entry.llm_rationale = str(llm_rationale)
+        if not entry.strategy_source:
+            entry.strategy_source = str(strategy_source)
+        key = json.dumps(entry.to_dict(), sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+    candidate.metadata["rewrite_actions"] = [item.to_dict() for item in merged]
+    candidate.metadata["llm_repair_actions"] = [item.to_dict() for item in list(actions or [])]
+    if llm_rationale:
+        candidate.metadata["llm_repair_rationale"] = str(llm_rationale)
+    return candidate.normalized()
 
 
 def _build_beam_snapshot(
@@ -649,13 +1079,53 @@ def _llm_supervisor_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
     return bool(str(llm_config.get("endpoint") or "").strip() and str(llm_config.get("model") or "").strip())
 
 
+def _llm_planner_mode(llm_config: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(llm_config, dict):
+        return "single_supervisor"
+    token = str(llm_config.get("planner_mode") or "single_supervisor").strip().lower()
+    return token if token in {"single_supervisor", "multi_agent"} else "single_supervisor"
+
+
+def _llm_multi_agent_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
+    return _llm_supervisor_enabled(llm_config) and _llm_planner_mode(llm_config) == "multi_agent"
+
+
 def _agent_topology_summary(llm_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     llm_enabled = _llm_supervisor_enabled(llm_config)
+    planner_mode = _llm_planner_mode(llm_config)
+    multi_agent = bool(llm_enabled and planner_mode == "multi_agent")
+    logical_roles = ["planner", "verifier", "executor"]
+    planner_roles = ["planner"] if llm_enabled else ["heuristic_planner"]
+    llm_planner_agents = 1 if llm_enabled else 0
+    if multi_agent:
+        logical_roles = [
+            "global_family_architect",
+            "bottleneck_diagnostician",
+            "rewrite_proposer",
+            "family_critic",
+            "verifier",
+            "executor",
+        ]
+        planner_roles = [
+            "global_family_architect",
+            "bottleneck_diagnostician",
+            "rewrite_proposer",
+            "family_critic",
+        ]
+        llm_planner_agents = 4
     return {
-        "planner_mode": "llm_http" if llm_enabled else "heuristic_only",
-        "logical_roles": ["planner", "verifier", "executor"],
-        "logical_agent_count": 3,
-        "llm_planner_agents": 1 if llm_enabled else 0,
+        "planner_mode": "llm_hierarchical_multi_agent_http" if multi_agent else ("llm_http" if llm_enabled else "heuristic_only"),
+        "logical_roles": logical_roles,
+        "planner_roles": planner_roles,
+        "logical_agent_count": len(logical_roles),
+        "llm_planner_agents": llm_planner_agents,
+        "llm_family_architect_agents": 1 if multi_agent else 0,
+        "llm_bottleneck_diagnostician_agents": 1 if multi_agent else 0,
+        "llm_rewrite_proposer_agents": 1 if multi_agent else 0,
+        "llm_family_critic_agents": 1 if multi_agent else 0,
+        "llm_proposer_agents": 0,
+        "llm_ranker_agents": 0,
+        "llm_critic_agents": 0,
         "heuristic_planner_agents": 0 if llm_enabled else 1,
         "verifier_agents": 1,
         "executor_agents": 1,
@@ -895,6 +1365,9 @@ def _proposal_prompt_entry(proposal: AgentProposal) -> Dict[str, Any]:
         "proposal_id": str(proposal.proposal_id),
         "scope": str(proposal.scope),
         "program_kind": str(program.metadata.get("program_kind") or "candidate"),
+        "patch_family": _proposal_patch_family_token(proposal),
+        "patch_category": _proposal_patch_category(proposal),
+        "target_scope": _proposal_target_scope_token(proposal),
         "template": str(program.schedule.template or "fixed_1f1b"),
         "dispatch_order": str(program.schedule.dispatch_order or "default"),
         "pp": int(program.parallel.pp_degree),
@@ -906,6 +1379,99 @@ def _proposal_prompt_entry(proposal: AgentProposal) -> Dict[str, Any]:
         "rationale": str(proposal.rationale or ""),
         "memory_policy": str(program.metadata.get("runtime_memory_policy_mode") or "none"),
         "estimated_step_delta_ms": float(program.metadata.get("morphable_estimated_step_delta_ms") or 0.0),
+        "counterfactual_repair_score": float(program.metadata.get("counterfactual_repair_score") or 0.0),
+        "counterfactual_repair_assessment": copy.deepcopy(
+            dict(program.metadata.get("counterfactual_repair_assessment") or {})
+        ),
+        "runtime_repair_actions": [
+            copy.deepcopy(item)
+            for item in list(program.metadata.get("rewrite_actions") or [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _normalize_llm_proposal_ids(
+    proposal_by_id: Dict[str, AgentProposal],
+    raw_ids: Optional[List[Any]],
+) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in list(raw_ids or []):
+        token = str(item or "").strip()
+        if not token or token not in proposal_by_id or token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _normalize_llm_concerns(
+    proposal_by_id: Dict[str, AgentProposal],
+    raw_concerns: Optional[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    concerns: Dict[str, List[str]] = {}
+    for key, value in dict(raw_concerns or {}).items():
+        proposal_id = str(key or "").strip()
+        if not proposal_id or proposal_id not in proposal_by_id:
+            continue
+        items: List[str] = []
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+        elif str(value or "").strip():
+            items = [str(value).strip()]
+        if items:
+            concerns[proposal_id] = items
+    return concerns
+
+
+def _planner_memory_search_state(
+    proposals: List[AgentProposal],
+    context_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    failure_labels = [
+        str(item.get("label") or "").strip()
+        for item in list((context_record or {}).get("failure_modes") or [])
+        if str(item.get("label") or "").strip()
+    ]
+    derived_labels = [
+        str(item.get("label") or "").strip()
+        for item in list((context_record or {}).get("derived_bottlenecks") or [])
+        if str(item.get("label") or "").strip()
+    ]
+    seed_program = proposals[0].program.normalized() if proposals else default_dense_program("single_g5").normalized()
+    bottleneck_signature = (
+        str((context_record or {}).get("bottleneck_signature") or "").strip()
+        or str((((context_record or {}).get("evidence_record") or {}).get("bottleneck_signature")) or "").strip()
+        or (derived_labels[0] if derived_labels else "")
+    )
+    return {
+        "model": {
+            "model_track": str(seed_program.model.track or "dense"),
+            "model_name": str(getattr(seed_program.model, "name", "") or ""),
+            "size_bucket": str(getattr(seed_program.model, "size_bucket", "") or getattr(seed_program.model, "name", "") or ""),
+        },
+        "hardware": {
+            "run_target": str(seed_program.cluster.target or "single_g5"),
+            "backend_family": "megatron",
+            "hardware_profile": str(seed_program.machine_profile.name if seed_program.machine_profile is not None else seed_program.cluster.target or ""),
+        },
+        "policy": {
+            "runtime_schedule_family": str(
+                (seed_program.metadata or {}).get("runtime_schedule_family")
+                or seed_program.schedule_ir.family
+                or seed_program.schedule.template
+                or seed_program.schedule.skeleton
+                or "fixed_1f1b"
+            ),
+            "pp_degree": int(seed_program.parallel.pp_degree or 1),
+            "vpp_degree": int(seed_program.parallel.vpp_degree or 1),
+            "interleaved_pipeline": bool(int(seed_program.parallel.vpp_degree or 1) > 1),
+        },
+        "runtime": runtime,
+        "active_labels": list(dict.fromkeys(failure_labels + derived_labels)),
+        "bottleneck_signature": bottleneck_signature,
     }
 
 
@@ -924,6 +1490,7 @@ def _build_llm_supervisor_prompt(
             "peak memory must remain within budget",
             "dependency legality must hold",
             "communication schedule must remain executable",
+            "repair actions must use supported_repair_actions only",
         ],
         "replan_decision": {
             "trigger": str(replan_decision.get("trigger") or "steady"),
@@ -937,7 +1504,11 @@ def _build_llm_supervisor_prompt(
             "cross_node_exposed_ratio": float(runtime.get("cross_node_exposed_ratio") or 0.0),
             "peak_reserved_ratio": float(runtime.get("peak_reserved_ratio") or 0.0),
             "memory_budget_gb": float(runtime.get("memory_budget_gb") or runtime.get("memory_limit_gb") or 0.0),
+            "tp_without_sp": bool(runtime.get("tp_without_sp")),
+            "optimizer_cpu_offload": bool(runtime.get("optimizer_cpu_offload")),
+            "cpu_offload_tail_ratio": float(runtime.get("cpu_offload_tail_ratio") or 0.0),
         },
+        "supported_repair_actions": list(_SUPPORTED_RUNTIME_REWRITE_TYPES),
         "derived_bottlenecks": [
             {
                 "label": str(item.get("label") or ""),
@@ -951,6 +1522,15 @@ def _build_llm_supervisor_prompt(
         "output_schema": {
             "selected_proposal_ids": ["proposal_id_1", "proposal_id_2"],
             "rationales": {"proposal_id_1": "short reason"},
+            "repair_actions": {
+                "proposal_id_1": [
+                    {
+                        "rewrite_type": "tail_optimizer_relief",
+                        "target_stage_ids": [1],
+                        "direction": "enable",
+                    }
+                ]
+            },
             "agent_topology": {
                 "llm_planner_agents": 1,
                 "verifier_agents": 1,
@@ -960,6 +1540,168 @@ def _build_llm_supervisor_prompt(
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _build_llm_multi_agent_prompt(
+    role: str,
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    candidate_limit: int,
+    family_memory_guidance: Optional[Dict[str, Any]] = None,
+    repair_memory_guidance: Optional[Dict[str, Any]] = None,
+    architect_plan: Optional[Dict[str, Any]] = None,
+    diagnostician_plan: Optional[Dict[str, Any]] = None,
+    proposer_plan: Optional[Dict[str, Any]] = None,
+) -> str:
+    runtime = dict((context_record or {}).get("runtime_evidence") or {})
+    payload: Dict[str, Any] = {
+        "role": str(role),
+        "objective": "maximize throughput under memory budget and legality constraints",
+        "hard_constraints": [
+            "peak memory must remain within budget",
+            "dependency legality must hold",
+            "communication schedule must remain executable",
+            "you must not invent proposal ids",
+            "repair actions must use supported_repair_actions only",
+        ],
+        "replan_decision": {
+            "trigger": str(replan_decision.get("trigger") or "steady"),
+            "scope": str(replan_decision.get("scope") or "none"),
+            "rationale": str(replan_decision.get("rationale") or ""),
+        },
+        "runtime_evidence": {
+            "bubble_ratio": float(runtime.get("bubble_ratio") or 0.0),
+            "pipeline_wait_ratio": float(runtime.get("pipeline_wait_ratio") or 0.0),
+            "optimizer_exposed_ratio": float(runtime.get("optimizer_exposed_ratio") or 0.0),
+            "cross_node_exposed_ratio": float(runtime.get("cross_node_exposed_ratio") or 0.0),
+            "peak_reserved_ratio": float(runtime.get("peak_reserved_ratio") or 0.0),
+            "comm_exposure_ratio": float(runtime.get("comm_exposure_ratio") or 0.0),
+            "reload_stall_ratio": float(runtime.get("reload_stall_ratio") or 0.0),
+            "tp_without_sp": bool(runtime.get("tp_without_sp")),
+            "optimizer_cpu_offload": bool(runtime.get("optimizer_cpu_offload")),
+            "cpu_offload_tail_ratio": float(runtime.get("cpu_offload_tail_ratio") or 0.0),
+        },
+        "supported_repair_actions": list(_SUPPORTED_RUNTIME_REWRITE_TYPES),
+        "candidate_limit": int(candidate_limit),
+        "proposals": [_proposal_prompt_entry(item) for item in proposals[: max(int(candidate_limit) * 2, 12)]],
+    }
+    if family_memory_guidance:
+        payload["family_memory_guidance"] = copy.deepcopy(dict(family_memory_guidance or {}))
+    if repair_memory_guidance:
+        payload["repair_memory_guidance"] = copy.deepcopy(dict(repair_memory_guidance or {}))
+    if role == "family_architect":
+        payload["instructions"] = [
+            "choose the schedule families and proposal families that best match the current runtime regime",
+            "use family_memory_guidance and repair_memory_guidance when available",
+            "prefer shortlist guidance over hard veto unless evidence is strong",
+        ]
+        payload["output_schema"] = {
+            "selected_schedule_families": ["dual_overlap_optimizer_hide"],
+            "shortlisted_proposal_ids": ["proposal_id_1", "proposal_id_2"],
+            "preferred_patch_families": ["reload_shift_patch"],
+            "deprioritized_families": ["dual_overlap_memory_safe"],
+            "rationales": {"dual_overlap_optimizer_hide": "short reason"},
+            "notes": ["optional note"],
+        }
+    elif role == "bottleneck_diagnostician":
+        payload["instructions"] = [
+            "identify the dominant bottleneck, the likely critical stages, and the runtime repair targets",
+            "use family_architect_plan to keep the diagnosis aligned with the selected family regime",
+            "return only existing proposal ids from the shortlist when selecting focus_proposal_ids",
+        ]
+        payload["family_architect_plan"] = copy.deepcopy(dict(architect_plan or {}))
+        payload["output_schema"] = {
+            "dominant_bottlenecks": ["optimizer_bound"],
+            "target_stage_ids": [1],
+            "target_layer_group_ids": ["group_1"],
+            "target_state_ids": ["activation:group_1"],
+            "focus_proposal_ids": ["proposal_id_1", "proposal_id_2"],
+            "repair_actions": {
+                "proposal_id_1": [
+                    {
+                        "rewrite_type": "tail_optimizer_relief",
+                        "target_stage_ids": [1],
+                        "direction": "enable",
+                    }
+                ]
+            },
+            "rationales": {"proposal_id_1": "short reason"},
+            "notes": ["optional note"],
+        }
+    elif role == "rewrite_proposer":
+        payload["instructions"] = [
+            "select and order the most promising proposal ids for the next execution wave",
+            "use the family architect and bottleneck diagnostician guidance to choose runtime repairs",
+            "return only existing proposal ids",
+        ]
+        payload["family_architect_plan"] = copy.deepcopy(dict(architect_plan or {}))
+        payload["bottleneck_diagnostician_plan"] = copy.deepcopy(dict(diagnostician_plan or {}))
+        payload["output_schema"] = {
+            "selected_proposal_ids": ["proposal_id_1", "proposal_id_2"],
+            "rationales": {"proposal_id_1": "short reason"},
+            "repair_actions": {
+                "proposal_id_1": [
+                    {
+                        "rewrite_type": "selective_reload_prefetch",
+                        "direction": "selective",
+                    }
+                ]
+            },
+            "notes": ["optional note"],
+        }
+    else:
+        payload["instructions"] = [
+            "review the shortlisted proposals against the selected family regime and diagnosed bottleneck",
+            "veto only when you see a concrete memory, communication, legality, or family mismatch risk",
+            "demote instead of veto when evidence is weak",
+        ]
+        payload["family_architect_plan"] = copy.deepcopy(dict(architect_plan or {}))
+        payload["bottleneck_diagnostician_plan"] = copy.deepcopy(dict(diagnostician_plan or {}))
+        payload["rewrite_proposer_plan"] = copy.deepcopy(dict(proposer_plan or {}))
+        payload["output_schema"] = {
+            "vetoed_proposal_ids": ["proposal_id_3"],
+            "demoted_proposal_ids": ["proposal_id_4"],
+            "concerns": {"proposal_id_3": ["memory risk"]},
+            "repair_actions": {
+                "proposal_id_4": [
+                    {
+                        "rewrite_type": "offload_timing_shift",
+                        "direction": "earlier",
+                    }
+                ]
+            },
+            "notes": ["optional note"],
+        }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _call_llm_role_plan(
+    *,
+    role: str,
+    prompt: str,
+    system_prompt: str,
+    llm_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if bool((llm_config or {}).get("log_llm")):
+        print(f"[megatron_agent] llm {role} prompt >>>")
+        print(prompt)
+    try:
+        reply = _call_llm_chat_completion(
+            endpoint=str((llm_config or {}).get("endpoint") or ""),
+            model=str((llm_config or {}).get("model") or ""),
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=float((llm_config or {}).get("temperature") or 0.0),
+        )
+        if bool((llm_config or {}).get("log_llm")):
+            print(f"[megatron_agent] llm {role} reply <<<")
+            print(reply)
+        parsed = _robust_parse_llm_json(reply)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 def _apply_llm_supervisor(
@@ -1012,6 +1754,10 @@ def _apply_llm_supervisor(
     ordered: List[AgentProposal] = []
     seen: set[str] = set()
     proposal_by_id = {str(item.proposal_id): item for item in proposals}
+    repair_action_map = _normalize_llm_rewrite_action_map(
+        proposal_by_id,
+        plan.get("repair_actions") if isinstance(plan, dict) else {},
+    )
     for proposal_id in selected_ids:
         proposal = proposal_by_id.get(str(proposal_id))
         if proposal is None:
@@ -1020,6 +1766,13 @@ def _apply_llm_supervisor(
         updated = proposal.normalized()
         updated.source = "llm_supervisor"
         updated.rationale = rationales.get(str(proposal_id), updated.rationale)
+        if str(proposal_id) in repair_action_map:
+            updated.program = _merge_rewrite_actions_into_program(
+                updated.program,
+                repair_action_map.get(str(proposal_id), []),
+                strategy_source="llm_http",
+                llm_rationale=updated.rationale,
+            )
         updated.program.metadata["planner_backend"] = "llm_http"
         updated.program.metadata["planner_model"] = str((llm_config or {}).get("model") or "")
         updated.program.metadata["agent_topology"] = _agent_topology_summary(llm_config)
@@ -1030,10 +1783,306 @@ def _apply_llm_supervisor(
         if str(proposal.proposal_id) in seen:
             continue
         updated = proposal.normalized()
+        proposal_id = str(updated.proposal_id or "")
+        if proposal_id in repair_action_map:
+            updated.program = _merge_rewrite_actions_into_program(
+                updated.program,
+                repair_action_map.get(proposal_id, []),
+                strategy_source="llm_http",
+                llm_rationale=rationales.get(proposal_id),
+            )
         if str(updated.source or "") == "heuristic_supervisor":
             updated.program.metadata["agent_topology"] = _agent_topology_summary(llm_config)
         ordered.append(updated.normalized())
-    return ordered or proposals
+    return _annotate_proposals_with_counterfactual_scores(
+        ordered or proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        preserve_order=True,
+    )
+
+
+def _apply_llm_multi_agent(
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    candidate_limit: int,
+    llm_config: Optional[Dict[str, Any]],
+    policy_memory_bank: Optional[PolicyMemoryBank] = None,
+) -> List[AgentProposal]:
+    if not proposals or not _llm_multi_agent_enabled(llm_config):
+        return proposals
+    proposal_by_id = {str(item.proposal_id): item for item in proposals}
+    original_ids = [str(item.proposal_id) for item in proposals]
+    search_state = _planner_memory_search_state(proposals, context_record)
+    family_memory_guidance = (
+        policy_memory_bank.recommend_schedule_families(search_state, top_k=6)
+        if policy_memory_bank is not None
+        else {"state_summary": summarize_state_for_memory(search_state), "ranked_families": [], "preferred_families": [], "avoid_families": []}
+    )
+    repair_memory_guidance = (
+        policy_memory_bank.recommend_patch_families(search_state, top_k=6)
+        if policy_memory_bank is not None
+        else {
+            "state_summary": summarize_state_for_memory(search_state),
+            "matched_entries": [],
+            "schedule_families": [],
+            "useful_patch_families": [],
+            "harmful_patch_families": [],
+            "rewrite_targets": {"target_stage_ids": [], "target_layer_group_ids": [], "target_state_ids": []},
+            "recent_failure_signatures": [],
+            "recent_rollback_reasons": [],
+        }
+    )
+
+    architect_prompt = _build_llm_multi_agent_prompt(
+        "family_architect",
+        proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        family_memory_guidance=family_memory_guidance,
+        repair_memory_guidance=repair_memory_guidance,
+    )
+    architect_plan = _call_llm_role_plan(
+        role="family_architect",
+        prompt=architect_prompt,
+        system_prompt=(
+            "You are the Global Family Architect in a Megatron pipeline optimization planner. "
+            "Choose the best schedule family regime and shortlist existing proposals that fit it. "
+            "Do not invent proposal ids. Return JSON only."
+        ),
+        llm_config=llm_config,
+    )
+    architect_ids = _normalize_llm_proposal_ids(
+        proposal_by_id,
+        architect_plan.get("shortlisted_proposal_ids") if isinstance(architect_plan, dict) else [],
+    )
+    selected_schedule_families = {
+        str(item).strip()
+        for item in list((architect_plan or {}).get("selected_schedule_families") or [])
+        if str(item).strip()
+    }
+    family_shortlist_ids = [
+        proposal_id
+        for proposal_id in original_ids
+        if str(_proposal_schedule_family(proposal_by_id.get(proposal_id)) or "").strip() in selected_schedule_families
+    ]
+    shortlist_ids = architect_ids or family_shortlist_ids or original_ids[: max(int(candidate_limit) * 2, min(len(original_ids), 6))]
+    shortlist = [proposal_by_id[proposal_id] for proposal_id in shortlist_ids if proposal_id in proposal_by_id]
+
+    diagnostician_prompt = _build_llm_multi_agent_prompt(
+        "bottleneck_diagnostician",
+        shortlist,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        family_memory_guidance=family_memory_guidance,
+        repair_memory_guidance=repair_memory_guidance,
+        architect_plan=architect_plan,
+    )
+    diagnostician_plan = _call_llm_role_plan(
+        role="bottleneck_diagnostician",
+        prompt=diagnostician_prompt,
+        system_prompt=(
+            "You are the Bottleneck Diagnostician in a Megatron pipeline optimization planner. "
+            "Diagnose the dominant bottleneck and identify the most relevant shortlisted proposals and repair targets. "
+            "Do not invent proposal ids. Return JSON only."
+        ),
+        llm_config=llm_config,
+    )
+    diagnostician_ids = _normalize_llm_proposal_ids(
+        proposal_by_id,
+        diagnostician_plan.get("focus_proposal_ids") if isinstance(diagnostician_plan, dict) else [],
+    )
+    proposer_seed_ids = diagnostician_ids or list(shortlist_ids)
+
+    proposer_prompt = _build_llm_multi_agent_prompt(
+        "rewrite_proposer",
+        [proposal_by_id[proposal_id] for proposal_id in proposer_seed_ids if proposal_id in proposal_by_id],
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        family_memory_guidance=family_memory_guidance,
+        repair_memory_guidance=repair_memory_guidance,
+        architect_plan=architect_plan,
+        diagnostician_plan=diagnostician_plan,
+    )
+    proposer_plan = _call_llm_role_plan(
+        role="rewrite_proposer",
+        prompt=proposer_prompt,
+        system_prompt=(
+            "You are the Rewrite Proposer in a Megatron pipeline optimization planner. "
+            "Select and order the best existing proposal ids, and attach runtime repair actions when helpful. "
+            "Do not invent proposal ids. Return JSON only."
+        ),
+        llm_config=llm_config,
+    )
+    ranked_ids = _normalize_llm_proposal_ids(
+        proposal_by_id,
+        proposer_plan.get("selected_proposal_ids") if isinstance(proposer_plan, dict) else [],
+    )
+    if not ranked_ids:
+        ranked_ids = list(proposer_seed_ids)
+
+    critic_prompt = _build_llm_multi_agent_prompt(
+        "family_critic",
+        [proposal_by_id[proposal_id] for proposal_id in ranked_ids if proposal_id in proposal_by_id],
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        family_memory_guidance=family_memory_guidance,
+        repair_memory_guidance=repair_memory_guidance,
+        architect_plan=architect_plan,
+        diagnostician_plan=diagnostician_plan,
+        proposer_plan=proposer_plan,
+    )
+    critic_plan = _call_llm_role_plan(
+        role="family_critic",
+        prompt=critic_prompt,
+        system_prompt=(
+            "You are the Family Critic in a Megatron pipeline optimization planner. "
+            "Flag risky, family-mismatched, or dominated shortlisted proposal ids, and prefer demotion over veto when evidence is weak. "
+            "Do not invent proposal ids. Return JSON only."
+        ),
+        llm_config=llm_config,
+    )
+    vetoed_ids = set(
+        _normalize_llm_proposal_ids(
+            proposal_by_id,
+            critic_plan.get("vetoed_proposal_ids") if isinstance(critic_plan, dict) else [],
+        )
+    )
+    demoted_ids = set(
+        _normalize_llm_proposal_ids(
+            proposal_by_id,
+            critic_plan.get("demoted_proposal_ids") if isinstance(critic_plan, dict) else [],
+        )
+    )
+    concerns = _normalize_llm_concerns(
+        proposal_by_id,
+        critic_plan.get("concerns") if isinstance(critic_plan, dict) else {},
+    )
+    repair_action_map: Dict[str, List[RewriteActionSpec]] = {}
+    for role_name, role_plan in (
+        ("family_architect", architect_plan),
+        ("bottleneck_diagnostician", diagnostician_plan),
+        ("rewrite_proposer", proposer_plan),
+        ("family_critic", critic_plan),
+    ):
+        current_map = _normalize_llm_rewrite_action_map(
+            proposal_by_id,
+            role_plan.get("repair_actions") if isinstance(role_plan, dict) else {},
+        )
+        for proposal_id, actions in current_map.items():
+            repair_action_map.setdefault(proposal_id, [])
+            repair_action_map[proposal_id].extend(actions)
+
+    priority_ids: List[str] = []
+    for proposal_id in list(ranked_ids) + list(diagnostician_ids) + list(architect_ids):
+        if proposal_id not in priority_ids:
+            priority_ids.append(proposal_id)
+    remainder_ids = [proposal_id for proposal_id in original_ids if proposal_id not in priority_ids]
+    demoted_tail = [proposal_id for proposal_id in priority_ids + remainder_ids if proposal_id in demoted_ids and proposal_id not in vetoed_ids]
+    vetoed_tail = [proposal_id for proposal_id in priority_ids + remainder_ids if proposal_id in vetoed_ids]
+    safe_primary = [
+        proposal_id
+        for proposal_id in priority_ids
+        if proposal_id not in demoted_ids and proposal_id not in vetoed_ids
+    ]
+    safe_remainder = [
+        proposal_id
+        for proposal_id in remainder_ids
+        if proposal_id not in demoted_ids and proposal_id not in vetoed_ids
+    ]
+    final_order_ids: List[str] = []
+    for proposal_id in safe_primary + safe_remainder + demoted_tail + vetoed_tail:
+        if proposal_id not in final_order_ids:
+            final_order_ids.append(proposal_id)
+
+    role_trace = {
+        "planner_mode": "hierarchical_multi_agent",
+        "family_architect": copy.deepcopy(dict(architect_plan or {})),
+        "bottleneck_diagnostician": copy.deepcopy(dict(diagnostician_plan or {})),
+        "rewrite_proposer": copy.deepcopy(dict(proposer_plan or {})),
+        "family_critic": copy.deepcopy(dict(critic_plan or {})),
+        "family_memory_guidance": copy.deepcopy(dict(family_memory_guidance or {})),
+        "repair_memory_guidance": copy.deepcopy(dict(repair_memory_guidance or {})),
+    }
+    dominant_bottlenecks = [
+        str(item).strip()
+        for item in list((diagnostician_plan or {}).get("dominant_bottlenecks") or [])
+        if str(item).strip()
+    ]
+    ordered: List[AgentProposal] = []
+    for rank_index, proposal_id in enumerate(final_order_ids, start=1):
+        proposal = proposal_by_id.get(proposal_id)
+        if proposal is None:
+            continue
+        updated = proposal.normalized()
+        updated.source = "llm_multi_agent"
+        updated.program.metadata["planner_backend"] = "llm_http_hierarchical_multi_agent"
+        updated.program.metadata["planner_model"] = str((llm_config or {}).get("model") or "")
+        updated.program.metadata["planner_mode"] = "hierarchical_multi_agent"
+        updated.program.metadata["agent_topology"] = _agent_topology_summary(llm_config)
+        updated.program.metadata["llm_multi_agent_trace"] = role_trace
+        updated.program.metadata["llm_rank_position"] = int(rank_index)
+        updated.program.metadata["llm_family_architect_selected"] = proposal_id in set(shortlist_ids)
+        updated.program.metadata["llm_bottleneck_diagnostician_selected"] = proposal_id in set(proposer_seed_ids)
+        updated.program.metadata["llm_rewrite_proposer_selected"] = proposal_id in set(ranked_ids)
+        updated.program.metadata["llm_family_critic_demoted"] = proposal_id in demoted_ids
+        updated.program.metadata["llm_family_critic_vetoed"] = proposal_id in vetoed_ids
+        updated.program.metadata["llm_family_critic_concerns"] = list(concerns.get(proposal_id) or [])
+        updated.program.metadata["llm_selected_schedule_families"] = sorted(selected_schedule_families)
+        updated.program.metadata["llm_diagnosed_bottlenecks"] = list(dominant_bottlenecks)
+        if proposal_id in repair_action_map:
+            updated.program = _merge_rewrite_actions_into_program(
+                updated.program,
+                repair_action_map.get(proposal_id, []),
+                strategy_source="llm_http_multi_agent",
+                llm_rationale=str(
+                    (dict(proposer_plan or {}).get("rationales") or {}).get(proposal_id)
+                    or (dict(diagnostician_plan or {}).get("rationales") or {}).get(proposal_id)
+                    or (dict(architect_plan or {}).get("rationales") or {}).get(str(_proposal_schedule_family(updated)))
+                    or ""
+                ).strip()
+                or None,
+            )
+        ordered.append(updated.normalized())
+    return _annotate_proposals_with_counterfactual_scores(
+        ordered or proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        preserve_order=True,
+    )
+
+
+def _apply_llm_planner(
+    proposals: List[AgentProposal],
+    *,
+    context_record: Dict[str, Any],
+    replan_decision: Dict[str, Any],
+    candidate_limit: int,
+    llm_config: Optional[Dict[str, Any]],
+    policy_memory_bank: Optional[PolicyMemoryBank] = None,
+) -> List[AgentProposal]:
+    if _llm_multi_agent_enabled(llm_config):
+        return _apply_llm_multi_agent(
+            proposals,
+            context_record=context_record,
+            replan_decision=replan_decision,
+            candidate_limit=candidate_limit,
+            llm_config=llm_config,
+            policy_memory_bank=policy_memory_bank,
+        )
+    return _apply_llm_supervisor(
+        proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+        candidate_limit=candidate_limit,
+        llm_config=llm_config,
+    )
 
 
 def _clone_program(program: MegatronProgram) -> MegatronProgram:
@@ -1046,6 +2095,12 @@ def _clone_program(program: MegatronProgram) -> MegatronProgram:
     clone.applied_patch = None
     clone.baseline_family = None
     clone.policy_objective = None
+    clone.layer_groups = []
+    clone.schedule_graph_nodes = []
+    clone.schedule_graph_edges = []
+    clone.state_plan = None
+    clone.global_strategy_plan = None
+    clone.rewrite_plan = None
     return clone
 
 
@@ -6034,12 +7089,18 @@ def _synthesize_proposals(
         replan_decision=replan_decision,
         policy_memory_bank=policy_memory_bank,
     )
-    proposals = _apply_llm_supervisor(
+    proposals = _annotate_proposals_with_counterfactual_scores(
+        proposals,
+        context_record=context_record,
+        replan_decision=replan_decision,
+    )
+    proposals = _apply_llm_planner(
         proposals,
         context_record=context_record,
         replan_decision=replan_decision,
         candidate_limit=candidate_limit,
         llm_config=llm_config,
+        policy_memory_bank=policy_memory_bank,
     )
     return _verify_agent_proposals(
         baseline,
@@ -6482,6 +7543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-unit", type=str, choices=["patch", "whole_config"], default="patch")
     parser.add_argument("--disable-patch-memory", action="store_true")
     parser.add_argument("--enable-llm-supervisor", action="store_true")
+    parser.add_argument("--llm-planner-mode", type=str, choices=["single_supervisor", "multi_agent"], default="single_supervisor")
     parser.add_argument("--llm-endpoint", type=str, default="http://10.100.1.93:12365/v1/chat/completions")
     parser.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     parser.add_argument("--llm-temperature", type=float, default=0.2)
@@ -6518,22 +7580,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--megatron-args-file", type=str, default=None)
     parser.add_argument("--transformer-impl", type=str, default="auto")
     parser.add_argument("--attention-backend", type=str, default="auto")
-    parser.add_argument("--enable-stateful-schedule", action="store_true")
     parser.add_argument("--enable-hierarchical-orchestrator", action="store_true")
     parser.add_argument("--enable-reload-shift", action="store_true")
     parser.add_argument("--enable-adaptive-chunking", action="store_true")
     parser.add_argument("--enable-local-verticalization", action="store_true")
-    parser.add_argument(
-        "--telemetry-budget",
-        dest="telemetry_budget_level",
-        type=str,
-        choices=["summary", "aggregated_grid", "full_debug"],
-        default="summary",
-    )
-    parser.add_argument("--telemetry-max-trace-mb", type=int, default=128)
-    parser.add_argument("--telemetry-max-events-per-rank", type=int, default=20000)
-    parser.add_argument("--telemetry-sampled-windows", type=int, default=2)
-    parser.add_argument("--window-steps", type=int, default=4)
     parser.add_argument("--tokenizer-model", type=str, default=DEFAULT_TOKENIZER_MODEL)
     parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)
     parser.add_argument("--use-mock-data", action="store_true")
@@ -6603,6 +7653,7 @@ def main() -> None:
     runtime_summary = _load_runtime_summary(args.runtime_summary)
     llm_config = {
         "enabled": bool(args.enable_llm_supervisor),
+        "planner_mode": str(args.llm_planner_mode),
         "endpoint": str(args.llm_endpoint),
         "model": str(args.llm_model),
         "temperature": float(args.llm_temperature),

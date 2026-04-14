@@ -800,6 +800,10 @@ def select_family_candidates(
     runtime = dict(search_state.get("runtime") or {})
     thresholds = dict(search_state.get("thresholds") or DEFAULT_FAMILY_THRESHOLDS)
     triggered = set(_string_list(search_state.get("triggered_families") or []))
+    family_memory_guidance: Dict[str, Dict[str, Any]] = {}
+    if memory_bank is not None:
+        for item in list(memory_bank.recommend_schedule_families(search_state, top_k=max(int(top_k), 4)).get("ranked_families") or []):
+            family_memory_guidance[str(item.get("family") or "")] = dict(item)
     ranked: List[Dict[str, Any]] = []
     for family in _FAMILY_ORDER:
         score = 0.0
@@ -847,6 +851,13 @@ def select_family_candidates(
             if retrieved:
                 score += 0.15 * max(_safe_float(item.get("similarity")) for item in retrieved)
                 reasons.append("similar_success_case")
+            family_guidance = family_memory_guidance.get(family)
+            if family_guidance is not None:
+                score += 0.35 * _safe_float(family_guidance.get("score"))
+                if float(family_guidance.get("bottleneck_match") or 0.0) > 0.0:
+                    reasons.append("family_memory_bottleneck_match")
+                if float(family_guidance.get("rollback_ratio") or 0.0) >= 0.34:
+                    reasons.append("family_memory_rollback_penalty")
         if family in triggered or score > 0.0:
             ranked.append({"family": family, "score": round(score, 4), "reasons": reasons})
     ranked.sort(
@@ -868,6 +879,11 @@ def build_feedback_search_plan(
     search_state = encode_search_state(baseline, context_record)
     ranked_families = select_family_candidates(search_state, memory_bank=memory_bank, top_k=top_k_families)
     selected_families = [str(item.get("family") or "") for item in ranked_families if str(item.get("family") or "").strip()]
+    family_memory_guidance = (
+        memory_bank.recommend_schedule_families(search_state, top_k=max(int(top_k_families), 4))
+        if memory_bank is not None
+        else {"state_summary": summarize_state_for_memory(search_state), "ranked_families": [], "preferred_families": [], "avoid_families": []}
+    )
     retrieved_cases: List[Dict[str, Any]] = []
     if memory_bank is not None:
         for family in selected_families[:1]:
@@ -879,6 +895,7 @@ def build_feedback_search_plan(
         "state_summary": summarize_state_for_memory(search_state),
         "ranked_families": ranked_families,
         "selected_families": selected_families,
+        "family_memory_guidance": family_memory_guidance,
         "retrieved_cases": retrieved_cases,
         "proposal_count": len(list(proposals or [])),
     }

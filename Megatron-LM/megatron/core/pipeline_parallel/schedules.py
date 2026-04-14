@@ -16,6 +16,10 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
+    fine_grained_offloading_disable_offload,
+    fine_grained_offloading_enable_offload,
+    fine_grained_offloading_flush_delayed_groups,
+    fine_grained_offloading_prefetch,
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -441,6 +445,16 @@ def forward_step(
             "is_last_stage": bool(is_last_stage),
         },
     )
+    invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {
+            "trigger_hook": "before_forward_hook",
+            "microbatch_id": current_microbatch,
+            "vchunk_id": vp_stage,
+            "is_last_stage": bool(is_last_stage),
+            "fine_grained_activation_offloading": bool(getattr(config, "fine_grained_activation_offloading", False)),
+        },
+    )
     runtime_token = runtime_runner.begin_action(
         "FWD",
         microbatch_id=current_microbatch,
@@ -504,6 +518,16 @@ def forward_step(
             "num_tokens": int(num_tokens) if num_tokens is not None else 0,
         },
     )
+    invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {
+            "trigger_hook": "after_forward_hook",
+            "microbatch_id": current_microbatch,
+            "vchunk_id": vp_stage,
+            "num_tokens": int(num_tokens) if num_tokens is not None else 0,
+            "fine_grained_activation_offloading": bool(getattr(config, "fine_grained_activation_offloading", False)),
+        },
+    )
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -525,6 +549,15 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         {
             "microbatch_id": current_context.get("microbatch_id"),
             "vchunk_id": current_context.get("vchunk_id"),
+        },
+    )
+    invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {
+            "trigger_hook": "before_backward_hook",
+            "microbatch_id": current_context.get("microbatch_id"),
+            "vchunk_id": current_context.get("vchunk_id"),
+            "fine_grained_activation_offloading": bool(getattr(config, "fine_grained_activation_offloading", False)),
         },
     )
     runtime_token = runtime_runner.begin_action(
@@ -1065,6 +1098,299 @@ def _parse_json_hint_dict(raw: str) -> Dict[str, Any]:
     return dict(payload) if isinstance(payload, dict) else {}
 
 
+def _parse_json_hint_list(raw: str) -> List[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def _dedupe_json_dict_list(items: Any) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            encoded = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            continue
+        if encoded in seen:
+            continue
+        seen.add(encoded)
+        deduped.append(dict(item))
+    return deduped
+
+
+def _parse_stage_chunk_priority_hint_map(raw: str) -> Dict[int, List[int]]:
+    parsed: Dict[int, List[int]] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return parsed
+    for stage_entry in text.split(";"):
+        stage_entry = stage_entry.strip()
+        if not stage_entry or ":" not in stage_entry:
+            continue
+        stage_token, priorities_token = stage_entry.split(":", 1)
+        try:
+            stage_id = int(stage_token.strip())
+        except ValueError:
+            continue
+        priorities: List[int] = []
+        for raw_priority in priorities_token.split(","):
+            token = str(raw_priority).strip()
+            if not token:
+                continue
+            try:
+                priorities.append(int(token))
+            except ValueError:
+                continue
+        if priorities:
+            parsed[int(stage_id)] = list(dict.fromkeys(priorities))
+    return parsed
+
+
+def _normalize_runtime_state_migration_hints(items: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip().lower()
+        target_stage_ids: List[int] = []
+        for raw_stage in list(item.get("target_stage_ids") or []):
+            try:
+                target_stage_ids.append(int(raw_stage))
+            except Exception:
+                continue
+        target_stage_ids = list(dict.fromkeys(target_stage_ids))
+        target_layer_group_ids = [
+            str(raw).strip()
+            for raw in list(item.get("target_layer_group_ids") or [])
+            if str(raw).strip()
+        ]
+        target_state_ids = [
+            str(raw).strip()
+            for raw in list(item.get("target_state_ids") or [])
+            if str(raw).strip()
+        ]
+        payload: Dict[str, Any] = {
+            "action": action,
+            "target_stage_ids": target_stage_ids,
+            "target_layer_group_ids": list(dict.fromkeys(target_layer_group_ids)),
+            "target_state_ids": list(dict.fromkeys(target_state_ids)),
+            "direction": str(item.get("direction") or "").strip(),
+        }
+        shift_unit = str(item.get("shift_unit") or "").strip()
+        if shift_unit:
+            payload["shift_unit"] = shift_unit
+        try:
+            offset_slots = int(item.get("offset_slots", 0) or 0)
+        except Exception:
+            offset_slots = 0
+        if offset_slots:
+            payload["offset_slots"] = offset_slots
+        try:
+            prefetch_distance_slots = int(item.get("prefetch_distance_slots", 0) or 0)
+        except Exception:
+            prefetch_distance_slots = 0
+        if prefetch_distance_slots:
+            payload["prefetch_distance_slots"] = prefetch_distance_slots
+        insert_before = [
+            str(raw).strip()
+            for raw in list(item.get("insert_before") or [])
+            if str(raw).strip()
+        ]
+        if insert_before:
+            payload["insert_before"] = list(dict.fromkeys(insert_before))
+        if payload["action"] and payload["target_stage_ids"]:
+            normalized.append(payload)
+    return _dedupe_json_dict_list(normalized)
+
+
+def _normalize_stage_chunk_priority_hint_map(payload: Any) -> Dict[int, List[int]]:
+    normalized: Dict[int, List[int]] = {}
+    for raw_stage_id, raw_hints in dict(payload or {}).items():
+        try:
+            stage_id = int(raw_stage_id)
+        except Exception:
+            continue
+        parsed_hints: List[int] = []
+        for raw_hint in list(raw_hints or []):
+            try:
+                parsed_hints.append(int(raw_hint))
+            except Exception:
+                continue
+        if parsed_hints:
+            normalized[int(stage_id)] = list(dict.fromkeys(parsed_hints))
+    return normalized
+
+
+def _merge_stage_chunk_priority_hint_maps(*maps: Dict[int, List[int]]) -> Dict[int, List[int]]:
+    merged: Dict[int, List[int]] = {}
+    for mapping in maps:
+        for stage_id, raw_hints in dict(mapping or {}).items():
+            try:
+                parsed_stage_id = int(stage_id)
+            except Exception:
+                continue
+            existing = list(merged.get(parsed_stage_id) or [])
+            parsed_hints = list(existing)
+            for raw_hint in list(raw_hints or []):
+                try:
+                    parsed_hints.append(int(raw_hint))
+                except Exception:
+                    continue
+            if parsed_hints:
+                merged[parsed_stage_id] = list(dict.fromkeys(parsed_hints))
+    return merged
+
+
+def _parse_runtime_repair_action_contracts(raw: str) -> List[Dict[str, Any]]:
+    return _parse_json_hint_list(raw)
+
+
+def _aggregate_runtime_repair_contracts(runtime_repair_actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    aggregated: Dict[str, Any] = {
+        "state_migration_hints": [],
+        "window_overrides": [],
+        "operator_cluster_overrides": [],
+        "chunk_priority_hints": {},
+        "overlap_channels": [],
+        "optimizer_runtime": {},
+        "memory_intents": {},
+        "state_plan_patch": {},
+    }
+    for action_contract in list(runtime_repair_actions or []):
+        lowering = dict(action_contract.get("compile_lowering") or {})
+        aggregated["state_migration_hints"].extend(list(lowering.get("state_migration_hints") or []))
+        aggregated["window_overrides"].extend(list(lowering.get("window_overrides") or []))
+        aggregated["operator_cluster_overrides"].extend(list(lowering.get("operator_cluster_overrides") or []))
+        aggregated["overlap_channels"].extend(
+            [
+                str(item).strip()
+                for item in list(lowering.get("overlap_channels") or [])
+                if str(item).strip()
+            ]
+        )
+        aggregated["memory_intents"].update(dict(lowering.get("memory_intents") or {}))
+        aggregated["state_plan_patch"].update(dict(lowering.get("state_plan_patch") or {}))
+        if dict(lowering.get("optimizer_runtime") or {}):
+            aggregated["optimizer_runtime"].update(dict(lowering.get("optimizer_runtime") or {}))
+        aggregated["chunk_priority_hints"] = _merge_stage_chunk_priority_hint_maps(
+            aggregated.get("chunk_priority_hints") or {},
+            _normalize_stage_chunk_priority_hint_map(lowering.get("chunk_priority_hints") or {}),
+        )
+    aggregated["state_migration_hints"] = _normalize_runtime_state_migration_hints(
+        aggregated.get("state_migration_hints") or []
+    )
+    aggregated["window_overrides"] = _dedupe_json_dict_list(aggregated.get("window_overrides") or [])
+    aggregated["operator_cluster_overrides"] = _dedupe_json_dict_list(
+        aggregated.get("operator_cluster_overrides") or []
+    )
+    aggregated["overlap_channels"] = sorted(
+        {
+            str(item).strip()
+            for item in list(aggregated.get("overlap_channels") or [])
+            if str(item).strip()
+        }
+    )
+    return aggregated
+
+
+def _parse_stage_tag_tokens(raw: str) -> List[str]:
+    return [
+        token.strip()
+        for token in str(raw or "").replace(",", "|").split("|")
+        if token.strip()
+    ]
+
+
+def _merge_string_hint_payload(
+    target: Dict[str, str],
+    source: Dict[str, str],
+    *,
+    overwrite: bool,
+) -> Dict[str, str]:
+    merged = dict(target or {})
+    for key, value in dict(source or {}).items():
+        token_key = str(key).strip()
+        token_value = str(value or "").strip()
+        if not token_key or not token_value:
+            continue
+        if token_key == "stage_tags":
+            merged["stage_tags"] = "|".join(
+                sorted(
+                    {
+                        *set(_parse_stage_tag_tokens(merged.get("stage_tags") or "")),
+                        *set(_parse_stage_tag_tokens(token_value)),
+                    }
+                )
+            )
+            continue
+        if overwrite or not str(merged.get(token_key) or "").strip():
+            merged[token_key] = token_value
+    return merged
+
+
+def _runtime_state_migration_semantics_by_stage(
+    state_migration_hints: List[Dict[str, Any]]
+) -> Dict[int, Dict[str, str]]:
+    semantics: Dict[int, Dict[str, str]] = {}
+    for hint in list(state_migration_hints or []):
+        action = str(hint.get("action") or "").strip().lower()
+        direction = str(hint.get("direction") or "").strip()
+        offset_slots = int(hint.get("offset_slots") or 0)
+        prefetch_distance_slots = int(hint.get("prefetch_distance_slots") or 0)
+        for stage_id in list(hint.get("target_stage_ids") or []):
+            try:
+                parsed_stage_id = int(stage_id)
+            except Exception:
+                continue
+            entry = dict(semantics.get(parsed_stage_id) or {})
+            stage_tags = set(_parse_stage_tag_tokens(entry.get("stage_tags") or ""))
+            stage_tags.add("state_migration_active")
+            if action == "offload_timing_shift":
+                stage_tags.add("memory_hotspot")
+                entry.setdefault("memory_policy_mode", "selective")
+                if direction:
+                    entry["offload_shift_direction"] = direction
+                if offset_slots:
+                    entry["offload_shift_offset_slots"] = str(offset_slots)
+            elif action == "selective_reload_prefetch":
+                stage_tags.add("reload_sensitive")
+                entry.setdefault("reload_policy", "selective_prefetch")
+                entry.setdefault("prefetch_policy", "selective")
+                if prefetch_distance_slots:
+                    entry["prefetch_distance_slots"] = str(prefetch_distance_slots)
+            entry["stage_tags"] = "|".join(sorted(stage_tags))
+            semantics[parsed_stage_id] = entry
+    return semantics
+
+
+def _merge_stage_semantic_maps(
+    base: Dict[int, Dict[str, str]],
+    extra: Dict[int, Dict[str, str]],
+) -> Dict[int, Dict[str, str]]:
+    merged: Dict[int, Dict[str, str]] = {int(key): dict(value) for key, value in dict(base or {}).items()}
+    for raw_stage_id, payload in dict(extra or {}).items():
+        try:
+            stage_id = int(raw_stage_id)
+        except Exception:
+            continue
+        merged[stage_id] = _merge_string_hint_payload(
+            dict(merged.get(stage_id) or {}),
+            {str(key): str(value) for key, value in dict(payload or {}).items()},
+            overwrite=False,
+        )
+    return merged
+
+
 def _parse_int_vector_hint(raw: str) -> List[int]:
     text = str(raw or "").strip()
     if not text:
@@ -1235,6 +1561,185 @@ def _parse_stage_semantic_hints(raw: str) -> Dict[int, Dict[str, str]]:
 
 
 def _parse_schedule_runtime_hints() -> Dict[str, Any]:
+    runtime_repair_actions = _parse_runtime_repair_action_contracts(
+        os.environ.get("RUNTIME_REPAIR_ACTIONS", "")
+    )
+    runtime_repair_recommendations = _parse_runtime_repair_action_contracts(
+        os.environ.get("RUNTIME_REPAIR_RECOMMENDATIONS", "")
+    )
+    runtime_repair_summary = _parse_json_hint_dict(os.environ.get("RUNTIME_REPAIR_SUMMARY", ""))
+    runtime_repair_score_weights = _parse_json_hint_dict(
+        os.environ.get("RUNTIME_REPAIR_SCORE_WEIGHTS", "")
+    )
+    runtime_repair_policy_table = _parse_json_hint_dict(
+        os.environ.get("RUNTIME_REPAIR_POLICY_TABLE", "")
+    )
+    runtime_repair_aggregated = _aggregate_runtime_repair_contracts(runtime_repair_actions)
+    telemetry_budget = _parse_json_hint_dict(os.environ.get("TELEMETRY_BUDGET", ""))
+    if not isinstance(telemetry_budget, dict):
+        telemetry_budget = {}
+    explicit_level = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_LEVEL", "") or "").strip()
+    explicit_max_mb = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_MAX_MB", "") or "").strip()
+    explicit_max_events = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_MAX_EVENTS", "") or "").strip()
+    explicit_sampled_windows = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_SAMPLED_WINDOWS", "") or "").strip()
+    if explicit_level:
+        telemetry_budget["level"] = explicit_level
+    if explicit_max_mb:
+        try:
+            telemetry_budget["max_trace_mb"] = int(explicit_max_mb)
+        except Exception:
+            pass
+    if explicit_max_events:
+        try:
+            telemetry_budget["max_events_per_rank"] = int(explicit_max_events)
+        except Exception:
+            pass
+    if explicit_sampled_windows:
+        try:
+            telemetry_budget["sampled_windows"] = int(explicit_sampled_windows)
+        except Exception:
+            pass
+    if not telemetry_budget:
+        telemetry_budget = {
+            "level": "summary",
+            "max_trace_mb": 128,
+            "max_events_per_rank": 20000,
+            "sampled_windows": 2,
+            "emit_compare_svg": False,
+        }
+    state_plan = _parse_json_hint_dict(os.environ.get("STATE_PLAN", ""))
+    offload_plan = _parse_json_hint_dict(os.environ.get("OFFLOAD_PLAN", ""))
+    reload_plan = _parse_json_hint_dict(os.environ.get("RELOAD_PLAN", ""))
+    comm_chunk_plan = _parse_json_hint_dict(os.environ.get("COMM_CHUNK_PLAN", ""))
+    overlap_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_OVERLAP_HINTS", ""))
+    memory_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_MEMORY_HINTS", ""))
+    partition_hints = _parse_json_hint_dict(os.environ.get("SCHEDULE_PARTITION_HINTS", ""))
+    state_plan.update(dict(runtime_repair_aggregated.get("state_plan_patch") or {}))
+
+    explicit_state_migration_hints = _parse_json_hint_list(
+        os.environ.get("SCHEDULE_STATE_MIGRATION_HINTS", "")
+    )
+    state_migration_hints = _normalize_runtime_state_migration_hints(
+        [
+            *list(explicit_state_migration_hints or []),
+            *list(state_plan.get("runtime_state_migration_hints") or []),
+            *list(offload_plan.get("runtime_state_migration_hints") or []),
+            *list(reload_plan.get("runtime_state_migration_hints") or []),
+            *list(runtime_repair_aggregated.get("state_migration_hints") or []),
+        ]
+    )
+    if state_migration_hints:
+        state_plan["runtime_state_migration_hints"] = list(state_migration_hints)
+        offload_plan["runtime_state_migration_hints"] = [
+            dict(item)
+            for item in state_migration_hints
+            if str(item.get("action") or "").strip() == "offload_timing_shift"
+        ]
+        reload_plan["runtime_state_migration_hints"] = [
+            dict(item)
+            for item in state_migration_hints
+            if str(item.get("action") or "").strip() == "selective_reload_prefetch"
+        ]
+    if "reload_prefetch_window" in state_plan and "prefetch_window" not in reload_plan:
+        try:
+            reload_plan["prefetch_window"] = int(state_plan.get("reload_prefetch_window") or 0)
+        except Exception:
+            pass
+
+    merged_window_overrides = _parse_window_override_hints(
+        json.dumps(
+            _dedupe_json_dict_list(
+                [
+                    *_parse_json_hint_list(os.environ.get("SCHEDULE_WINDOW_OVERRIDE_HINTS", "")),
+                    *list(runtime_repair_aggregated.get("window_overrides") or []),
+                ]
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    merged_operator_cluster_hints_by_stage = _parse_operator_cluster_hints(
+        json.dumps(
+            _dedupe_json_dict_list(
+                [
+                    *_parse_json_hint_list(os.environ.get("SCHEDULE_OPERATOR_CLUSTER_HINTS", "")),
+                    *list(runtime_repair_aggregated.get("operator_cluster_overrides") or []),
+                ]
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    merged_operator_cluster_hints = [
+        dict(item)
+        for hints in merged_operator_cluster_hints_by_stage.values()
+        for item in list(hints or [])
+    ]
+    runtime_chunk_priority_hints = _normalize_stage_chunk_priority_hint_map(
+        dict(comm_chunk_plan.get("runtime_chunk_priority_hints") or {})
+    )
+    stage_chunk_priority_hints = _merge_stage_chunk_priority_hint_maps(
+        _parse_stage_chunk_priority_hint_map(os.environ.get("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", "")),
+        runtime_chunk_priority_hints,
+        dict(runtime_repair_aggregated.get("chunk_priority_hints") or {}),
+    )
+    if stage_chunk_priority_hints:
+        comm_chunk_plan["runtime_chunk_priority_hints"] = {
+            str(stage_id): list(hints) for stage_id, hints in stage_chunk_priority_hints.items()
+        }
+
+    overlap_channels = {
+        str(item).strip()
+        for item in list(runtime_repair_aggregated.get("overlap_channels") or [])
+        if str(item).strip()
+    }
+    if "reload" in overlap_channels:
+        overlap_hints["enable_reload_overlap"] = True
+    if "optimizer_tail" in overlap_channels:
+        overlap_hints["enable_optimizer_tail_overlap"] = True
+        overlap_hints["enable_grad_reduce_overlap"] = True
+        overlap_hints["enable_param_gather_overlap"] = True
+    if overlap_channels:
+        existing_pairs = [
+            str(item).strip()
+            for item in list(overlap_hints.get("priority_frontier_pairs") or [])
+            if str(item).strip()
+        ]
+        overlap_hints["priority_frontier_pairs"] = list(
+            dict.fromkeys(existing_pairs + [f"channel:{item}" for item in sorted(overlap_channels)])
+        )
+        overlap_hints["status"] = "runtime_repair"
+
+    memory_hints.update(dict(runtime_repair_aggregated.get("memory_intents") or {}))
+    if state_migration_hints:
+        existing_stage_policies = [
+            dict(item)
+            for item in list(memory_hints.get("per_stage_policies") or [])
+            if isinstance(item, dict)
+        ]
+        for hint in state_migration_hints:
+            existing_stage_policies.append(
+                {
+                    "action": str(hint.get("action") or ""),
+                    "target_stage_ids": [int(item) for item in list(hint.get("target_stage_ids") or [])],
+                    "target_layer_group_ids": [
+                        str(item) for item in list(hint.get("target_layer_group_ids") or []) if str(item).strip()
+                    ],
+                    "target_state_ids": [
+                        str(item) for item in list(hint.get("target_state_ids") or []) if str(item).strip()
+                    ],
+                    "direction": str(hint.get("direction") or ""),
+                    "offset_slots": int(hint.get("offset_slots") or 0),
+                    "prefetch_distance_slots": int(hint.get("prefetch_distance_slots") or 0),
+                }
+            )
+        memory_hints["per_stage_policies"] = _dedupe_json_dict_list(existing_stage_policies)
+        memory_hints["status"] = "runtime_repair"
+
+    stage_semantic_hints = _merge_stage_semantic_maps(
+        _parse_stage_semantic_hints(os.environ.get("SCHEDULE_STAGE_SEMANTIC_HINTS", "")),
+        _runtime_state_migration_semantics_by_stage(state_migration_hints),
+    )
     return {
         "family": str(os.environ.get("SCHEDULE_FAMILY", "") or "").strip(),
         "dispatch_order": str(os.environ.get("SCHEDULE_DISPATCH_ORDER", "") or "").strip(),
@@ -1242,10 +1747,29 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
         "group_size_vector": _parse_int_vector_hint(os.environ.get("SCHEDULE_GROUP_SIZE_VECTOR", "")),
         "schedule_grid_spec": _parse_schedule_grid_spec(os.environ.get("SCHEDULE_GRID_SPEC", "")),
         "schedule_action_specs": _parse_schedule_action_specs(os.environ.get("SCHEDULE_ACTION_SPECS", "")),
-        "stage_semantic_hints": _parse_stage_semantic_hints(os.environ.get("SCHEDULE_STAGE_SEMANTIC_HINTS", "")),
-        "overlap_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_OVERLAP_HINTS", "")),
-        "memory_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_MEMORY_HINTS", "")),
-        "partition_hints": _parse_json_hint_dict(os.environ.get("SCHEDULE_PARTITION_HINTS", "")),
+        "schedule_node_specs": _parse_json_hint_list(os.environ.get("SCHEDULE_NODE_SPECS", "")),
+        "schedule_edge_specs": _parse_json_hint_list(os.environ.get("SCHEDULE_EDGE_SPECS", "")),
+        "runtime_repair_summary": runtime_repair_summary,
+        "runtime_repair_score_weights": runtime_repair_score_weights,
+        "runtime_repair_policy_table": runtime_repair_policy_table,
+        "runtime_repair_actions": runtime_repair_actions,
+        "runtime_repair_recommendations": runtime_repair_recommendations,
+        "state_plan": state_plan,
+        "offload_plan": offload_plan,
+        "reload_plan": reload_plan,
+        "comm_chunk_plan": comm_chunk_plan,
+        "window_reconfig_plan": _parse_json_hint_dict(os.environ.get("WINDOW_RECONFIG_PLAN", "")),
+        "telemetry_budget": telemetry_budget,
+        "stage_semantic_hints": stage_semantic_hints,
+        "state_migration_hints": state_migration_hints,
+        "window_override_hints": merged_window_overrides,
+        "operator_cluster_hints": merged_operator_cluster_hints,
+        "operator_cluster_hints_by_stage": merged_operator_cluster_hints_by_stage,
+        "stage_chunk_priority_hints": stage_chunk_priority_hints,
+        "overlap_hints": overlap_hints,
+        "memory_hints": memory_hints,
+        "partition_hints": partition_hints,
+        "stage_local_vpp_vector": _parse_int_vector_hint(os.environ.get("STAGE_LOCAL_VPP_VECTOR", "")),
         "supported_families": sorted(_ALL_SCHEDULE_FAMILIES),
         "available_hooks": list(_SCHEDULE_RUNTIME_HOOKS),
     }
@@ -1261,10 +1785,11 @@ def _get_local_stage_family_hint() -> Dict[str, str]:
     semantic_hints = dict(runtime_hints.get("stage_semantic_hints") or {})
     local_semantic = semantic_hints.get(int(pp_rank))
     if isinstance(local_semantic, dict):
-        for key, value in dict(local_semantic).items():
-            token = str(value or "").strip()
-            if token:
-                merged[str(key)] = token
+        merged = _merge_string_hint_payload(
+            merged,
+            {str(key): str(value) for key, value in dict(local_semantic).items()},
+            overwrite=True,
+        )
     overlap_hints = dict(runtime_hints.get("overlap_hints") or {})
     memory_hints = dict(runtime_hints.get("memory_hints") or {})
     partition_hints = dict(runtime_hints.get("partition_hints") or {})
@@ -1365,12 +1890,74 @@ def get_schedule_action_view() -> Dict[str, Any]:
     }
 
 
+def _memory_action_runtime_enabled(payload: Optional[Dict[str, Any]] = None) -> bool:
+    event = dict(payload or {})
+    explicit = event.get("fine_grained_activation_offloading")
+    if explicit is not None:
+        return bool(explicit)
+    raw = str(os.environ.get("ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _execute_memory_action_hook(policy: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    event = dict(payload or {})
+    event["hook_name"] = "memory_action_hook"
+    if not _memory_action_runtime_enabled(event):
+        event["status"] = "inactive"
+        event["reason"] = "fine_grained_activation_offloading_disabled"
+        return event
+
+    local_stage_hint = dict(policy.get("local_stage_hint") or {})
+    state_migration_hints = list(policy.get("state_migration_hints") or [])
+    trigger_hook = str(event.get("trigger_hook") or "").strip().lower()
+    microbatch_id = max(int(event.get("microbatch_id") or 0), 0)
+    applied_actions: List[str] = []
+
+    offload_shift_direction = str(local_stage_hint.get("offload_shift_direction") or "").strip().lower()
+    offload_shift_offset_slots = max(int(local_stage_hint.get("offload_shift_offset_slots") or 0), 0)
+    if trigger_hook in {"before_forward_hook", "after_forward_hook"} and any(
+        str(item.get("action") or "").strip() == "offload_timing_shift" for item in state_migration_hints
+    ):
+        if offload_shift_direction == "later" and microbatch_id < offload_shift_offset_slots:
+            fine_grained_offloading_disable_offload()
+            applied_actions.append("disable_offload")
+        else:
+            fine_grained_offloading_enable_offload()
+            applied_actions.append("enable_offload")
+        if trigger_hook == "after_forward_hook":
+            flushed = int(fine_grained_offloading_flush_delayed_groups() or 0)
+            event["flushed_delayed_groups"] = flushed
+            if flushed > 0:
+                applied_actions.append("flush_delayed_groups")
+
+    reload_policy = str(local_stage_hint.get("reload_policy") or "").strip().lower()
+    prefetch_policy = str(local_stage_hint.get("prefetch_policy") or "").strip().lower()
+    prefetch_distance_slots = max(int(local_stage_hint.get("prefetch_distance_slots") or 0), 0)
+    if trigger_hook == "before_backward_hook" and (
+        reload_policy == "selective_prefetch"
+        or prefetch_policy == "selective"
+        or any(str(item.get("action") or "").strip() == "selective_reload_prefetch" for item in state_migration_hints)
+    ):
+        requested = max(prefetch_distance_slots, 1)
+        prefetched = int(fine_grained_offloading_prefetch(distance_slots=requested) or 0)
+        event["prefetch_distance_slots"] = requested
+        event["prefetched_groups"] = prefetched
+        if prefetched > 0:
+            applied_actions.append("prefetch_reload_groups")
+
+    event["applied_actions"] = applied_actions
+    event["status"] = "applied" if applied_actions else "noop"
+    return event
+
+
 def invoke_schedule_runtime_hook(hook_name: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     event = dict(payload or {})
     token = str(hook_name or "").strip()
     if token not in _SCHEDULE_RUNTIME_HOOKS:
         event["status"] = "unknown_hook"
         return event
+    if token == "memory_action_hook":
+        return _execute_memory_action_hook(get_schedule_runtime_policy(), event)
     policy = get_schedule_runtime_policy()
     event["status"] = "ready"
     event["hook_name"] = token
@@ -1383,6 +1970,12 @@ def invoke_schedule_runtime_hook(hook_name: str, payload: Optional[Dict[str, Any
     event["partition_hints"] = dict(policy.get("partition_hints") or {})
     event["schedule_grid_spec"] = dict(policy.get("schedule_grid_spec") or {})
     event["schedule_action_specs"] = list(policy.get("schedule_action_specs") or [])
+    event["telemetry_budget"] = dict(policy.get("telemetry_budget") or {})
+    event["state_plan"] = dict(policy.get("state_plan") or {})
+    event["runtime_repair_summary"] = dict(policy.get("runtime_repair_summary") or {})
+    event["runtime_repair_actions"] = list(policy.get("runtime_repair_actions") or [])
+    event["runtime_repair_recommendations"] = list(policy.get("runtime_repair_recommendations") or [])
+    event["state_migration_hints"] = list(policy.get("state_migration_hints") or [])
     return event
 
 
@@ -1401,6 +1994,12 @@ class ScheduleActionRunner:
         self.stage_id = self.policy.get("local_stage_index")
         self.family = str(self.policy.get("family") or "fixed_1f1b")
         self.trace_dir = str(os.environ.get("SCHEDULE_RUNTIME_TRACE_DIR") or "").strip()
+        telemetry_budget = dict(self.policy.get("telemetry_budget") or {})
+        self.telemetry_level = str(telemetry_budget.get("level") or "full_debug").strip().lower() or "full_debug"
+        self.max_trace_mb = max(int(telemetry_budget.get("max_trace_mb") or 256), 1)
+        self.max_events_per_rank = max(int(telemetry_budget.get("max_events_per_rank") or 20000), 1)
+        self.sampled_windows = max(int(telemetry_budget.get("sampled_windows") or 2), 1)
+        self.emit_compare_svg = bool(telemetry_budget.get("emit_compare_svg", True))
         self.rank = self._resolve_global_rank()
         self._trace_start = time.perf_counter()
         self._context: Dict[str, Any] = {
@@ -1410,11 +2009,13 @@ class ScheduleActionRunner:
             "lane_id": 0,
         }
         self._events: List[Dict[str, Any]] = []
+        self._sampled_microbatches: List[int] = []
         self._lock = threading.Lock()
         self._flushed = False
         self._expected_local_actions = self._filter_local_actions()
         self._metrics: Dict[str, float] = {
             "comm_ms": 0.0,
+            "wait_ms": 0.0,
             "reload_stall_ms": 0.0,
             "offload_overlap_success_ratio": 0.0,
             "observed_action_count": 0.0,
@@ -1600,6 +2201,36 @@ class ScheduleActionRunner:
             "notes": ["observed local stage grid synthesized from runtime action events"],
         }
 
+    def _compact_grid_trace(self, grid_trace: Dict[str, Any]) -> Dict[str, Any]:
+        if not grid_trace:
+            return {}
+        counts: Dict[str, int] = {}
+        for cell in list(grid_trace.get("cells") or []):
+            token = str(cell.get("kind") or "BUBBLE").upper()
+            counts[token] = int(counts.get(token, 0)) + 1
+        compact = {key: value for key, value in dict(grid_trace).items() if key != "cells"}
+        compact["counts"] = counts
+        compact["cell_count"] = int(sum(counts.values()))
+        compact["notes"] = list(compact.get("notes") or []) + ["cells elided by telemetry budget"]
+        return compact
+
+    def _should_keep_event(self, event: Dict[str, Any]) -> bool:
+        if self.telemetry_level == "summary":
+            return False
+        if len(self._events) >= self.max_events_per_rank:
+            return False
+        if self.telemetry_level == "full_debug":
+            return True
+        microbatch_id = int(event.get("microbatch_id") or -1)
+        if microbatch_id < 0:
+            return len(self._events) < self.max_events_per_rank
+        if microbatch_id in self._sampled_microbatches:
+            return True
+        if len(self._sampled_microbatches) < self.sampled_windows:
+            self._sampled_microbatches.append(microbatch_id)
+            return True
+        return False
+
     @property
     def enabled(self) -> bool:
         return bool(self.trace_dir)
@@ -1671,7 +2302,6 @@ class ScheduleActionRunner:
             "evidence_source": "runtime_observed",
         }
         with self._lock:
-            self._events.append(event)
             self._metrics["observed_action_count"] += 1.0
             if event["action_type"] == "COMM":
                 self._metrics["comm_ms"] += float(event["duration_ms"])
@@ -1681,11 +2311,13 @@ class ScheduleActionRunner:
                 self._metrics["reload_stall_ms"] += float(event["duration_ms"])
             elif event["action_type"] == "OFFLOAD":
                 overlap_mode = str((event.get("metadata") or {}).get("overlap_mode") or "").strip().lower()
+                total_count = self._metrics.get("offload_overlap_total_count", 0.0) + 1.0
+                self._metrics["offload_overlap_total_count"] = total_count
                 if overlap_mode in {"async", "overlapped", "nonblocking"}:
                     success_count = self._metrics.get("offload_overlap_success_count", 0.0) + 1.0
-                    total_count = self._metrics.get("offload_overlap_total_count", 0.0) + 1.0
                     self._metrics["offload_overlap_success_count"] = success_count
-                    self._metrics["offload_overlap_total_count"] = total_count
+            if self._should_keep_event(event):
+                self._events.append(event)
 
     def build_trace_payload(self) -> Dict[str, Any]:
         with self._lock:
@@ -1736,28 +2368,79 @@ class ScheduleActionRunner:
         metrics["action_type_duration_breakdown"] = {
             str(key): round(float(value), 4) for key, value in sorted(action_type_duration_breakdown.items())
         }
-        return {
+        effective_level = self.telemetry_level
+        action_plan: Dict[str, Any] = {
+            "action_count": int(len(self._expected_local_actions)),
+            "actions_by_phase_counts": {
+                str(phase): int(len(items))
+                for phase, items in sorted(self._actions_by_phase().items())
+            },
+        }
+        if effective_level == "full_debug":
+            action_plan["actions"] = list(self._expected_local_actions)
+            action_plan["actions_by_phase"] = self._actions_by_phase()
+
+        payload: Dict[str, Any] = {
             "format": "schedule_runtime_event_trace",
             "timing_basis": "runtime_observed",
             "family": self.family,
             "rank": int(self.rank),
             "stage_id": int(self.stage_id) if self.stage_id is not None else None,
             "stage_semantics": local_stage_hint,
-            "action_plan": {
-                "action_count": int(len(self._expected_local_actions)),
-                "actions": list(self._expected_local_actions),
-                "actions_by_phase": self._actions_by_phase(),
+            "telemetry": {
+                "requested_level": self.telemetry_level,
+                "effective_level": effective_level,
+                "max_trace_mb": int(self.max_trace_mb),
+                "max_events_per_rank": int(self.max_events_per_rank),
+                "sampled_windows": int(self.sampled_windows),
+                "emit_compare_svg": bool(self.emit_compare_svg),
+                "sampled_microbatches": list(self._sampled_microbatches),
             },
+            "action_plan": action_plan,
             "metrics": metrics,
             "summary": {
                 "projected_timeline_span_ms": round(float(max_end_ms), 4),
                 "available_hooks": list(self.policy.get("available_hooks") or []),
                 "action_type_counts": action_type_counts,
             },
-            "planned_grid_trace": planned_grid_trace,
-            "observed_grid_trace": observed_grid_trace,
-            "events": events,
         }
+        if effective_level == "summary":
+            payload["planned_grid_trace"] = self._compact_grid_trace(planned_grid_trace)
+            payload["observed_grid_trace"] = self._compact_grid_trace(observed_grid_trace)
+            payload["events"] = []
+        elif effective_level == "aggregated_grid":
+            payload["planned_grid_trace"] = self._compact_grid_trace(planned_grid_trace)
+            payload["observed_grid_trace"] = observed_grid_trace
+            payload["events"] = events
+        else:
+            payload["planned_grid_trace"] = planned_grid_trace
+            payload["observed_grid_trace"] = observed_grid_trace
+            payload["events"] = events
+
+        encoded = json.dumps(payload, ensure_ascii=False)
+        budget_bytes = int(self.max_trace_mb) * 1024 * 1024
+        if len(encoded.encode("utf-8")) > budget_bytes and payload.get("events"):
+            payload["telemetry"]["effective_level"] = "aggregated_grid"
+            payload["telemetry"]["downgrade_reason"] = "trace_size_budget"
+            payload["planned_grid_trace"] = self._compact_grid_trace(planned_grid_trace)
+            payload["observed_grid_trace"] = self._compact_grid_trace(observed_grid_trace)
+            payload["events"] = []
+
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > budget_bytes:
+            payload["telemetry"]["effective_level"] = "summary"
+            payload["telemetry"]["downgrade_reason"] = "trace_size_budget_summary"
+            payload["observed_grid_trace"] = self._compact_grid_trace(observed_grid_trace)
+            payload["planned_grid_trace"] = self._compact_grid_trace(planned_grid_trace)
+            payload["events"] = []
+            payload["action_plan"] = {
+                "action_count": int(len(self._expected_local_actions)),
+                "actions_by_phase_counts": {
+                    str(phase): int(len(items))
+                    for phase, items in sorted(self._actions_by_phase().items())
+                },
+            }
+        return payload
 
     def flush(self) -> Optional[str]:
         if not self.enabled:
@@ -1950,7 +2633,7 @@ def _get_local_operator_cluster_hints() -> List[Dict[str, object]]:
     pp_rank, _ = _pipeline_parallel_location()
     if pp_rank is None:
         return []
-    parsed = _parse_operator_cluster_hints(os.environ.get("SCHEDULE_OPERATOR_CLUSTER_HINTS", ""))
+    parsed = dict(_parse_schedule_runtime_hints().get("operator_cluster_hints_by_stage") or {})
     return list(parsed.get(int(pp_rank)) or [])
 
 
@@ -2090,7 +2773,7 @@ def _matching_window_overrides(
     num_groups: int,
     local_stage_hint: Dict[str, str],
 ) -> List[Dict[str, str]]:
-    overrides = _parse_window_override_hints(os.environ.get("SCHEDULE_WINDOW_OVERRIDE_HINTS", ""))
+    overrides = list(_parse_schedule_runtime_hints().get("window_override_hints") or [])
     if not overrides:
         return []
     return [
@@ -2288,10 +2971,21 @@ def _resolve_window_override_value(
 
 def _get_structure_aware_chunk_metadata(num_model_chunks: int) -> Optional[List[Dict[str, int]]]:
     pp_rank, pp_world_size = _pipeline_parallel_location()
-    per_stage_hints = _parse_stage_chunk_priority_hints(
-        os.environ.get("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", ""),
-        num_model_chunks,
-    )
+    policy_stage_hints = dict(_parse_schedule_runtime_hints().get("stage_chunk_priority_hints") or {})
+    per_stage_hints: Dict[int, List[int]] = {}
+    for raw_stage_id, raw_hints in policy_stage_hints.items():
+        try:
+            stage_id = int(raw_stage_id)
+        except Exception:
+            continue
+        parsed_hints: List[int] = []
+        for raw_hint in list(raw_hints or []):
+            try:
+                parsed_hints.append(int(raw_hint))
+            except Exception:
+                continue
+        if len(parsed_hints) == num_model_chunks:
+            per_stage_hints[int(stage_id)] = parsed_hints
     if pp_rank is not None:
         explicit_stage_hints = per_stage_hints.get(int(pp_rank))
         if explicit_stage_hints is not None:

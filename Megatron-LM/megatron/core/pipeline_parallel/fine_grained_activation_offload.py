@@ -1059,6 +1059,36 @@ def fine_grained_offloading_enable_offload():
     PipelineOffloadManager.get_instance().enable_offload()
 
 
+def fine_grained_offloading_flush_delayed_groups() -> int:
+    """Flush delayed offload groups and return how many were pending."""
+    manager = PipelineOffloadManager.get_instance()
+    pending = int(len(getattr(manager, "_delayed_offload_groups", []) or []))
+    manager.flush_delayed_groups()
+    return pending
+
+
+def fine_grained_offloading_prefetch(distance_slots: int = 1, name: str = None) -> int:
+    """Prefetch one or more pending reload groups for the current/next backward chunk."""
+    manager = PipelineOffloadManager.get_instance()
+    requested = max(int(distance_slots or 1), 1)
+    completed = 0
+    for _ in range(requested):
+        current_chunk = manager.cur_backward_chunk()
+        if current_chunk is not None:
+            before = int(len(getattr(current_chunk, "_groups_to_reload", []) or []))
+            current_chunk.bulk_reload()
+            after = int(len(getattr(current_chunk, "_groups_to_reload", []) or []))
+            if before > after or before > 0:
+                completed += 1
+                continue
+        next_chunk = manager.front_backward_chunk(name)
+        if next_chunk is None:
+            break
+        next_chunk.pre_reload_last_layer()
+        completed += 1
+    return completed
+
+
 class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
     Identity operation that marks the end of a layer group for offload synchronization.

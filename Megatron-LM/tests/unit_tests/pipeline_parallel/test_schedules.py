@@ -359,6 +359,194 @@ def test_operator_cluster_memory_hotspot_biases_cooldown_center_out(monkeypatch,
     assert order == [1, 2, 0]
 
 
+def test_runtime_repair_actions_populate_runtime_policy_without_preexpanded_env(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "RUNTIME_REPAIR_ACTIONS",
+        json.dumps(
+            [
+                {
+                    "action": {"rewrite_type": "offload_timing_shift"},
+                    "compile_lowering": {
+                        "state_migration_hints": [
+                            {
+                                "action": "offload_timing_shift",
+                                "target_stage_ids": [1],
+                                "target_layer_group_ids": ["stage01_lg00"],
+                                "target_state_ids": ["activation.stage1.tail"],
+                                "direction": "later",
+                                "shift_unit": "window_offset",
+                                "offset_slots": 1,
+                            }
+                        ],
+                        "memory_intents": {"offload_policy": "selective"},
+                    },
+                },
+                {
+                    "action": {"rewrite_type": "tail_optimizer_relief"},
+                    "compile_lowering": {
+                        "optimizer_runtime": {
+                            "mode": "tail_guarded_overlap",
+                            "target_policy": "tail_stage_first",
+                            "chunk_scope": "tail_only",
+                            "window_policy": "optimizer_tail_hide",
+                            "enable_distributed_optimizer": True,
+                            "enable_overlap_grad_reduce": True,
+                            "enable_overlap_param_gather": True,
+                            "enable_overlap_param_gather_with_optimizer_step": True,
+                        },
+                        "window_overrides": [
+                            {
+                                "phase": "cooldown",
+                                "window": "cooldown_first_group",
+                                "stage_selector": "optimizer_sensitive_stage",
+                                "chunk_order_policy": "target_chunk_first",
+                                "optimizer_target_chunk": "tail",
+                            }
+                        ],
+                        "overlap_channels": ["optimizer_tail"],
+                    },
+                },
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    policy = schedule.get_schedule_runtime_policy()
+
+    assert any(str(item.get("action") or "") == "offload_timing_shift" for item in policy["state_migration_hints"])
+    assert any(str(item.get("phase") or "") == "cooldown" for item in policy["window_override_hints"])
+    assert policy["overlap_hints"].get("enable_optimizer_tail_overlap") is True
+    assert policy["local_stage_hint"].get("memory_policy_mode") == "selective"
+    assert "state_migration_active" in str(policy["local_stage_hint"].get("stage_tags") or "")
+
+
+def test_runtime_repair_chunk_priority_hints_drive_structure_metadata(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "RUNTIME_REPAIR_ACTIONS",
+        json.dumps(
+            [
+                {
+                    "action": {"rewrite_type": "chunk_priority_rewrite"},
+                    "compile_lowering": {"chunk_priority_hints": {"1": [0, 1]}},
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    metadata = schedule._get_structure_aware_chunk_metadata(2)
+
+    assert metadata == [
+        {"chunk_id": 0, "compute_weight": 0, "criticality": 0},
+        {"chunk_id": 1, "compute_weight": 1, "criticality": 0},
+    ]
+
+
+def test_schedule_state_migration_hints_feed_local_stage_semantics(monkeypatch, mocker):
+    monkeypatch.setenv(
+        "SCHEDULE_STATE_MIGRATION_HINTS",
+        json.dumps(
+            [
+                {
+                    "action": "selective_reload_prefetch",
+                    "target_stage_ids": [1],
+                    "target_layer_group_ids": ["stage01_lg00"],
+                    "target_state_ids": ["activation.stage1.tail"],
+                    "direction": "selective",
+                    "prefetch_distance_slots": 2,
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+
+    local_stage_hint = schedule._get_local_stage_family_hint()
+
+    assert local_stage_hint.get("prefetch_policy") == "selective"
+    assert local_stage_hint.get("reload_policy") == "selective_prefetch"
+    assert local_stage_hint.get("prefetch_distance_slots") == "2"
+    assert "state_migration_active" in str(local_stage_hint.get("stage_tags") or "")
+
+
+def test_memory_action_hook_can_toggle_fine_grained_offload_for_later_shift(monkeypatch, mocker):
+    monkeypatch.setenv("ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING", "1")
+    monkeypatch.setenv(
+        "SCHEDULE_STATE_MIGRATION_HINTS",
+        json.dumps(
+            [
+                {
+                    "action": "offload_timing_shift",
+                    "target_stage_ids": [1],
+                    "target_layer_group_ids": ["stage01_lg00"],
+                    "target_state_ids": ["activation.stage1.tail"],
+                    "direction": "later",
+                    "offset_slots": 2,
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+    disable_mock = mocker.patch.object(schedule, "fine_grained_offloading_disable_offload")
+    enable_mock = mocker.patch.object(schedule, "fine_grained_offloading_enable_offload")
+
+    early = schedule.invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {"trigger_hook": "before_forward_hook", "microbatch_id": 0},
+    )
+    late = schedule.invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {"trigger_hook": "before_forward_hook", "microbatch_id": 3},
+    )
+
+    disable_mock.assert_called_once()
+    enable_mock.assert_called_once()
+    assert early["status"] == "applied"
+    assert "disable_offload" in early["applied_actions"]
+    assert late["status"] == "applied"
+    assert "enable_offload" in late["applied_actions"]
+
+
+def test_memory_action_hook_prefetches_reload_groups_on_backward(monkeypatch, mocker):
+    monkeypatch.setenv("ENABLE_FINE_GRAINED_ACTIVATION_OFFLOADING", "1")
+    monkeypatch.setenv(
+        "SCHEDULE_STATE_MIGRATION_HINTS",
+        json.dumps(
+            [
+                {
+                    "action": "selective_reload_prefetch",
+                    "target_stage_ids": [1],
+                    "target_layer_group_ids": ["stage01_lg00"],
+                    "target_state_ids": ["activation.stage1.tail"],
+                    "direction": "selective",
+                    "prefetch_distance_slots": 2,
+                }
+            ]
+        ),
+    )
+    mocker.patch.object(schedule.parallel_state, "model_parallel_is_initialized", return_value=True)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_rank", return_value=1)
+    mocker.patch.object(schedule.parallel_state, "get_pipeline_model_parallel_world_size", return_value=2)
+    prefetch_mock = mocker.patch.object(schedule, "fine_grained_offloading_prefetch", return_value=2)
+
+    event = schedule.invoke_schedule_runtime_hook(
+        "memory_action_hook",
+        {"trigger_hook": "before_backward_hook", "microbatch_id": 2},
+    )
+
+    prefetch_mock.assert_called_once_with(distance_slots=2)
+    assert event["status"] == "applied"
+    assert int(event.get("prefetched_groups") or 0) == 2
+    assert "prefetch_reload_groups" in event["applied_actions"]
+
+
 def test_operator_cluster_attention_comm_can_disable_phase_overlap(monkeypatch, mocker):
     monkeypatch.setenv(
         "SCHEDULE_OPERATOR_CLUSTER_HINTS",

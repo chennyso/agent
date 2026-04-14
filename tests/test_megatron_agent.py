@@ -76,6 +76,9 @@ from megatron_agent.config import (  # noqa: E402
     ProgramPatchSpec,
     ProgramTemplate,
     ReplanDecision,
+    RewriteActionSpec,
+    RewriteExecutionPlanSpec,
+    StatePlanSpec,
     VerifierReport,
     default_backend_caps,
     default_dense_program,
@@ -88,6 +91,7 @@ from megatron_agent.trace_reducer import (  # noqa: E402
     build_context_record,
     build_trial_artifact,
     classify_bottleneck,
+    detect_failure_modes,
     recommend_optimization_methods,
     reduce_trial_trace,
 )
@@ -2099,6 +2103,56 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("performance_regression", list(guidance.get("recent_rollback_reasons") or []))
         self.assertTrue(bank.should_avoid_patch_family(search_state, "reload_shift_patch"))
 
+    def test_policy_memory_family_memory_recommends_matching_schedule_family(self) -> None:
+        from megatron_agent.policy_memory import PolicyCase, TrialOutcome, TrialReflection
+
+        bank = PolicyMemoryBank()
+        search_state = {
+            "model": {"model_track": "dense", "size_bucket": "qwen14b"},
+            "hardware": {"run_target": "single_g5", "backend_family": "megatron"},
+            "policy": {"runtime_schedule_family": "dual_overlap_optimizer_hide", "pp_degree": 2, "vpp_degree": 2},
+            "runtime": {
+                "optimizer_exposed_ratio": 0.24,
+                "stage_tail_ratio": 0.10,
+                "tail_step_jitter_ratio": 0.09,
+                "peak_reserved_ratio": 0.82,
+            },
+            "bottleneck_signature": "optimizer_bound",
+        }
+        case = PolicyCase(
+            case_id="case_0000",
+            family="dual_overlap_optimizer_hide",
+            local_policy={
+                "runtime_schedule_family": "dual_overlap_optimizer_hide",
+                "patch_family": "tail_relief_patch",
+                "target_stage_ids": [1],
+                "target_layer_group_ids": ["group_tail"],
+                "target_state_ids": ["activation:group_tail"],
+            },
+            outcome=TrialOutcome(
+                success=True,
+                step_improvement_ms=120.0,
+                throughput_gain=180.0,
+                critical_component_type="reload",
+            ),
+            reflection=TrialReflection(
+                family="dual_overlap_optimizer_hide",
+                improved_critical_path=True,
+                gain_sources=["optimizer_exposure"],
+                recommended_next_action="expand_family",
+            ),
+        )
+        bank.record_case(case, search_state=search_state)
+
+        guidance = bank.recommend_schedule_families(search_state, top_k=3)
+
+        self.assertEqual(str(guidance["ranked_families"][0].get("family") or ""), "dual_overlap_optimizer_hide")
+        self.assertIn("dual_overlap_optimizer_hide", guidance["preferred_families"])
+        self.assertFalse(bank.should_avoid_schedule_family(search_state, "dual_overlap_optimizer_hide"))
+        scoreboard = bank.family_memory_scoreboard()
+        self.assertEqual(str(scoreboard[0].get("family") or ""), "dual_overlap_optimizer_hide")
+        self.assertIn("tail_relief_patch", list(scoreboard[0].get("useful_patch_families") or []))
+
     def test_build_beam_snapshot_prefers_high_value_patch(self) -> None:
         baseline = default_dense_program("single_g5").normalized()
         stronger = baseline.normalized()
@@ -2780,6 +2834,16 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                     "summary",
                     "--window-steps",
                     "4",
+                    "--enable-llm-supervisor",
+                    "--llm-planner-mode",
+                    "multi_agent",
+                    "--llm-endpoint",
+                    "http://planner.test/v1/chat/completions",
+                    "--llm-model",
+                    "qwen-agent",
+                    "--llm-temperature",
+                    "0.1",
+                    "--log-llm",
                 ],
                 check=True,
                 capture_output=True,
@@ -2804,6 +2868,15 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertIn("--enable-local-verticalization", list(patch_variant.get("command") or []))
             self.assertIn("--telemetry-budget", list(patch_variant.get("command") or []))
             self.assertIn("--window-steps", list(patch_variant.get("command") or []))
+            self.assertIn("--enable-llm-supervisor", list(patch_variant.get("command") or []))
+            self.assertIn("--llm-planner-mode", list(patch_variant.get("command") or []))
+            self.assertIn("multi_agent", list(patch_variant.get("command") or []))
+            self.assertIn("--llm-endpoint", list(patch_variant.get("command") or []))
+            self.assertIn("http://planner.test/v1/chat/completions", list(patch_variant.get("command") or []))
+            self.assertIn("--llm-model", list(patch_variant.get("command") or []))
+            self.assertIn("qwen-agent", list(patch_variant.get("command") or []))
+            self.assertIn("--llm-temperature", list(patch_variant.get("command") or []))
+            self.assertIn("--log-llm", list(patch_variant.get("command") or []))
             self.assertTrue((analysis_dir / "patch_observations.csv").exists())
             self.assertTrue((analysis_dir / "search_ablation.csv").exists())
             self.assertTrue((analysis_dir / "case_study_manifest.json").exists())
@@ -3332,6 +3405,295 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(int(topology.get("verifier_agents") or 0), 1)
         self.assertEqual(int(topology.get("executor_agents") or 0), 1)
 
+    @mock.patch(
+        "megatron_agent.agent_loop._call_llm_chat_completion",
+        side_effect=[
+            json.dumps(
+                {
+                    "selected_schedule_families": ["dual_overlap_stage_asymmetric"],
+                    "shortlisted_proposal_ids": ["candidate_runtime_guided_partition"],
+                    "preferred_patch_families": ["layer_group_repartition"],
+                    "rationales": {"dual_overlap_stage_asymmetric": "fix the hottest stage family first"},
+                    "notes": ["family architect prefers targeted repartition"],
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "dominant_bottlenecks": ["stage_skew"],
+                    "target_stage_ids": [0],
+                    "focus_proposal_ids": ["candidate_runtime_guided_partition"],
+                    "rationales": {"candidate_runtime_guided_partition": "stage 0 remains the hottest target"},
+                    "notes": ["diagnostician keeps runtime-guided partition first"],
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "selected_proposal_ids": ["candidate_runtime_guided_partition"],
+                    "rationales": {"candidate_runtime_guided_partition": "best throughput upside under current skew"},
+                    "notes": ["rewrite proposer keeps runtime-guided partition first"],
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "vetoed_proposal_ids": [],
+                    "demoted_proposal_ids": [],
+                    "concerns": {},
+                    "notes": ["family critic sees no blocking issue for the top choice"],
+                },
+                ensure_ascii=False,
+            ),
+        ],
+    )
+    def test_llm_multi_agent_planner_runs_proposer_ranker_critic_chain(self, _mock_llm: mock.Mock) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.06,
+            "stage_load_variance": 0.05,
+            "cross_node_exposed_ratio": 0.02,
+            "peak_memory_ratio": 0.76,
+            "steady_state_step_time_ms_p50": 1100.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1080.0, "comm_ms": 80.0, "bubble_ms": 35.0, "window_ms": 1195.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 760.0, "comm_ms": 55.0, "bubble_ms": 20.0, "window_ms": 835.0, "peak_reserved_gib": 15.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="tail_drift", scope="skeleton").to_dict(),
+            candidate_limit=6,
+            llm_config={
+                "enabled": True,
+                "planner_mode": "multi_agent",
+                "endpoint": "http://10.100.1.93:12365/v1/chat/completions",
+                "model": "/models/Qwen2.5-72B-Instruct",
+                "temperature": 0.2,
+                "log_llm": False,
+            },
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(_mock_llm.call_count, 4)
+        self.assertEqual(str(proposals[0].program.metadata.get("program_kind")), "candidate_runtime_guided_partition")
+        self.assertEqual(str(proposals[0].source), "llm_multi_agent")
+        self.assertEqual(str(proposals[0].program.metadata.get("planner_backend")), "llm_http_hierarchical_multi_agent")
+        self.assertEqual(str(proposals[0].program.metadata.get("planner_mode")), "hierarchical_multi_agent")
+        topology = dict(proposals[0].program.metadata.get("agent_topology") or {})
+        self.assertEqual(str(topology.get("planner_mode") or ""), "llm_hierarchical_multi_agent_http")
+        self.assertEqual(int(topology.get("llm_planner_agents") or 0), 4)
+        self.assertEqual(int(topology.get("llm_family_architect_agents") or 0), 1)
+        self.assertEqual(int(topology.get("llm_bottleneck_diagnostician_agents") or 0), 1)
+        self.assertEqual(int(topology.get("llm_rewrite_proposer_agents") or 0), 1)
+        self.assertEqual(int(topology.get("llm_family_critic_agents") or 0), 1)
+        trace = dict(proposals[0].program.metadata.get("llm_multi_agent_trace") or {})
+        self.assertIn("family_architect", trace)
+        self.assertIn("bottleneck_diagnostician", trace)
+        self.assertIn("rewrite_proposer", trace)
+        self.assertIn("family_critic", trace)
+
+    def test_rewrite_action_spec_supports_counterfactual_runtime_repair_fields(self) -> None:
+        action = RewriteActionSpec(
+            rewrite_type="tp_sp_recomposition",
+            target_stage_ids=[1, 1, 0],
+            diagnostic_labels=["TP_WITHOUT_SP", "optimizer_bound"],
+            bottleneck_match_score=1.2,
+            target_compatibility_score=0.8,
+            rollback_risk=-1.0,
+            expected_mfu_gain=0.12,
+            memory_safety_margin=1.5,
+            counterfactual_score=2.0,
+            strategy_source="llm_http",
+            llm_rationale="enable sequence parallel before another TP sweep",
+        ).normalized()
+
+        self.assertEqual(action.rewrite_type, "tp_sp_recomposition")
+        self.assertEqual(action.target_stage_ids, [0, 1])
+        self.assertEqual(action.diagnostic_labels, ["tp_without_sp", "optimizer_bound"])
+        self.assertAlmostEqual(float(action.bottleneck_match_score), 1.0, places=6)
+        self.assertAlmostEqual(float(action.rollback_risk), 0.0, places=6)
+        self.assertAlmostEqual(float(action.memory_safety_margin), 1.0, places=6)
+        self.assertAlmostEqual(float(action.counterfactual_score), 1.0, places=6)
+        self.assertEqual(str(action.strategy_source or ""), "llm_http")
+        self.assertIn("sequence parallel", str(action.llm_rationale or ""))
+
+    def test_context_and_failure_modes_surface_tp_without_sp_and_cpu_offload_tail(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.metadata["runtime_enable_optimizer_cpu_offload"] = True
+        program.metadata["optimizer_offload_fraction"] = 1.0
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 6000.0,
+            "steady_state_step_time_ms_p95": 6900.0,
+            "optimizer_exposed_ms": 1800.0,
+            "bubble_ratio": 0.04,
+            "peak_memory_ratio": 0.78,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1550.0, "comm_ms": 120.0, "bubble_ms": 80.0, "window_ms": 1750.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 2440.0, "comm_ms": 160.0, "bubble_ms": 140.0, "window_ms": 2740.0, "peak_reserved_gib": 25.0},
+            },
+        }
+        context = build_context_record(program, runtime_summary=runtime_summary)
+        failures = detect_failure_modes(program, context)
+        signature = classify_bottleneck(program, context)
+
+        runtime = dict(context.get("runtime_evidence") or {})
+        failure_labels = {str(item.get("label") or "") for item in failures}
+        canonical = set(signature.get("canonical_labels") or [])
+
+        self.assertTrue(bool(runtime.get("tp_without_sp")))
+        self.assertTrue(bool(runtime.get("optimizer_cpu_offload")))
+        self.assertGreater(float(runtime.get("cpu_offload_tail_ratio") or 0.0), 0.18)
+        self.assertIn("tp_without_sp", failure_labels)
+        self.assertIn("optimizer_bound", failure_labels)
+        self.assertIn("cpu_offload_tail", failure_labels)
+        self.assertIn("tp_without_sp", canonical)
+        self.assertIn("optimizer_bound", canonical)
+        self.assertIn("cpu_offload_tail", canonical)
+
+    def test_recommended_rewrite_actions_emit_extended_runtime_repair_dsl(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.metadata["runtime_enable_optimizer_cpu_offload"] = True
+        program.metadata["optimizer_offload_fraction"] = 1.0
+        trace_summary = reduce_trial_trace(
+            program,
+            runtime_summary={
+                "steady_state_step_time_ms_p50": 6200.0,
+                "steady_state_step_time_ms_p95": 7100.0,
+                "optimizer_exposed_ms": 1900.0,
+                "bubble_ratio": 0.05,
+                "peak_memory_ratio": 0.80,
+                "stage_window_summary": {
+                    "0": {"compute_ms": 1500.0, "comm_ms": 110.0, "bubble_ms": 70.0, "window_ms": 1680.0, "peak_reserved_gib": 22.0},
+                    "1": {"compute_ms": 2520.0, "comm_ms": 150.0, "bubble_ms": 120.0, "window_ms": 2790.0, "peak_reserved_gib": 24.5},
+                },
+            },
+        )
+
+        actions = trial_runner._recommended_rewrite_actions(program, trace_summary)
+        rewrite_types = {str(item.rewrite_type or "") for item in actions}
+
+        self.assertIn("tp_sp_recomposition", rewrite_types)
+        self.assertTrue({"tail_optimizer_relief", "cpu_offload_scope_switch"} & rewrite_types)
+        for action in actions:
+            self.assertGreaterEqual(float(action.bottleneck_match_score or 0.0), 0.0)
+            self.assertGreaterEqual(float(action.memory_safety_margin or 0.0), 0.0)
+
+    def test_counterfactual_annotation_scores_runtime_repair_candidates(self) -> None:
+        baseline = default_dense_program("single_g5").normalized()
+        baseline.metadata["runtime_enable_optimizer_cpu_offload"] = True
+        baseline.metadata["optimizer_offload_fraction"] = 1.0
+        runtime_summary = {
+            "steady_state_step_time_ms_p50": 6100.0,
+            "steady_state_step_time_ms_p95": 7050.0,
+            "optimizer_exposed_ms": 1850.0,
+            "bubble_ratio": 0.04,
+            "peak_memory_ratio": 0.86,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1520.0, "comm_ms": 120.0, "bubble_ms": 75.0, "window_ms": 1715.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 2500.0, "comm_ms": 170.0, "bubble_ms": 140.0, "window_ms": 2810.0, "peak_reserved_gib": 25.0},
+            },
+        }
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        sp_candidate = agent_loop._build_sequence_parallel_candidate(baseline)
+        self.assertIsNotNone(sp_candidate)
+        offload_candidate = agent_loop._build_offload_first_refinement_candidate(baseline, context)
+        self.assertIsNotNone(offload_candidate)
+        proposals = agent_loop._annotate_proposals_with_counterfactual_scores(
+            [
+                AgentProposal(proposal_id="sp", scope="local_parallel", program=sp_candidate).normalized(),
+                AgentProposal(proposal_id="offload", scope="local_parallel", program=offload_candidate).normalized(),
+            ],
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="memory_pressure", scope="local_parallel").to_dict(),
+        )
+
+        proposal_by_id = {str(item.proposal_id): item for item in proposals}
+        sp_assessment = dict((proposal_by_id["sp"].program.metadata or {}).get("counterfactual_repair_assessment") or {})
+        offload_assessment = dict((proposal_by_id["offload"].program.metadata or {}).get("counterfactual_repair_assessment") or {})
+        sp_actions = {
+            str(item.get("rewrite_type") or "")
+            for item in list((proposal_by_id["sp"].program.metadata or {}).get("rewrite_actions") or [])
+        }
+        offload_actions = {
+            str(item.get("rewrite_type") or "")
+            for item in list((proposal_by_id["offload"].program.metadata or {}).get("rewrite_actions") or [])
+        }
+
+        self.assertIn("tp_sp_recomposition", sp_actions)
+        self.assertTrue({"cpu_offload_scope_switch", "offload_timing_shift"} & offload_actions)
+        self.assertIn("tp_without_sp", set(sp_assessment.get("dominant_diagnostics") or []))
+        self.assertIn("cpu_offload_tail", set(offload_assessment.get("dominant_diagnostics") or []))
+        self.assertGreater(float(sp_assessment.get("counterfactual_score") or 0.0), 0.0)
+        self.assertGreater(float(offload_assessment.get("counterfactual_score") or 0.0), 0.0)
+
+    @mock.patch(
+        "megatron_agent.agent_loop._call_llm_chat_completion",
+        return_value=json.dumps(
+            {
+                "selected_proposal_ids": ["candidate_runtime_guided_partition"],
+                "rationales": {"candidate_runtime_guided_partition": "attach a runtime repair before execution"},
+                "repair_actions": {
+                    "candidate_runtime_guided_partition": [
+                        {
+                            "rewrite_type": "schedule_family_switch",
+                            "direction": "dualpipe_v",
+                            "target_stage_ids": [0, 1],
+                            "llm_rationale": "use a more aggressive PP family only for the current bottleneck",
+                        }
+                    ]
+                },
+                "agent_topology": {"llm_planner_agents": 1, "verifier_agents": 1, "executor_agents": 1},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    def test_llm_supervisor_can_attach_runtime_repair_actions(self, _mock_llm: mock.Mock) -> None:
+        baseline = default_dense_program("single_g5")
+        runtime_summary = {
+            "bubble_ratio": 0.11,
+            "stage_load_variance": 0.05,
+            "cross_node_exposed_ratio": 0.02,
+            "peak_memory_ratio": 0.76,
+            "steady_state_step_time_ms_p50": 1100.0,
+            "stage_window_summary": {
+                "0": {"compute_ms": 1080.0, "comm_ms": 80.0, "bubble_ms": 35.0, "window_ms": 1195.0, "peak_reserved_gib": 23.0},
+                "1": {"compute_ms": 760.0, "comm_ms": 55.0, "bubble_ms": 20.0, "window_ms": 835.0, "peak_reserved_gib": 15.0},
+            },
+        }
+        rewrite = agent_loop._rewrite_space(baseline, runtime_summary)
+        context = build_context_record(baseline, runtime_summary=runtime_summary)
+        proposals, rejected = agent_loop._synthesize_proposals(
+            baseline,
+            rewrite,
+            runtime_summary=runtime_summary,
+            context_record=context,
+            replan_decision=ReplanDecision(trigger="tail_drift", scope="skeleton").to_dict(),
+            candidate_limit=6,
+            llm_config={
+                "enabled": True,
+                "endpoint": "http://10.100.1.93:12365/v1/chat/completions",
+                "model": "/models/Qwen2.5-72B-Instruct",
+                "temperature": 0.2,
+                "log_llm": False,
+            },
+        )
+
+        self.assertEqual(rejected, [])
+        llm_tagged = next(
+            proposal.program
+            for proposal in proposals
+            if str((proposal.program.metadata or {}).get("planner_backend") or "") == "llm_http"
+        )
+        actions = list(llm_tagged.metadata.get("rewrite_actions") or [])
+        self.assertTrue(any(str(item.get("rewrite_type") or "") == "schedule_family_switch" for item in actions))
+        self.assertEqual(str(llm_tagged.metadata.get("planner_backend") or ""), "llm_http")
+        self.assertGreater(float(llm_tagged.metadata.get("counterfactual_repair_score") or 0.0), 0.0)
+
     def test_external_inputs_are_merged_into_context_and_digested(self) -> None:
         baseline = default_dense_program("single_g5")
         context = build_context_record(baseline, runtime_summary={"bubble_ratio": 0.04, "peak_memory_ratio": 0.72})
@@ -3821,6 +4183,222 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         payload = json.loads(encoded)
         self.assertTrue(any(str(item.get("cluster_role") or "") == "optimizer_sensitive" for item in payload))
         self.assertTrue(any(str(item.get("cluster_role") or "") == "backward_critical" for item in payload))
+
+    def test_compile_program_exports_runtime_repair_execution_contract(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.pp_degree = 2
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        program.global_strategy_plan = None
+        program.partition = program.partition.from_dict(
+            {
+                "stages": [
+                    {"decoder_layers": 20, "special_tokens": ["E"]},
+                    {"decoder_layers": 20, "special_tokens": ["L"]},
+                ]
+            }
+        )
+        program.layout.stage_to_node = [str(program.cluster.nodes[-1]), str(program.cluster.nodes[-1])]
+        program.state_plan = StatePlanSpec.from_dict(
+            {
+                "objects": [
+                    {
+                        "state_id": "activation.stage1.tail",
+                        "state_type": "activation",
+                        "owner_stage": 1,
+                        "owner_layer_group": "stage01_lg00",
+                        "size_mb": 512.0,
+                        "offloadable": True,
+                        "prefetchable": True,
+                    }
+                ],
+                "placements": [
+                    {
+                        "state_id": "activation.stage1.tail",
+                        "placement": "hbm",
+                        "ready_for_use": True,
+                        "valid_from_slot": 0,
+                    }
+                ],
+                "offload_budget_mb": 1024.0,
+                "reload_prefetch_window": 1,
+            }
+        ).normalized()
+        program.schedule.template = "interleaved_grouped_g2"
+        program.schedule.skeleton = "stage_aware_grouped"
+        program.schedule.microbatch_group_size_per_vp_stage = 2
+        program.rewrite_plan = RewriteExecutionPlanSpec(
+            rewrite_actions=[
+                RewriteActionSpec(rewrite_type="offload_timing_shift", target_stage_ids=[1], direction="later", magnitude=1),
+                RewriteActionSpec(rewrite_type="selective_reload_prefetch", target_stage_ids=[1], direction="selective", magnitude=2),
+                RewriteActionSpec(rewrite_type="overlap_window_switch", target_stage_ids=[1], direction="optimizer_tail", magnitude=1),
+                RewriteActionSpec(rewrite_type="chunk_priority_rewrite", target_stage_ids=[0, 1], direction="finer", magnitude=2),
+                RewriteActionSpec(rewrite_type="tail_optimizer_relief", target_stage_ids=[1], direction="tail", magnitude=2),
+                RewriteActionSpec(rewrite_type="schedule_family_switch", direction="dualpipe_v", magnitude=1),
+            ],
+        ).normalized()
+        program.metadata["rewrite_actions"] = [
+            item.to_dict() for item in list(program.rewrite_plan.rewrite_actions or [])
+        ]
+
+        compiled = compile_program(program)
+        env = compiled.launcher_env
+        self.assertIn("RUNTIME_REPAIR_ACTIONS", env)
+        self.assertIn("RUNTIME_REPAIR_RECOMMENDATIONS", env)
+        self.assertIn("RUNTIME_REPAIR_POLICY_TABLE", env)
+        self.assertIn("RUNTIME_REPAIR_SCORE_WEIGHTS", env)
+        self.assertIn("SCHEDULE_STATE_MIGRATION_HINTS", env)
+        self.assertIn("SCHEDULE_WINDOW_OVERRIDE_HINTS", env)
+        self.assertIn("SCHEDULE_OPERATOR_CLUSTER_HINTS", env)
+
+        action_payload = json.loads(env["RUNTIME_REPAIR_ACTIONS"])
+        recommendation_payload = json.loads(env["RUNTIME_REPAIR_RECOMMENDATIONS"])
+        state_plan_payload = json.loads(env["STATE_PLAN"])
+        overlap_payload = json.loads(env["SCHEDULE_OVERLAP_HINTS"])
+        memory_payload = json.loads(env["SCHEDULE_MEMORY_HINTS"])
+        reload_payload = json.loads(env["RELOAD_PLAN"])
+        comm_chunk_payload = json.loads(env["COMM_CHUNK_PLAN"])
+
+        action_types = {str((item.get("action") or {}).get("rewrite_type") or "") for item in action_payload}
+        recommendation_types = {
+            str((item.get("action") or {}).get("rewrite_type") or "") for item in recommendation_payload
+        }
+        self.assertTrue(
+            {
+                "offload_timing_shift",
+                "selective_reload_prefetch",
+                "overlap_window_switch",
+                "chunk_priority_rewrite",
+                "tail_optimizer_relief",
+            }
+            <= action_types
+        )
+        self.assertEqual(recommendation_types, {"schedule_family_switch"})
+        self.assertIn("runtime_state_migration_hints", state_plan_payload)
+        self.assertIn("runtime_repair_action_types", state_plan_payload)
+        self.assertTrue(overlap_payload.get("enable_optimizer_tail_overlap"))
+        self.assertEqual(str(memory_payload.get("offload_policy") or ""), "selective")
+        self.assertEqual(str(memory_payload.get("prefetch_policy") or ""), "selective")
+        self.assertEqual(int(reload_payload.get("prefetch_window") or 0), 2)
+        self.assertIn("runtime_chunk_priority_hints", comm_chunk_payload)
+        self.assertIn("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", env)
+        self.assertEqual(
+            str(((compiled.runtime_repair_plan.get("summary") or {}).get("decision")) or ""),
+            "allow",
+        )
+        self.assertEqual(
+            str((((compiled.schedule_detail.get("effective") or {}).get("runtime_repair") or {}).get("decision")) or ""),
+            "allow",
+        )
+
+    def test_trial_runner_normalizes_runtime_repair_contract_env(self) -> None:
+        env = {
+            "RUNTIME_REPAIR_ACTIONS": json.dumps(
+                [
+                    {
+                        "action": {"rewrite_type": "offload_timing_shift"},
+                        "compile_lowering": {
+                            "state_migration_hints": [
+                                {
+                                    "action": "offload_timing_shift",
+                                    "target_stage_ids": [1],
+                                    "target_layer_group_ids": ["stage01_lg00"],
+                                    "target_state_ids": ["activation.stage1.tail"],
+                                    "direction": "later",
+                                    "shift_unit": "window_offset",
+                                    "offset_slots": 1,
+                                }
+                            ],
+                            "memory_intents": {"offload_policy": "selective"},
+                        },
+                    },
+                    {
+                        "action": {"rewrite_type": "chunk_priority_rewrite"},
+                        "compile_lowering": {"chunk_priority_hints": {"1": [0, 1]}},
+                    },
+                    {
+                        "action": {"rewrite_type": "tail_optimizer_relief"},
+                        "compile_lowering": {
+                            "optimizer_runtime": {
+                                "mode": "tail_guarded_overlap",
+                                "target_policy": "tail_stage_first",
+                                "chunk_scope": "tail_only",
+                                "window_policy": "optimizer_tail_hide",
+                                "enable_distributed_optimizer": True,
+                                "enable_overlap_grad_reduce": True,
+                                "enable_overlap_param_gather": True,
+                                "enable_overlap_param_gather_with_optimizer_step": True,
+                            },
+                            "window_overrides": [
+                                {
+                                    "phase": "cooldown",
+                                    "window": "cooldown_first_group",
+                                    "stage_selector": "optimizer_sensitive_stage",
+                                    "chunk_order_policy": "target_chunk_first",
+                                    "optimizer_target_chunk": "tail",
+                                }
+                            ],
+                            "operator_cluster_overrides": [
+                                {
+                                    "stage_index": 1,
+                                    "cluster_role": "optimizer_sensitive",
+                                    "semantic_role": "decoder",
+                                    "local_priority": "protected",
+                                    "overlap_policy": "guarded",
+                                    "memory_policy": "resident",
+                                    "phases": ["steady", "cooldown"],
+                                    "optimizer_target_chunk": "tail",
+                                }
+                            ],
+                            "overlap_channels": ["optimizer_tail"],
+                        },
+                    },
+                ]
+            ),
+            "STATE_PLAN": json.dumps({"objects": [], "placements": []}),
+        }
+
+        normalized = trial_runner._normalize_runtime_repair_contract_env(env)
+
+        self.assertIn("SCHEDULE_STATE_MIGRATION_HINTS", normalized)
+        self.assertIn("SCHEDULE_WINDOW_OVERRIDE_HINTS", normalized)
+        self.assertIn("SCHEDULE_OPERATOR_CLUSTER_HINTS", normalized)
+        self.assertIn("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", normalized)
+        self.assertEqual(str(normalized.get("SCHEDULE_OPTIMIZER_RUNTIME_MODE") or ""), "tail_guarded_overlap")
+
+        state_plan_payload = json.loads(normalized["STATE_PLAN"])
+        overlap_payload = json.loads(normalized["SCHEDULE_OVERLAP_HINTS"])
+        comm_chunk_payload = json.loads(normalized["COMM_CHUNK_PLAN"])
+
+        self.assertIn("runtime_state_migration_hints", state_plan_payload)
+        self.assertTrue(overlap_payload.get("enable_optimizer_tail_overlap"))
+        self.assertIn("runtime_chunk_priority_hints", comm_chunk_payload)
+        self.assertEqual(
+            list((comm_chunk_payload.get("runtime_chunk_priority_hints") or {}).get("1") or []),
+            [0, 1],
+        )
+
+    def test_verify_program_marks_recommendation_only_runtime_repair_as_deprioritized(self) -> None:
+        program = default_dense_program("single_g5").normalized()
+        program.rewrite_plan = RewriteExecutionPlanSpec(
+            rewrite_actions=[
+                RewriteActionSpec(rewrite_type="schedule_family_switch", direction="dualpipe_v", magnitude=1)
+            ],
+        ).normalized()
+        program.metadata["rewrite_actions"] = [
+            item.to_dict() for item in list(program.rewrite_plan.rewrite_actions or [])
+        ]
+
+        report = verify_program(program)
+        self.assertTrue(report.is_legal)
+        self.assertEqual(report.decision, "allow_but_deprioritize")
+        self.assertEqual(str(((report.runtime_risk.get("summary") or {}).get("decision")) or ""), "allow_but_deprioritize")
+        recommendation_actions = list(report.runtime_risk.get("recommendation_actions") or [])
+        self.assertEqual(len(recommendation_actions), 1)
+        self.assertEqual(
+            str(((recommendation_actions[0].get("action") or {}).get("rewrite_type")) or ""),
+            "schedule_family_switch",
+        )
 
     def test_check_program_rejects_fine_grained_offload_without_transformer_engine(self) -> None:
         baseline = default_dense_program("single_g5")

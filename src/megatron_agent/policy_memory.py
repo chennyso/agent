@@ -319,6 +319,193 @@ class FamilyScore:
 
 
 @dataclass
+class FamilyMemoryEntry:
+    family: str
+    attempts: int = 0
+    successes: int = 0
+    oom_failures: int = 0
+    launch_failures: int = 0
+    rollback_count: int = 0
+    best_step_improvement_ms: float = 0.0
+    best_throughput_gain: float = 0.0
+    score: float = 0.0
+    schedule_variants: List[str] = field(default_factory=list)
+    useful_patch_families: List[str] = field(default_factory=list)
+    harmful_patch_families: List[str] = field(default_factory=list)
+    target_stage_ids: List[int] = field(default_factory=list)
+    target_layer_group_ids: List[str] = field(default_factory=list)
+    target_state_ids: List[str] = field(default_factory=list)
+    bottleneck_signatures: Dict[str, int] = field(default_factory=dict)
+    critical_component_counts: Dict[str, int] = field(default_factory=dict)
+    recent_failure_signatures: List[str] = field(default_factory=list)
+    recent_rollback_reasons: List[str] = field(default_factory=list)
+    recent_recommended_actions: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "family": str(self.family),
+            "attempts": int(self.attempts),
+            "successes": int(self.successes),
+            "oom_failures": int(self.oom_failures),
+            "launch_failures": int(self.launch_failures),
+            "rollback_count": int(self.rollback_count),
+            "best_step_improvement_ms": round(_safe_float(self.best_step_improvement_ms), 4),
+            "best_throughput_gain": round(_safe_float(self.best_throughput_gain), 4),
+            "score": round(_safe_float(self.score), 4),
+            "schedule_variants": _clean_string_list(self.schedule_variants),
+            "useful_patch_families": _clean_string_list(self.useful_patch_families),
+            "harmful_patch_families": _clean_string_list(self.harmful_patch_families),
+            "target_stage_ids": [int(item) for item in list(self.target_stage_ids or []) if _safe_int(item) is not None],
+            "target_layer_group_ids": _clean_string_list(self.target_layer_group_ids),
+            "target_state_ids": _clean_string_list(self.target_state_ids),
+            "bottleneck_signatures": {
+                str(key): _safe_int(value) for key, value in dict(self.bottleneck_signatures or {}).items() if str(key).strip()
+            },
+            "critical_component_counts": {
+                str(key): _safe_int(value) for key, value in dict(self.critical_component_counts or {}).items() if str(key).strip()
+            },
+            "recent_failure_signatures": _clean_string_list(self.recent_failure_signatures)[-8:],
+            "recent_rollback_reasons": _clean_string_list(self.recent_rollback_reasons)[-8:],
+            "recent_recommended_actions": _clean_string_list(self.recent_recommended_actions)[-8:],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "FamilyMemoryEntry":
+        return cls(
+            family=str(payload.get("family") or ""),
+            attempts=_safe_int(payload.get("attempts")),
+            successes=_safe_int(payload.get("successes")),
+            oom_failures=_safe_int(payload.get("oom_failures")),
+            launch_failures=_safe_int(payload.get("launch_failures")),
+            rollback_count=_safe_int(payload.get("rollback_count")),
+            best_step_improvement_ms=_safe_float(payload.get("best_step_improvement_ms")),
+            best_throughput_gain=_safe_float(payload.get("best_throughput_gain")),
+            score=_safe_float(payload.get("score")),
+            schedule_variants=_clean_string_list(payload.get("schedule_variants") or []),
+            useful_patch_families=_clean_string_list(payload.get("useful_patch_families") or []),
+            harmful_patch_families=_clean_string_list(payload.get("harmful_patch_families") or []),
+            target_stage_ids=[int(item) for item in list(payload.get("target_stage_ids") or []) if _safe_int(item) is not None],
+            target_layer_group_ids=_clean_string_list(payload.get("target_layer_group_ids") or []),
+            target_state_ids=_clean_string_list(payload.get("target_state_ids") or []),
+            bottleneck_signatures={
+                str(key): _safe_int(value)
+                for key, value in dict(payload.get("bottleneck_signatures") or {}).items()
+                if str(key).strip()
+            },
+            critical_component_counts={
+                str(key): _safe_int(value)
+                for key, value in dict(payload.get("critical_component_counts") or {}).items()
+                if str(key).strip()
+            },
+            recent_failure_signatures=_clean_string_list(payload.get("recent_failure_signatures") or []),
+            recent_rollback_reasons=_clean_string_list(payload.get("recent_rollback_reasons") or []),
+            recent_recommended_actions=_clean_string_list(payload.get("recent_recommended_actions") or []),
+        )
+
+    def success_ratio(self) -> float:
+        return float(self.successes) / float(max(int(self.attempts), 1))
+
+    def rollback_ratio(self) -> float:
+        return float(self.rollback_count) / float(max(int(self.attempts), 1))
+
+    def oom_ratio(self) -> float:
+        return float(self.oom_failures) / float(max(int(self.attempts), 1))
+
+    def record(
+        self,
+        case: PolicyCase,
+        *,
+        state_summary: Dict[str, Any],
+    ) -> None:
+        self.attempts += 1
+        if bool(case.outcome.success):
+            self.successes += 1
+        if bool(case.outcome.oom):
+            self.oom_failures += 1
+        if bool(case.outcome.launch_failure):
+            self.launch_failures += 1
+        if bool(case.outcome.rollback_triggered):
+            self.rollback_count += 1
+        self.best_step_improvement_ms = max(
+            _safe_float(self.best_step_improvement_ms),
+            _safe_float(case.outcome.step_improvement_ms),
+        )
+        self.best_throughput_gain = max(
+            _safe_float(self.best_throughput_gain),
+            _safe_float(case.outcome.throughput_gain),
+        )
+
+        schedule_variant = str((case.local_policy or {}).get("runtime_schedule_family") or case.family or "").strip()
+        if schedule_variant and schedule_variant not in self.schedule_variants:
+            self.schedule_variants.append(schedule_variant)
+
+        patch_family = str((case.local_policy or {}).get("patch_family") or "").strip()
+        if patch_family:
+            improved = bool(case.outcome.success) and (
+                _safe_float(case.outcome.step_improvement_ms) > 0.0 or _safe_float(case.outcome.throughput_gain) > 0.0
+            )
+            harmful = bool(case.outcome.oom or case.outcome.launch_failure or not case.outcome.success)
+            if improved and patch_family not in self.useful_patch_families:
+                self.useful_patch_families.append(patch_family)
+            if harmful and patch_family not in self.harmful_patch_families:
+                self.harmful_patch_families.append(patch_family)
+
+        for item in list((case.local_policy or {}).get("target_stage_ids") or []):
+            if _safe_int(item) is not None and int(item) not in self.target_stage_ids:
+                self.target_stage_ids.append(int(item))
+        for item in list((case.local_policy or {}).get("target_layer_group_ids") or []):
+            token = str(item or "").strip()
+            if token and token not in self.target_layer_group_ids:
+                self.target_layer_group_ids.append(token)
+        for item in list((case.local_policy or {}).get("target_state_ids") or []):
+            token = str(item or "").strip()
+            if token and token not in self.target_state_ids:
+                self.target_state_ids.append(token)
+
+        bottleneck_signature = str(state_summary.get("bottleneck_signature") or "").strip()
+        if bottleneck_signature:
+            self.bottleneck_signatures[bottleneck_signature] = int(self.bottleneck_signatures.get(bottleneck_signature, 0)) + 1
+
+        critical_component = str(case.outcome.critical_component_type or "").strip()
+        if critical_component:
+            self.critical_component_counts[critical_component] = int(self.critical_component_counts.get(critical_component, 0)) + 1
+
+        for item in list(case.reflection.failure_sources or []):
+            token = str(item or "").strip()
+            if token:
+                self.recent_failure_signatures.append(token)
+        rollback_reason = str((case.reflection.window_feedback_digest or {}).get("rollback_reason") or "").strip()
+        if rollback_reason:
+            self.recent_rollback_reasons.append(rollback_reason)
+        recommended_next_action = str(case.reflection.recommended_next_action or "").strip()
+        if recommended_next_action:
+            self.recent_recommended_actions.append(recommended_next_action)
+        for item in list((((case.reflection.rewrite_recommendation or {}).get("recommended_rewrites")) or [])):
+            token = str((item or {}).get("rewrite_type") or "").strip()
+            if token:
+                self.recent_recommended_actions.append(token)
+
+        self.recent_failure_signatures = self.recent_failure_signatures[-8:]
+        self.recent_rollback_reasons = self.recent_rollback_reasons[-8:]
+        self.recent_recommended_actions = self.recent_recommended_actions[-8:]
+
+        delta = 0.0
+        if bool(case.outcome.oom):
+            delta -= 2.0
+        elif bool(case.outcome.launch_failure):
+            delta -= 1.5
+        elif not bool(case.outcome.success):
+            delta -= 1.0
+        else:
+            delta += 1.0
+            delta += min(max(_safe_float(case.outcome.step_improvement_ms), 0.0) / 500.0, 1.25)
+            delta += min(max(_safe_float(case.outcome.throughput_gain), 0.0) / 1000.0, 0.75)
+            if bool(case.outcome.rollback_triggered):
+                delta -= 0.4
+        self.score = 0.70 * _safe_float(self.score) + delta
+
+
+@dataclass
 class ThresholdCalibration:
     thresholds: Dict[str, float] = field(default_factory=lambda: copy.deepcopy(DEFAULT_FAMILY_THRESHOLDS))
     trigger_counts: Dict[str, int] = field(default_factory=dict)
@@ -351,6 +538,7 @@ class ThresholdCalibration:
 class PolicyMemoryBank:
     cases: List[PolicyCase] = field(default_factory=list)
     family_scores: Dict[str, FamilyScore] = field(default_factory=dict)
+    family_memory: Dict[str, FamilyMemoryEntry] = field(default_factory=dict)
     threshold_calibration: ThresholdCalibration = field(default_factory=ThresholdCalibration)
     patch_memory: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     max_cases: int = 256
@@ -361,6 +549,10 @@ class PolicyMemoryBank:
         norm.family_scores = {
             str(key): (value if isinstance(value, FamilyScore) else FamilyScore.from_dict(value))
             for key, value in dict(norm.family_scores or {}).items()
+        }
+        norm.family_memory = {
+            str(key): (value if isinstance(value, FamilyMemoryEntry) else FamilyMemoryEntry.from_dict(value))
+            for key, value in dict(norm.family_memory or {}).items()
         }
         if not isinstance(norm.threshold_calibration, ThresholdCalibration):
             norm.threshold_calibration = ThresholdCalibration.from_dict(norm.threshold_calibration or {})
@@ -377,6 +569,7 @@ class PolicyMemoryBank:
         return {
             "cases": [case.to_dict() for case in norm.cases],
             "family_scores": {str(key): value.to_dict() for key, value in norm.family_scores.items()},
+            "family_memory": {str(key): value.to_dict() for key, value in norm.family_memory.items()},
             "threshold_calibration": norm.threshold_calibration.to_dict(),
             "patch_memory": copy.deepcopy(norm.patch_memory),
             "max_cases": int(norm.max_cases),
@@ -389,6 +582,10 @@ class PolicyMemoryBank:
             family_scores={
                 str(key): FamilyScore.from_dict(value)
                 for key, value in dict(payload.get("family_scores") or {}).items()
+            },
+            family_memory={
+                str(key): FamilyMemoryEntry.from_dict(value)
+                for key, value in dict(payload.get("family_memory") or {}).items()
             },
             threshold_calibration=ThresholdCalibration.from_dict(payload.get("threshold_calibration") or {}),
             patch_memory={
@@ -428,6 +625,9 @@ class PolicyMemoryBank:
             score = norm.family_scores.get(family) or FamilyScore(family=family)
             score.record(case.outcome, case.reflection)
             norm.family_scores[family] = score
+            family_entry = norm.family_memory.get(family) or FamilyMemoryEntry(family=family)
+            family_entry.record(case, state_summary=state_summary)
+            norm.family_memory[family] = family_entry
         norm.threshold_calibration.observe(state_summary)
         patch_family = str((case.local_policy or {}).get("patch_family") or family or "")
         bottleneck_signature = str(state_summary.get("bottleneck_signature") or "")
@@ -512,6 +712,7 @@ class PolicyMemoryBank:
         norm.patch_memory[patch_key] = entry
         self.cases = norm.cases
         self.family_scores = norm.family_scores
+        self.family_memory = norm.family_memory
         self.threshold_calibration = norm.threshold_calibration
         self.patch_memory = norm.patch_memory
 
@@ -557,6 +758,114 @@ class PolicyMemoryBank:
             reverse=True,
         )
         return entries
+
+    def family_memory_scoreboard(self) -> List[Dict[str, Any]]:
+        entries = [entry.to_dict() for entry in self.family_memory.values()]
+        entries.sort(
+            key=lambda item: (
+                float(item.get("score") or 0.0),
+                float(item.get("best_step_improvement_ms") or 0.0),
+                float(item.get("best_throughput_gain") or 0.0),
+                int(item.get("successes") or 0),
+            ),
+            reverse=True,
+        )
+        return entries
+
+    def recommend_schedule_families(
+        self,
+        search_state: Optional[Dict[str, Any]],
+        *,
+        top_k: int = 4,
+    ) -> Dict[str, Any]:
+        target = summarize_state_for_memory(search_state)
+        ranked: List[Dict[str, Any]] = []
+        target_bottleneck = str(target.get("bottleneck_signature") or "").strip()
+        for family, entry_value in dict(self.family_memory or {}).items():
+            entry = entry_value if isinstance(entry_value, FamilyMemoryEntry) else FamilyMemoryEntry.from_dict(entry_value)
+            similar_cases = self.retrieve_cases(search_state, family=family, top_k=3, require_success=False)
+            success_cases = self.retrieve_cases(search_state, family=family, top_k=2, require_success=True)
+            similarity = max([_safe_float(item.get("similarity")) for item in similar_cases] or [0.0])
+            success_similarity = max([_safe_float(item.get("similarity")) for item in success_cases] or [0.0])
+            family_score = self.family_scores.get(family)
+            family_score_norm = 0.0
+            if family_score is not None:
+                family_score_norm = min(max(_safe_float(family_score.score) / 4.0, -1.0), 1.0)
+            bottleneck_bonus = 0.0
+            if target_bottleneck:
+                total_bottlenecks = max(sum(int(value) for value in dict(entry.bottleneck_signatures or {}).values()), 1)
+                bottleneck_bonus = float(entry.bottleneck_signatures.get(target_bottleneck, 0)) / float(total_bottlenecks)
+            rollback_penalty = entry.rollback_ratio()
+            oom_penalty = entry.oom_ratio()
+            score = (
+                0.32 * similarity
+                + 0.18 * success_similarity
+                + 0.20 * entry.success_ratio()
+                + 0.15 * family_score_norm
+                + 0.15 * bottleneck_bonus
+                - 0.18 * rollback_penalty
+                - 0.22 * oom_penalty
+            )
+            reasons: List[str] = []
+            if similarity > 0.0:
+                reasons.append("similar_family_case")
+            if success_similarity > 0.0:
+                reasons.append("similar_family_success")
+            if bottleneck_bonus > 0.0:
+                reasons.append(f"bottleneck_match:{target_bottleneck}")
+            if family_score is not None and _safe_float(family_score.score) > 0.0:
+                reasons.append("family_scoreboard_positive")
+            if rollback_penalty >= 0.34:
+                reasons.append("rollback_penalty")
+            if oom_penalty >= 0.34:
+                reasons.append("oom_penalty")
+            ranked.append(
+                {
+                    "family": str(family),
+                    "score": round(float(score), 4),
+                    "similarity": round(float(similarity), 4),
+                    "success_similarity": round(float(success_similarity), 4),
+                    "success_ratio": round(float(entry.success_ratio()), 4),
+                    "rollback_ratio": round(float(rollback_penalty), 4),
+                    "oom_ratio": round(float(oom_penalty), 4),
+                    "bottleneck_match": round(float(bottleneck_bonus), 4),
+                    "useful_patch_families": list(entry.useful_patch_families or []),
+                    "harmful_patch_families": list(entry.harmful_patch_families or []),
+                    "target_stage_ids": list(entry.target_stage_ids or []),
+                    "target_layer_group_ids": list(entry.target_layer_group_ids or []),
+                    "target_state_ids": list(entry.target_state_ids or []),
+                    "recent_failure_signatures": list(entry.recent_failure_signatures or []),
+                    "recent_rollback_reasons": list(entry.recent_rollback_reasons or []),
+                    "recent_recommended_actions": list(entry.recent_recommended_actions or []),
+                    "critical_component_counts": copy.deepcopy(entry.critical_component_counts),
+                    "schedule_variants": list(entry.schedule_variants or []),
+                    "reasons": reasons,
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                float(item.get("score") or 0.0),
+                float(item.get("success_ratio") or 0.0),
+                float(item.get("similarity") or 0.0),
+            ),
+            reverse=True,
+        )
+        preferred = [
+            str(item.get("family") or "")
+            for item in ranked
+            if float(item.get("score") or 0.0) > 0.12
+        ][: max(int(top_k), 0)]
+        avoid = [
+            str(item.get("family") or "")
+            for item in ranked
+            if float(item.get("score") or 0.0) < -0.05
+        ][: max(int(top_k), 0)]
+        return {
+            "state_summary": target,
+            "ranked_families": ranked[: max(int(top_k), 0)],
+            "preferred_families": preferred,
+            "avoid_families": avoid,
+        }
 
     def recommend_patch_families(
         self,
@@ -684,3 +993,18 @@ class PolicyMemoryBank:
         harmful = set(_clean_string_list(guidance.get("harmful_patch_families") or []))
         useful = set(_clean_string_list(guidance.get("useful_patch_families") or []))
         return token in harmful and token not in useful
+
+    def should_avoid_schedule_family(
+        self,
+        search_state: Optional[Dict[str, Any]],
+        family: str,
+        *,
+        top_k: int = 4,
+    ) -> bool:
+        token = str(family or "").strip()
+        if not token:
+            return False
+        guidance = self.recommend_schedule_families(search_state, top_k=top_k)
+        preferred = set(_clean_string_list(guidance.get("preferred_families") or []))
+        avoid = set(_clean_string_list(guidance.get("avoid_families") or []))
+        return token in avoid and token not in preferred
