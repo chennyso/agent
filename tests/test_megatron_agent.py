@@ -58,6 +58,10 @@ from megatron_agent.feedback_optimizer import (  # noqa: E402
     reflect_on_trial,
 )
 from megatron_agent.metrics_parser import parse_megatron_logs  # noqa: E402
+from megatron_agent.pipeline_visualization import (  # noqa: E402
+    extract_pipeline_event_trace,
+    prepare_pipeline_timeline_panels,
+)
 from megatron_agent.policy_memory import PolicyMemoryBank  # noqa: E402
 from megatron_agent.torchtitan_hybrid import (  # noqa: E402
     TorchTitanHybridController,
@@ -1345,6 +1349,35 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "runtime_optimizer_target_policy": "tail_stage_first",
                 "runtime_optimizer_chunk_scope": "tail_and_hotspot",
                 "runtime_optimizer_window_policy": "tail_flush_aligned",
+                "runtime_optimizer_state_partition_policy": "state_disaggregated_hierarchical",
+                "runtime_optimizer_param_shard_group": "dp_intra_node",
+                "runtime_optimizer_grad_shard_group": "dp_global",
+                "runtime_optimizer_opt_state_shard_group": "dp_hierarchical",
+                "runtime_optimizer_allow_owner_decoupling": True,
+                "runtime_optimizer_param_owner_policy": "forward_critical_locality",
+                "runtime_optimizer_opt_state_owner_policy": "update_locality",
+                "runtime_optimizer_state_shard_hierarchy": {
+                    "intra_node_group": "dp_node_local",
+                    "inter_node_group": "dp_cross_node",
+                },
+                "runtime_optimizer_state_family_policy": {
+                    "ffn": {"state_shard_level": "deep"},
+                    "attention": {"state_shard_level": "medium"},
+                },
+                "runtime_optimizer_chunk_pipeline_mode": "h2d_update_writeback",
+                "runtime_optimizer_chunk_size_mb": 384,
+                "runtime_optimizer_pipeline_prefetch_depth": 3,
+                "runtime_optimizer_pipeline_writeback_depth": 2,
+                "runtime_optimizer_tail_aware_schedule": "cooldown_staggered_owner_local",
+                "runtime_optimizer_tail_barrier_policy": "late_commit_min_barrier",
+                "runtime_optimizer_offload_family_policy": {
+                    "ffn": "cpu_streaming",
+                    "small": "gpu_resident",
+                },
+                "runtime_optimizer_offload_phase_policy": {
+                    "warmup": "prefetch_aggressive",
+                    "cooldown": "tail_guarded",
+                },
                 "morphable_stage_families": [
                     {
                         "stage_index": 1,
@@ -1372,6 +1405,22 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_TARGET_POLICY"], "tail_stage_first")
         self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"], "tail_and_hotspot")
         self.assertEqual(compiled.launcher_env["SCHEDULE_OPTIMIZER_WINDOW_POLICY"], "tail_flush_aligned")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_STATE_PARTITION_POLICY"], "state_disaggregated_hierarchical")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_PARAM_SHARD_GROUP"], "dp_intra_node")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_GRAD_SHARD_GROUP"], "dp_global")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_STATE_SHARD_GROUP"], "dp_hierarchical")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_ALLOW_OWNER_DECOUPLING"], "1")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_PARAM_OWNER_POLICY"], "forward_critical_locality")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_STATE_OWNER_POLICY"], "update_locality")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_CHUNK_PIPELINE_MODE"], "h2d_update_writeback")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_CHUNK_SIZE_MB"], "384")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_PIPELINE_PREFETCH_DEPTH"], "3")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_PIPELINE_WRITEBACK_DEPTH"], "2")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_TAIL_AWARE_SCHEDULE"], "cooldown_staggered_owner_local")
+        self.assertEqual(compiled.launcher_env["OPTIMIZER_TAIL_BARRIER_POLICY"], "late_commit_min_barrier")
+        self.assertIn("intra_node_group", str(compiled.launcher_env.get("OPTIMIZER_STATE_SHARD_HIERARCHY") or ""))
+        self.assertIn("state_shard_level", str(compiled.launcher_env.get("OPTIMIZER_STATE_FAMILY_POLICY") or ""))
+        self.assertIn("prefetch_aggressive", str(compiled.launcher_env.get("OPTIMIZER_OFFLOAD_PHASE_POLICY") or ""))
         self.assertIn("optimizer_window_policy=tail_flush_aligned", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
         self.assertIn("stage_tags=tail_sensitive|optimizer_sensitive", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
 
@@ -1456,6 +1505,82 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(compiled.launcher_env["MORPHABLE_PIPE_CHUNK_SHAPE_VECTOR"], "2,1,1,2")
         self.assertIn("0,family=critical_path_first", compiled.launcher_env["SCHEDULE_STAGE_FAMILY_HINTS"])
         self.assertIn("0:4,2", compiled.launcher_env["SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS"])
+
+    def test_compile_program_exports_asymmetric_vpp_and_exposed_cost_envs(self) -> None:
+        from megatron_agent.config import PartitionOptimizationSpec
+
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.pp_degree = 2
+        program.partition = program.partition.from_dict(
+            {
+                "stages": [
+                    {"decoder_layers": 18, "special_tokens": ["E"]},
+                    {"decoder_layers": 22, "special_tokens": ["L"]},
+                ]
+            }
+        )
+        program.partition_optimization = PartitionOptimizationSpec(
+            partition_mode="nonuniform",
+            allow_nonuniform_partition=True,
+            stage_layer_counts=[18, 22],
+            stage_local_vpp_vector=[2, 1],
+            stage_local_vpp_forward_vector=[2, 2],
+            stage_local_vpp_backward_vector=[1, 1],
+            exposed_cost_weights={"alpha": 0.4, "beta": 0.3, "gamma": 0.2, "eta": 0.1},
+        )
+        program.metadata["partition_exposed_cost_weights"] = {
+            "alpha": 0.4,
+            "beta": 0.3,
+            "gamma": 0.2,
+            "eta": 0.1,
+        }
+        program.metadata["runtime_edge_lane_policy"] = {
+            "stable_lane": {"dispatch_order": "stage_local_nonuniform_vpp"},
+            "edge_lane": {"dispatch_order": "tail_boundary_rewrite"},
+        }
+        program.metadata["runtime_spill_window_policy"] = {
+            "warmup": {"policy": "prefetch_aggressive"},
+            "steady": {"policy": "overlap_max"},
+            "cooldown": {"policy": "tail_guarded"},
+        }
+
+        compiled = compile_program(program)
+        self.assertIn("EXPOSED_COST_SCORE", compiled.launcher_env)
+        self.assertIn("EXPOSED_COST_WEIGHTS", compiled.launcher_env)
+        self.assertEqual(compiled.launcher_env["PARTITION_VPP_ASYMMETRIC"], "1")
+        self.assertEqual(json.loads(compiled.launcher_env["STAGE_LOCAL_VPP_FWD_VECTOR"]), [2, 2])
+        self.assertEqual(json.loads(compiled.launcher_env["STAGE_LOCAL_VPP_BWD_VECTOR"]), [1, 1])
+        self.assertEqual(
+            json.loads(compiled.launcher_env["EXPOSED_COST_WEIGHTS"]),
+            {"alpha": 0.4, "beta": 0.3, "gamma": 0.2, "eta": 0.1},
+        )
+        self.assertIn("SCHEDULE_EDGE_LANE_POLICY", compiled.launcher_env)
+        self.assertIn("SCHEDULE_SPILL_WINDOW_POLICY", compiled.launcher_env)
+
+    def test_runtime_guided_partition_plan_emits_exposed_components(self) -> None:
+        runtime_summary = {
+            "stage_window_summary": {
+                "0": {"window_ms": 1400.0, "compute_ms": 900.0, "comm_ms": 320.0, "bubble_ms": 120.0, "peak_reserved_gib": 19.0},
+                "1": {"window_ms": 2200.0, "compute_ms": 1400.0, "comm_ms": 500.0, "bubble_ms": 220.0, "peak_reserved_gib": 23.4},
+                "2": {"window_ms": 1500.0, "compute_ms": 1000.0, "comm_ms": 280.0, "bubble_ms": 110.0, "peak_reserved_gib": 18.7},
+            },
+            "pipeline_wait_ratio": 0.14,
+            "optimizer_exposed_ratio": 0.22,
+            "bubble_ratio": 0.12,
+            "stage_skew": 1.19,
+        }
+        plan = agent_loop._runtime_guided_partition_plan(
+            [10, 16, 14],
+            runtime_summary,
+            exposed_cost_weights={"alpha": 0.5, "beta": 0.2, "gamma": 0.2, "eta": 0.1},
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn("stage_exposed_components", plan)
+        self.assertEqual(len(list(plan.get("stage_exposed_components") or [])), 3)
+        self.assertEqual(
+            dict(plan.get("exposed_cost_weights") or {}),
+            {"alpha": 0.5, "beta": 0.2, "gamma": 0.2, "eta": 0.1},
+        )
 
     def test_context_record_includes_runtime_memory_policy(self) -> None:
         program = default_dense_program("single_g5")
@@ -1995,6 +2120,9 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             allow_nonuniform_partition=True,
             stage_layer_counts=[18, 22],
             stage_local_vpp_vector=[1, 2],
+            stage_local_vpp_forward_vector=[2, 2],
+            stage_local_vpp_backward_vector=[1, 2],
+            exposed_cost_weights={"alpha": 0.5, "beta": 0.2, "gamma": 0.2, "eta": 0.1},
             preferred_boundary_modules=["attention"],
         )
         program.applied_patch = ProgramPatchSpec(
@@ -2009,6 +2137,13 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(restored.schedule_ir.dispatch_order, "zero_bubble_proxy")
         self.assertEqual(restored.partition_optimization.partition_mode, "nonuniform")
         self.assertEqual(restored.partition_optimization.stage_layer_counts, [18, 22])
+        self.assertEqual(restored.partition_optimization.stage_local_vpp_forward_vector, [2, 2])
+        self.assertEqual(restored.partition_optimization.stage_local_vpp_backward_vector, [1, 2])
+        self.assertAlmostEqual(
+            float(restored.partition_optimization.exposed_cost_weights.get("alpha") or 0.0),
+            0.5,
+            places=6,
+        )
         self.assertEqual(restored.applied_patch.patch_family, "change_schedule_family")
 
     def test_policy_memory_recommend_patch_families_prefers_useful_entries(self) -> None:
@@ -3135,6 +3270,56 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
             self.assertGreaterEqual(float(phase.get("end_ms") or 0.0), float(phase.get("start_ms") or 0.0))
             previous_end = float(phase.get("end_ms") or 0.0)
 
+    def test_pipeline_visualization_extracts_nested_event_trace(self) -> None:
+        payload = {
+            "visualization_artifacts": {
+                "pipeline_event_trace": {
+                    "format": "pipeline_event_trace",
+                    "summary": {"schedule_template": "interleaved_1f1b", "projected_timeline_span_ms": 320.0},
+                    "lane_summaries": [{"stage_id": 0, "peak_reserved_gib": 8.0}],
+                    "events": [{"stage_id": 0, "op_kind": "fwd", "start_ms": 0.0, "duration_ms": 10.0, "end_ms": 10.0}],
+                }
+            }
+        }
+        trace = extract_pipeline_event_trace(payload)
+        self.assertEqual(trace["format"], "pipeline_event_trace")
+        self.assertEqual(trace["summary"]["schedule_template"], "interleaved_1f1b")
+
+    def test_pipeline_visualization_prepares_panels_from_trial_artifact_shape(self) -> None:
+        payload = {
+            "trial_artifact": {
+                "visualization_artifacts": {
+                    "pipeline_event_trace": {
+                        "format": "pipeline_event_trace",
+                        "summary": {
+                            "schedule_template": "zerobubble",
+                            "pp_degree": 2,
+                            "vpp_degree": 2,
+                            "estimated_microbatches": 4,
+                            "projected_timeline_span_ms": 480.0,
+                        },
+                        "phase_windows": [{"name": "steady", "start_ms": 0.0, "end_ms": 480.0}],
+                        "lane_summaries": [
+                            {"stage_id": 0, "peak_reserved_gib": 8.0},
+                            {"stage_id": 1, "peak_reserved_gib": 7.5},
+                        ],
+                        "events": [
+                            {"stage_id": 0, "op_kind": "fwd", "label": "F0:0", "start_ms": 0.0, "duration_ms": 40.0, "end_ms": 40.0},
+                            {"stage_id": 1, "op_kind": "bwd", "label": "B0:0", "start_ms": 120.0, "duration_ms": 50.0, "end_ms": 170.0},
+                        ],
+                    }
+                }
+            }
+        }
+        panels = prepare_pipeline_timeline_panels([payload], labels=["paper_view"])
+        self.assertEqual(len(panels), 1)
+        panel = panels[0]
+        self.assertEqual(panel.label, "paper_view")
+        self.assertEqual(panel.summary["schedule_template"], "zerobubble")
+        self.assertEqual(panel.total_span_ms, 480.0)
+        self.assertEqual(len(panel.lane_summaries), 2)
+        self.assertEqual(len(panel.events), 2)
+
     def test_verify_program_returns_structured_verifier_report(self) -> None:
         program = default_dense_program("single_g5")
         program.constraints.memory_budget_gb = 4.0
@@ -3532,6 +3717,18 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertAlmostEqual(float(action.counterfactual_score), 1.0, places=6)
         self.assertEqual(str(action.strategy_source or ""), "llm_http")
         self.assertIn("sequence parallel", str(action.llm_rationale or ""))
+
+    def test_rewrite_action_spec_supports_optimizer_state_partition_rewrite(self) -> None:
+        action = RewriteActionSpec(
+            rewrite_type="optimizer_state_partition_rewrite",
+            target_stage_ids=[1, 0, 1],
+            direction="hierarchical_decoupled",
+            expected_gain=0.08,
+        ).normalized()
+
+        self.assertEqual(action.rewrite_type, "optimizer_state_partition_rewrite")
+        self.assertEqual(action.target_stage_ids, [0, 1])
+        self.assertEqual(action.direction, "hierarchical_decoupled")
 
     def test_context_and_failure_modes_surface_tp_without_sp_and_cpu_offload_tail(self) -> None:
         program = default_dense_program("single_g5").normalized()
@@ -4245,7 +4442,20 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 RewriteActionSpec(rewrite_type="overlap_window_switch", target_stage_ids=[1], direction="optimizer_tail", magnitude=1),
                 RewriteActionSpec(rewrite_type="chunk_priority_rewrite", target_stage_ids=[0, 1], direction="finer", magnitude=2),
                 RewriteActionSpec(rewrite_type="tail_optimizer_relief", target_stage_ids=[1], direction="tail", magnitude=2),
+                RewriteActionSpec(
+                    rewrite_type="optimizer_offload_policy_rewrite",
+                    target_stage_ids=[1],
+                    direction="tail_guarded_streaming",
+                    magnitude=1,
+                ),
+                RewriteActionSpec(
+                    rewrite_type="recompute_policy_rewrite",
+                    target_stage_ids=[1],
+                    direction="aggressive",
+                    magnitude=2,
+                ),
                 RewriteActionSpec(rewrite_type="schedule_family_switch", direction="dualpipe_v", magnitude=1),
+                RewriteActionSpec(rewrite_type="pp_vpp_partition_rewrite", direction="stage_aware_nonuniform_vpp", magnitude=1),
             ],
         ).normalized()
         program.metadata["rewrite_actions"] = [
@@ -4281,25 +4491,30 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                 "overlap_window_switch",
                 "chunk_priority_rewrite",
                 "tail_optimizer_relief",
+                "optimizer_offload_policy_rewrite",
+                "recompute_policy_rewrite",
             }
             <= action_types
         )
-        self.assertEqual(recommendation_types, {"schedule_family_switch"})
+        self.assertEqual(recommendation_types, {"schedule_family_switch", "pp_vpp_partition_rewrite"})
         self.assertIn("runtime_state_migration_hints", state_plan_payload)
         self.assertIn("runtime_repair_action_types", state_plan_payload)
         self.assertTrue(overlap_payload.get("enable_optimizer_tail_overlap"))
-        self.assertEqual(str(memory_payload.get("offload_policy") or ""), "selective")
+        self.assertEqual(str(memory_payload.get("offload_policy") or ""), "optimizer_streaming")
         self.assertEqual(str(memory_payload.get("prefetch_policy") or ""), "selective")
         self.assertEqual(int(reload_payload.get("prefetch_window") or 0), 2)
         self.assertIn("runtime_chunk_priority_hints", comm_chunk_payload)
         self.assertIn("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", env)
+        self.assertEqual(str(env.get("ENABLE_OPTIMIZER_CPU_OFFLOAD") or ""), "1")
+        self.assertEqual(str(env.get("RECOMPUTE_GRANULARITY") or ""), "selective")
+        self.assertIn("core_attn", str(env.get("RECOMPUTE_MODULES") or ""))
         self.assertEqual(
             str(((compiled.runtime_repair_plan.get("summary") or {}).get("decision")) or ""),
-            "allow",
+            "allow_with_risk",
         )
         self.assertEqual(
             str((((compiled.schedule_detail.get("effective") or {}).get("runtime_repair") or {}).get("decision")) or ""),
-            "allow",
+            "allow_with_risk",
         )
 
     def test_trial_runner_normalizes_runtime_repair_contract_env(self) -> None:
@@ -4339,6 +4554,10 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                                 "enable_overlap_grad_reduce": True,
                                 "enable_overlap_param_gather": True,
                                 "enable_overlap_param_gather_with_optimizer_step": True,
+                                "enable_optimizer_cpu_offload": True,
+                                "optimizer_offload_fraction": 1.0,
+                                "use_torch_optimizer_for_cpu_offload": True,
+                                "use_precision_aware_optimizer": True,
                             },
                             "window_overrides": [
                                 {
@@ -4364,6 +4583,60 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
                             "overlap_channels": ["optimizer_tail"],
                         },
                     },
+                    {
+                        "action": {"rewrite_type": "optimizer_state_partition_rewrite"},
+                        "compile_lowering": {
+                            "optimizer_runtime": {
+                                "mode": "tail_guarded_overlap",
+                                "target_policy": "tail_stage_first",
+                                "chunk_scope": "tail_and_hotspot",
+                                "window_policy": "optimizer_tail_hide",
+                                "enable_distributed_optimizer": True,
+                                "enable_overlap_grad_reduce": True,
+                                "enable_overlap_param_gather": True,
+                                "enable_overlap_param_gather_with_optimizer_step": True,
+                                "state_partition_policy": "state_disaggregated_hierarchical",
+                                "param_shard_group": "dp_intra_node",
+                                "grad_shard_group": "dp_global",
+                                "opt_state_shard_group": "dp_hierarchical",
+                                "allow_owner_decoupling": True,
+                                "param_owner_policy": "forward_critical_locality",
+                                "opt_state_owner_policy": "update_locality",
+                                "opt_state_shard_hierarchy": {
+                                    "intra_node_group": "dp_node_local",
+                                    "inter_node_group": "dp_cross_node",
+                                },
+                                "optimizer_state_family_policy": {
+                                    "ffn": {"state_shard_level": "deep"},
+                                    "attention": {"state_shard_level": "medium"},
+                                },
+                                "optimizer_chunk_pipeline_mode": "h2d_update_writeback",
+                                "optimizer_chunk_size_mb": 384,
+                                "optimizer_pipeline_prefetch_depth": 3,
+                                "optimizer_pipeline_writeback_depth": 2,
+                                "optimizer_tail_aware_schedule": "cooldown_staggered_owner_local",
+                                "optimizer_tail_barrier_policy": "late_commit_min_barrier",
+                                "optimizer_offload_family_policy": {
+                                    "ffn": "cpu_streaming",
+                                    "small": "gpu_resident",
+                                },
+                                "optimizer_offload_phase_policy": {
+                                    "warmup": "prefetch_aggressive",
+                                    "cooldown": "tail_guarded",
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "action": {"rewrite_type": "recompute_policy_rewrite"},
+                        "compile_lowering": {
+                            "recompute_runtime": {
+                                "recompute_granularity": "selective",
+                                "enable_recompute_activations": True,
+                                "recompute_modules": ["core_attn", "mlp"],
+                            }
+                        },
+                    },
                 ]
             ),
             "STATE_PLAN": json.dumps({"objects": [], "placements": []}),
@@ -4376,6 +4649,20 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("SCHEDULE_OPERATOR_CLUSTER_HINTS", normalized)
         self.assertIn("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS", normalized)
         self.assertEqual(str(normalized.get("SCHEDULE_OPTIMIZER_RUNTIME_MODE") or ""), "tail_guarded_overlap")
+        self.assertEqual(str(normalized.get("ENABLE_OPTIMIZER_CPU_OFFLOAD") or ""), "1")
+        self.assertEqual(str(normalized.get("OPTIMIZER_STATE_PARTITION_POLICY") or ""), "state_disaggregated_hierarchical")
+        self.assertEqual(str(normalized.get("OPTIMIZER_PARAM_SHARD_GROUP") or ""), "dp_intra_node")
+        self.assertEqual(str(normalized.get("OPTIMIZER_GRAD_SHARD_GROUP") or ""), "dp_global")
+        self.assertEqual(str(normalized.get("OPTIMIZER_STATE_SHARD_GROUP") or ""), "dp_hierarchical")
+        self.assertEqual(str(normalized.get("OPTIMIZER_ALLOW_OWNER_DECOUPLING") or ""), "1")
+        self.assertEqual(str(normalized.get("OPTIMIZER_CHUNK_SIZE_MB") or ""), "384")
+        self.assertEqual(str(normalized.get("OPTIMIZER_PIPELINE_PREFETCH_DEPTH") or ""), "3")
+        self.assertEqual(str(normalized.get("OPTIMIZER_PIPELINE_WRITEBACK_DEPTH") or ""), "2")
+        self.assertEqual(str(normalized.get("RECOMPUTE_GRANULARITY") or ""), "selective")
+        self.assertIn("core_attn", str(normalized.get("RECOMPUTE_MODULES") or ""))
+        self.assertIn("dp_node_local", str(normalized.get("OPTIMIZER_STATE_SHARD_HIERARCHY") or ""))
+        self.assertIn("state_shard_level", str(normalized.get("OPTIMIZER_STATE_FAMILY_POLICY") or ""))
+        self.assertIn("prefetch_aggressive", str(normalized.get("OPTIMIZER_OFFLOAD_PHASE_POLICY") or ""))
 
         state_plan_payload = json.loads(normalized["STATE_PLAN"])
         overlap_payload = json.loads(normalized["SCHEDULE_OVERLAP_HINTS"])
