@@ -708,11 +708,30 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
             match += 0.44
             expected_mfu_gain = max(expected_mfu_gain, 0.06 + 0.30 * cpu_offload_tail_ratio)
             memory_margin = min(memory_margin + 0.10, 1.0)
+        if rewrite_type == "optimizer_offload_policy_rewrite" and (
+            "cpu_offload_tail" in labels or "optimizer_bound" in labels or cpu_offload_tail_ratio >= 0.18
+        ):
+            match += 0.46
+            expected_mfu_gain = max(expected_mfu_gain, 0.07 + 0.34 * max(cpu_offload_tail_ratio, optimizer_exposed_ratio))
+            memory_margin = min(memory_margin + 0.12, 1.0)
+        if rewrite_type == "optimizer_state_partition_rewrite" and (
+            "cpu_offload_tail" in labels or "optimizer_bound" in labels or optimizer_exposed_ratio >= 0.18
+        ):
+            match += 0.48
+            expected_mfu_gain = max(expected_mfu_gain, 0.08 + 0.36 * max(cpu_offload_tail_ratio, optimizer_exposed_ratio))
+            memory_margin = min(memory_margin + 0.10, 1.0)
+        if rewrite_type == "recompute_policy_rewrite" and ("memory_bound" in labels or peak_reserved_ratio >= 0.84):
+            match += 0.40
+            expected_mfu_gain = max(
+                expected_mfu_gain,
+                0.05 + 0.30 * max(peak_reserved_ratio - 0.78, 0.0),
+            )
+            memory_margin = min(memory_margin + 0.18, 1.0)
         if rewrite_type == "tp_sp_recomposition" and "tp_without_sp" in labels:
             match += 0.46
             expected_mfu_gain = max(expected_mfu_gain, 0.08)
             memory_margin = min(memory_margin + 0.04, 1.0)
-        if rewrite_type in {"schedule_family_switch", "pp_family_exploration"} and "bubble_bound" in labels:
+        if rewrite_type in {"schedule_family_switch", "pp_family_exploration", "pp_vpp_partition_rewrite"} and "bubble_bound" in labels:
             match += 0.34
             expected_mfu_gain = max(expected_mfu_gain, 0.04 + 0.20 * float(runtime.get("bubble_ratio") or trace_summary.get("bubble_ratio") or 0.0))
         if rewrite_type in {"selective_reload_prefetch", "reload_shift"} and ("reload_bound" in labels or "memory_bound" in labels):
@@ -723,7 +742,12 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
             match += 0.30
             expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.18 * float(runtime.get("comm_exposure_ratio") or trace_summary.get("comm_exposure_ratio") or 0.0))
 
-        if peak_reserved_ratio >= 0.90 and rewrite_type in {"schedule_family_switch", "pp_family_exploration", "overlap_window_switch"}:
+        if peak_reserved_ratio >= 0.90 and rewrite_type in {
+            "schedule_family_switch",
+            "pp_family_exploration",
+            "pp_vpp_partition_rewrite",
+            "overlap_window_switch",
+        }:
             rollback_risk += 0.12
         if cpu_offload_tail_ratio >= 0.18 and rewrite_type == "overlap_window_switch":
             rollback_risk += 0.10
@@ -797,6 +821,66 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
                 **scores,
             ).normalized()
         )
+    if "memory_bound" in diagnostic_labels or peak_reserved_ratio >= 0.84:
+        scores = _estimated_action_scores("recompute_policy_rewrite", risk_flags=["recompute_overhead_guard"])
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="recompute_policy_rewrite",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_ids,
+                direction="aggressive" if peak_reserved_ratio >= 0.90 else "selective",
+                magnitude=2.0 if peak_reserved_ratio >= 0.90 else 1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
+                risk_flags=["recompute_overhead_guard"],
+                **scores,
+            ).normalized()
+        )
+    if (
+        "cpu_offload_tail" in diagnostic_labels
+        or "optimizer_bound" in diagnostic_labels
+        or cpu_offload_tail_ratio >= 0.18
+    ):
+        scores = _estimated_action_scores(
+            "optimizer_offload_policy_rewrite",
+            risk_flags=["optimizer_offload_tail_guard"],
+        )
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="optimizer_offload_policy_rewrite",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_ids,
+                direction="tail_guarded_streaming",
+                magnitude=1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
+                risk_flags=["optimizer_offload_tail_guard"],
+                **scores,
+            ).normalized()
+        )
+        scores = _estimated_action_scores(
+            "optimizer_state_partition_rewrite",
+            risk_flags=["state_owner_decoupling_guard"],
+        )
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="optimizer_state_partition_rewrite",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_ids,
+                direction="hierarchical_decoupled",
+                magnitude=1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
+                risk_flags=["state_owner_decoupling_guard"],
+                **scores,
+            ).normalized()
+        )
     if overlap_family in {"adaptive_chunking_patch", "comm_chunk_patch", "overlap_policy_patch"}:
         scores = _estimated_action_scores("adaptive_chunking", risk_flags=["comm_interference_guard"])
         actions.append(
@@ -830,6 +914,23 @@ def _recommended_rewrite_actions(program: MegatronProgram, trace_summary: Dict[s
                 diagnostic_labels=list(diagnostic_labels),
                 strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
                 risk_flags=["memory_headroom_guard"],
+                **scores,
+            ).normalized()
+        )
+    if "bubble_bound" in diagnostic_labels:
+        scores = _estimated_action_scores("pp_vpp_partition_rewrite", risk_flags=["family_switch_guard"])
+        actions.append(
+            RewriteActionSpec(
+                rewrite_type="pp_vpp_partition_rewrite",
+                target_stage_ids=target_stage_ids,
+                target_layer_group_ids=local_verticalization_targets or target_layer_groups,
+                target_state_ids=[],
+                direction="stage_aware_nonuniform_vpp",
+                magnitude=1.0,
+                expected_gain=float((trace_summary.get("policy_outcome_summary") or {}).get("reward_delta") or 0.0),
+                diagnostic_labels=list(diagnostic_labels),
+                strategy_source=str(hypotheses.get("repair_dsl_version") or "trace_reducer"),
+                risk_flags=["family_switch_guard"],
                 **scores,
             ).normalized()
         )
@@ -1370,6 +1471,7 @@ _FILE_BACKED_LAUNCHER_ENV_KEYS: Dict[str, str] = {
     "OFFLOAD_PLAN": "offload_plan.json",
     "RELOAD_PLAN": "reload_plan.json",
     "COMM_CHUNK_PLAN": "comm_chunk_plan.json",
+    "VPP_FLOW_POLICY": "vpp_flow_policy.json",
     "WINDOW_RECONFIG_PLAN": "window_reconfig_plan.json",
     "WINDOW_FEEDBACK_PLAN": "window_feedback_plan.json",
 }
@@ -1461,6 +1563,7 @@ def _normalize_runtime_repair_contract_env(env: Dict[str, str]) -> Dict[str, str
         "chunk_priority_hints": _parse_stage_chunk_priority_env(merged.get("SCHEDULE_STAGE_CHUNK_PRIORITY_HINTS")),
         "overlap_channels": [],
         "optimizer_runtime": {},
+        "recompute_runtime": {},
         "memory_intents": {},
         "state_plan_patch": {},
     }
@@ -1476,6 +1579,18 @@ def _normalize_runtime_repair_contract_env(env: Dict[str, str]) -> Dict[str, str
         aggregated["state_plan_patch"].update(dict(lowering.get("state_plan_patch") or {}))
         if dict(lowering.get("optimizer_runtime") or {}):
             aggregated["optimizer_runtime"].update(dict(lowering.get("optimizer_runtime") or {}))
+        if dict(lowering.get("recompute_runtime") or {}):
+            merged_recompute = dict(aggregated.get("recompute_runtime") or {})
+            merged_recompute.update(dict(lowering.get("recompute_runtime") or {}))
+            if isinstance(merged_recompute.get("recompute_modules"), list):
+                merged_recompute["recompute_modules"] = list(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in list(merged_recompute.get("recompute_modules") or [])
+                        if str(item).strip()
+                    )
+                )
+            aggregated["recompute_runtime"] = merged_recompute
         for raw_stage_id, raw_hints in dict(lowering.get("chunk_priority_hints") or {}).items():
             stage_key = str(raw_stage_id).strip()
             if not stage_key:
@@ -1626,6 +1741,26 @@ def _normalize_runtime_repair_contract_env(env: Dict[str, str]) -> Dict[str, str
             "ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP",
             "1" if bool(optimizer_runtime.get("enable_overlap_param_gather_with_optimizer_step", True)) else "0",
         )
+        if "enable_optimizer_cpu_offload" in optimizer_runtime:
+            merged.setdefault(
+                "ENABLE_OPTIMIZER_CPU_OFFLOAD",
+                "1" if bool(optimizer_runtime.get("enable_optimizer_cpu_offload")) else "0",
+            )
+        if "optimizer_offload_fraction" in optimizer_runtime:
+            merged.setdefault(
+                "OPTIMIZER_OFFLOAD_FRACTION",
+                str(float(optimizer_runtime.get("optimizer_offload_fraction") or 0.0)),
+            )
+        if "use_torch_optimizer_for_cpu_offload" in optimizer_runtime:
+            merged.setdefault(
+                "USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD",
+                "1" if bool(optimizer_runtime.get("use_torch_optimizer_for_cpu_offload")) else "0",
+            )
+        if "use_precision_aware_optimizer" in optimizer_runtime:
+            merged.setdefault(
+                "USE_PRECISION_AWARE_OPTIMIZER",
+                "1" if bool(optimizer_runtime.get("use_precision_aware_optimizer")) else "0",
+            )
         if str(merged.get("SCHEDULE_OPTIMIZER_RUNTIME_MODE") or "").strip() == "":
             merged["SCHEDULE_OPTIMIZER_RUNTIME_MODE"] = str(optimizer_runtime.get("mode") or "")
         if str(merged.get("SCHEDULE_OPTIMIZER_TARGET_POLICY") or "").strip() == "":
@@ -1634,6 +1769,70 @@ def _normalize_runtime_repair_contract_env(env: Dict[str, str]) -> Dict[str, str
             merged["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"] = str(optimizer_runtime.get("chunk_scope") or "")
         if str(merged.get("SCHEDULE_OPTIMIZER_WINDOW_POLICY") or "").strip() == "":
             merged["SCHEDULE_OPTIMIZER_WINDOW_POLICY"] = str(optimizer_runtime.get("window_policy") or "")
+        if str(optimizer_runtime.get("state_partition_policy") or "").strip():
+            merged.setdefault("OPTIMIZER_STATE_PARTITION_POLICY", str(optimizer_runtime.get("state_partition_policy") or ""))
+        if str(optimizer_runtime.get("param_shard_group") or "").strip():
+            merged.setdefault("OPTIMIZER_PARAM_SHARD_GROUP", str(optimizer_runtime.get("param_shard_group") or ""))
+        if str(optimizer_runtime.get("grad_shard_group") or "").strip():
+            merged.setdefault("OPTIMIZER_GRAD_SHARD_GROUP", str(optimizer_runtime.get("grad_shard_group") or ""))
+        if str(optimizer_runtime.get("opt_state_shard_group") or "").strip():
+            merged.setdefault("OPTIMIZER_STATE_SHARD_GROUP", str(optimizer_runtime.get("opt_state_shard_group") or ""))
+        if "allow_owner_decoupling" in optimizer_runtime:
+            merged.setdefault(
+                "OPTIMIZER_ALLOW_OWNER_DECOUPLING",
+                "1" if bool(optimizer_runtime.get("allow_owner_decoupling")) else "0",
+            )
+        if str(optimizer_runtime.get("param_owner_policy") or "").strip():
+            merged.setdefault("OPTIMIZER_PARAM_OWNER_POLICY", str(optimizer_runtime.get("param_owner_policy") or ""))
+        if str(optimizer_runtime.get("opt_state_owner_policy") or "").strip():
+            merged.setdefault("OPTIMIZER_STATE_OWNER_POLICY", str(optimizer_runtime.get("opt_state_owner_policy") or ""))
+        if str(optimizer_runtime.get("optimizer_chunk_pipeline_mode") or "").strip():
+            merged.setdefault("OPTIMIZER_CHUNK_PIPELINE_MODE", str(optimizer_runtime.get("optimizer_chunk_pipeline_mode") or ""))
+        if str(optimizer_runtime.get("optimizer_tail_aware_schedule") or "").strip():
+            merged.setdefault("OPTIMIZER_TAIL_AWARE_SCHEDULE", str(optimizer_runtime.get("optimizer_tail_aware_schedule") or ""))
+        if str(optimizer_runtime.get("optimizer_tail_barrier_policy") or "").strip():
+            merged.setdefault("OPTIMIZER_TAIL_BARRIER_POLICY", str(optimizer_runtime.get("optimizer_tail_barrier_policy") or ""))
+        for key, env_key in (
+            ("optimizer_chunk_size_mb", "OPTIMIZER_CHUNK_SIZE_MB"),
+            ("optimizer_pipeline_prefetch_depth", "OPTIMIZER_PIPELINE_PREFETCH_DEPTH"),
+            ("optimizer_pipeline_writeback_depth", "OPTIMIZER_PIPELINE_WRITEBACK_DEPTH"),
+        ):
+            raw_value = optimizer_runtime.get(key)
+            if raw_value is None:
+                continue
+            try:
+                parsed = int(float(raw_value))
+            except Exception:
+                continue
+            if parsed > 0:
+                merged.setdefault(env_key, str(parsed))
+        for key, env_key in (
+            ("opt_state_shard_hierarchy", "OPTIMIZER_STATE_SHARD_HIERARCHY"),
+            ("optimizer_state_family_policy", "OPTIMIZER_STATE_FAMILY_POLICY"),
+            ("optimizer_offload_family_policy", "OPTIMIZER_OFFLOAD_FAMILY_POLICY"),
+            ("optimizer_offload_phase_policy", "OPTIMIZER_OFFLOAD_PHASE_POLICY"),
+        ):
+            payload = optimizer_runtime.get(key)
+            if isinstance(payload, dict) and payload:
+                merged.setdefault(env_key, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    recompute_runtime = dict(aggregated.get("recompute_runtime") or {})
+    if recompute_runtime:
+        granularity = str(recompute_runtime.get("recompute_granularity") or "").strip()
+        if granularity and str(merged.get("RECOMPUTE_GRANULARITY") or "").strip() == "":
+            merged["RECOMPUTE_GRANULARITY"] = granularity
+        if "enable_recompute_activations" in recompute_runtime:
+            merged.setdefault(
+                "ENABLE_RECOMPUTE_ACTIVATIONS",
+                "1" if bool(recompute_runtime.get("enable_recompute_activations")) else "0",
+            )
+        modules = [
+            str(item).strip()
+            for item in list(recompute_runtime.get("recompute_modules") or [])
+            if str(item).strip()
+        ]
+        if modules and str(merged.get("RECOMPUTE_MODULES") or "").strip() == "":
+            merged["RECOMPUTE_MODULES"] = ",".join(list(dict.fromkeys(modules)))
 
     return merged
 
@@ -1666,6 +1865,28 @@ def _training_args(
         launcher_env,
         "ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP",
         False,
+    )
+    enable_optimizer_cpu_offload = _env_flag_enabled(
+        launcher_env,
+        "ENABLE_OPTIMIZER_CPU_OFFLOAD",
+        False,
+    )
+    optimizer_offload_fraction = 0.0
+    try:
+        optimizer_offload_fraction = float(
+            launcher_env.get("OPTIMIZER_OFFLOAD_FRACTION", 0.0) or 0.0
+        )
+    except Exception:
+        optimizer_offload_fraction = 0.0
+    use_torch_optimizer_for_cpu_offload = _env_flag_enabled(
+        launcher_env,
+        "USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD",
+        True,
+    )
+    use_precision_aware_optimizer = _env_flag_enabled(
+        launcher_env,
+        "USE_PRECISION_AWARE_OPTIMIZER",
+        True,
     )
     runtime_recompute_granularity = str(
         launcher_env.get("RECOMPUTE_GRANULARITY") or strategy.recompute_granularity or ""
@@ -1739,6 +1960,14 @@ def _training_args(
         common.append("--overlap-param-gather")
     if enable_overlap_param_gather_with_optimizer_step:
         common.append("--overlap-param-gather-with-optimizer-step")
+    if enable_optimizer_cpu_offload:
+        common.append("--optimizer-cpu-offload")
+        if optimizer_offload_fraction > 0.0:
+            common += ["--optimizer-offload-fraction", str(optimizer_offload_fraction)]
+        if use_torch_optimizer_for_cpu_offload:
+            common.append("--use-torch-optimizer-for-cpu-offload")
+        if use_precision_aware_optimizer:
+            common.append("--use-precision-aware-optimizer")
     if strategy.use_bf16:
         common.append("--bf16")
     elif strategy.use_fp16:

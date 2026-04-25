@@ -71,12 +71,16 @@ _EXECUTABLE_RUNTIME_REPAIR_TYPES = {
     "overlap_window_switch",
     "chunk_priority_rewrite",
     "tail_optimizer_relief",
+    "optimizer_state_partition_rewrite",
+    "optimizer_offload_policy_rewrite",
+    "recompute_policy_rewrite",
 }
 _RECOMMENDATION_ONLY_RUNTIME_REPAIR_TYPES = {
     "tp_sp_recomposition",
     "schedule_family_switch",
     "pp_family_exploration",
     "cpu_offload_scope_switch",
+    "pp_vpp_partition_rewrite",
 }
 _RUNTIME_REPAIR_CATEGORY_MAP = {
     "reload_shift": "memory",
@@ -87,24 +91,48 @@ _RUNTIME_REPAIR_CATEGORY_MAP = {
     "chunk_priority_rewrite": "overlap",
     "overlap_window_switch": "overlap",
     "tail_optimizer_relief": "overlap",
+    "optimizer_state_partition_rewrite": "partition",
+    "optimizer_offload_policy_rewrite": "memory",
+    "recompute_policy_rewrite": "memory",
     "local_verticalization": "schedule",
     "schedule_family_switch": "schedule",
     "tp_sp_recomposition": "schedule",
     "pp_family_exploration": "partition",
+    "pp_vpp_partition_rewrite": "partition",
 }
 _RUNTIME_REPAIR_POLICY_TABLE = {
     "optimizer_bound": {
-        "preferred_actions": ["tail_optimizer_relief", "overlap_window_switch"],
+        "preferred_actions": [
+            "tail_optimizer_relief",
+            "optimizer_state_partition_rewrite",
+            "overlap_window_switch",
+            "optimizer_offload_policy_rewrite",
+        ],
         "suppressed_actions": ["offload_timing_shift", "local_verticalization"],
-        "recommendation_actions": ["schedule_family_switch", "tp_sp_recomposition"],
+        "recommendation_actions": [
+            "schedule_family_switch",
+            "tp_sp_recomposition",
+            "pp_vpp_partition_rewrite",
+        ],
     },
     "cpu_offload_tail": {
-        "preferred_actions": ["offload_timing_shift", "selective_reload_prefetch", "tail_optimizer_relief"],
+        "preferred_actions": [
+            "offload_timing_shift",
+            "selective_reload_prefetch",
+            "tail_optimizer_relief",
+            "optimizer_state_partition_rewrite",
+            "optimizer_offload_policy_rewrite",
+        ],
         "suppressed_actions": ["overlap_window_switch"],
-        "recommendation_actions": ["cpu_offload_scope_switch"],
+        "recommendation_actions": ["cpu_offload_scope_switch", "pp_vpp_partition_rewrite"],
     },
     "reload_bound": {
-        "preferred_actions": ["selective_reload_prefetch", "offload_timing_shift", "local_verticalization"],
+        "preferred_actions": [
+            "selective_reload_prefetch",
+            "offload_timing_shift",
+            "local_verticalization",
+            "recompute_policy_rewrite",
+        ],
         "suppressed_actions": [],
         "recommendation_actions": [],
     },
@@ -124,7 +152,13 @@ _RUNTIME_REPAIR_POLICY_TABLE = {
         "recommendation_actions": ["schedule_family_switch", "pp_family_exploration"],
     },
     "memory_bound": {
-        "preferred_actions": ["offload_timing_shift", "selective_reload_prefetch"],
+        "preferred_actions": [
+            "offload_timing_shift",
+            "selective_reload_prefetch",
+            "optimizer_state_partition_rewrite",
+            "optimizer_offload_policy_rewrite",
+            "recompute_policy_rewrite",
+        ],
         "suppressed_actions": ["overlap_window_switch"],
         "recommendation_actions": ["cpu_offload_scope_switch"],
     },
@@ -247,6 +281,7 @@ class CompiledProgram:
     window_feedback_plan: Dict[str, Any] = field(default_factory=dict)
     stateful_plan_notes: List[str] = field(default_factory=list)
     runtime_repair_plan: Dict[str, Any] = field(default_factory=dict)
+    vpp_flow_policy: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -274,6 +309,7 @@ class CompiledProgram:
             "window_feedback_plan": copy.deepcopy(self.window_feedback_plan),
             "stateful_plan_notes": list(self.stateful_plan_notes),
             "runtime_repair_plan": copy.deepcopy(self.runtime_repair_plan),
+            "vpp_flow_policy": copy.deepcopy(self.vpp_flow_policy),
             "resolved_profile": {
                 "machine_profile": self.resolved_profile.get("machine_profile").to_dict()
                 if self.resolved_profile.get("machine_profile") is not None
@@ -334,6 +370,8 @@ class CostModelEstimate:
     tail_score: float
     memory_skew_score: float
     comm_pressure_score: float
+    exposed_cost_score: float
+    exposed_cost_weights: Dict[str, float]
     switch_score: float
     vpp_veto_margin: float
     total_score: float
@@ -347,6 +385,11 @@ class CostModelEstimate:
             "tail_score": round(float(self.tail_score), 4),
             "memory_skew_score": round(float(self.memory_skew_score), 4),
             "comm_pressure_score": round(float(self.comm_pressure_score), 4),
+            "exposed_cost_score": round(float(self.exposed_cost_score), 4),
+            "exposed_cost_weights": {
+                str(key): round(float(value), 4)
+                for key, value in dict(self.exposed_cost_weights or {}).items()
+            },
             "switch_score": round(float(self.switch_score), 4),
             "vpp_veto_margin": round(float(self.vpp_veto_margin), 4),
             "total_score": round(float(self.total_score), 4),
@@ -555,6 +598,11 @@ def _validate_stateful_plan(program: MegatronProgram) -> tuple[List[str], List[s
                 errors.append("adaptive_chunking finer magnitude exceeds supported runtime/budget limit")
     if list(norm.stage_local_vpp or []) and len(list(norm.stage_local_vpp or [])) != stage_count:
         errors.append("stage_local_vpp length must match number of partition stages")
+    partition_opt = (norm.partition_optimization or PartitionOptimizationSpec()).normalized()
+    if list(partition_opt.stage_local_vpp_forward_vector or []) and len(list(partition_opt.stage_local_vpp_forward_vector or [])) != stage_count:
+        errors.append("partition_optimization.stage_local_vpp_forward_vector length must match number of partition stages")
+    if list(partition_opt.stage_local_vpp_backward_vector or []) and len(list(partition_opt.stage_local_vpp_backward_vector or [])) != stage_count:
+        errors.append("partition_optimization.stage_local_vpp_backward_vector length must match number of partition stages")
     if not errors:
         if any(str(item.node_type) == "reload" for item in (norm.schedule_graph_nodes or [])):
             diagnosis.append("reload_before_use_active")
@@ -870,12 +918,19 @@ def _partition_detail_report(program: MegatronProgram) -> Dict[str, Any]:
         stage_ranges.append([int(cursor), int(end)])
         cursor += layers
     effective = partition_opt.to_dict()
+    stage_local_vpp_fwd = list(partition_opt.stage_local_vpp_forward_vector or [])
+    stage_local_vpp_bwd = list(partition_opt.stage_local_vpp_backward_vector or [])
     effective.update(
         {
             "stage_ranges": stage_ranges,
             "stage_to_node": list(program.layout.stage_to_node or []),
             "pp_degree": int(program.parallel.pp_degree),
             "vpp_degree": int(program.parallel.vpp_degree),
+            "asymmetric_virtualization": bool(
+                stage_local_vpp_fwd
+                and stage_local_vpp_bwd
+                and list(stage_local_vpp_fwd) != list(stage_local_vpp_bwd)
+            ),
         }
     )
     return {
@@ -1078,6 +1133,16 @@ def score_runtime_repair_action(
         bottleneck_match_score += 0.18 + 0.22 * optimizer_ratio
         expected_mfu_gain = max(expected_mfu_gain, 0.05 + 0.35 * optimizer_ratio)
         reasons.append("metric:optimizer_exposed_ratio")
+    elif action_type == "optimizer_state_partition_rewrite":
+        optimizer_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+        tail_ratio = float(runtime.get("cpu_offload_tail_ratio") or 0.0)
+        peak_ratio = float(runtime.get("peak_reserved_ratio") or runtime.get("peak_memory_ratio") or 0.0)
+        bottleneck_match_score += 0.20 + 0.24 * max(optimizer_ratio, tail_ratio)
+        expected_mfu_gain = max(expected_mfu_gain, 0.06 + 0.28 * max(optimizer_ratio, tail_ratio))
+        memory_safety_margin = min(memory_safety_margin + 0.08, 1.0)
+        rollback_risk += 0.04 if peak_ratio >= 0.90 else 0.0
+        reasons.append("metric:optimizer_exposed_ratio")
+        reasons.append("metric:cpu_offload_tail_ratio")
     elif action_type == "overlap_window_switch":
         comm_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
         optimizer_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
@@ -1107,13 +1172,31 @@ def score_runtime_repair_action(
         expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.15 * reload_ratio)
         memory_safety_margin = min(memory_safety_margin + 0.06, 1.0)
         reasons.append("metric:reload_stall_ratio")
+    elif action_type == "optimizer_offload_policy_rewrite":
+        tail_ratio = float(runtime.get("cpu_offload_tail_ratio") or 0.0)
+        optimizer_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+        peak_ratio = float(runtime.get("peak_reserved_ratio") or runtime.get("peak_memory_ratio") or 0.0)
+        bottleneck_match_score += 0.14 + 0.16 * max(tail_ratio, optimizer_ratio)
+        expected_mfu_gain = max(expected_mfu_gain, 0.04 + 0.20 * max(tail_ratio, optimizer_ratio))
+        memory_safety_margin = min(memory_safety_margin + 0.10, 1.0)
+        rollback_risk += 0.04 if peak_ratio >= 0.92 else 0.0
+        reasons.append("metric:cpu_offload_tail_ratio")
+        reasons.append("metric:optimizer_exposed_ratio")
+    elif action_type == "recompute_policy_rewrite":
+        peak_ratio = float(runtime.get("peak_reserved_ratio") or runtime.get("peak_memory_ratio") or 0.0)
+        reload_ratio = float(runtime.get("reload_stall_ratio") or 0.0)
+        bottleneck_match_score += 0.10 + 0.22 * max(peak_ratio - 0.75, 0.0)
+        expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.18 * max(peak_ratio - 0.78, 0.0))
+        memory_safety_margin = min(memory_safety_margin + 0.16, 1.0)
+        rollback_risk += 0.04 + 0.10 * reload_ratio
+        reasons.append("metric:peak_reserved_ratio")
     elif action_type == "tp_sp_recomposition":
         if bool(runtime.get("tp_without_sp")):
             bottleneck_match_score += 0.36
             expected_mfu_gain = max(expected_mfu_gain, 0.08)
             memory_safety_margin = min(memory_safety_margin + 0.04, 1.0)
             reasons.append("metric:tp_without_sp")
-    elif action_type in {"schedule_family_switch", "pp_family_exploration"}:
+    elif action_type in {"schedule_family_switch", "pp_family_exploration", "pp_vpp_partition_rewrite"}:
         bubble_ratio = float(runtime.get("bubble_ratio") or 0.0)
         bottleneck_match_score += 0.08 + 0.18 * bubble_ratio
         expected_mfu_gain = max(expected_mfu_gain, 0.03 + 0.18 * bubble_ratio)
@@ -1346,9 +1429,9 @@ def _resolve_runtime_repair_targets(
                 if str(action.rewrite_type) in {"offload_timing_shift", "selective_reload_prefetch"}:
                     if state_type in {"activation", "optimizer"}:
                         target_state_ids.append(state_id)
-                elif str(action.rewrite_type) == "tail_optimizer_relief" and state_type == "optimizer":
+                elif str(action.rewrite_type) in {"tail_optimizer_relief", "optimizer_state_partition_rewrite"} and state_type == "optimizer":
                     target_state_ids.append(state_id)
-            elif owner_stage in target_stage_ids and str(action.rewrite_type) == "tail_optimizer_relief" and state_type == "optimizer":
+            elif owner_stage in target_stage_ids and str(action.rewrite_type) in {"tail_optimizer_relief", "optimizer_state_partition_rewrite"} and state_type == "optimizer":
                 target_state_ids.append(state_id)
     target_state_ids = list(dict.fromkeys(target_state_ids))
 
@@ -1390,7 +1473,15 @@ def _runtime_repair_support_matrix(program: MegatronProgram) -> Dict[str, Any]:
             and int(norm.parallel.pp_degree) > 1
             and interleaved_pipeline
         ),
-        "supports_optimizer_runtime_contract": bool(optimizer_runtime),
+        "supports_optimizer_runtime_contract": bool(
+            backend_family == "megatron_core"
+            and int(norm.parallel.pp_degree) > 1
+        ),
+        "existing_optimizer_runtime_contract": bool(optimizer_runtime),
+        "supports_recompute_runtime_contract": bool(
+            backend_family == "megatron_core"
+            and int(norm.parallel.pp_degree) > 0
+        ),
         "distributed_optimizer_enabled": bool(
             optimizer_runtime.get("enable_distributed_optimizer", True) if optimizer_runtime else True
         ),
@@ -1443,6 +1534,19 @@ def _build_runtime_repair_action_contract(
         requires_runtime_support.extend(["stage_chunk_priority_hints"])
     elif action_type == "tail_optimizer_relief":
         requires_runtime_support.extend(["optimizer_runtime_contract", "window_override_hints", "operator_cluster_hints"])
+    elif action_type == "optimizer_state_partition_rewrite":
+        requires_runtime_support.extend(
+            [
+                "optimizer_runtime_contract",
+                "hierarchical_state_placement_runtime",
+                "optimizer_owner_decoupling_runtime",
+                "window_override_hints",
+            ]
+        )
+    elif action_type == "optimizer_offload_policy_rewrite":
+        requires_runtime_support.extend(["optimizer_runtime_contract", "offload_policy_runtime"])
+    elif action_type == "recompute_policy_rewrite":
+        requires_runtime_support.extend(["recompute_runtime_contract"])
 
     if action_type == "offload_timing_shift":
         compile_lowering = {
@@ -1620,6 +1724,225 @@ def _build_runtime_repair_action_contract(
             hard_constraints.append("tail_optimizer_relief_requires_distributed_optimizer")
         if bool(runtime.get("optimizer_cpu_offload")):
             soft_risks.append("cpu_optimizer_offload_can_reduce_tail_overlap_gain")
+    elif action_type == "optimizer_state_partition_rewrite":
+        direction = str(action.direction or "hierarchical_decoupled").strip().lower()
+        chunk_size_mb = 512 if magnitude <= 1 else (384 if magnitude == 2 else 256)
+        prefetch_depth = 2 if magnitude <= 1 else min(2 + magnitude, 4)
+        writeback_depth = 2 if magnitude <= 2 else 3
+        allow_owner_decoupling = direction not in {"conservative", "owner_coupled"}
+        compile_lowering = {
+            "optimizer_runtime": {
+                "mode": "tail_guarded_overlap",
+                "target_policy": "tail_stage_first",
+                "chunk_scope": "tail_and_hotspot",
+                "window_policy": "optimizer_tail_hide",
+                "enable_distributed_optimizer": True,
+                "enable_overlap_grad_reduce": True,
+                "enable_overlap_param_gather": True,
+                "enable_overlap_param_gather_with_optimizer_step": True,
+                "state_partition_policy": "state_disaggregated_hierarchical",
+                "param_shard_group": "dp_intra_node",
+                "grad_shard_group": "dp_global",
+                "opt_state_shard_group": "dp_hierarchical",
+                "allow_owner_decoupling": allow_owner_decoupling,
+                "param_owner_policy": "forward_critical_locality",
+                "opt_state_owner_policy": "update_locality",
+                "opt_state_shard_hierarchy": {
+                    "intra_node_group": "dp_node_local",
+                    "inter_node_group": "dp_cross_node",
+                    "state_group_priority": ["ffn", "attention", "small", "embedding_head"],
+                },
+                "optimizer_state_family_policy": {
+                    "ffn": {"state_shard_level": "deep", "offload": "aggressive", "chunk_priority": "high"},
+                    "attention": {"state_shard_level": "medium", "offload": "balanced", "chunk_priority": "medium"},
+                    "small": {"state_shard_level": "light", "offload": "minimal", "chunk_priority": "low"},
+                    "embedding_head": {"state_shard_level": "guarded", "offload": "tail_guarded", "chunk_priority": "high"},
+                },
+                "optimizer_chunk_pipeline_mode": "h2d_update_writeback",
+                "optimizer_chunk_size_mb": int(chunk_size_mb),
+                "optimizer_pipeline_prefetch_depth": int(prefetch_depth),
+                "optimizer_pipeline_writeback_depth": int(writeback_depth),
+                "optimizer_tail_aware_schedule": "cooldown_staggered_owner_local",
+                "optimizer_tail_barrier_policy": "late_commit_min_barrier",
+                "optimizer_offload_family_policy": {
+                    "ffn": "cpu_streaming",
+                    "attention": "hybrid_streaming",
+                    "small": "gpu_resident",
+                    "embedding_head": "gpu_resident_tail_guarded",
+                },
+                "optimizer_offload_phase_policy": {
+                    "warmup": "prefetch_aggressive",
+                    "steady": "overlap_max",
+                    "cooldown": "tail_guarded",
+                },
+            },
+            "window_overrides": [
+                {
+                    "phase": "cooldown",
+                    "window": "cooldown_first_group",
+                    "stage_selector": "optimizer_sensitive_stage",
+                    "chunk_order_policy": "target_chunk_first",
+                    "optimizer_target_chunk": "tail",
+                    "flush_policy": "owner_local_chunk_pipeline",
+                }
+            ],
+            "operator_cluster_overrides": [
+                {
+                    "stage_index": int(stage_id),
+                    "cluster_role": "optimizer_sensitive",
+                    "semantic_role": "decoder",
+                    "local_priority": "protected",
+                    "overlap_policy": "guarded",
+                    "memory_policy": "resident",
+                    "phases": ["steady", "cooldown"],
+                    "optimizer_target_chunk": "tail",
+                    "reason": "optimizer_state_partition_rewrite",
+                }
+                for stage_id in list(targets["target_stage_ids"])
+            ],
+            "overlap_channels": ["optimizer_tail"],
+            "state_plan_patch": {
+                "optimizer_state_partition_policy": "state_disaggregated_hierarchical",
+                "optimizer_owner_decoupling": bool(allow_owner_decoupling),
+            },
+            "memory_intents": {"offload_policy": "optimizer_family_nonuniform"},
+        }
+        expected_side_effects = {
+            "primary_metrics": [
+                "optimizer_exposed_ratio",
+                "cpu_offload_tail_ratio",
+                "params_all_gather_ms",
+                "all_grads_sync_ms",
+                "step_time_ms_p50",
+            ],
+            "expected_direction": {
+                "optimizer_exposed_ratio": "down",
+                "cpu_offload_tail_ratio": "down_or_flat",
+                "step_time_ms_p50": "down",
+            },
+        }
+        rollback_rule = {
+            "trigger_metrics": {
+                "optimizer_exposed_ratio_not_improved": 0.0,
+                "step_time_ms_p50_regression_ratio": 0.05,
+                "params_all_gather_ms_increase_ratio": 0.15,
+                "all_grads_sync_ms_increase_ratio": 0.15,
+            },
+            "scope": "window",
+        }
+        observability = {
+            "required_summary_metrics": [
+                "optimizer_exposed_ratio",
+                "optimizer_ratio",
+                "cpu_offload_tail_ratio",
+                "params_all_gather_ms",
+                "all_grads_sync_ms",
+            ]
+        }
+        if not bool(support.get("supports_optimizer_runtime_contract")):
+            hard_constraints.append("optimizer_state_partition_rewrite_requires_optimizer_runtime_contract")
+        if not bool(support.get("supports_optimizer_tail_runtime")):
+            hard_constraints.append("optimizer_state_partition_rewrite_requires_interleaved_optimizer_runtime")
+        if not bool(support.get("distributed_optimizer_enabled")):
+            hard_constraints.append("optimizer_state_partition_rewrite_requires_distributed_optimizer")
+        if peak_reserved_ratio >= 0.92 and allow_owner_decoupling:
+            soft_risks.append("owner_decoupling_under_high_memory_pressure_needs_guarded_chunking")
+    elif action_type == "optimizer_offload_policy_rewrite":
+        direction = str(action.direction or "tail_guarded_streaming").strip().lower()
+        offload_fraction = 1.0 if direction in {"full", "tail_guarded_streaming", "streaming"} else 0.5
+        if direction in {"conservative", "light"}:
+            offload_fraction = 0.25
+        compile_lowering = {
+            "optimizer_runtime": {
+                "mode": "tail_guarded_overlap",
+                "target_policy": "tail_stage_first",
+                "chunk_scope": "tail_and_hotspot" if magnitude > 1 else "tail_only",
+                "window_policy": "optimizer_tail_hide",
+                "enable_distributed_optimizer": True,
+                "enable_overlap_grad_reduce": True,
+                "enable_overlap_param_gather": True,
+                "enable_overlap_param_gather_with_optimizer_step": True,
+                "enable_optimizer_cpu_offload": True,
+                "optimizer_offload_fraction": offload_fraction,
+                "use_torch_optimizer_for_cpu_offload": True,
+                "use_precision_aware_optimizer": True,
+            },
+            "memory_intents": {"offload_policy": "optimizer_streaming"},
+            "state_plan_patch": {"optimizer_offload_policy": "tail_guarded_streaming"},
+            "overlap_channels": ["optimizer_tail"],
+        }
+        expected_side_effects = {
+            "primary_metrics": [
+                "cpu_offload_tail_ratio",
+                "optimizer_exposed_ratio",
+                "peak_reserved_ratio",
+                "step_time_ms_p50",
+            ],
+            "expected_direction": {
+                "cpu_offload_tail_ratio": "down",
+                "optimizer_exposed_ratio": "down_or_flat",
+                "peak_reserved_ratio": "down_or_flat",
+            },
+        }
+        rollback_rule = {
+            "trigger_metrics": {
+                "step_time_ms_p50_regression_ratio": 0.05,
+                "cpu_offload_tail_ratio_increase": 0.08,
+                "optimizer_exposed_ratio_increase": 0.08,
+            },
+            "scope": "window",
+        }
+        observability = {
+            "required_summary_metrics": [
+                "cpu_offload_tail_ratio",
+                "optimizer_exposed_ratio",
+                "peak_reserved_ratio",
+            ]
+        }
+        if not bool(support.get("supports_optimizer_runtime_contract")):
+            hard_constraints.append("optimizer_offload_policy_requires_optimizer_runtime_contract")
+        if not bool(support.get("distributed_optimizer_enabled")):
+            hard_constraints.append("optimizer_offload_policy_requires_distributed_optimizer")
+        if peak_reserved_ratio >= 0.94 and offload_fraction >= 0.5:
+            soft_risks.append("full_optimizer_offload_can_increase_reload_pressure_under_tight_memory")
+    elif action_type == "recompute_policy_rewrite":
+        direction = str(action.direction or "selective").strip().lower()
+        recompute_modules = ["core_attn"]
+        if direction in {"aggressive", "full", "extended"} or magnitude >= 2:
+            recompute_modules = ["core_attn", "mlp"]
+        compile_lowering = {
+            "recompute_runtime": {
+                "recompute_granularity": "selective",
+                "enable_recompute_activations": True,
+                "recompute_modules": recompute_modules,
+            },
+            "memory_intents": {"checkpoint_policy": "guarded_selective"},
+            "state_plan_patch": {"recompute_policy": "guarded_selective"},
+        }
+        expected_side_effects = {
+            "primary_metrics": ["peak_reserved_ratio", "oom_risk", "step_time_ms_p50"],
+            "expected_direction": {
+                "peak_reserved_ratio": "down",
+                "oom_risk": "down",
+                "step_time_ms_p50": "flat_or_up_small",
+            },
+        }
+        rollback_rule = {
+            "trigger_metrics": {
+                "step_time_ms_p50_regression_ratio": 0.08,
+                "peak_reserved_ratio_not_improved": 0.0,
+            },
+            "scope": "window",
+        }
+        observability = {
+            "required_summary_metrics": ["peak_reserved_ratio", "reload_stall_ratio", "step_time_ms_p50"]
+        }
+        if not bool(support.get("supports_recompute_runtime_contract")):
+            hard_constraints.append("recompute_policy_requires_runtime_contract")
+        if direction not in {"selective", "aggressive", "full", "extended", "conservative", "light"}:
+            hard_constraints.append("recompute_policy_direction_unsupported")
+        if peak_reserved_ratio <= 0.72:
+            soft_risks.append("recompute_gain_may_be_limited_under_low_memory_pressure")
     else:
         compile_lowering = {"recommendation": {"rewrite_type": action_type, "direction": str(action.direction or "")}}
         expected_side_effects = {"primary_metrics": ["step_time_ms_p50"], "expected_direction": {}}
@@ -1708,6 +2031,7 @@ def _finalize_runtime_repair_action_compatibility(
     reload_prefetch = action_types.get("selective_reload_prefetch")
     overlap_switch = action_types.get("overlap_window_switch")
     optimizer_relief = action_types.get("tail_optimizer_relief")
+    optimizer_state_partition = action_types.get("optimizer_state_partition_rewrite")
 
     if offload_shift is not None and reload_prefetch is not None and peak_reserved_ratio >= 0.88:
         for item in (offload_shift, reload_prefetch):
@@ -1725,6 +2049,18 @@ def _finalize_runtime_repair_action_compatibility(
             item.setdefault("verifier_reasons", []).append("cpu_optimizer_offload_reduces_overlap_stability")
             checks = dict(item.get("verifier_checks") or {})
             checks["action_compatibility_check"] = {"status": "risk", "detail": "optimizer overlap and CPU offload can interfere"}
+            item["verifier_checks"] = checks
+            if str(item.get("verifier_decision") or "") == "allow":
+                item["verifier_decision"] = "allow_with_risk"
+    if overlap_switch is not None and optimizer_state_partition is not None and bool(runtime.get("optimizer_cpu_offload")):
+        for item in (overlap_switch, optimizer_state_partition):
+            item.setdefault("soft_risks", []).append("cpu_optimizer_offload_can_reduce_state_partition_overlap_gain")
+            item.setdefault("verifier_reasons", []).append("cpu_optimizer_offload_can_reduce_state_partition_overlap_gain")
+            checks = dict(item.get("verifier_checks") or {})
+            checks["action_compatibility_check"] = {
+                "status": "risk",
+                "detail": "state-disaggregated optimizer overlap may require wider windows under CPU offload",
+            }
             item["verifier_checks"] = checks
             if str(item.get("verifier_decision") or "") == "allow":
                 item["verifier_decision"] = "allow_with_risk"
@@ -1769,6 +2105,7 @@ def _build_runtime_repair_plan(
         "chunk_priority_hints": {},
         "overlap_channels": [],
         "optimizer_runtime": {},
+        "recompute_runtime": {},
         "memory_intents": {},
         "state_plan_patch": {},
     }
@@ -1783,6 +2120,18 @@ def _build_runtime_repair_plan(
         aggregated_lowering["state_plan_patch"].update(dict(lowering.get("state_plan_patch") or {}))
         if dict(lowering.get("optimizer_runtime") or {}):
             aggregated_lowering["optimizer_runtime"].update(dict(lowering.get("optimizer_runtime") or {}))
+        if dict(lowering.get("recompute_runtime") or {}):
+            merged_recompute = dict(aggregated_lowering.get("recompute_runtime") or {})
+            merged_recompute.update(dict(lowering.get("recompute_runtime") or {}))
+            if isinstance(merged_recompute.get("recompute_modules"), list):
+                merged_recompute["recompute_modules"] = list(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in list(merged_recompute.get("recompute_modules") or [])
+                        if str(item).strip()
+                    )
+                )
+            aggregated_lowering["recompute_runtime"] = merged_recompute
         for stage_id, priorities in dict(lowering.get("chunk_priority_hints") or {}).items():
             existing = list(aggregated_lowering["chunk_priority_hints"].get(str(stage_id)) or [])
             aggregated_lowering["chunk_priority_hints"][str(stage_id)] = list(
@@ -1851,7 +2200,7 @@ def _optimizer_runtime_contract(program: MegatronProgram) -> Dict[str, Any]:
     mode = str(metadata.get("runtime_optimizer_policy_mode") or "").strip()
     if not mode:
         return {}
-    return {
+    contract = {
         "mode": mode,
         "target_policy": str(metadata.get("runtime_optimizer_target_policy") or "tail_stage_first").strip(),
         "chunk_scope": str(metadata.get("runtime_optimizer_chunk_scope") or "tail_only").strip(),
@@ -1862,7 +2211,67 @@ def _optimizer_runtime_contract(program: MegatronProgram) -> Dict[str, Any]:
         "enable_overlap_param_gather_with_optimizer_step": bool(
             metadata.get("runtime_enable_overlap_param_gather_with_optimizer_step", True)
         ),
+        "enable_optimizer_cpu_offload": bool(
+            metadata.get("runtime_enable_optimizer_cpu_offload", metadata.get("optimizer_cpu_offload", False))
+        ),
+        "optimizer_offload_fraction": float(
+            metadata.get("optimizer_offload_fraction", 0.0) or 0.0
+        ),
+        "use_torch_optimizer_for_cpu_offload": bool(
+            metadata.get("runtime_use_torch_optimizer_for_cpu_offload", True)
+        ),
+        "use_precision_aware_optimizer": bool(
+            metadata.get("runtime_use_precision_aware_optimizer", True)
+        ),
     }
+    state_partition_policy = str(metadata.get("runtime_optimizer_state_partition_policy") or "").strip().lower()
+    if state_partition_policy:
+        contract["state_partition_policy"] = state_partition_policy
+
+    for key, metadata_key, default_value in (
+        ("param_shard_group", "runtime_optimizer_param_shard_group", "dp_intra_node"),
+        ("grad_shard_group", "runtime_optimizer_grad_shard_group", "dp_global"),
+        ("opt_state_shard_group", "runtime_optimizer_opt_state_shard_group", "dp_hierarchical"),
+        ("param_owner_policy", "runtime_optimizer_param_owner_policy", "forward_critical_locality"),
+        ("opt_state_owner_policy", "runtime_optimizer_opt_state_owner_policy", "update_locality"),
+        ("optimizer_chunk_pipeline_mode", "runtime_optimizer_chunk_pipeline_mode", "h2d_update_writeback"),
+        ("optimizer_tail_aware_schedule", "runtime_optimizer_tail_aware_schedule", "cooldown_staggered_owner_local"),
+        ("optimizer_tail_barrier_policy", "runtime_optimizer_tail_barrier_policy", "late_commit_min_barrier"),
+    ):
+        value = str(metadata.get(metadata_key) or "").strip()
+        if value:
+            contract[key] = value
+        elif key in {"param_shard_group", "grad_shard_group", "opt_state_shard_group"} and state_partition_policy:
+            contract[key] = str(default_value)
+
+    if "runtime_optimizer_allow_owner_decoupling" in metadata:
+        contract["allow_owner_decoupling"] = bool(metadata.get("runtime_optimizer_allow_owner_decoupling"))
+
+    for key, metadata_key in (
+        ("optimizer_chunk_size_mb", "runtime_optimizer_chunk_size_mb"),
+        ("optimizer_pipeline_prefetch_depth", "runtime_optimizer_pipeline_prefetch_depth"),
+        ("optimizer_pipeline_writeback_depth", "runtime_optimizer_pipeline_writeback_depth"),
+    ):
+        raw = metadata.get(metadata_key)
+        if raw is None:
+            continue
+        try:
+            parsed = int(raw)
+        except Exception:
+            continue
+        if parsed > 0:
+            contract[key] = parsed
+
+    for key, metadata_key in (
+        ("opt_state_shard_hierarchy", "runtime_optimizer_state_shard_hierarchy"),
+        ("optimizer_state_family_policy", "runtime_optimizer_state_family_policy"),
+        ("optimizer_offload_family_policy", "runtime_optimizer_offload_family_policy"),
+        ("optimizer_offload_phase_policy", "runtime_optimizer_offload_phase_policy"),
+    ):
+        raw = metadata.get(metadata_key)
+        if isinstance(raw, dict) and raw:
+            contract[key] = copy.deepcopy(raw)
+    return contract
 
 
 def _estimate_grouped_interleave_overhead(program: MegatronProgram, bubble_ratio: float) -> float:
@@ -2129,6 +2538,42 @@ def _switch_penalty(program: MegatronProgram, previous_program: Optional[Megatro
     return penalty
 
 
+def _resolved_exposed_cost_weights(
+    program: MegatronProgram,
+    runtime_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
+    partition_opt = (program.partition_optimization or PartitionOptimizationSpec()).normalized()
+    merged_weights: Dict[str, float] = {
+        str(key): float(value)
+        for key, value in dict(partition_opt.exposed_cost_weights or {}).items()
+        if str(key).strip()
+    }
+    runtime_payload = _merged_runtime_payload(runtime_summary)
+    runtime_weights = dict(
+        runtime_payload.get("partition_exposed_cost_weights")
+        or runtime_payload.get("runtime_partition_exposed_cost_weights")
+        or {}
+    )
+    if runtime_weights:
+        merged_weights.update(
+            {
+                str(key): float(value)
+                for key, value in runtime_weights.items()
+                if str(key).strip()
+            }
+        )
+    alpha = max(float(merged_weights.get("alpha", 0.45) or 0.45), 0.0)
+    beta = max(float(merged_weights.get("beta", 0.25) or 0.25), 0.0)
+    gamma = max(float(merged_weights.get("gamma", 0.20) or 0.20), 0.0)
+    eta = max(float(merged_weights.get("eta", 0.10) or 0.10), 0.0)
+    return {
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "gamma": float(gamma),
+        "eta": float(eta),
+    }
+
+
 def _build_cost_model(
     program: MegatronProgram,
     *,
@@ -2164,17 +2609,26 @@ def _build_cost_model(
     )
     comm_pressure_score = max(stall_score, comm_exposure_ratio)
     vpp_tradeoff = assess_vpp_comm_tradeoff(norm, runtime_summary=runtime_summary)
-    switch_score = _switch_penalty(norm, previous_program)
-    total_score = (
-        0.45 * step_time_score
+    exposed_cost_weights = _resolved_exposed_cost_weights(norm, runtime_summary=runtime_summary)
+    fragmentation_component = max(float(-1.0 * float(vpp_tradeoff.get("veto_margin") or 0.0)), 0.0)
+    exposed_cost_score = (
+        float(exposed_cost_weights.get("alpha", 0.45)) * float(step_time_score)
         + 1000.0
         * (
-            0.25 * peak_pressure
-            + 0.15 * bubble_score
-            + 0.10 * comm_pressure_score
-            + 0.10 * tail_score
-            + 0.05 * memory_skew_score
-            + 0.05 * max(float(-1.0 * float(vpp_tradeoff.get("veto_margin") or 0.0)), 0.0)
+            float(exposed_cost_weights.get("beta", 0.25)) * float(comm_pressure_score)
+            + float(exposed_cost_weights.get("gamma", 0.20))
+            * float(max(tail_score, bubble_score))
+            + float(exposed_cost_weights.get("eta", 0.10))
+            * float(max(fragmentation_component, memory_skew_score))
+        )
+    )
+    switch_score = _switch_penalty(norm, previous_program)
+    total_score = (
+        float(exposed_cost_score)
+        + 1000.0
+        * (
+            0.22 * peak_pressure
+            + 0.05 * bubble_score
             + 0.05 * switch_score
         )
     )
@@ -2186,6 +2640,8 @@ def _build_cost_model(
         tail_score=tail_score,
         memory_skew_score=memory_skew_score,
         comm_pressure_score=comm_pressure_score,
+        exposed_cost_score=exposed_cost_score,
+        exposed_cost_weights=copy.deepcopy(exposed_cost_weights),
         switch_score=switch_score,
         vpp_veto_margin=float(vpp_tradeoff.get("veto_margin") or 0.0),
         total_score=total_score,
@@ -2208,9 +2664,15 @@ def classify_program_family(program: MegatronProgram) -> FamilyClassification:
     else:
         violated.append("single_plane")
 
-    if int(norm.parallel.vpp_degree) <= 1 and not norm.layout.pipeline_layout:
+    partition_opt = (norm.partition_optimization or PartitionOptimizationSpec()).normalized()
+    has_asymmetric_stage_vpp = bool(
+        partition_opt.stage_local_vpp_forward_vector
+        and partition_opt.stage_local_vpp_backward_vector
+        and list(partition_opt.stage_local_vpp_forward_vector) != list(partition_opt.stage_local_vpp_backward_vector)
+    )
+    if int(norm.parallel.vpp_degree) <= 1 and not norm.layout.pipeline_layout and not has_asymmetric_stage_vpp:
         tags.append("symmetric_vpp")
-    elif int(norm.parallel.vpp_degree) > 1 and not norm.layout.pipeline_layout:
+    elif int(norm.parallel.vpp_degree) > 1 and not norm.layout.pipeline_layout and not has_asymmetric_stage_vpp:
         tags.append("symmetric_vpp")
     else:
         violated.append("symmetric_vpp")
@@ -2996,6 +3458,10 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
             "estimated composite cost="
             f"{float((legality.cost_model or {}).get('total_score', 0.0)):.2f}"
         )
+        compile_notes.append(
+            "exposed_cost="
+            f"{float((legality.cost_model or {}).get('exposed_cost_score', 0.0)):.2f}"
+        )
     compile_notes.extend(_stateful_compile_notes(norm))
     compile_notes.append(
         "critical_path_risk="
@@ -3139,6 +3605,32 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     if overlap_channels:
         effective_comm_chunk_plan["runtime_overlap_channels"] = sorted(overlap_channels)
 
+    vpp_flow_policy_payload = copy.deepcopy(norm.vpp_flow.to_dict() if norm.vpp_flow is not None else {})
+    if vpp_flow_policy_payload:
+        vpp_flow_policy_payload.setdefault("compiled_from", {})
+        vpp_flow_policy_payload["compiled_from"].update(
+            {
+                "parallel": {
+                    "tp": int(norm.parallel.tp_degree),
+                    "pp": int(norm.parallel.pp_degree),
+                    "vpp": int(norm.parallel.vpp_degree),
+                    "sp": bool(norm.parallel.sp_enabled),
+                },
+                "pipeline_layout": str(norm.layout.pipeline_layout or ""),
+                "stage_local_vpp_vector": [int(item) for item in (norm.stage_local_vpp or [])],
+                "offload_plan_enabled": bool(effective_offload_plan.get("enabled", False)),
+                "reload_prefetch_window": int(effective_reload_plan.get("prefetch_window", 0) or 0),
+                "comm_chunk_level": str(effective_comm_chunk_plan.get("level") or ""),
+            }
+        )
+        compile_notes.append(
+            "vpp_flow_policy="
+            f"{'enabled' if bool(vpp_flow_policy_payload.get('enabled')) else 'disabled'} "
+            f"(chunks={len(vpp_flow_policy_payload.get('virtual_chunks') or [])}, "
+            f"lifecycle={len(vpp_flow_policy_payload.get('activation_lifecycle') or [])}, "
+            f"credits={len(vpp_flow_policy_payload.get('flow_credit_policy') or [])})"
+        )
+
     env: Dict[str, str] = {
         "RUN_TARGET": str(norm.cluster.target),
         "MODEL_TRACK": str(norm.model.track),
@@ -3174,6 +3666,13 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         "BACKEND_CAPS_IMPL": str(backend_caps.transformer_impl),
         "BACKEND_SUPPORTS_SEQUENCE_PARALLEL": "1" if backend_caps.supports_sequence_parallel else "0",
     }
+    if legality.cost_model:
+        env["EXPOSED_COST_SCORE"] = str(
+            float((legality.cost_model or {}).get("exposed_cost_score") or 0.0)
+        )
+        exposed_weights = dict((legality.cost_model or {}).get("exposed_cost_weights") or {})
+        if exposed_weights:
+            env["EXPOSED_COST_WEIGHTS"] = json.dumps(exposed_weights, ensure_ascii=False)
     if runtime_repair_plan:
         env["RUNTIME_REPAIR_DSL_VERSION"] = str(runtime_repair_plan.get("dsl_version") or "v3_runtime_semantics")
         env["RUNTIME_REPAIR_SUMMARY"] = json.dumps(runtime_repair_plan.get("summary") or {}, ensure_ascii=False)
@@ -3239,6 +3738,20 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     env["SCHEDULE_OVERLAP_HINTS"] = json.dumps(effective_overlap_spec.to_dict(), ensure_ascii=False)
     env["SCHEDULE_MEMORY_HINTS"] = json.dumps(effective_memory_spec.to_dict(), ensure_ascii=False)
     env["SCHEDULE_PARTITION_HINTS"] = json.dumps(partition_optimization.to_dict(), ensure_ascii=False)
+    stage_local_vpp_fwd = list(partition_optimization.stage_local_vpp_forward_vector or [])
+    stage_local_vpp_bwd = list(partition_optimization.stage_local_vpp_backward_vector or [])
+    if stage_local_vpp_fwd:
+        env["STAGE_LOCAL_VPP_FWD_VECTOR"] = json.dumps(
+            [int(item) for item in stage_local_vpp_fwd], ensure_ascii=False
+        )
+    if stage_local_vpp_bwd:
+        env["STAGE_LOCAL_VPP_BWD_VECTOR"] = json.dumps(
+            [int(item) for item in stage_local_vpp_bwd], ensure_ascii=False
+        )
+    if stage_local_vpp_fwd and stage_local_vpp_bwd:
+        env["PARTITION_VPP_ASYMMETRIC"] = (
+            "1" if list(stage_local_vpp_fwd) != list(stage_local_vpp_bwd) else "0"
+        )
     env["SCHEDULE_GRID_SPEC"] = json.dumps(materialized_schedule_grid.to_dict(), ensure_ascii=False)
     env["SCHEDULE_ACTION_SPECS"] = json.dumps([item.to_dict() for item in derived_actions], ensure_ascii=False)
     env["ENABLE_STATEFUL_SCHEDULE"] = "1"
@@ -3250,6 +3763,12 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
     env["OFFLOAD_PLAN"] = json.dumps(effective_offload_plan, ensure_ascii=False)
     env["RELOAD_PLAN"] = json.dumps(effective_reload_plan, ensure_ascii=False)
     env["COMM_CHUNK_PLAN"] = json.dumps(effective_comm_chunk_plan, ensure_ascii=False)
+    if vpp_flow_policy_payload:
+        env["ENABLE_VPP_FLOW_RUNTIME"] = "1" if bool(vpp_flow_policy_payload.get("enabled")) else "0"
+        env["VPP_FLOW_POLICY"] = json.dumps(vpp_flow_policy_payload, ensure_ascii=False)
+        env["VPP_FLOW_OBJECTIVE"] = str(vpp_flow_policy_payload.get("objective") or "")
+        exposed_cost = dict(vpp_flow_policy_payload.get("exposed_cost") or {})
+        env["VPP_FLOW_EXPOSED_COST_MS"] = str(float(exposed_cost.get("total_exposed_ms", 0.0) or 0.0))
     env["TELEMETRY_BUDGET"] = json.dumps(stateful_plan.get("telemetry_budget") or {}, ensure_ascii=False)
     env["WINDOW_RECONFIG_PLAN"] = json.dumps(stateful_plan.get("window_reconfig") or {}, ensure_ascii=False)
     env["WINDOW_FEEDBACK_PLAN"] = json.dumps(
@@ -3272,6 +3791,12 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
             env["SCHEDULE_WARMUP_POLICY"] = str(runtime_phase_policy.get("warmup_policy"))
         if str(runtime_phase_policy.get("cooldown_policy") or "").strip() and "SCHEDULE_COOLDOWN_POLICY" not in env:
             env["SCHEDULE_COOLDOWN_POLICY"] = str(runtime_phase_policy.get("cooldown_policy"))
+    runtime_edge_lane_policy = dict((norm.metadata or {}).get("runtime_edge_lane_policy") or {})
+    if runtime_edge_lane_policy:
+        env["SCHEDULE_EDGE_LANE_POLICY"] = json.dumps(runtime_edge_lane_policy, ensure_ascii=False)
+    runtime_spill_window_policy = dict((norm.metadata or {}).get("runtime_spill_window_policy") or {})
+    if runtime_spill_window_policy:
+        env["SCHEDULE_SPILL_WINDOW_POLICY"] = json.dumps(runtime_spill_window_policy, ensure_ascii=False)
     schedule_warmup_checkpoint_policy = str(
         (norm.metadata or {}).get("schedule_warmup_checkpoint_policy") or ""
     ).strip()
@@ -3312,14 +3837,33 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         or strategy.recompute_granularity
         or ""
     ).strip()
+    aggregated_recompute_runtime = dict(runtime_repair_aggregated.get("recompute_runtime") or {})
+    if not runtime_recompute_granularity:
+        runtime_recompute_granularity = str(
+            aggregated_recompute_runtime.get("recompute_granularity") or ""
+        ).strip()
+    runtime_enable_recompute_activations = bool(
+        (norm.metadata or {}).get("runtime_enable_recompute_activations", True)
+    )
+    if "enable_recompute_activations" in aggregated_recompute_runtime:
+        runtime_enable_recompute_activations = bool(
+            aggregated_recompute_runtime.get("enable_recompute_activations")
+        )
     if runtime_recompute_granularity:
         env["RECOMPUTE_GRANULARITY"] = runtime_recompute_granularity
         env["ENABLE_RECOMPUTE_ACTIVATIONS"] = (
             "1"
-            if bool((norm.metadata or {}).get("runtime_enable_recompute_activations", True))
+            if runtime_enable_recompute_activations
             else "0"
         )
     runtime_recompute_modules = (norm.metadata or {}).get("runtime_recompute_modules")
+    if not runtime_recompute_modules and isinstance(
+        aggregated_recompute_runtime.get("recompute_modules"),
+        list,
+    ):
+        runtime_recompute_modules = list(
+            aggregated_recompute_runtime.get("recompute_modules") or []
+        )
     if isinstance(runtime_recompute_modules, list):
         parsed = []
         for item in runtime_recompute_modules:
@@ -3382,10 +3926,78 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         env["ENABLE_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"] = (
             "1" if bool(optimizer_runtime["enable_overlap_param_gather_with_optimizer_step"]) else "0"
         )
+        if "enable_optimizer_cpu_offload" in optimizer_runtime:
+            env["ENABLE_OPTIMIZER_CPU_OFFLOAD"] = (
+                "1" if bool(optimizer_runtime.get("enable_optimizer_cpu_offload")) else "0"
+            )
+        if "optimizer_offload_fraction" in optimizer_runtime:
+            env["OPTIMIZER_OFFLOAD_FRACTION"] = str(
+                float(optimizer_runtime.get("optimizer_offload_fraction") or 0.0)
+            )
+        if "use_torch_optimizer_for_cpu_offload" in optimizer_runtime:
+            env["USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD"] = (
+                "1" if bool(optimizer_runtime.get("use_torch_optimizer_for_cpu_offload")) else "0"
+            )
+        if "use_precision_aware_optimizer" in optimizer_runtime:
+            env["USE_PRECISION_AWARE_OPTIMIZER"] = (
+                "1" if bool(optimizer_runtime.get("use_precision_aware_optimizer")) else "0"
+            )
         env["SCHEDULE_OPTIMIZER_RUNTIME_MODE"] = str(optimizer_runtime["mode"])
         env["SCHEDULE_OPTIMIZER_TARGET_POLICY"] = str(optimizer_runtime["target_policy"])
         env["SCHEDULE_OPTIMIZER_CHUNK_SCOPE"] = str(optimizer_runtime["chunk_scope"])
         env["SCHEDULE_OPTIMIZER_WINDOW_POLICY"] = str(optimizer_runtime["window_policy"])
+        if str(optimizer_runtime.get("state_partition_policy") or "").strip():
+            env["OPTIMIZER_STATE_PARTITION_POLICY"] = str(optimizer_runtime.get("state_partition_policy") or "")
+        if str(optimizer_runtime.get("param_shard_group") or "").strip():
+            env["OPTIMIZER_PARAM_SHARD_GROUP"] = str(optimizer_runtime.get("param_shard_group") or "")
+        if str(optimizer_runtime.get("grad_shard_group") or "").strip():
+            env["OPTIMIZER_GRAD_SHARD_GROUP"] = str(optimizer_runtime.get("grad_shard_group") or "")
+        if str(optimizer_runtime.get("opt_state_shard_group") or "").strip():
+            env["OPTIMIZER_STATE_SHARD_GROUP"] = str(optimizer_runtime.get("opt_state_shard_group") or "")
+        if "allow_owner_decoupling" in optimizer_runtime:
+            env["OPTIMIZER_ALLOW_OWNER_DECOUPLING"] = (
+                "1" if bool(optimizer_runtime.get("allow_owner_decoupling")) else "0"
+            )
+        if str(optimizer_runtime.get("param_owner_policy") or "").strip():
+            env["OPTIMIZER_PARAM_OWNER_POLICY"] = str(optimizer_runtime.get("param_owner_policy") or "")
+        if str(optimizer_runtime.get("opt_state_owner_policy") or "").strip():
+            env["OPTIMIZER_STATE_OWNER_POLICY"] = str(optimizer_runtime.get("opt_state_owner_policy") or "")
+        if _safe_float(optimizer_runtime.get("optimizer_chunk_size_mb")) is not None:
+            try:
+                chunk_size = int(float(optimizer_runtime.get("optimizer_chunk_size_mb") or 0.0))
+            except Exception:
+                chunk_size = 0
+            if chunk_size > 0:
+                env["OPTIMIZER_CHUNK_SIZE_MB"] = str(chunk_size)
+        if _safe_float(optimizer_runtime.get("optimizer_pipeline_prefetch_depth")) is not None:
+            try:
+                prefetch_depth = int(float(optimizer_runtime.get("optimizer_pipeline_prefetch_depth") or 0.0))
+            except Exception:
+                prefetch_depth = 0
+            if prefetch_depth > 0:
+                env["OPTIMIZER_PIPELINE_PREFETCH_DEPTH"] = str(prefetch_depth)
+        if _safe_float(optimizer_runtime.get("optimizer_pipeline_writeback_depth")) is not None:
+            try:
+                writeback_depth = int(float(optimizer_runtime.get("optimizer_pipeline_writeback_depth") or 0.0))
+            except Exception:
+                writeback_depth = 0
+            if writeback_depth > 0:
+                env["OPTIMIZER_PIPELINE_WRITEBACK_DEPTH"] = str(writeback_depth)
+        if str(optimizer_runtime.get("optimizer_chunk_pipeline_mode") or "").strip():
+            env["OPTIMIZER_CHUNK_PIPELINE_MODE"] = str(optimizer_runtime.get("optimizer_chunk_pipeline_mode") or "")
+        if str(optimizer_runtime.get("optimizer_tail_aware_schedule") or "").strip():
+            env["OPTIMIZER_TAIL_AWARE_SCHEDULE"] = str(optimizer_runtime.get("optimizer_tail_aware_schedule") or "")
+        if str(optimizer_runtime.get("optimizer_tail_barrier_policy") or "").strip():
+            env["OPTIMIZER_TAIL_BARRIER_POLICY"] = str(optimizer_runtime.get("optimizer_tail_barrier_policy") or "")
+        for key, env_key in (
+            ("opt_state_shard_hierarchy", "OPTIMIZER_STATE_SHARD_HIERARCHY"),
+            ("optimizer_state_family_policy", "OPTIMIZER_STATE_FAMILY_POLICY"),
+            ("optimizer_offload_family_policy", "OPTIMIZER_OFFLOAD_FAMILY_POLICY"),
+            ("optimizer_offload_phase_policy", "OPTIMIZER_OFFLOAD_PHASE_POLICY"),
+        ):
+            payload = optimizer_runtime.get(key)
+            if isinstance(payload, dict) and payload:
+                env[env_key] = json.dumps(payload, ensure_ascii=False)
     if runtime_window_overrides:
         encoded_window_overrides = _encode_runtime_window_overrides(runtime_window_overrides)
         if encoded_window_overrides:
@@ -3598,4 +4210,5 @@ def compile_program(program: MegatronProgram, target: Optional[str] = None) -> C
         ).to_dict(),
         stateful_plan_notes=list(_stateful_compile_notes(norm)),
         runtime_repair_plan=copy.deepcopy(runtime_repair_plan),
+        vpp_flow_policy=copy.deepcopy(vpp_flow_policy_payload),
     )

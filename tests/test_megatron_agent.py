@@ -1557,6 +1557,162 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertIn("SCHEDULE_EDGE_LANE_POLICY", compiled.launcher_env)
         self.assertIn("SCHEDULE_SPILL_WINDOW_POLICY", compiled.launcher_env)
 
+    def test_compile_program_exports_vpp_flow_policy(self) -> None:
+        from megatron_agent.config import PartitionOptimizationSpec
+
+        program = default_dense_program("single_g5").normalized()
+        program.parallel.pp_degree = 2
+        program.parallel.vpp_degree = 2
+        program.layout.vpp_degree = 2
+        program.partition_optimization = PartitionOptimizationSpec(
+            partition_mode="nonuniform",
+            allow_nonuniform_partition=True,
+            stage_layer_counts=[20, 20],
+            stage_local_vpp_vector=[2, 1],
+        )
+        program.metadata["enable_vpp_flow"] = True
+        program.metadata["vpp_flow_memory_pressure_threshold"] = 0.01
+        program.metadata["stage_local_vpp_vector"] = [2, 1]
+
+        compiled = compile_program(program)
+        self.assertEqual(compiled.launcher_env["ENABLE_VPP_FLOW_RUNTIME"], "1")
+        policy = json.loads(compiled.launcher_env["VPP_FLOW_POLICY"])
+        self.assertTrue(policy["enabled"])
+        self.assertEqual(policy["objective"], "minimize_exposed_critical_path")
+        self.assertTrue(policy["virtual_chunks"])
+        self.assertTrue(policy["activation_lifecycle"])
+        self.assertTrue(policy["flow_credit_policy"])
+        self.assertEqual(policy["constraints"]["stage_local_vpp_vector"], [2, 1])
+        self.assertEqual(compiled.vpp_flow_policy["policy_version"], "vpp_flow_v1")
+        restored = type(program).from_dict(program.to_dict()).normalized()
+        self.assertIsNotNone(restored.vpp_flow)
+        self.assertTrue(restored.vpp_flow.virtual_chunks)
+
+    def test_file_backed_launcher_env_supports_vpp_flow_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            materialized = trial_runner._materialize_file_backed_launcher_env(
+                {"VPP_FLOW_POLICY": json.dumps({"enabled": True, "virtual_chunks": []})},
+                tmpdir,
+            )
+
+            self.assertNotIn("VPP_FLOW_POLICY", materialized)
+            self.assertIn("VPP_FLOW_POLICY_FILE", materialized)
+            payload = json.loads(Path(materialized["VPP_FLOW_POLICY_FILE"]).read_text(encoding="utf-8"))
+            self.assertTrue(payload["enabled"])
+
+    def test_schedule_runtime_hints_read_file_backed_vpp_flow_policy(self) -> None:
+        from megatron.core.pipeline_parallel.schedules import _parse_schedule_runtime_hints
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy_path = Path(tmpdir) / "vpp_flow_policy.json"
+            policy_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "virtual_chunks": [{"chunk_id": "s0v0", "stage_id": 0, "memory_pressure": 0.5}],
+                        "activation_lifecycle": [{"chunk_id": "s0v0", "stage_id": 0, "policy": "resident"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"VPP_FLOW_POLICY_FILE": str(policy_path)}, clear=False):
+                hints = _parse_schedule_runtime_hints()
+
+        self.assertTrue(hints["vpp_flow_policy"]["enabled"])
+        self.assertEqual(hints["vpp_flow_policy"]["virtual_chunks"][0]["chunk_id"], "s0v0")
+
+    def test_vpp_flow_runtime_reorders_reload_sensitive_chunks(self) -> None:
+        from megatron.core.pipeline_parallel import schedules
+
+        policy = {
+            "enabled": True,
+            "virtual_chunks": [
+                {"chunk_id": "s0v0", "stage_id": 0, "local_vchunk_id": 0, "memory_pressure": 0.1},
+                {"chunk_id": "s0v1", "stage_id": 0, "local_vchunk_id": 1, "memory_pressure": 0.2},
+                {"chunk_id": "s0v2", "stage_id": 0, "local_vchunk_id": 2, "memory_pressure": 0.8},
+            ],
+            "activation_lifecycle": [
+                {"chunk_id": "s0v0", "stage_id": 0, "microbatch_class": "stable", "phase": "steady", "policy": "resident"},
+                {"chunk_id": "s0v1", "stage_id": 0, "microbatch_class": "stable", "phase": "steady", "policy": "resident"},
+                {"chunk_id": "s0v2", "stage_id": 0, "microbatch_class": "stable", "phase": "steady", "policy": "offload"},
+            ],
+            "flow_credit_policy": [
+                {"resource": "h2d", "priority_order": ["near_deadline_reload", "normal_reload"]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_VPP_FLOW_RUNTIME": "1", "VPP_FLOW_POLICY": json.dumps(policy)}, clear=False):
+            with mock.patch.object(schedules, "_pipeline_parallel_location", return_value=(0, 2)):
+                order = schedules._resolve_model_chunk_order(
+                    3,
+                    template="interleaved",
+                    dispatch_order="",
+                    phase="steady",
+                    warmup_policy="",
+                    cooldown_policy="",
+                    group_index=1,
+                    num_groups=3,
+                    local_stage_hint={},
+                )
+
+        self.assertEqual(order[0], 2)
+
+    def test_vpp_flow_memory_action_applies_lifecycle_policy(self) -> None:
+        from megatron.core.pipeline_parallel import schedules
+
+        runtime_policy = {
+            "local_stage_index": 0,
+            "state_migration_hints": [],
+            "local_stage_hint": {},
+            "vpp_flow_policy": {
+                "enabled": True,
+                "virtual_chunks": [
+                    {"chunk_id": "s0v0", "stage_id": 0, "local_vchunk_id": 0},
+                    {"chunk_id": "s0v1", "stage_id": 0, "local_vchunk_id": 1},
+                ],
+                "activation_lifecycle": [
+                    {"chunk_id": "s0v0", "stage_id": 0, "microbatch_class": "stable", "phase": "steady", "policy": "resident"},
+                    {
+                        "chunk_id": "s0v1",
+                        "stage_id": 0,
+                        "microbatch_class": "stable",
+                        "phase": "steady",
+                        "policy": "offload",
+                        "prefetch_distance": 3,
+                    },
+                ],
+                "flow_credit_policy": [{"resource": "h2d", "priority_order": ["near_deadline_reload"]}],
+            },
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_VPP_FLOW_RUNTIME": "1"}, clear=False):
+            with mock.patch.object(schedules, "fine_grained_offloading_disable_offload") as disable_offload:
+                event = schedules._execute_memory_action_hook(
+                    runtime_policy,
+                    {
+                        "trigger_hook": "before_forward_hook",
+                        "microbatch_id": 2,
+                        "vchunk_id": 0,
+                        "phase": "steady",
+                        "fine_grained_activation_offloading": True,
+                    },
+                )
+        disable_offload.assert_called_once()
+        self.assertIn("vpp_flow_resident_guard", event["applied_actions"])
+
+        with mock.patch.dict(os.environ, {"ENABLE_VPP_FLOW_RUNTIME": "1"}, clear=False):
+            with mock.patch.object(schedules, "fine_grained_offloading_prefetch", return_value=2) as prefetch:
+                event = schedules._execute_memory_action_hook(
+                    runtime_policy,
+                    {
+                        "trigger_hook": "before_backward_hook",
+                        "microbatch_id": 2,
+                        "vchunk_id": 1,
+                        "phase": "steady",
+                        "fine_grained_activation_offloading": True,
+                    },
+                )
+        prefetch.assert_called_once_with(distance_slots=3)
+        self.assertEqual(event["prefetched_groups"], 2)
+
     def test_runtime_guided_partition_plan_emits_exposed_components(self) -> None:
         runtime_summary = {
             "stage_window_summary": {
@@ -3319,6 +3475,37 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         self.assertEqual(panel.total_span_ms, 480.0)
         self.assertEqual(len(panel.lane_summaries), 2)
         self.assertEqual(len(panel.events), 2)
+
+    def test_pipeline_visualization_collapses_duplicate_stage_lanes(self) -> None:
+        payload = {
+            "format": "pipeline_event_trace",
+            "summary": {"schedule_template": "fixed_1f1b", "projected_timeline_span_ms": 200.0},
+            "lane_summaries": [
+                {"stage_id": 0, "peak_reserved_gib": 7.0},
+                {"stage_id": 0, "peak_reserved_gib": 8.0},
+                {"stage_id": 1, "peak_reserved_gib": 6.5},
+                {"stage_id": 1, "peak_reserved_gib": 6.0},
+            ],
+            "events": [
+                {"stage_id": 0, "op_kind": "fwd", "label": "F0:0", "start_ms": 0.0, "duration_ms": 20.0, "end_ms": 20.0},
+                {"stage_id": 1, "op_kind": "bwd", "label": "B0:0", "start_ms": 80.0, "duration_ms": 25.0, "end_ms": 105.0},
+            ],
+        }
+        panels = prepare_pipeline_timeline_panels([payload])
+        self.assertEqual(len(panels), 1)
+        self.assertEqual(len(panels[0].lane_summaries), 2)
+        self.assertEqual(float(panels[0].lane_summaries[0]["peak_reserved_gib"]), 8.0)
+        self.assertEqual(int(panels[0].lane_summaries[0]["replica_count"]), 2)
+
+    def test_pipeline_visualization_rejects_empty_runtime_trace(self) -> None:
+        payload = {
+            "format": "pipeline_event_trace",
+            "summary": {"schedule_template": "fixed_1f1b", "projected_timeline_span_ms": 1.0},
+            "lane_summaries": [{"stage_id": 0, "peak_reserved_gib": 0.0}],
+            "events": [],
+        }
+        with self.assertRaises(ValueError):
+            prepare_pipeline_timeline_panels([payload])
 
     def test_verify_program_returns_structured_verifier_report(self) -> None:
         program = default_dense_program("single_g5")

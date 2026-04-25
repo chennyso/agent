@@ -707,6 +707,9 @@ class PartitionOptimizationSpec:
     allow_nonuniform_partition: bool = False
     stage_layer_counts: List[int] = field(default_factory=list)
     stage_local_vpp_vector: List[int] = field(default_factory=list)
+    stage_local_vpp_forward_vector: List[int] = field(default_factory=list)
+    stage_local_vpp_backward_vector: List[int] = field(default_factory=list)
+    exposed_cost_weights: Dict[str, float] = field(default_factory=dict)
     preferred_boundary_modules: List[str] = field(default_factory=list)
     anti_boundary_modules: List[str] = field(default_factory=list)
     asymmetry_notes: List[str] = field(default_factory=list)
@@ -717,6 +720,23 @@ class PartitionOptimizationSpec:
         norm.allow_nonuniform_partition = bool(norm.allow_nonuniform_partition)
         norm.stage_layer_counts = [max(int(item), 0) for item in (norm.stage_layer_counts or [])]
         norm.stage_local_vpp_vector = [max(int(item), 1) for item in (norm.stage_local_vpp_vector or [])]
+        norm.stage_local_vpp_forward_vector = [max(int(item), 1) for item in (norm.stage_local_vpp_forward_vector or [])]
+        norm.stage_local_vpp_backward_vector = [max(int(item), 1) for item in (norm.stage_local_vpp_backward_vector or [])]
+        if not norm.stage_local_vpp_forward_vector and norm.stage_local_vpp_vector:
+            norm.stage_local_vpp_forward_vector = list(norm.stage_local_vpp_vector)
+        if not norm.stage_local_vpp_backward_vector and norm.stage_local_vpp_vector:
+            norm.stage_local_vpp_backward_vector = list(norm.stage_local_vpp_vector)
+        raw_weights = dict(norm.exposed_cost_weights or {})
+        alpha = max(float(raw_weights.get("alpha", 0.45) or 0.45), 0.0)
+        beta = max(float(raw_weights.get("beta", 0.25) or 0.25), 0.0)
+        gamma = max(float(raw_weights.get("gamma", 0.20) or 0.20), 0.0)
+        eta = max(float(raw_weights.get("eta", 0.10) or 0.10), 0.0)
+        norm.exposed_cost_weights = {
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "gamma": float(gamma),
+            "eta": float(eta),
+        }
         norm.preferred_boundary_modules = [str(item) for item in (norm.preferred_boundary_modules or []) if str(item).strip()]
         norm.anti_boundary_modules = [str(item) for item in (norm.anti_boundary_modules or []) if str(item).strip()]
         norm.asymmetry_notes = [str(item) for item in (norm.asymmetry_notes or []) if str(item).strip()]
@@ -729,6 +749,9 @@ class PartitionOptimizationSpec:
             "allow_nonuniform_partition": bool(norm.allow_nonuniform_partition),
             "stage_layer_counts": list(norm.stage_layer_counts),
             "stage_local_vpp_vector": list(norm.stage_local_vpp_vector),
+            "stage_local_vpp_forward_vector": list(norm.stage_local_vpp_forward_vector),
+            "stage_local_vpp_backward_vector": list(norm.stage_local_vpp_backward_vector),
+            "exposed_cost_weights": copy.deepcopy(norm.exposed_cost_weights),
             "preferred_boundary_modules": list(norm.preferred_boundary_modules),
             "anti_boundary_modules": list(norm.anti_boundary_modules),
             "asymmetry_notes": list(norm.asymmetry_notes),
@@ -741,6 +764,12 @@ class PartitionOptimizationSpec:
             allow_nonuniform_partition=bool(payload.get("allow_nonuniform_partition", False)),
             stage_layer_counts=[int(item) for item in (payload.get("stage_layer_counts") or [])],
             stage_local_vpp_vector=[int(item) for item in (payload.get("stage_local_vpp_vector") or [])],
+            stage_local_vpp_forward_vector=[int(item) for item in (payload.get("stage_local_vpp_forward_vector") or [])],
+            stage_local_vpp_backward_vector=[int(item) for item in (payload.get("stage_local_vpp_backward_vector") or [])],
+            exposed_cost_weights={
+                str(key): float(value)
+                for key, value in dict(payload.get("exposed_cost_weights") or {}).items()
+            },
             preferred_boundary_modules=[str(item) for item in (payload.get("preferred_boundary_modules") or [])],
             anti_boundary_modules=[str(item) for item in (payload.get("anti_boundary_modules") or [])],
             asymmetry_notes=[str(item) for item in (payload.get("asymmetry_notes") or [])],
@@ -1350,6 +1379,300 @@ class StatePlanSpec:
 
 
 @dataclass
+class VPPFlowVirtualChunkSpec:
+    chunk_id: str
+    stage_id: int
+    local_vchunk_id: int
+    layer_group_ids: List[str] = field(default_factory=list)
+    device_group: str = ""
+    lifecycle_unit: str = "activation"
+    compute_ms: float = 0.0
+    activation_mb: float = 0.0
+    boundary_comm_ms: float = 0.0
+    reload_cost_ms: float = 0.0
+    offload_cost_ms: float = 0.0
+    memory_pressure: float = 0.0
+    priority: int = 0
+
+    def normalized(self) -> "VPPFlowVirtualChunkSpec":
+        norm = copy.deepcopy(self)
+        norm.chunk_id = str(norm.chunk_id or f"s{int(norm.stage_id)}v{int(norm.local_vchunk_id)}")
+        norm.stage_id = max(int(norm.stage_id or 0), 0)
+        norm.local_vchunk_id = max(int(norm.local_vchunk_id or 0), 0)
+        norm.layer_group_ids = [str(item) for item in (norm.layer_group_ids or []) if str(item).strip()]
+        norm.device_group = str(norm.device_group or f"pp{norm.stage_id}")
+        norm.lifecycle_unit = str(norm.lifecycle_unit or "activation")
+        norm.compute_ms = max(float(norm.compute_ms or 0.0), 0.0)
+        norm.activation_mb = max(float(norm.activation_mb or 0.0), 0.0)
+        norm.boundary_comm_ms = max(float(norm.boundary_comm_ms or 0.0), 0.0)
+        norm.reload_cost_ms = max(float(norm.reload_cost_ms or 0.0), 0.0)
+        norm.offload_cost_ms = max(float(norm.offload_cost_ms or 0.0), 0.0)
+        norm.memory_pressure = max(float(norm.memory_pressure or 0.0), 0.0)
+        norm.priority = max(int(norm.priority or 0), 0)
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "chunk_id": norm.chunk_id,
+            "stage_id": int(norm.stage_id),
+            "local_vchunk_id": int(norm.local_vchunk_id),
+            "layer_group_ids": list(norm.layer_group_ids),
+            "device_group": norm.device_group,
+            "lifecycle_unit": norm.lifecycle_unit,
+            "compute_ms": float(norm.compute_ms),
+            "activation_mb": float(norm.activation_mb),
+            "boundary_comm_ms": float(norm.boundary_comm_ms),
+            "reload_cost_ms": float(norm.reload_cost_ms),
+            "offload_cost_ms": float(norm.offload_cost_ms),
+            "memory_pressure": float(norm.memory_pressure),
+            "priority": int(norm.priority),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VPPFlowVirtualChunkSpec":
+        return cls(
+            chunk_id=str(payload.get("chunk_id") or ""),
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            local_vchunk_id=int(payload.get("local_vchunk_id", 0) or 0),
+            layer_group_ids=[str(item) for item in (payload.get("layer_group_ids") or [])],
+            device_group=str(payload.get("device_group") or ""),
+            lifecycle_unit=str(payload.get("lifecycle_unit") or "activation"),
+            compute_ms=float(payload.get("compute_ms", 0.0) or 0.0),
+            activation_mb=float(payload.get("activation_mb", 0.0) or 0.0),
+            boundary_comm_ms=float(payload.get("boundary_comm_ms", 0.0) or 0.0),
+            reload_cost_ms=float(payload.get("reload_cost_ms", 0.0) or 0.0),
+            offload_cost_ms=float(payload.get("offload_cost_ms", 0.0) or 0.0),
+            memory_pressure=float(payload.get("memory_pressure", 0.0) or 0.0),
+            priority=int(payload.get("priority", 0) or 0),
+        )
+
+
+@dataclass
+class VPPFlowActivationPolicySpec:
+    stage_id: int
+    chunk_id: str
+    microbatch_class: str = "stable"
+    phase: str = "steady"
+    family: str = "activation"
+    policy: str = "resident"
+    prefetch_distance: int = 1
+    reload_deadline_slot: int = 0
+    forbid_tail_reload: bool = False
+    rationale: str = ""
+
+    def normalized(self) -> "VPPFlowActivationPolicySpec":
+        norm = copy.deepcopy(self)
+        norm.stage_id = max(int(norm.stage_id or 0), 0)
+        norm.chunk_id = str(norm.chunk_id or f"s{norm.stage_id}v0")
+        norm.microbatch_class = str(norm.microbatch_class or "stable").strip().lower() or "stable"
+        if norm.microbatch_class not in {"stable", "edge"}:
+            norm.microbatch_class = "stable"
+        norm.phase = str(norm.phase or "steady").strip().lower() or "steady"
+        if norm.phase not in {"warmup", "steady", "cooldown"}:
+            norm.phase = "steady"
+        norm.family = str(norm.family or "activation").strip().lower() or "activation"
+        norm.policy = str(norm.policy or "resident").strip().lower() or "resident"
+        if norm.policy not in {"resident", "offload", "reload", "recompute"}:
+            norm.policy = "resident"
+        norm.prefetch_distance = max(int(norm.prefetch_distance or 0), 0)
+        norm.reload_deadline_slot = max(int(norm.reload_deadline_slot or 0), 0)
+        norm.forbid_tail_reload = bool(norm.forbid_tail_reload)
+        norm.rationale = str(norm.rationale or "")
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "stage_id": int(norm.stage_id),
+            "chunk_id": norm.chunk_id,
+            "microbatch_class": norm.microbatch_class,
+            "phase": norm.phase,
+            "family": norm.family,
+            "policy": norm.policy,
+            "prefetch_distance": int(norm.prefetch_distance),
+            "reload_deadline_slot": int(norm.reload_deadline_slot),
+            "forbid_tail_reload": bool(norm.forbid_tail_reload),
+            "rationale": norm.rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VPPFlowActivationPolicySpec":
+        return cls(
+            stage_id=int(payload.get("stage_id", 0) or 0),
+            chunk_id=str(payload.get("chunk_id") or ""),
+            microbatch_class=str(payload.get("microbatch_class") or "stable"),
+            phase=str(payload.get("phase") or "steady"),
+            family=str(payload.get("family") or "activation"),
+            policy=str(payload.get("policy") or "resident"),
+            prefetch_distance=int(payload.get("prefetch_distance", 1) or 1),
+            reload_deadline_slot=int(payload.get("reload_deadline_slot", 0) or 0),
+            forbid_tail_reload=bool(payload.get("forbid_tail_reload", False)),
+            rationale=str(payload.get("rationale") or ""),
+        )
+
+
+@dataclass
+class VPPFlowCreditPolicySpec:
+    resource: str = "h2d"
+    capacity: int = 1
+    priority_order: List[str] = field(default_factory=list)
+    watermark_policy: Dict[str, Any] = field(default_factory=dict)
+    notes: str = ""
+
+    def normalized(self) -> "VPPFlowCreditPolicySpec":
+        norm = copy.deepcopy(self)
+        norm.resource = str(norm.resource or "h2d").strip().lower() or "h2d"
+        norm.capacity = max(int(norm.capacity or 1), 1)
+        default_order = [
+            "near_deadline_reload",
+            "cross_node_boundary_send",
+            "normal_send",
+            "normal_reload",
+            "d2h_offload",
+        ]
+        norm.priority_order = [
+            str(item).strip()
+            for item in (norm.priority_order or default_order)
+            if str(item).strip()
+        ] or default_order
+        norm.watermark_policy = copy.deepcopy(norm.watermark_policy or {})
+        norm.notes = str(norm.notes or "")
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "resource": norm.resource,
+            "capacity": int(norm.capacity),
+            "priority_order": list(norm.priority_order),
+            "watermark_policy": copy.deepcopy(norm.watermark_policy),
+            "notes": norm.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VPPFlowCreditPolicySpec":
+        return cls(
+            resource=str(payload.get("resource") or "h2d"),
+            capacity=int(payload.get("capacity", 1) or 1),
+            priority_order=[str(item) for item in (payload.get("priority_order") or [])],
+            watermark_policy=copy.deepcopy(payload.get("watermark_policy") or {}),
+            notes=str(payload.get("notes") or ""),
+        )
+
+
+@dataclass
+class VPPFlowExposedCostSpec:
+    terms: Dict[str, float] = field(default_factory=dict)
+    weights: Dict[str, float] = field(default_factory=dict)
+    total_exposed_ms: float = 0.0
+    dominant_term: str = ""
+
+    def normalized(self) -> "VPPFlowExposedCostSpec":
+        norm = copy.deepcopy(self)
+        norm.terms = {str(key): max(float(value or 0.0), 0.0) for key, value in (norm.terms or {}).items()}
+        default_weights = {
+            "stage_exposed_ms": 1.0,
+            "comm_exposed_ms": 1.0,
+            "reload_stall_ms": 1.0,
+            "copy_stall_ms": 0.6,
+            "uncovered_bubble_ms": 0.8,
+            "optimizer_tail_ms": 0.7,
+            "straggler_penalty_ms": 0.8,
+        }
+        norm.weights = {
+            str(key): max(float(value or 0.0), 0.0)
+            for key, value in ({**default_weights, **(norm.weights or {})}).items()
+        }
+        if norm.total_exposed_ms <= 0.0:
+            norm.total_exposed_ms = sum(
+                float(norm.terms.get(key, 0.0)) * float(norm.weights.get(key, 1.0))
+                for key in norm.terms
+            )
+        norm.total_exposed_ms = max(float(norm.total_exposed_ms or 0.0), 0.0)
+        if not norm.dominant_term and norm.terms:
+            norm.dominant_term = max(norm.terms, key=lambda key: float(norm.terms.get(key, 0.0)))
+        norm.dominant_term = str(norm.dominant_term or "")
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "terms": {str(key): float(value) for key, value in norm.terms.items()},
+            "weights": {str(key): float(value) for key, value in norm.weights.items()},
+            "total_exposed_ms": float(norm.total_exposed_ms),
+            "dominant_term": norm.dominant_term,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VPPFlowExposedCostSpec":
+        return cls(
+            terms={str(key): float(value or 0.0) for key, value in (payload.get("terms") or {}).items()},
+            weights={str(key): float(value or 0.0) for key, value in (payload.get("weights") or {}).items()},
+            total_exposed_ms=float(payload.get("total_exposed_ms", 0.0) or 0.0),
+            dominant_term=str(payload.get("dominant_term") or ""),
+        )
+
+
+@dataclass
+class VPPFlowPolicySpec:
+    enabled: bool = True
+    policy_version: str = "vpp_flow_v1"
+    objective: str = "minimize_exposed_critical_path"
+    virtual_chunks: List[VPPFlowVirtualChunkSpec] = field(default_factory=list)
+    activation_lifecycle: List[VPPFlowActivationPolicySpec] = field(default_factory=list)
+    flow_credit_policy: List[VPPFlowCreditPolicySpec] = field(default_factory=list)
+    exposed_cost: VPPFlowExposedCostSpec = field(default_factory=VPPFlowExposedCostSpec)
+    constraints: Dict[str, Any] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    def normalized(self) -> "VPPFlowPolicySpec":
+        norm = copy.deepcopy(self)
+        norm.enabled = bool(norm.enabled)
+        norm.policy_version = str(norm.policy_version or "vpp_flow_v1")
+        norm.objective = str(norm.objective or "minimize_exposed_critical_path")
+        norm.virtual_chunks = [item.normalized() for item in (norm.virtual_chunks or [])]
+        norm.activation_lifecycle = [item.normalized() for item in (norm.activation_lifecycle or [])]
+        norm.flow_credit_policy = [item.normalized() for item in (norm.flow_credit_policy or [])]
+        norm.exposed_cost = norm.exposed_cost.normalized()
+        norm.constraints = copy.deepcopy(norm.constraints or {})
+        norm.notes = [str(item) for item in (norm.notes or []) if str(item).strip()]
+        return norm
+
+    def to_dict(self) -> Dict[str, Any]:
+        norm = self.normalized()
+        return {
+            "enabled": bool(norm.enabled),
+            "policy_version": norm.policy_version,
+            "objective": norm.objective,
+            "virtual_chunks": [item.to_dict() for item in norm.virtual_chunks],
+            "activation_lifecycle": [item.to_dict() for item in norm.activation_lifecycle],
+            "flow_credit_policy": [item.to_dict() for item in norm.flow_credit_policy],
+            "exposed_cost": norm.exposed_cost.to_dict(),
+            "constraints": copy.deepcopy(norm.constraints),
+            "notes": list(norm.notes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "VPPFlowPolicySpec":
+        return cls(
+            enabled=bool(payload.get("enabled", True)),
+            policy_version=str(payload.get("policy_version") or "vpp_flow_v1"),
+            objective=str(payload.get("objective") or "minimize_exposed_critical_path"),
+            virtual_chunks=[VPPFlowVirtualChunkSpec.from_dict(item) for item in (payload.get("virtual_chunks") or [])],
+            activation_lifecycle=[
+                VPPFlowActivationPolicySpec.from_dict(item) for item in (payload.get("activation_lifecycle") or [])
+            ],
+            flow_credit_policy=[
+                VPPFlowCreditPolicySpec.from_dict(item) for item in (payload.get("flow_credit_policy") or [])
+            ],
+            exposed_cost=VPPFlowExposedCostSpec.from_dict(payload.get("exposed_cost") or {}),
+            constraints=copy.deepcopy(payload.get("constraints") or {}),
+            notes=[str(item) for item in (payload.get("notes") or [])],
+        )
+
+
+@dataclass
 class TelemetryBudgetSpec:
     level: str = "summary"
     max_trace_mb: int = 128
@@ -1555,11 +1878,15 @@ class RewriteActionSpec:
             "selective_reload_prefetch",
             "overlap_window_switch",
             "tail_optimizer_relief",
+            "optimizer_state_partition_rewrite",
             "tp_sp_recomposition",
             "schedule_family_switch",
             "chunk_priority_rewrite",
             "cpu_offload_scope_switch",
             "pp_family_exploration",
+            "optimizer_offload_policy_rewrite",
+            "recompute_policy_rewrite",
+            "pp_vpp_partition_rewrite",
         }:
             rewrite_type = "reload_shift"
         norm.rewrite_type = rewrite_type
@@ -2600,6 +2927,7 @@ class MegatronProgram:
     schedule_graph_nodes: List[ScheduleNodeSpec] = field(default_factory=list)
     schedule_graph_edges: List[ScheduleEdgeSpec] = field(default_factory=list)
     state_plan: Optional[StatePlanSpec] = None
+    vpp_flow: Optional[VPPFlowPolicySpec] = None
     global_strategy_plan: Optional[GlobalStrategyPlanSpec] = None
     rewrite_plan: Optional[RewriteExecutionPlanSpec] = None
     telemetry_budget: Optional[TelemetryBudgetSpec] = None
@@ -2640,6 +2968,8 @@ class MegatronProgram:
         norm.schedule_graph_edges = [item.normalized() for item in (norm.schedule_graph_edges or [])]
         if norm.state_plan is not None:
             norm.state_plan = norm.state_plan.normalized()
+        if norm.vpp_flow is not None:
+            norm.vpp_flow = norm.vpp_flow.normalized()
         if norm.global_strategy_plan is not None:
             norm.global_strategy_plan = norm.global_strategy_plan.normalized()
         if norm.rewrite_plan is not None:
@@ -2697,6 +3027,21 @@ class MegatronProgram:
             norm.layer_groups = _derive_layer_groups(norm)
         if norm.state_plan is None:
             norm.state_plan = _derive_state_plan(norm)
+        if norm.vpp_flow is None:
+            norm.vpp_flow = _derive_vpp_flow_policy(norm)
+        else:
+            requested_vpp = [
+                int(item)
+                for item in list((norm.metadata or {}).get("stage_local_vpp_vector") or [])
+                if int(item) > 0
+            ]
+            current_vpp = [
+                int(item)
+                for item in list((norm.vpp_flow.constraints or {}).get("stage_local_vpp_vector") or [])
+                if int(item) > 0
+            ]
+            if requested_vpp and requested_vpp != current_vpp:
+                norm.vpp_flow = _derive_vpp_flow_policy(norm)
         if not norm.schedule_graph_nodes or not norm.schedule_graph_edges:
             derived_nodes, derived_edges = _derive_schedule_graph(norm)
             if not norm.schedule_graph_nodes:
@@ -2742,6 +3087,7 @@ class MegatronProgram:
             "schedule_graph_nodes": [item.to_dict() for item in norm.schedule_graph_nodes],
             "schedule_graph_edges": [item.to_dict() for item in norm.schedule_graph_edges],
             "state_plan": norm.state_plan.to_dict() if norm.state_plan is not None else None,
+            "vpp_flow": norm.vpp_flow.to_dict() if norm.vpp_flow is not None else None,
             "global_strategy_plan": norm.global_strategy_plan.to_dict() if norm.global_strategy_plan is not None else None,
             "rewrite_plan": norm.rewrite_plan.to_dict() if norm.rewrite_plan is not None else None,
             "telemetry_budget": norm.telemetry_budget.to_dict() if norm.telemetry_budget is not None else None,
@@ -2801,6 +3147,9 @@ class MegatronProgram:
             schedule_graph_edges=[ScheduleEdgeSpec.from_dict(item) for item in (payload.get("schedule_graph_edges") or [])],
             state_plan=StatePlanSpec.from_dict(payload.get("state_plan") or {})
             if payload.get("state_plan") is not None
+            else None,
+            vpp_flow=VPPFlowPolicySpec.from_dict(payload.get("vpp_flow") or {})
+            if payload.get("vpp_flow") is not None
             else None,
             global_strategy_plan=GlobalStrategyPlanSpec.from_dict(payload.get("global_strategy_plan") or {})
             if payload.get("global_strategy_plan") is not None
@@ -3238,6 +3587,10 @@ def _derive_schedule_ir(program: MegatronProgram) -> ScheduleIRSpec:
     metadata = copy.deepcopy(program.metadata or {})
     family = str(metadata.get("runtime_schedule_family") or program.schedule.template or program.schedule.skeleton or "fixed_1f1b")
     stage_local_vpp = list(metadata.get("stage_local_vpp_vector") or [])
+    stage_local_vpp_fwd = list(metadata.get("stage_local_vpp_forward_vector") or [])
+    stage_local_vpp_bwd = list(metadata.get("stage_local_vpp_backward_vector") or [])
+    if not stage_local_vpp and stage_local_vpp_fwd:
+        stage_local_vpp = list(stage_local_vpp_fwd)
     runtime_requirements = {
         "execution_backend": str(metadata.get("execution_backend") or metadata.get("planner_backend") or ""),
         "sandbox_only": bool(metadata.get("sandbox_only", False)),
@@ -3249,6 +3602,13 @@ def _derive_schedule_ir(program: MegatronProgram) -> ScheduleIRSpec:
         "window_overrides": copy.deepcopy(metadata.get("runtime_window_overrides") or []),
         "operator_cluster_overrides": copy.deepcopy(metadata.get("runtime_operator_cluster_overrides") or []),
         "stage_local_vpp_vector": [int(item) for item in stage_local_vpp],
+        "stage_local_vpp_forward_vector": [int(item) for item in stage_local_vpp_fwd],
+        "stage_local_vpp_backward_vector": [int(item) for item in stage_local_vpp_bwd],
+        "vpp_asymmetry_enabled": bool(
+            stage_local_vpp_fwd
+            and stage_local_vpp_bwd
+            and list(stage_local_vpp_fwd) != list(stage_local_vpp_bwd)
+        ),
         "program_kind": str(metadata.get("program_kind") or "program"),
     }
     return ScheduleIRSpec(
@@ -3274,6 +3634,14 @@ def _derive_partition_optimization(program: MegatronProgram) -> PartitionOptimiz
     metadata = copy.deepcopy(program.metadata or {})
     stage_layer_counts = [int(stage.decoder_layers) for stage in (program.partition.stages or [])]
     stage_local_vpp = list(metadata.get("stage_local_vpp_vector") or [])
+    stage_local_vpp_fwd = list(metadata.get("stage_local_vpp_forward_vector") or [])
+    stage_local_vpp_bwd = list(metadata.get("stage_local_vpp_backward_vector") or [])
+    if not stage_local_vpp and stage_local_vpp_fwd:
+        stage_local_vpp = list(stage_local_vpp_fwd)
+    if not stage_local_vpp_fwd and stage_local_vpp:
+        stage_local_vpp_fwd = list(stage_local_vpp)
+    if not stage_local_vpp_bwd and stage_local_vpp:
+        stage_local_vpp_bwd = list(stage_local_vpp)
     allow_nonuniform = bool(program.search_space.allow_nonuniform_partition or len(set(stage_layer_counts or [0])) > 1)
     boundary_modules: List[str] = []
     anti_boundary_modules: List[str] = []
@@ -3290,6 +3658,17 @@ def _derive_partition_optimization(program: MegatronProgram) -> PartitionOptimiz
         allow_nonuniform_partition=allow_nonuniform,
         stage_layer_counts=stage_layer_counts,
         stage_local_vpp_vector=[int(item) for item in stage_local_vpp if int(item) > 0],
+        stage_local_vpp_forward_vector=[int(item) for item in stage_local_vpp_fwd if int(item) > 0],
+        stage_local_vpp_backward_vector=[int(item) for item in stage_local_vpp_bwd if int(item) > 0],
+        exposed_cost_weights={
+            str(key): float(value)
+            for key, value in dict(
+                metadata.get("partition_exposed_cost_weights")
+                or metadata.get("runtime_partition_exposed_cost_weights")
+                or {}
+            ).items()
+            if str(key).strip()
+        },
         preferred_boundary_modules=boundary_modules,
         anti_boundary_modules=anti_boundary_modules,
         asymmetry_notes=[str(item) for item in (metadata.get("partition_asymmetry_notes") or [])],
@@ -3437,6 +3816,202 @@ def _derive_state_plan(program: MegatronProgram) -> StatePlanSpec:
         placements=placements,
         offload_budget_mb=round(offload_budget_mb, 4),
         reload_prefetch_window=max(int(norm.schedule_ir.memory_intents.prefetch_policy not in {"none", "off"}), 1),
+    ).normalized()
+
+
+def _derive_vpp_flow_policy(program: MegatronProgram) -> VPPFlowPolicySpec:
+    norm = copy.deepcopy(program)
+    pp_degree = max(int(norm.parallel.pp_degree or 1), 1)
+    stage_local_vpp: List[int] = []
+    if norm.partition_optimization is not None:
+        stage_local_vpp = [
+            max(int(item), 1) for item in list(norm.partition_optimization.stage_local_vpp_vector or [])
+        ]
+    if not stage_local_vpp:
+        stage_local_vpp = [max(int(item), 1) for item in (norm.stage_local_vpp or [])]
+    if not stage_local_vpp:
+        stage_local_vpp = [max(int(norm.parallel.vpp_degree or 1), 1) for _ in range(pp_degree)]
+    if len(stage_local_vpp) < pp_degree:
+        stage_local_vpp.extend([stage_local_vpp[-1] if stage_local_vpp else 1] * (pp_degree - len(stage_local_vpp)))
+
+    grouped: Dict[int, List[LayerGroupSpec]] = {}
+    for group in list(norm.layer_groups or []):
+        grouped.setdefault(int(group.stage_id), []).append(group.normalized())
+
+    max_stage_activation = 0.0
+    for groups in grouped.values():
+        max_stage_activation = max(max_stage_activation, sum(float(item.activation_size_mb) for item in groups))
+    max_stage_activation = max(max_stage_activation, 1.0)
+
+    virtual_chunks: List[VPPFlowVirtualChunkSpec] = []
+    for stage_id in range(pp_degree):
+        local_degree = max(int(stage_local_vpp[stage_id] if stage_id < len(stage_local_vpp) else stage_local_vpp[-1]), 1)
+        buckets: Dict[int, List[LayerGroupSpec]] = {idx: [] for idx in range(local_degree)}
+        for index, group in enumerate(grouped.get(stage_id, [])):
+            buckets[index % local_degree].append(group)
+        for local_vchunk_id, bucket in buckets.items():
+            if not bucket:
+                continue
+            activation_mb = sum(float(item.activation_size_mb) for item in bucket)
+            compute_ms = sum(
+                float(item.fwd_time_ms) + float(item.bwd_input_time_ms) + float(item.bwd_weight_time_ms)
+                for item in bucket
+            )
+            boundary_comm_ms = sum(float(item.comm_boundary_cost_ms) for item in bucket)
+            reload_cost_ms = sum(float(item.reload_cost_ms) for item in bucket)
+            offload_cost_ms = sum(float(item.offload_cost_ms) for item in bucket)
+            memory_pressure = activation_mb / max_stage_activation
+            virtual_chunks.append(
+                VPPFlowVirtualChunkSpec(
+                    chunk_id=f"s{stage_id}v{local_vchunk_id}",
+                    stage_id=stage_id,
+                    local_vchunk_id=local_vchunk_id,
+                    layer_group_ids=[str(item.group_id) for item in bucket],
+                    device_group=f"pp{stage_id}",
+                    compute_ms=round(compute_ms, 4),
+                    activation_mb=round(activation_mb, 4),
+                    boundary_comm_ms=round(boundary_comm_ms, 4),
+                    reload_cost_ms=round(reload_cost_ms, 4),
+                    offload_cost_ms=round(offload_cost_ms, 4),
+                    memory_pressure=round(memory_pressure, 4),
+                    priority=0 if stage_id in {0, pp_degree - 1} else 1,
+                ).normalized()
+            )
+
+    activation_lifecycle: List[VPPFlowActivationPolicySpec] = []
+    allow_activation_offload = False
+    if norm.schedule_ir is not None:
+        allow_activation_offload = (
+            str(norm.schedule_ir.memory_intents.offload_policy or "none").strip().lower()
+            not in {"", "none", "off"}
+        )
+    memory_pressure_threshold = float((norm.metadata or {}).get("vpp_flow_memory_pressure_threshold", 0.34) or 0.34)
+    for chunk in virtual_chunks:
+        is_boundary_stage = int(chunk.stage_id) in {0, pp_degree - 1}
+        reload_hidden = float(chunk.reload_cost_ms) <= max(float(chunk.compute_ms) * 0.20, 0.1)
+        if is_boundary_stage:
+            stable_policy = "resident"
+            rationale = "boundary stage is tail/edge sensitive"
+        elif allow_activation_offload and float(chunk.memory_pressure) >= memory_pressure_threshold and reload_hidden:
+            stable_policy = "offload"
+            rationale = "activation pressure is high and reload can fit the compute slack"
+        elif float(chunk.memory_pressure) >= memory_pressure_threshold and not reload_hidden:
+            stable_policy = "recompute"
+            rationale = "reload is likely exposed, prefer recompute over tail stall"
+        else:
+            stable_policy = "resident"
+            rationale = "activation pressure below policy threshold"
+        activation_lifecycle.append(
+            VPPFlowActivationPolicySpec(
+                stage_id=int(chunk.stage_id),
+                chunk_id=str(chunk.chunk_id),
+                microbatch_class="stable",
+                phase="steady",
+                policy=stable_policy,
+                prefetch_distance=max(int(norm.state_plan.reload_prefetch_window if norm.state_plan is not None else 1), 1),
+                reload_deadline_slot=max(int(chunk.local_vchunk_id), 0),
+                forbid_tail_reload=False,
+                rationale=rationale,
+            ).normalized()
+        )
+        edge_policy = "resident" if stable_policy in {"resident", "offload"} else "recompute"
+        activation_lifecycle.append(
+            VPPFlowActivationPolicySpec(
+                stage_id=int(chunk.stage_id),
+                chunk_id=str(chunk.chunk_id),
+                microbatch_class="edge",
+                phase="cooldown",
+                policy=edge_policy,
+                prefetch_distance=0,
+                reload_deadline_slot=max(int(chunk.local_vchunk_id), 0),
+                forbid_tail_reload=True,
+                rationale="edge microbatches avoid reloads that cannot be hidden by following work",
+            ).normalized()
+        )
+
+    flow_credit_policy = [
+        VPPFlowCreditPolicySpec(
+            resource="h2d",
+            capacity=int((norm.metadata or {}).get("vpp_flow_h2d_credits", 1) or 1),
+            priority_order=[
+                "near_deadline_reload",
+                "cross_node_boundary_send",
+                "normal_reload",
+                "normal_send",
+                "d2h_offload",
+            ],
+            watermark_policy={"high_hbm_pressure_promotes": "d2h_offload"},
+            notes="reload misses are treated as critical-path debt",
+        ).normalized(),
+        VPPFlowCreditPolicySpec(
+            resource="d2h",
+            capacity=int((norm.metadata or {}).get("vpp_flow_d2h_credits", 1) or 1),
+            priority_order=[
+                "hbm_watermark_offload",
+                "stable_activation_offload",
+                "optimizer_state_writeback",
+                "background_offload",
+            ],
+            watermark_policy={"pause_when_h2d_backlog": True},
+            notes="D2H work yields to near-deadline H2D reload",
+        ).normalized(),
+        VPPFlowCreditPolicySpec(
+            resource="nic",
+            capacity=int((norm.metadata or {}).get("vpp_flow_nic_credits", 1) or 1),
+            priority_order=[
+                "cross_node_boundary_send",
+                "near_deadline_reload",
+                "normal_send",
+                "grad_reduce",
+                "background_offload",
+            ],
+            watermark_policy={"boundary_chunks_preempt": True},
+            notes="boundary activation sends are prioritized over background memory traffic",
+        ).normalized(),
+    ]
+
+    stage_exposed_ms = max((float(item.compute_ms) for item in virtual_chunks), default=0.0)
+    comm_exposed_ms = max((float(item.boundary_comm_ms) for item in virtual_chunks), default=0.0)
+    reload_stall_ms = max(
+        (
+            float(item.reload_cost_ms)
+            for item in virtual_chunks
+            if any(
+                policy.chunk_id == item.chunk_id and policy.policy == "offload"
+                for policy in activation_lifecycle
+            )
+        ),
+        default=0.0,
+    )
+    exposed_cost = VPPFlowExposedCostSpec(
+        terms={
+            "stage_exposed_ms": round(stage_exposed_ms, 4),
+            "comm_exposed_ms": round(comm_exposed_ms, 4),
+            "reload_stall_ms": round(reload_stall_ms, 4),
+            "copy_stall_ms": round(max((float(item.offload_cost_ms) for item in virtual_chunks), default=0.0), 4),
+            "uncovered_bubble_ms": float((norm.metadata or {}).get("uncovered_bubble_ms", 0.0) or 0.0),
+            "optimizer_tail_ms": float((norm.metadata or {}).get("optimizer_tail_ms", 0.0) or 0.0),
+            "straggler_penalty_ms": float((norm.metadata or {}).get("straggler_penalty_ms", 0.0) or 0.0),
+        },
+        weights=copy.deepcopy((norm.metadata or {}).get("vpp_flow_exposed_cost_weights") or {}),
+    ).normalized()
+
+    return VPPFlowPolicySpec(
+        enabled=bool((norm.metadata or {}).get("enable_vpp_flow", True)),
+        virtual_chunks=virtual_chunks,
+        activation_lifecycle=activation_lifecycle,
+        flow_credit_policy=flow_credit_policy,
+        exposed_cost=exposed_cost,
+        constraints={
+            "stage_local_vpp_vector": [int(item) for item in stage_local_vpp[:pp_degree]],
+            "allow_activation_offload": bool(allow_activation_offload),
+            "memory_pressure_threshold": float(memory_pressure_threshold),
+            "runtime_target": str(norm.cluster.target),
+        },
+        notes=[
+            "virtual chunks are the joint unit for VPP partitioning, activation lifetime, and memory-flow priority",
+            "edge microbatches use conservative lifecycle policies to avoid cooldown reload exposure",
+        ],
     ).normalized()
 
 
@@ -3611,6 +4186,48 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
                     risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
                 ).normalized()
             )
+        elif patch_family in {"optimizer_offload_policy_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="optimizer_offload_policy_rewrite",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("optimizer_offload_policy_direction") or "tail_guarded_streaming"),
+                    magnitude=float((norm.metadata or {}).get("optimizer_offload_policy_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"optimizer_state_partition_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="optimizer_state_partition_rewrite",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("optimizer_state_partition_direction") or "hierarchical_decoupled"),
+                    magnitude=float((norm.metadata or {}).get("optimizer_state_partition_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"recompute_policy_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="recompute_policy_rewrite",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("runtime_recompute_policy") or "selective"),
+                    magnitude=float((norm.metadata or {}).get("recompute_policy_magnitude", 1.0) or 1.0),
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
         elif patch_family in {"change_schedule_family"}:
             rewrite_actions.append(
                 RewriteActionSpec(
@@ -3620,6 +4237,20 @@ def _derive_rewrite_plan(program: MegatronProgram) -> RewriteExecutionPlanSpec:
                     target_state_ids=target_state_objects,
                     direction=str((norm.metadata or {}).get("runtime_schedule_family") or norm.schedule.template or "preserve"),
                     magnitude=1.0,
+                    expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
+                    **base_action_kwargs,
+                    risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
+                ).normalized()
+            )
+        elif patch_family in {"pp_vpp_partition_patch"}:
+            rewrite_actions.append(
+                RewriteActionSpec(
+                    rewrite_type="pp_vpp_partition_rewrite",
+                    target_stage_ids=target_stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    target_state_ids=target_state_objects,
+                    direction=str((norm.metadata or {}).get("runtime_partition_focus") or "stage_aware_nonuniform_vpp"),
+                    magnitude=float((norm.metadata or {}).get("runtime_partition_shift", 1.0) or 1.0),
                     expected_gain=float((norm.metadata or {}).get("expected_gain", 0.0) or 0.0),
                     **base_action_kwargs,
                     risk_flags=[str(item) for item in (norm.applied_patch.risk_flags or []) if str(item).strip()],
@@ -3903,10 +4534,40 @@ def _legacy_partition_fields_override_partition_optimization(
     metadata = copy.deepcopy(program.metadata or {})
     stage_layer_counts = [int(stage.decoder_layers) for stage in (program.partition.stages or [])]
     stage_local_vpp_vector = [int(item) for item in list(metadata.get("stage_local_vpp_vector") or []) if int(item) > 0]
+    stage_local_vpp_forward_vector = [
+        int(item) for item in list(metadata.get("stage_local_vpp_forward_vector") or []) if int(item) > 0
+    ]
+    stage_local_vpp_backward_vector = [
+        int(item) for item in list(metadata.get("stage_local_vpp_backward_vector") or []) if int(item) > 0
+    ]
+    partition_exposed_cost_weights = {
+        str(key): float(value)
+        for key, value in dict(
+            metadata.get("partition_exposed_cost_weights")
+            or metadata.get("runtime_partition_exposed_cost_weights")
+            or {}
+        ).items()
+        if str(key).strip()
+    }
     override_signals = 0
     if (
         stage_local_vpp_vector
         and stage_local_vpp_vector != list(current_norm.stage_local_vpp_vector or [])
+    ):
+        override_signals += 1
+    if (
+        stage_local_vpp_forward_vector
+        and stage_local_vpp_forward_vector != list(current_norm.stage_local_vpp_forward_vector or [])
+    ):
+        override_signals += 1
+    if (
+        stage_local_vpp_backward_vector
+        and stage_local_vpp_backward_vector != list(current_norm.stage_local_vpp_backward_vector or [])
+    ):
+        override_signals += 1
+    if (
+        partition_exposed_cost_weights
+        and partition_exposed_cost_weights != dict(current_norm.exposed_cost_weights or {})
     ):
         override_signals += 1
     if len(stage_layer_counts) == len(current_norm.stage_layer_counts or []) and len(stage_layer_counts) > 1:
@@ -3942,6 +4603,12 @@ def _backfill_legacy_policy_fields(program: MegatronProgram) -> None:
     program.strategy_ir.pipe.cooldown_policy = str(schedule_ir.cooldown_policy or program.strategy_ir.pipe.cooldown_policy or "default")
     if partition_optimization.stage_local_vpp_vector:
         program.metadata["stage_local_vpp_vector"] = list(partition_optimization.stage_local_vpp_vector)
+    if partition_optimization.stage_local_vpp_forward_vector:
+        program.metadata["stage_local_vpp_forward_vector"] = list(partition_optimization.stage_local_vpp_forward_vector)
+    if partition_optimization.stage_local_vpp_backward_vector:
+        program.metadata["stage_local_vpp_backward_vector"] = list(partition_optimization.stage_local_vpp_backward_vector)
+    if partition_optimization.exposed_cost_weights:
+        program.metadata["partition_exposed_cost_weights"] = copy.deepcopy(partition_optimization.exposed_cost_weights)
     if partition_optimization.preferred_boundary_modules:
         program.metadata["boundary_semantic_focus"] = str(partition_optimization.preferred_boundary_modules[0])
     if partition_optimization.anti_boundary_modules:

@@ -25,6 +25,7 @@ from megatron_agent.config import (
     MegatronProgram,
     PatchProposal,
     ProgramPatchSpec,
+    PartitionOptimizationSpec,
     RewriteActionSpec,
     SearchSpaceSpec,
     VerifierReport,
@@ -327,10 +328,10 @@ def _proposal_hypothesis_bonus(
     policy_outcome = dict(hypotheses.get("policy_outcome_summary") or {})
     demotion_action = str(policy_outcome.get("demotion_action") or "").strip()
     if demotion_action == "demote_overlap" and patch_category == "overlap":
-        bonus -= 0.20
+        bonus -= 0.35
         reasons.append("hypothesis_penalty:demote_overlap")
     if demotion_action == "rollback_overlap" and patch_category == "overlap":
-        bonus -= 0.30
+        bonus -= 0.55
         reasons.append("hypothesis_penalty:rollback_overlap")
     promotion_action = str(policy_outcome.get("promotion_action") or "").strip()
     if promotion_action == "promote_memory_patch":
@@ -560,11 +561,15 @@ _SUPPORTED_RUNTIME_REWRITE_TYPES: List[str] = [
     "selective_reload_prefetch",
     "overlap_window_switch",
     "tail_optimizer_relief",
+    "optimizer_state_partition_rewrite",
     "tp_sp_recomposition",
     "schedule_family_switch",
     "chunk_priority_rewrite",
     "cpu_offload_scope_switch",
     "pp_family_exploration",
+    "optimizer_offload_policy_rewrite",
+    "recompute_policy_rewrite",
+    "pp_vpp_partition_rewrite",
 ]
 
 
@@ -689,11 +694,33 @@ def _rewrite_actions_from_program(
         )
         _append(
             RewriteActionSpec(
+                rewrite_type="optimizer_offload_policy_rewrite",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                direction="tail_guarded_streaming",
+                diagnostic_labels=diagnostic_labels or ["cpu_offload_tail", "optimizer_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        _append(
+            RewriteActionSpec(
                 rewrite_type="offload_timing_shift",
                 target_stage_ids=stage_ids,
                 target_layer_group_ids=target_layer_groups,
                 target_state_ids=target_state_objects,
                 direction="earlier",
+                diagnostic_labels=diagnostic_labels or ["memory_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        _append(
+            RewriteActionSpec(
+                rewrite_type="recompute_policy_rewrite",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                direction="selective",
                 diagnostic_labels=diagnostic_labels or ["memory_bound"],
                 strategy_source="heuristic_program_inference",
             )
@@ -706,6 +733,17 @@ def _rewrite_actions_from_program(
                 target_layer_group_ids=target_layer_groups[:1],
                 direction="enable",
                 diagnostic_labels=diagnostic_labels or ["optimizer_bound"],
+                strategy_source="heuristic_program_inference",
+            )
+        )
+        _append(
+            RewriteActionSpec(
+                rewrite_type="optimizer_state_partition_rewrite",
+                target_stage_ids=stage_ids,
+                target_layer_group_ids=target_layer_groups,
+                target_state_ids=target_state_objects,
+                direction="hierarchical_decoupled",
+                diagnostic_labels=diagnostic_labels or ["optimizer_bound", "cpu_offload_tail"],
                 strategy_source="heuristic_program_inference",
             )
         )
@@ -739,6 +777,16 @@ def _rewrite_actions_from_program(
                     strategy_source="heuristic_program_inference",
                 )
             )
+            _append(
+                RewriteActionSpec(
+                    rewrite_type="pp_vpp_partition_rewrite",
+                    target_stage_ids=stage_ids,
+                    target_layer_group_ids=target_layer_groups,
+                    direction="stage_aware_nonuniform_vpp",
+                    diagnostic_labels=diagnostic_labels or ["bubble_bound", "tail_bound"],
+                    strategy_source="heuristic_program_inference",
+                )
+            )
     if any(token in program_kind for token in ("runtime_guided_partition", "nonuniform_partition", "boundary_semantic")):
         _append(
             RewriteActionSpec(
@@ -765,6 +813,10 @@ def _rewrite_actions_from_program(
         "change_schedule_family": "schedule_family_switch",
         "local_verticalization_patch": "local_verticalization",
         "layer_group_repack": "local_verticalization",
+        "optimizer_offload_policy_patch": "optimizer_offload_policy_rewrite",
+        "optimizer_state_partition_patch": "optimizer_state_partition_rewrite",
+        "recompute_policy_patch": "recompute_policy_rewrite",
+        "pp_vpp_partition_patch": "pp_vpp_partition_rewrite",
     }
     if patch_family in patch_to_action:
         _append(
@@ -2353,6 +2405,41 @@ def _attach_optimizer_runtime_contract(
     candidate.metadata["runtime_enable_overlap_grad_reduce"] = True
     candidate.metadata["runtime_enable_overlap_param_gather"] = True
     candidate.metadata["runtime_enable_overlap_param_gather_with_optimizer_step"] = True
+    candidate.metadata["runtime_optimizer_state_partition_policy"] = "state_disaggregated_hierarchical"
+    candidate.metadata["runtime_optimizer_param_shard_group"] = "dp_intra_node"
+    candidate.metadata["runtime_optimizer_grad_shard_group"] = "dp_global"
+    candidate.metadata["runtime_optimizer_opt_state_shard_group"] = "dp_hierarchical"
+    candidate.metadata["runtime_optimizer_allow_owner_decoupling"] = True
+    candidate.metadata["runtime_optimizer_param_owner_policy"] = "forward_critical_locality"
+    candidate.metadata["runtime_optimizer_opt_state_owner_policy"] = "update_locality"
+    candidate.metadata["runtime_optimizer_state_shard_hierarchy"] = {
+        "intra_node_group": "dp_node_local",
+        "inter_node_group": "dp_cross_node",
+        "state_group_priority": ["ffn", "attention", "small", "embedding_head"],
+    }
+    candidate.metadata["runtime_optimizer_state_family_policy"] = {
+        "ffn": {"state_shard_level": "deep", "offload": "aggressive", "chunk_priority": "high"},
+        "attention": {"state_shard_level": "medium", "offload": "balanced", "chunk_priority": "medium"},
+        "small": {"state_shard_level": "light", "offload": "minimal", "chunk_priority": "low"},
+        "embedding_head": {"state_shard_level": "guarded", "offload": "tail_guarded", "chunk_priority": "high"},
+    }
+    candidate.metadata["runtime_optimizer_chunk_pipeline_mode"] = "h2d_update_writeback"
+    candidate.metadata["runtime_optimizer_chunk_size_mb"] = 384 if peak_reserved_ratio >= 0.84 else 512
+    candidate.metadata["runtime_optimizer_pipeline_prefetch_depth"] = 3 if tail_ratio >= 0.14 else 2
+    candidate.metadata["runtime_optimizer_pipeline_writeback_depth"] = 2
+    candidate.metadata["runtime_optimizer_tail_aware_schedule"] = "cooldown_staggered_owner_local"
+    candidate.metadata["runtime_optimizer_tail_barrier_policy"] = "late_commit_min_barrier"
+    candidate.metadata["runtime_optimizer_offload_family_policy"] = {
+        "ffn": "cpu_streaming",
+        "attention": "hybrid_streaming",
+        "small": "gpu_resident",
+        "embedding_head": "gpu_resident_tail_guarded",
+    }
+    candidate.metadata["runtime_optimizer_offload_phase_policy"] = {
+        "warmup": "prefetch_aggressive",
+        "steady": "overlap_max",
+        "cooldown": "tail_guarded",
+    }
     return resolved_chunk_scope
 
 
@@ -2688,6 +2775,46 @@ def _nonuniform_vpp_vector_from_evidence(
         if cleaned_shapes:
             chunk_shapes[int(stage_id)] = cleaned_shapes
     return vector, chunk_shapes
+
+
+def _derive_asymmetric_stage_local_vpp_vectors(
+    base_vector: List[int],
+    *,
+    runtime_summary: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[int], List[int]]:
+    fwd_vector = [max(int(item), 1) for item in list(base_vector or [])]
+    bwd_vector = [max(int(item), 1) for item in list(base_vector or [])]
+    if not fwd_vector:
+        return fwd_vector, bwd_vector
+    runtime = dict(runtime_summary or {})
+    stage_windows = {
+        int(stage_id): dict(values or {})
+        for stage_id, values in dict(runtime.get("stage_window_summary") or {}).items()
+        if _safe_int(stage_id) is not None
+    }
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+    peak_reserved_ratio = float(runtime.get("peak_reserved_ratio") or 0.0)
+    last_stage = len(fwd_vector) - 1
+    for stage_id in range(len(fwd_vector)):
+        window = dict(stage_windows.get(stage_id) or {})
+        compute_ms = max(float(window.get("compute_ms") or 0.0), 1.0)
+        comm_ms = max(float(window.get("comm_ms") or 0.0), 0.0)
+        reserved_gib = float(window.get("peak_reserved_gib") or 0.0)
+        comm_ratio = comm_ms / max(compute_ms, 1.0)
+        if comm_ratio >= 0.35 and fwd_vector[stage_id] < 2:
+            fwd_vector[stage_id] += 1
+        if stage_id in {0, last_stage} and comm_ratio >= 0.25 and fwd_vector[stage_id] < 2:
+            fwd_vector[stage_id] += 1
+        memory_hot = bool(
+            reserved_gib >= 22.0
+            or peak_reserved_ratio >= 0.88
+        )
+        tail_hot = bool(stage_id == last_stage and optimizer_exposed_ratio >= 0.18)
+        if (memory_hot or tail_hot) and bwd_vector[stage_id] > 1:
+            bwd_vector[stage_id] -= 1
+        if bwd_vector[stage_id] > fwd_vector[stage_id] + 1:
+            bwd_vector[stage_id] = max(fwd_vector[stage_id] + 1, 1)
+    return [max(int(item), 1) for item in fwd_vector], [max(int(item), 1) for item in bwd_vector]
 
 
 def _stage_cost_breakdown(
@@ -3295,6 +3422,8 @@ def _position_aware_partition_focus(runtime_summary: Dict[str, Any]) -> str:
 def _runtime_guided_partition_plan(
     stage_layers: List[int],
     runtime_summary: Dict[str, Any],
+    *,
+    exposed_cost_weights: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     expected_count = len(stage_layers)
     if expected_count < 2:
@@ -3313,14 +3442,19 @@ def _runtime_guided_partition_plan(
     focus = _position_aware_partition_focus(runtime_summary)
     mean_window = sum(value for value in window_ms if value > 0.0) / float(max(sum(1 for value in window_ms if value > 0.0), 1))
 
+    weight_payload = dict(exposed_cost_weights or {})
+    alpha = max(float(weight_payload.get("alpha", 0.45) or 0.45), 0.0)
+    beta = max(float(weight_payload.get("beta", 0.25) or 0.25), 0.0)
+    gamma = max(float(weight_payload.get("gamma", 0.20) or 0.20), 0.0)
+    eta = max(float(weight_payload.get("eta", 0.10) or 0.10), 0.0)
     stage_objectives: List[float] = []
+    stage_components: List[Dict[str, float]] = []
     last_index = expected_count - 1
     for idx in range(expected_count):
         compute = float(compute_ms[idx] or 0.0)
         comm = float(comm_ms[idx] or 0.0)
         bubble = float(bubble_ms[idx] or 0.0)
         memory = float(peak_reserved_gib[idx] or 0.0)
-        objective = compute + 0.85 * comm + 0.65 * bubble
         edge_wait_penalty = mean_window * pipeline_wait_ratio * (0.85 if idx in {0, last_index} else 0.35)
         tail_penalty = 0.0
         if idx == last_index:
@@ -3328,14 +3462,30 @@ def _runtime_guided_partition_plan(
         elif idx == 0:
             tail_penalty = mean_window * optimizer_exposed_ratio * 0.35
         memory_penalty = mean_window * 0.02 * max(memory - _median(peak_reserved_gib), 0.0)
+        comm_exposed = max(comm - 0.40 * bubble, 0.0)
+        tail_exposed = tail_penalty + edge_wait_penalty
+        fragmentation = bubble + memory_penalty
         if focus == "comm-aware":
-            objective += edge_wait_penalty + 0.35 * mean_window * bubble_ratio * (1.0 if idx in {0, last_index} else 0.5)
+            comm_exposed += 0.35 * mean_window * bubble_ratio * (1.0 if idx in {0, last_index} else 0.5)
         elif focus == "tail-aware":
-            objective += 0.60 * edge_wait_penalty + tail_penalty
+            tail_exposed += 0.60 * edge_wait_penalty
         else:
-            objective += 0.75 * edge_wait_penalty + 0.45 * tail_penalty
-        objective += memory_penalty
+            tail_exposed += 0.45 * tail_penalty
+        objective = (
+            alpha * compute
+            + beta * comm_exposed
+            + gamma * tail_exposed
+            + eta * fragmentation
+        )
         stage_objectives.append(float(objective))
+        stage_components.append(
+            {
+                "compute": float(compute),
+                "comm_exposed": float(comm_exposed),
+                "tail_exposed": float(tail_exposed),
+                "fragmentation": float(fragmentation),
+            }
+        )
 
     donor = max(range(expected_count), key=lambda idx: stage_objectives[idx])
     receiver_candidates = sorted(range(expected_count), key=lambda idx: stage_objectives[idx])
@@ -3381,6 +3531,16 @@ def _runtime_guided_partition_plan(
         "pipeline_wait_ratio": round(float(pipeline_wait_ratio), 4),
         "optimizer_exposed_ratio": round(float(optimizer_exposed_ratio), 4),
         "stage_skew": round(float(stage_skew), 4),
+        "exposed_cost_weights": {
+            "alpha": round(float(alpha), 4),
+            "beta": round(float(beta), 4),
+            "gamma": round(float(gamma), 4),
+            "eta": round(float(eta), 4),
+        },
+        "stage_exposed_components": [
+            {str(key): round(float(value), 4) for key, value in item.items()}
+            for item in stage_components
+        ],
     }
 
 
@@ -4931,7 +5091,26 @@ def _build_runtime_guided_partition(program: MegatronProgram, runtime_summary: D
         return None
     candidate = _clone_program(program)
     stage_layers = [int(stage.decoder_layers) for stage in candidate.partition.stages]
-    plan = _runtime_guided_partition_plan(stage_layers, runtime_summary)
+    partition_opt = (candidate.partition_optimization or PartitionOptimizationSpec()).normalized()
+    runtime_weights = dict(
+        (runtime_summary or {}).get("partition_exposed_cost_weights")
+        or (runtime_summary or {}).get("runtime_partition_exposed_cost_weights")
+        or {}
+    )
+    exposed_cost_weights = dict(partition_opt.exposed_cost_weights or {})
+    if runtime_weights:
+        exposed_cost_weights.update(
+            {
+                str(key): float(value)
+                for key, value in runtime_weights.items()
+                if str(key).strip()
+            }
+        )
+    plan = _runtime_guided_partition_plan(
+        stage_layers,
+        runtime_summary,
+        exposed_cost_weights=exposed_cost_weights,
+    )
     if plan is None:
         return None
     slow_idx = int(plan["donor_stage_index"])
@@ -4951,6 +5130,10 @@ def _build_runtime_guided_partition(program: MegatronProgram, runtime_summary: D
     candidate.metadata["runtime_partition_focus"] = str(plan["focus"])
     candidate.metadata["runtime_partition_shift"] = int(shift)
     candidate.metadata["runtime_partition_stage_objectives"] = list(plan["stage_objectives"])
+    candidate.metadata["runtime_partition_stage_exposed_components"] = list(plan.get("stage_exposed_components") or [])
+    candidate.metadata["runtime_partition_exposed_cost_weights"] = dict(plan.get("exposed_cost_weights") or {})
+    candidate.metadata["partition_exposed_cost_weights"] = dict(plan.get("exposed_cost_weights") or {})
+    candidate.policy_objective = "minimize_exposed_cost_under_memory_and_legality_constraints"
     candidate.metadata["boundary_semantic_focus"] = str(plan["focus"])
     candidate.metadata["pipeline_wait_ratio"] = float(plan["pipeline_wait_ratio"])
     candidate.metadata["optimizer_exposed_ratio"] = float(plan["optimizer_exposed_ratio"])
@@ -5480,8 +5663,54 @@ def _build_stage_local_vpp_shape_candidate(
         for stage_id, values in dict(runtime.get("stage_window_summary") or {}).items()
         if _safe_int(stage_id) is not None
     }
+    stage_local_vpp_fwd_vector, stage_local_vpp_bwd_vector = _derive_asymmetric_stage_local_vpp_vectors(
+        target_vector,
+        runtime_summary=runtime,
+    )
     candidate.metadata["stage_local_vpp_vector"] = [int(value) for value in target_vector]
+    candidate.metadata["stage_local_vpp_forward_vector"] = [int(value) for value in stage_local_vpp_fwd_vector]
+    candidate.metadata["stage_local_vpp_backward_vector"] = [int(value) for value in stage_local_vpp_bwd_vector]
+    candidate.metadata["stage_local_vpp_mode"] = (
+        "asymmetric_fwd_bwd"
+        if list(stage_local_vpp_fwd_vector) != list(stage_local_vpp_bwd_vector)
+        else "symmetric"
+    )
     candidate.metadata["preserve_stage_local_vpp"] = True
+    candidate.metadata["runtime_edge_lane_policy"] = {
+        "stable_lane": {
+            "dispatch_order": "stage_local_nonuniform_vpp",
+            "checkpoint_policy": "selective",
+            "prefetch_distance_slots": 2,
+            "optimizer_target_chunk": "middle",
+        },
+        "edge_lane": {
+            "dispatch_order": "tail_boundary_rewrite",
+            "checkpoint_policy": "tail_selective",
+            "prefetch_distance_slots": 1,
+            "optimizer_target_chunk": "tail",
+            "reload_guarded": True,
+        },
+    }
+    candidate.metadata["runtime_spill_window_policy"] = {
+        "warmup": {"policy": "prefetch_aggressive", "allow_reload_overlap": True},
+        "steady": {"policy": "overlap_max", "allow_reload_overlap": True},
+        "cooldown": {"policy": "tail_guarded", "allow_reload_overlap": False},
+    }
+    if list(stage_local_vpp_fwd_vector) != list(stage_local_vpp_bwd_vector):
+        existing_asymmetry_notes = [
+            str(item)
+            for item in list(candidate.metadata.get("partition_asymmetry_notes") or [])
+            if str(item).strip()
+        ]
+        candidate.metadata["partition_asymmetry_notes"] = list(
+            dict.fromkeys(
+                [
+                    *existing_asymmetry_notes,
+                    "forward_backward_virtualization_is_stage_asymmetric",
+                ]
+            )
+        )
+        candidate.search_space.allow_asymmetric_vpp = True
     if chunk_shapes:
         candidate.metadata["stage_local_chunk_shapes"] = {str(key): value for key, value in chunk_shapes.items()}
 
@@ -7548,6 +7777,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-model", type=str, default="/models/Qwen2.5-72B-Instruct")
     parser.add_argument("--llm-temperature", type=float, default=0.2)
     parser.add_argument("--log-llm", action="store_true")
+    parser.add_argument(
+        "--require-llm-agent",
+        action="store_true",
+        help="Fail fast unless LLM supervisor is effectively enabled (endpoint+model configured).",
+    )
     parser.add_argument("--model-structure-summary", type=str, default=None)
     parser.add_argument("--hardware-topology-summary", type=str, default=None)
     parser.add_argument("--profile-summary", type=str, default=None)
@@ -7659,6 +7893,11 @@ def main() -> None:
         "temperature": float(args.llm_temperature),
         "log_llm": bool(args.log_llm),
     }
+    if bool(getattr(args, "require_llm_agent", False)) and not _llm_supervisor_enabled(llm_config):
+        raise ValueError(
+            "LLM agent is required but not enabled. "
+            "Set --enable-llm-supervisor and provide valid --llm-endpoint/--llm-model."
+        )
     external_inputs = _load_external_agent_inputs(args)
     baseline = _build_baseline_program(args)
     runtime_signature = reduce_trial_trace(baseline, runtime_summary=runtime_summary)

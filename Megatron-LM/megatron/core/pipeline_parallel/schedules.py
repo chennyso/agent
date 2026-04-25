@@ -1624,6 +1624,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
     offload_plan = _parse_json_hint_dict(_read_env_or_file("OFFLOAD_PLAN"))
     reload_plan = _parse_json_hint_dict(_read_env_or_file("RELOAD_PLAN"))
     comm_chunk_plan = _parse_json_hint_dict(_read_env_or_file("COMM_CHUNK_PLAN"))
+    vpp_flow_policy = _parse_json_hint_dict(_read_env_or_file("VPP_FLOW_POLICY"))
     overlap_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_OVERLAP_HINTS"))
     memory_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_MEMORY_HINTS"))
     partition_hints = _parse_json_hint_dict(_read_env_or_file("SCHEDULE_PARTITION_HINTS"))
@@ -1773,6 +1774,7 @@ def _parse_schedule_runtime_hints() -> Dict[str, Any]:
         "offload_plan": offload_plan,
         "reload_plan": reload_plan,
         "comm_chunk_plan": comm_chunk_plan,
+        "vpp_flow_policy": vpp_flow_policy,
         "window_reconfig_plan": _parse_json_hint_dict(_read_env_or_file("WINDOW_RECONFIG_PLAN")),
         "telemetry_budget": telemetry_budget,
         "stage_semantic_hints": stage_semantic_hints,
@@ -1830,6 +1832,53 @@ def _get_local_stage_family_hint() -> Dict[str, str]:
     partition_mode = str(partition_hints.get("partition_mode") or "").strip()
     if partition_mode:
         merged.setdefault("partition_mode", partition_mode)
+    vpp_flow_policy = dict(runtime_hints.get("vpp_flow_policy") or {})
+    if bool(vpp_flow_policy.get("enabled")):
+        merged.setdefault("vpp_flow_runtime", "enabled")
+        local_chunks = []
+        for item in list(vpp_flow_policy.get("virtual_chunks") or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                if int(item.get("stage_id")) == int(pp_rank):
+                    local_chunks.append(dict(item))
+            except Exception:
+                continue
+        local_lifecycle = []
+        for item in list(vpp_flow_policy.get("activation_lifecycle") or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                if int(item.get("stage_id")) == int(pp_rank):
+                    local_lifecycle.append(dict(item))
+            except Exception:
+                continue
+        if local_chunks:
+            merged.setdefault("vpp_flow_chunk_count", str(len(local_chunks)))
+            pressure = max(float(item.get("memory_pressure") or 0.0) for item in local_chunks)
+            merged.setdefault("vpp_flow_memory_pressure", f"{pressure:.4f}")
+        if local_lifecycle:
+            policies = sorted({str(item.get("policy") or "").strip() for item in local_lifecycle if str(item.get("policy") or "").strip()})
+            if policies:
+                merged.setdefault("activation_lifecycle_policy", ",".join(policies))
+            if any(bool(item.get("forbid_tail_reload")) for item in local_lifecycle):
+                merged.setdefault("tail_reload_policy", "forbidden_for_edge_microbatches")
+        credit_policies = [
+            dict(item)
+            for item in list(vpp_flow_policy.get("flow_credit_policy") or [])
+            if isinstance(item, dict)
+        ]
+        for credit in credit_policies:
+            resource = str(credit.get("resource") or "").strip()
+            if not resource:
+                continue
+            priority_order = [
+                str(item).strip()
+                for item in list(credit.get("priority_order") or [])
+                if str(item).strip()
+            ]
+            if priority_order:
+                merged.setdefault(f"{resource}_flow_priority", ">".join(priority_order[:5]))
     return merged
 
 
@@ -1855,6 +1904,122 @@ def get_schedule_runtime_policy() -> Dict[str, Any]:
     policy["local_stage_index"] = int(pp_rank) if pp_rank is not None else None
     policy["local_stage_hint"] = dict(local_stage_hint or {})
     return policy
+
+
+def _vpp_flow_runtime_enabled(policy: Optional[Dict[str, Any]] = None) -> bool:
+    raw = str(os.environ.get("ENABLE_VPP_FLOW_RUNTIME", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return False
+    if raw in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    payload = dict((policy or {}).get("vpp_flow_policy") or {})
+    return bool(payload.get("enabled"))
+
+
+def _local_vpp_flow_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    vpp_flow = dict(policy.get("vpp_flow_policy") or {})
+    if not bool(vpp_flow.get("enabled")):
+        return {}
+    stage_id = policy.get("local_stage_index")
+    try:
+        stage_id_int = int(stage_id)
+    except Exception:
+        stage_id_int = None
+    if stage_id_int is None:
+        return {}
+    local_chunks = []
+    for item in list(vpp_flow.get("virtual_chunks") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            if int(item.get("stage_id")) == stage_id_int:
+                local_chunks.append(dict(item))
+        except Exception:
+            continue
+    local_lifecycle = []
+    for item in list(vpp_flow.get("activation_lifecycle") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            if int(item.get("stage_id")) == stage_id_int:
+                local_lifecycle.append(dict(item))
+        except Exception:
+            continue
+    return {
+        "enabled": True,
+        "stage_id": stage_id_int,
+        "virtual_chunks": local_chunks,
+        "activation_lifecycle": local_lifecycle,
+        "flow_credit_policy": [
+            dict(item)
+            for item in list(vpp_flow.get("flow_credit_policy") or [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _vpp_flow_microbatch_class(phase: str, microbatch_id: Any) -> str:
+    phase_token = str(phase or "").strip().lower()
+    try:
+        microbatch_index = int(microbatch_id)
+    except Exception:
+        microbatch_index = -1
+    if phase_token in {"warmup", "cooldown"} or microbatch_index <= 0:
+        return "edge"
+    return "stable"
+
+
+def _vpp_flow_lifecycle_for(
+    policy: Dict[str, Any],
+    *,
+    vchunk_id: Any,
+    phase: str,
+    microbatch_id: Any,
+) -> Dict[str, Any]:
+    local = _local_vpp_flow_policy(policy)
+    if not local:
+        return {}
+    try:
+        chunk_id = int(vchunk_id)
+    except Exception:
+        chunk_id = 0
+    wanted_class = _vpp_flow_microbatch_class(phase, microbatch_id)
+    wanted_phase = str(phase or "steady").strip().lower() or "steady"
+    candidates: List[Dict[str, Any]] = []
+    for item in list(local.get("activation_lifecycle") or []):
+        raw_chunk_id = str(item.get("chunk_id") or "")
+        local_vchunk = raw_chunk_id.rsplit("v", 1)[-1]
+        try:
+            local_vchunk_id = int(local_vchunk)
+        except Exception:
+            local_vchunk_id = -1
+        if local_vchunk_id != chunk_id:
+            continue
+        candidates.append(dict(item))
+    for item in candidates:
+        if (
+            str(item.get("microbatch_class") or "").strip().lower() == wanted_class
+            and str(item.get("phase") or "").strip().lower() == wanted_phase
+        ):
+            return item
+    for item in candidates:
+        if str(item.get("microbatch_class") or "").strip().lower() == wanted_class:
+            return item
+    return candidates[0] if candidates else {}
+
+
+def _vpp_flow_credit_priority(policy: Dict[str, Any], resource: str) -> List[str]:
+    local = _local_vpp_flow_policy(policy)
+    resource_token = str(resource or "").strip().lower()
+    for item in list(local.get("flow_credit_policy") or []):
+        if str(item.get("resource") or "").strip().lower() != resource_token:
+            continue
+        return [
+            str(entry).strip()
+            for entry in list(item.get("priority_order") or [])
+            if str(entry).strip()
+        ]
+    return []
 
 
 def get_schedule_family_registry() -> Dict[str, Dict[str, Any]]:
@@ -1927,18 +2092,44 @@ def _execute_memory_action_hook(policy: Dict[str, Any], payload: Optional[Dict[s
     trigger_hook = str(event.get("trigger_hook") or "").strip().lower()
     microbatch_id = max(int(event.get("microbatch_id") or 0), 0)
     applied_actions: List[str] = []
+    phase = str(event.get("phase") or policy.get("phase") or (policy.get("local_stage_hint") or {}).get("phase") or "steady").strip().lower()
+    if not phase or phase == "none":
+        phase = "steady"
+    lifecycle = (
+        _vpp_flow_lifecycle_for(
+            policy,
+            vchunk_id=event.get("vchunk_id"),
+            phase=phase,
+            microbatch_id=microbatch_id,
+        )
+        if _vpp_flow_runtime_enabled(policy)
+        else {}
+    )
+    lifecycle_policy = str(lifecycle.get("policy") or "").strip().lower()
+    if lifecycle:
+        event["vpp_flow_lifecycle_policy"] = lifecycle_policy
+        event["vpp_flow_microbatch_class"] = _vpp_flow_microbatch_class(phase, microbatch_id)
 
     offload_shift_direction = str(local_stage_hint.get("offload_shift_direction") or "").strip().lower()
     offload_shift_offset_slots = max(int(local_stage_hint.get("offload_shift_offset_slots") or 0), 0)
-    if trigger_hook in {"before_forward_hook", "after_forward_hook"} and any(
-        str(item.get("action") or "").strip() == "offload_timing_shift" for item in state_migration_hints
+    if (
+        trigger_hook in {"before_forward_hook", "after_forward_hook"}
+        and lifecycle_policy in {"resident", "recompute"}
+    ):
+        fine_grained_offloading_disable_offload()
+        applied_actions.append(f"vpp_flow_{lifecycle_policy}_guard")
+    elif trigger_hook in {"before_forward_hook", "after_forward_hook"} and (
+        lifecycle_policy == "offload"
+        or any(
+            str(item.get("action") or "").strip() == "offload_timing_shift" for item in state_migration_hints
+        )
     ):
         if offload_shift_direction == "later" and microbatch_id < offload_shift_offset_slots:
             fine_grained_offloading_disable_offload()
             applied_actions.append("disable_offload")
         else:
             fine_grained_offloading_enable_offload()
-            applied_actions.append("enable_offload")
+            applied_actions.append("vpp_flow_enable_offload" if lifecycle_policy == "offload" else "enable_offload")
         if trigger_hook == "after_forward_hook":
             flushed = int(fine_grained_offloading_flush_delayed_groups() or 0)
             event["flushed_delayed_groups"] = flushed
@@ -1948,7 +2139,18 @@ def _execute_memory_action_hook(policy: Dict[str, Any], payload: Optional[Dict[s
     reload_policy = str(local_stage_hint.get("reload_policy") or "").strip().lower()
     prefetch_policy = str(local_stage_hint.get("prefetch_policy") or "").strip().lower()
     prefetch_distance_slots = max(int(local_stage_hint.get("prefetch_distance_slots") or 0), 0)
-    if trigger_hook == "before_backward_hook" and (
+    if lifecycle:
+        try:
+            prefetch_distance_slots = max(prefetch_distance_slots, int(lifecycle.get("prefetch_distance") or 0))
+        except Exception:
+            pass
+    tail_reload_forbidden = bool(lifecycle.get("forbid_tail_reload")) and _vpp_flow_microbatch_class(phase, microbatch_id) == "edge"
+    if trigger_hook == "before_backward_hook" and tail_reload_forbidden:
+        event["vpp_flow_reload_guard"] = "tail_reload_forbidden"
+        applied_actions.append("vpp_flow_skip_tail_reload")
+    elif trigger_hook == "before_backward_hook" and (
+        lifecycle_policy in {"offload", "reload"}
+        or
         reload_policy == "selective_prefetch"
         or prefetch_policy == "selective"
         or any(str(item.get("action") or "").strip() == "selective_reload_prefetch" for item in state_migration_hints)
@@ -1983,6 +2185,8 @@ def invoke_schedule_runtime_hook(hook_name: str, payload: Optional[Dict[str, Any
     event["overlap_hints"] = dict(policy.get("overlap_hints") or {})
     event["memory_hints"] = dict(policy.get("memory_hints") or {})
     event["partition_hints"] = dict(policy.get("partition_hints") or {})
+    if _vpp_flow_runtime_enabled(policy):
+        event["vpp_flow"] = _local_vpp_flow_policy(policy)
     event["schedule_grid_spec"] = dict(policy.get("schedule_grid_spec") or {})
     event["schedule_action_specs"] = list(policy.get("schedule_action_specs") or [])
     event["telemetry_budget"] = dict(policy.get("telemetry_budget") or {})
@@ -2812,6 +3016,28 @@ def _resolve_optimizer_runtime_value(
     return str(os.environ.get(env_key, default) or default).strip()
 
 
+def _optimizer_env_flag_enabled(env_key: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(env_key, "") or "").strip().lower()
+    if raw == "":
+        return bool(default)
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _optimizer_env_json_dict(env_key: str) -> Dict[str, Any]:
+    raw = str(os.environ.get(env_key, "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _optimizer_state_partition_policy() -> str:
+    return str(os.environ.get("OPTIMIZER_STATE_PARTITION_POLICY", "") or "").strip().lower()
+
+
 def _local_stage_tags(local_stage_hint: Dict[str, str]) -> set[str]:
     raw = str(local_stage_hint.get("stage_tags") or "").strip()
     if not raw:
@@ -2858,14 +3084,29 @@ def _resolve_local_optimizer_target_chunk(
         "SCHEDULE_OPTIMIZER_TARGET_POLICY",
         "tail_stage_first",
     )
+    state_partition_policy = _optimizer_state_partition_policy()
+    owner_decoupling_enabled = _optimizer_env_flag_enabled("OPTIMIZER_ALLOW_OWNER_DECOUPLING", default=False)
     family = str(local_stage_hint.get("family") or "").strip()
     stage_tags = _local_stage_tags(local_stage_hint)
     if (
         target_policy == "tail_stage_first"
+        and not (
+            state_partition_policy == "state_disaggregated_hierarchical"
+            and owner_decoupling_enabled
+        )
         and family not in {"optimizer_guarded_tail", "tail_guarded"}
         and not {"tail_sensitive", "optimizer_sensitive"}.issubset(stage_tags)
     ):
         return None
+
+    family_policy = _optimizer_env_json_dict("OPTIMIZER_STATE_FAMILY_POLICY")
+    embedding_head_policy = dict(family_policy.get("embedding_head") or {})
+    if (
+        target_policy == "tail_stage_first"
+        and str(embedding_head_policy.get("chunk_priority") or "").strip().lower() == "high"
+        and str(family).strip().lower() in {"optimizer_guarded_tail", "tail_guarded", "embedding_head", "loss"}
+    ):
+        return num_model_chunks - 1
 
     explicit_target = str(local_stage_hint.get("optimizer_target_chunk") or "").strip().lower()
     if explicit_target.isdigit():
@@ -2897,14 +3138,26 @@ def _apply_optimizer_windowed_chunk_order(
         "optimizer_window_policy",
         "SCHEDULE_OPTIMIZER_WINDOW_POLICY",
     )
-    if window_policy != "tail_flush_aligned":
+    chunk_pipeline_mode = str(os.environ.get("OPTIMIZER_CHUNK_PIPELINE_MODE", "") or "").strip().lower()
+    tail_aware_schedule = str(os.environ.get("OPTIMIZER_TAIL_AWARE_SCHEDULE", "") or "").strip().lower()
+    if window_policy not in {"tail_flush_aligned", "optimizer_tail_hide", "tail_guarded"}:
         return order
     if group_index < max(num_groups - 2, 0):
         return order
     target_chunk = _resolve_local_optimizer_target_chunk(num_model_chunks, local_stage_hint)
     if target_chunk is None or target_chunk not in order:
         return order
-    return [target_chunk] + [chunk_id for chunk_id in order if chunk_id != target_chunk]
+    reordered = [target_chunk] + [chunk_id for chunk_id in order if chunk_id != target_chunk]
+    if (
+        chunk_pipeline_mode == "h2d_update_writeback"
+        and tail_aware_schedule in {"cooldown_staggered_owner_local", "staggered_owner_local"}
+        and phase == "cooldown"
+        and len(reordered) > 2
+    ):
+        hot = reordered[0]
+        others = _edge_interleave(reordered[1:])
+        reordered = [hot] + others
+    return reordered
 
 
 def _apply_chunk_order_policy(
@@ -3087,6 +3340,83 @@ def _apply_structure_aware_chunk_order(order: List[int], phase: str) -> List[int
     return sorted(order, key=_warm_key)
 
 
+def _apply_vpp_flow_chunk_order(
+    order: List[int],
+    *,
+    phase: str,
+    group_index: int,
+    num_groups: int,
+) -> List[int]:
+    if not order:
+        return order
+    runtime_policy = _parse_schedule_runtime_hints()
+    if not _vpp_flow_runtime_enabled(runtime_policy):
+        return order
+    local = _local_vpp_flow_policy(
+        {
+            **runtime_policy,
+            "local_stage_index": _pipeline_parallel_location()[0],
+        }
+    )
+    if not local:
+        return order
+    chunks_by_local_id: Dict[int, Dict[str, Any]] = {}
+    for item in list(local.get("virtual_chunks") or []):
+        try:
+            chunks_by_local_id[int(item.get("local_vchunk_id"))] = dict(item)
+        except Exception:
+            continue
+    if not chunks_by_local_id:
+        return order
+    lifecycle_by_local_id: Dict[int, List[Dict[str, Any]]] = {}
+    for item in list(local.get("activation_lifecycle") or []):
+        raw_chunk_id = str(item.get("chunk_id") or "")
+        try:
+            local_id = int(raw_chunk_id.rsplit("v", 1)[-1])
+        except Exception:
+            continue
+        lifecycle_by_local_id.setdefault(local_id, []).append(dict(item))
+    h2d_priority = _vpp_flow_credit_priority(
+        {
+            **runtime_policy,
+            "local_stage_index": _pipeline_parallel_location()[0],
+        },
+        "h2d",
+    )
+    nic_priority = _vpp_flow_credit_priority(
+        {
+            **runtime_policy,
+            "local_stage_index": _pipeline_parallel_location()[0],
+        },
+        "nic",
+    )
+    phase_token = str(phase or "steady").strip().lower() or "steady"
+    edge_window = phase_token in {"warmup", "cooldown"} or group_index in {0, max(num_groups - 1, 0)}
+
+    def _score(chunk_id: int) -> tuple:
+        chunk = chunks_by_local_id.get(int(chunk_id), {})
+        lifecycle_items = lifecycle_by_local_id.get(int(chunk_id), [])
+        lifecycle_policies = {str(item.get("policy") or "").strip().lower() for item in lifecycle_items}
+        forbids_tail_reload = any(bool(item.get("forbid_tail_reload")) for item in lifecycle_items)
+        memory_pressure = float(chunk.get("memory_pressure") or 0.0)
+        boundary_comm_ms = float(chunk.get("boundary_comm_ms") or 0.0)
+        compute_ms = float(chunk.get("compute_ms") or 0.0)
+        reload_sensitive = 1 if lifecycle_policies.intersection({"offload", "reload"}) else 0
+        resident_edge_guard = 1 if edge_window and forbids_tail_reload else 0
+        h2d_near_deadline_first = 1 if h2d_priority and h2d_priority[0] == "near_deadline_reload" else 0
+        nic_boundary_first = 1 if nic_priority and nic_priority[0] == "cross_node_boundary_send" else 0
+        return (
+            -resident_edge_guard,
+            -(reload_sensitive * h2d_near_deadline_first),
+            -(boundary_comm_ms * nic_boundary_first),
+            -memory_pressure,
+            -compute_ms,
+            order.index(chunk_id),
+        )
+
+    return sorted(order, key=_score)
+
+
 def _resolve_model_chunk_order(
     num_model_chunks: int,
     *,
@@ -3147,13 +3477,19 @@ def _resolve_model_chunk_order(
         phase=phase,
         local_stage_hint=local_stage_hint,
     )
-    return _apply_window_override_chunk_order(
+    order = _apply_window_override_chunk_order(
         order,
         num_model_chunks=num_model_chunks,
         phase=phase,
         group_index=group_index,
         num_groups=num_groups,
         local_stage_hint=local_stage_hint,
+    )
+    return _apply_vpp_flow_chunk_order(
+        order,
+        phase=phase,
+        group_index=group_index,
+        num_groups=num_groups,
     )
 
 

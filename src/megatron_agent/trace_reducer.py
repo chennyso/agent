@@ -64,6 +64,30 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _optimizer_cpu_offload_enabled(program: MegatronProgram) -> bool:
+    norm = program.normalized()
+    metadata = dict(norm.metadata or {})
+    return bool(metadata.get("runtime_enable_optimizer_cpu_offload", False)) or bool(
+        metadata.get("optimizer_cpu_offload", False)
+    )
+
+
+def _optimizer_offload_fraction(program: MegatronProgram) -> float:
+    norm = program.normalized()
+    metadata = dict(norm.metadata or {})
+    return max(
+        min(
+            float(
+                metadata.get("runtime_optimizer_offload_fraction")
+                or metadata.get("optimizer_offload_fraction")
+                or 0.0
+            ),
+            1.0,
+        ),
+        0.0,
+    )
+
+
 def infer_program_patch_family(program: MegatronProgram) -> str:
     norm = program.normalized()
     patch = norm.applied_patch
@@ -276,6 +300,10 @@ def _derive_runtime_bottlenecks(
     comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
     bubble_ratio = float(runtime_evidence.get("bubble_ratio") or 0.0)
     cross_node_ratio = float(runtime_evidence.get("cross_node_exposed_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
+    tp_without_sp = bool(runtime_evidence.get("tp_without_sp"))
+    cpu_offload_tail_ratio = float(runtime_evidence.get("cpu_offload_tail_ratio") or 0.0)
+    optimizer_cpu_offload = bool(runtime_evidence.get("optimizer_cpu_offload"))
 
     derived: List[Dict[str, Any]] = []
     if stage_tail_ratio >= 0.12 or tail_step_jitter_ratio >= 0.18:
@@ -285,6 +313,33 @@ def _derive_runtime_bottlenecks(
                 "severity": "high" if stage_tail_ratio >= 0.20 else "medium",
                 "metric": max(stage_tail_ratio, tail_step_jitter_ratio),
                 "anchor": hottest.get("subgraph"),
+            }
+        )
+    if optimizer_exposed_ratio >= 0.18:
+        derived.append(
+            {
+                "label": "optimizer_bound",
+                "severity": "high" if optimizer_exposed_ratio >= 0.30 else "medium",
+                "metric": optimizer_exposed_ratio,
+                "anchor": "optimizer_tail",
+            }
+        )
+    if tp_without_sp:
+        derived.append(
+            {
+                "label": "tp_without_sp",
+                "severity": "high" if int(runtime_evidence.get("tp_degree") or 1) >= 4 else "medium",
+                "metric": float(runtime_evidence.get("tp_degree") or 1.0),
+                "anchor": "tensor_parallel",
+            }
+        )
+    if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18:
+        derived.append(
+            {
+                "label": "cpu_offload_tail",
+                "severity": "high" if cpu_offload_tail_ratio >= 0.30 else "medium",
+                "metric": cpu_offload_tail_ratio,
+                "anchor": hottest.get("subgraph") or "optimizer_state",
             }
         )
     if memory_skew_ratio >= 0.12:
@@ -1676,6 +1731,9 @@ def _build_next_step_hypotheses(
     comm_exposure_ratio = float(runtime_evidence.get("comm_exposure_ratio") or 0.0)
     optimizer_exposed_ratio = float(runtime_evidence.get("optimizer_exposed_ratio") or 0.0)
     reload_stall_ratio = float(runtime_evidence.get("reload_stall_ratio") or 0.0)
+    tp_without_sp = bool(runtime_evidence.get("tp_without_sp"))
+    optimizer_cpu_offload = bool(runtime_evidence.get("optimizer_cpu_offload"))
+    cpu_offload_tail_ratio = float(runtime_evidence.get("cpu_offload_tail_ratio") or 0.0)
     interleaved = int(norm.parallel.vpp_degree) > 1 or bool(norm.metadata.get("pipeline_layout"))
 
     next_schedule_family = str(norm.schedule.template or "fixed_1f1b")
@@ -1683,6 +1741,15 @@ def _build_next_step_hypotheses(
     next_memory_patch_family = "preserve_memory_policy"
     next_overlap_patch_family = "preserve_overlap_policy"
     stop_signal = "continue_search"
+    diagnostic_labels = [
+        str(item).strip()
+        for item in list((bottleneck_signature or {}).get("canonical_labels") or [])
+        if str(item).strip()
+    ]
+    if tp_without_sp and "tp_without_sp" not in diagnostic_labels:
+        diagnostic_labels.append("tp_without_sp")
+    if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18 and "cpu_offload_tail" not in diagnostic_labels:
+        diagnostic_labels.append("cpu_offload_tail")
     sorted_groups = sorted(
         list(norm.layer_groups or []),
         key=lambda item: (
@@ -1703,6 +1770,8 @@ def _build_next_step_hypotheses(
     reload_shift_direction = "hold"
     comm_chunk_direction = "preserve"
     local_verticalization_targets: List[str] = []
+    next_runtime_repair_actions: List[Dict[str, Any]] = []
+    next_pp_family_candidates: List[str] = []
 
     if dominant == "bubble_bound":
         next_schedule_family = "zero_bubble" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
@@ -1711,6 +1780,16 @@ def _build_next_step_hypotheses(
         next_overlap_patch_family = "adaptive_chunking_patch"
         comm_chunk_direction = "finer"
         local_verticalization_targets = list(target_layer_groups[:2])
+        next_runtime_repair_actions.append(
+            {
+                "rewrite_type": "schedule_family_switch",
+                "direction": str(next_schedule_family),
+                "target_stage_ids": list(target_stages),
+                "target_layer_group_ids": list(target_layer_groups[:2]),
+                "diagnostic_labels": ["bubble_bound"],
+            }
+        )
+        next_pp_family_candidates = ["zero_bubble", "dualpipe_v", "zbv"]
     elif dominant == "memory_bound":
         next_schedule_family = next_schedule_family if interleaved else "interleaved"
         next_partition_patch_family = "layer_group_repartition"
@@ -1718,18 +1797,73 @@ def _build_next_step_hypotheses(
         next_overlap_patch_family = "adaptive_chunking_patch"
         reload_shift_direction = "earlier"
         local_verticalization_targets = list(target_layer_groups[:2])
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "selective_reload_prefetch",
+                    "direction": "earlier",
+                    "target_stage_ids": list(target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["memory_bound"],
+                },
+                {
+                    "rewrite_type": "offload_timing_shift",
+                    "direction": "earlier",
+                    "target_stage_ids": list(target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["memory_bound"],
+                },
+            ]
+        )
     elif dominant == "comm_bound":
         next_schedule_family = "interleaved" if int(norm.parallel.pp_degree) > 1 else next_schedule_family
         next_partition_patch_family = "change_schedule_family"
         next_memory_patch_family = "preserve_memory_policy"
         next_overlap_patch_family = "adaptive_chunking_patch"
         comm_chunk_direction = "coarser"
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "chunk_priority_rewrite",
+                    "direction": "coarser",
+                    "target_stage_ids": list(target_stages),
+                    "target_layer_group_ids": list(target_layer_groups),
+                    "diagnostic_labels": ["comm_bound"],
+                },
+                {
+                    "rewrite_type": "overlap_window_switch",
+                    "direction": "guarded_enable",
+                    "target_stage_ids": list(target_stages),
+                    "diagnostic_labels": ["comm_bound"],
+                },
+            ]
+        )
+        next_pp_family_candidates = ["dualpipe_v", "v_half", "v_min"]
     elif dominant == "tail_bound":
         next_schedule_family = "dualpipe_v" if interleaved else "interleaved"
         next_partition_patch_family = "local_verticalization_patch"
         next_memory_patch_family = "preserve_memory_policy"
         next_overlap_patch_family = "tail_relief_patch"
         local_verticalization_targets = list(target_layer_groups[:2])
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "tail_optimizer_relief",
+                    "direction": "enable",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "target_layer_group_ids": list(target_layer_groups[:1]),
+                    "diagnostic_labels": ["tail_bound"],
+                },
+                {
+                    "rewrite_type": "local_verticalization",
+                    "direction": "enable",
+                    "target_stage_ids": list(target_stages),
+                    "target_layer_group_ids": list(local_verticalization_targets),
+                    "diagnostic_labels": ["tail_bound"],
+                },
+            ]
+        )
+        next_pp_family_candidates = ["dualpipe_v", "v_half", "v_min"]
     elif dominant == "reload_bound":
         next_schedule_family = next_schedule_family
         next_partition_patch_family = "preserve_partition"
@@ -1737,16 +1871,121 @@ def _build_next_step_hypotheses(
         next_overlap_patch_family = "adaptive_chunking_patch"
         reload_shift_direction = "earlier"
         local_verticalization_targets = list(target_layer_groups[:1])
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "selective_reload_prefetch",
+                    "direction": "earlier",
+                    "target_stage_ids": list(target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["reload_bound"],
+                },
+                {
+                    "rewrite_type": "offload_timing_shift",
+                    "direction": "earlier",
+                    "target_stage_ids": list(target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["reload_bound"],
+                },
+            ]
+        )
+    elif dominant == "cpu_offload_tail":
+        next_schedule_family = "dualpipe_v" if interleaved else next_schedule_family
+        next_partition_patch_family = "preserve_partition"
+        next_memory_patch_family = "offload_enable_patch"
+        next_overlap_patch_family = "tail_relief_patch"
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "cpu_offload_scope_switch",
+                    "direction": "retarget_tail",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["cpu_offload_tail"],
+                },
+                {
+                    "rewrite_type": "offload_timing_shift",
+                    "direction": "earlier",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "target_state_ids": list(target_state_objects),
+                    "diagnostic_labels": ["cpu_offload_tail"],
+                },
+                {
+                    "rewrite_type": "tail_optimizer_relief",
+                    "direction": "enable",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "diagnostic_labels": ["cpu_offload_tail", "optimizer_bound"],
+                },
+            ]
+        )
+        next_pp_family_candidates = ["dualpipe_v", "zbv", "v_min"]
     elif dominant == "optimizer_bound":
         next_schedule_family = next_schedule_family
         next_partition_patch_family = "preserve_partition"
         next_memory_patch_family = "preserve_memory_policy"
         next_overlap_patch_family = "tail_relief_patch"
+        next_runtime_repair_actions.extend(
+            [
+                {
+                    "rewrite_type": "tail_optimizer_relief",
+                    "direction": "enable",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "target_layer_group_ids": list(target_layer_groups[:1]),
+                    "diagnostic_labels": ["optimizer_bound"],
+                },
+                {
+                    "rewrite_type": "overlap_window_switch",
+                    "direction": "optimizer_tail_guarded",
+                    "target_stage_ids": list(target_stages[-1:] or target_stages),
+                    "diagnostic_labels": ["optimizer_bound"],
+                },
+            ]
+        )
+        if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18:
+            next_runtime_repair_actions.extend(
+                [
+                    {
+                        "rewrite_type": "cpu_offload_scope_switch",
+                        "direction": "retarget_tail",
+                        "target_stage_ids": list(target_stages[-1:] or target_stages),
+                        "target_state_ids": list(target_state_objects),
+                        "diagnostic_labels": ["optimizer_bound", "cpu_offload_tail"],
+                    },
+                    {
+                        "rewrite_type": "offload_timing_shift",
+                        "direction": "earlier",
+                        "target_stage_ids": list(target_stages[-1:] or target_stages),
+                        "target_state_ids": list(target_state_objects),
+                        "diagnostic_labels": ["optimizer_bound", "cpu_offload_tail"],
+                    },
+                ]
+            )
+        next_pp_family_candidates = ["dualpipe_v", "zbv", "v_half"]
     else:
         next_schedule_family = "dualpipe_v" if interleaved and bubble_ratio >= 0.10 else next_schedule_family
         next_partition_patch_family = "critical_path_relief_patch" if bubble_ratio >= 0.10 else "preserve_partition"
         next_memory_patch_family = "reload_shift_patch" if peak_reserved_ratio >= 0.82 else "preserve_memory_policy"
         next_overlap_patch_family = "adaptive_chunking_patch" if comm_exposure_ratio >= 0.12 else "preserve_overlap_policy"
+        next_runtime_repair_actions.append(
+            {
+                "rewrite_type": "schedule_family_switch" if bubble_ratio >= 0.10 else "adaptive_chunking",
+                "direction": str(next_schedule_family if bubble_ratio >= 0.10 else "preserve"),
+                "target_stage_ids": list(target_stages),
+                "target_layer_group_ids": list(target_layer_groups[:2]),
+                "diagnostic_labels": list(diagnostic_labels),
+            }
+        )
+
+    if tp_without_sp:
+        next_runtime_repair_actions.append(
+            {
+                "rewrite_type": "tp_sp_recomposition",
+                "direction": "enable_sp",
+                "target_stage_ids": list(target_stages),
+                "target_layer_group_ids": list(target_layer_groups[:2]),
+                "diagnostic_labels": ["tp_without_sp"],
+            }
+        )
 
     if peak_reserved_ratio >= 0.98:
         stop_signal = "memory_saturation"
@@ -1766,6 +2005,13 @@ def _build_next_step_hypotheses(
         "reload_shift_direction": str(reload_shift_direction),
         "comm_chunk_direction": str(comm_chunk_direction),
         "local_verticalization_targets": list(local_verticalization_targets),
+        "diagnostic_labels": list(diagnostic_labels),
+        "tp_without_sp": bool(tp_without_sp),
+        "optimizer_cpu_offload": bool(optimizer_cpu_offload),
+        "cpu_offload_tail_ratio": round(cpu_offload_tail_ratio, 4),
+        "next_runtime_repair_actions": list(next_runtime_repair_actions),
+        "next_pp_family_candidates": list(dict.fromkeys(next_pp_family_candidates)),
+        "repair_dsl_version": "v2_counterfactual",
         "stop_signal": str(stop_signal),
     }
 
@@ -3182,6 +3428,79 @@ def _morphable_objective_terms(
     }
 
 
+def _build_exposed_critical_path_objective(
+    runtime_evidence: Dict[str, Any],
+    stage_evidence: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    step_time_ms = float(
+        runtime_evidence.get("steady_state_step_time_ms_p50")
+        or runtime_evidence.get("step_time_ms")
+        or 0.0
+    )
+    stage_exposed_ms = max(
+        (
+            float(item.get("compute_ms") or 0.0)
+            + float(item.get("boundary_wait_ms") or 0.0)
+            + float(item.get("stall_ms") or 0.0)
+            for item in (stage_evidence or [])
+        ),
+        default=0.0,
+    )
+    comm_exposed_ms = max(
+        float(runtime_evidence.get("runtime_comm_ms") or 0.0),
+        float(runtime_evidence.get("comm_exposure_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    reload_stall_ms = max(float(runtime_evidence.get("reload_stall_ms") or 0.0), 0.0)
+    copy_stall_ms = max(
+        0.0,
+        float(runtime_evidence.get("offload_ratio") or 0.0) * max(step_time_ms, 0.0),
+    )
+    uncovered_bubble_ms = max(
+        0.0,
+        float(runtime_evidence.get("bubble_ratio") or 0.0) * max(step_time_ms, 0.0)
+        - min(comm_exposed_ms + copy_stall_ms, max(step_time_ms, 0.0)),
+    )
+    optimizer_tail_ms = max(float(runtime_evidence.get("optimizer_exposed_ms") or 0.0), 0.0)
+    stage_completion_values = [
+        float(item.get("completion_ms") or item.get("window_ms") or 0.0)
+        for item in (stage_evidence or [])
+    ]
+    straggler_penalty_ms = (
+        max(stage_completion_values) - (sum(stage_completion_values) / max(len(stage_completion_values), 1))
+        if stage_completion_values
+        else 0.0
+    )
+    terms = {
+        "stage_exposed_ms": round(stage_exposed_ms, 4),
+        "comm_exposed_ms": round(comm_exposed_ms, 4),
+        "reload_stall_ms": round(reload_stall_ms, 4),
+        "copy_stall_ms": round(copy_stall_ms, 4),
+        "uncovered_bubble_ms": round(max(uncovered_bubble_ms, 0.0), 4),
+        "optimizer_tail_ms": round(optimizer_tail_ms, 4),
+        "straggler_penalty_ms": round(max(straggler_penalty_ms, 0.0), 4),
+    }
+    weights = {
+        "stage_exposed_ms": 1.0,
+        "comm_exposed_ms": 1.0,
+        "reload_stall_ms": 1.0,
+        "copy_stall_ms": 0.6,
+        "uncovered_bubble_ms": 0.8,
+        "optimizer_tail_ms": 0.7,
+        "straggler_penalty_ms": 0.8,
+    }
+    weighted_terms = {key: float(terms.get(key, 0.0)) * float(weights.get(key, 1.0)) for key in terms}
+    dominant_term = max(weighted_terms, key=lambda key: float(weighted_terms.get(key, 0.0)), default="")
+    return {
+        "objective": "minimize_exposed_critical_path",
+        "step_time_ms": round(step_time_ms, 4),
+        "terms": terms,
+        "weights": weights,
+        "weighted_terms": {key: round(value, 4) for key, value in weighted_terms.items()},
+        "total_exposed_ms": round(sum(weighted_terms.values()), 4),
+        "dominant_term": dominant_term,
+    }
+
+
 def _morphable_budget_summary(
     program: MegatronProgram,
     runtime_evidence: Dict[str, Any],
@@ -4037,6 +4356,15 @@ def _build_context_from_trace(
         0.0,
     ) if steady_state_p50 > 0.0 else 0.0
     comm_exposure_ratio = (send_recv_ms + fsdp_ag_ms + fsdp_rs_ms + cp_collective_ms) / max(steady_state_p50, 1.0)
+    sequence_parallel_active = bool(int(norm.parallel.tp_degree) > 1 and bool(norm.parallel.sp_enabled))
+    tp_without_sp = bool(int(norm.parallel.tp_degree) > 1 and not bool(norm.parallel.sp_enabled))
+    optimizer_cpu_offload = _optimizer_cpu_offload_enabled(norm)
+    optimizer_offload_fraction = _optimizer_offload_fraction(norm)
+    cpu_offload_tail_ratio = (
+        optimizer_exposed_ratio * max(1.0 + max(stage_tail_ratio, tail_step_jitter_ratio), 1.0)
+        if optimizer_cpu_offload
+        else 0.0
+    )
 
     runtime_evidence = {
         "steady_state_step_time_ms_p50": trace_summary.get("steady_state_step_time_ms_p50"),
@@ -4054,6 +4382,12 @@ def _build_context_from_trace(
         "peak_reserved_gib": peak_reserved_gib,
         "peak_reserved_ratio": peak_reserved_ratio,
         "tp_overpartition_proxy": float(trace_summary.get("tp_overpartition_proxy") or 0.0),
+        "tp_degree": int(norm.parallel.tp_degree),
+        "pp_degree": int(norm.parallel.pp_degree),
+        "vpp_degree": int(norm.parallel.vpp_degree),
+        "sequence_parallel_active": bool(sequence_parallel_active),
+        "tp_without_sp": bool(tp_without_sp),
+        "supports_sequence_parallel": bool(norm.backend_caps.supports_sequence_parallel if norm.backend_caps is not None else False),
         "send_recv_ms": send_recv_ms,
         "fsdp_ag_ms": fsdp_ag_ms,
         "fsdp_rs_ms": fsdp_rs_ms,
@@ -4063,6 +4397,9 @@ def _build_context_from_trace(
         "tail_step_jitter_ratio": tail_step_jitter_ratio,
         "mem_skew_ratio": mem_skew_ratio,
         "comm_exposure_ratio": comm_exposure_ratio,
+        "optimizer_cpu_offload": bool(optimizer_cpu_offload),
+        "optimizer_offload_fraction": round(optimizer_offload_fraction, 4),
+        "cpu_offload_tail_ratio": round(cpu_offload_tail_ratio, 4),
         "backend_family": str(backend_context.get("backend_family") or "megatron_core"),
         "schedule_template": str(norm.schedule.template),
     }
@@ -4078,6 +4415,13 @@ def _build_context_from_trace(
         runtime_evidence["reload_stall_ratio"] = float(runtime_evidence.get("reload_stall_ms") or 0.0) / max(steady_state_p50, 1.0)
     local_window_observability = _build_local_window_observability(norm, stage_evidence, runtime_evidence)
     runtime_evidence.update(local_window_observability)
+    exposed_critical_path_objective = _build_exposed_critical_path_objective(runtime_evidence, stage_evidence)
+    runtime_evidence["exposed_critical_path_ms"] = float(
+        exposed_critical_path_objective.get("total_exposed_ms") or 0.0
+    )
+    runtime_evidence["exposed_critical_path_dominant"] = str(
+        exposed_critical_path_objective.get("dominant_term") or ""
+    )
     evidence_record = {
         "stage_evidence": stage_evidence,
         "subgraph_evidence": subgraph_evidence,
@@ -4087,6 +4431,7 @@ def _build_context_from_trace(
             "memory_hot_stage": memory_hot_stage,
         },
         "local_window_observability": local_window_observability,
+        "exposed_critical_path_objective": exposed_critical_path_objective,
     }
     derived_bottlenecks = _derive_runtime_bottlenecks(
         stage_evidence=stage_evidence,
@@ -4381,6 +4726,10 @@ def detect_failure_modes(program: MegatronProgram, context_record: Dict[str, Any
     stage_tail_ratio = float(runtime.get("stage_tail_ratio") or 0.0)
     mem_skew_ratio = float(runtime.get("mem_skew_ratio") or 0.0)
     comm_exposure_ratio = float(runtime.get("comm_exposure_ratio") or 0.0)
+    optimizer_exposed_ratio = float(runtime.get("optimizer_exposed_ratio") or 0.0)
+    tp_without_sp = bool(runtime.get("tp_without_sp"))
+    optimizer_cpu_offload = bool(runtime.get("optimizer_cpu_offload"))
+    cpu_offload_tail_ratio = float(runtime.get("cpu_offload_tail_ratio") or 0.0)
 
     if stage_load_variance >= 0.03:
         hot = max(stage_evidence, key=lambda item: float(item.get("completion_ms") or 0.0), default={})
@@ -4394,9 +4743,15 @@ def detect_failure_modes(program: MegatronProgram, context_record: Dict[str, Any
         failures.append({"label": "schedule_coupling", "severity": "medium", "anchor": str(program.schedule.template), "metric": max(bubble_ratio, float(runtime.get("grouped_interleave_overhead") or 0.0))})
     if tp_proxy >= 3.0 and int(program.parallel.tp_degree) >= 4:
         failures.append({"label": "tp_overpartitioned", "severity": "medium", "anchor": "tensor_parallel", "metric": tp_proxy})
+    if tp_without_sp:
+        failures.append({"label": "tp_without_sp", "severity": "high" if int(program.parallel.tp_degree) >= 4 else "medium", "anchor": "tensor_parallel", "metric": float(runtime.get("tp_degree") or program.parallel.tp_degree or 1.0)})
     if stage_tail_ratio >= 0.12:
         hot = max(stage_evidence, key=lambda item: float(item.get("completion_ms") or 0.0), default={})
         failures.append({"label": "tail_heavy", "severity": "medium", "anchor": hot.get("subgraph"), "metric": stage_tail_ratio})
+    if optimizer_exposed_ratio >= 0.18:
+        failures.append({"label": "optimizer_bound", "severity": "high" if optimizer_exposed_ratio >= 0.30 else "medium", "anchor": "optimizer_tail", "metric": optimizer_exposed_ratio})
+    if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18:
+        failures.append({"label": "cpu_offload_tail", "severity": "high" if cpu_offload_tail_ratio >= 0.30 else "medium", "anchor": "optimizer_state", "metric": cpu_offload_tail_ratio})
     if mem_skew_ratio >= 0.12:
         hot = max(stage_evidence, key=lambda item: float(item.get("peak_reserved_gib") or 0.0), default={})
         failures.append({"label": "memory_skew", "severity": "medium", "anchor": hot.get("subgraph"), "metric": mem_skew_ratio})
@@ -4651,6 +5006,9 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
     mem_skew_ratio = _safe_float(runtime_payload.get("mem_skew_ratio")) or 0.0
     reload_stall_ratio = _safe_float(runtime_payload.get("reload_stall_ratio")) or 0.0
     optimizer_exposed_ratio = _safe_float(runtime_payload.get("optimizer_exposed_ratio")) or 0.0
+    tp_without_sp = bool(runtime_payload.get("tp_without_sp"))
+    optimizer_cpu_offload = bool(runtime_payload.get("optimizer_cpu_offload"))
+    cpu_offload_tail_ratio = _safe_float(runtime_payload.get("cpu_offload_tail_ratio")) or 0.0
     seq_len = int(norm.metadata.get("seq_len", 1024) or 1024)
     failure_modes = [str(item.get("label")) for item in (trace_summary.get("failure_modes") or [])]
     derived_labels = [str(item.get("label")) for item in (trace_summary.get("derived_bottlenecks") or [])]
@@ -4666,6 +5024,10 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
         legacy_labels.append("comm_exposed")
     if mem_skew_ratio >= 0.12:
         legacy_labels.append("memory_skew")
+    if tp_without_sp:
+        legacy_labels.append("tp_without_sp")
+    if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18:
+        legacy_labels.append("cpu_offload_tail")
     if seq_len >= 2048 and int(norm.parallel.cp_degree) == 1:
         legacy_labels.append("long_context_attention_heavy")
     if peak_reserved_ratio > 0 and peak_reserved_ratio < 0.75:
@@ -4673,7 +5035,7 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
     if bool(trace_summary.get("oom")) or peak_reserved_ratio >= 0.90:
         legacy_labels.append("memory_bound")
     for label in failure_modes + derived_labels:
-        if label in {"tp_overpartitioned", "memory_hotspot", "compute_imbalance", "communication_drag", "schedule_coupling", "tail_heavy", "memory_skew", "comm_exposed", "topology_mismatch"}:
+        if label in {"tp_overpartitioned", "memory_hotspot", "compute_imbalance", "communication_drag", "schedule_coupling", "tail_heavy", "memory_skew", "comm_exposed", "topology_mismatch", "optimizer_bound", "tp_without_sp", "cpu_offload_tail"}:
             mapped = {
                 "memory_hotspot": "memory_bound",
                 "compute_imbalance": "stage_imbalanced",
@@ -4683,6 +5045,9 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
                 "memory_skew": "memory_bound",
                 "comm_exposed": "comm_exposed",
                 "topology_mismatch": "comm_exposed",
+                "optimizer_bound": "optimizer_bound",
+                "tp_without_sp": "tp_without_sp",
+                "cpu_offload_tail": "cpu_offload_tail",
             }.get(label, label)
             if mapped not in legacy_labels:
                 legacy_labels.append(mapped)
@@ -4700,6 +5065,10 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
         canonical_labels.append("reload_bound")
     if optimizer_exposed_ratio >= 0.18:
         canonical_labels.append("optimizer_bound")
+    if tp_without_sp:
+        canonical_labels.append("tp_without_sp")
+    if optimizer_cpu_offload and cpu_offload_tail_ratio >= 0.18:
+        canonical_labels.append("cpu_offload_tail")
     if len(canonical_labels) > 1:
         canonical_labels.append("mixed_bound")
     if not canonical_labels:
@@ -4707,7 +5076,9 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
 
     priority = [
         "memory_bound",
+        "cpu_offload_tail",
         "optimizer_bound",
+        "tp_without_sp",
         "reload_bound",
         "comm_bound",
         "tail_bound",
@@ -4717,6 +5088,9 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
     canonical_dominant = next((label for label in priority if label in canonical_labels), "mixed_bound")
     legacy_priority = [
         "tp_overpartitioned",
+        "tp_without_sp",
+        "cpu_offload_tail",
+        "optimizer_bound",
         "memory_bound",
         "stage_imbalanced",
         "tail_heavy",
@@ -4744,6 +5118,9 @@ def classify_bottleneck(program: MegatronProgram, trace_summary: Dict[str, Any])
             "mem_skew_ratio": mem_skew_ratio,
             "reload_stall_ratio": reload_stall_ratio,
             "optimizer_exposed_ratio": optimizer_exposed_ratio,
+            "tp_without_sp": 1.0 if tp_without_sp else 0.0,
+            "optimizer_cpu_offload": 1.0 if optimizer_cpu_offload else 0.0,
+            "cpu_offload_tail_ratio": cpu_offload_tail_ratio,
         },
     }
 
