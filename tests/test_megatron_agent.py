@@ -62,6 +62,12 @@ from megatron_agent.pipeline_visualization import (  # noqa: E402
     extract_pipeline_event_trace,
     prepare_pipeline_timeline_panels,
 )
+from megatron_agent.rac_vpp_validation import (  # noqa: E402
+    critical_path_resource_conflict,
+    generate_offload_policy_comparison,
+    generate_vpp_config_comparison,
+    run_validation_suite,
+)
 from megatron_agent.policy_memory import PolicyMemoryBank  # noqa: E402
 from megatron_agent.torchtitan_hybrid import (  # noqa: E402
     TorchTitanHybridController,
@@ -185,6 +191,55 @@ class TestMegatronAgentProgramFlow(unittest.TestCase):
         target = next(candidate for candidate in candidates if candidate.metadata.get("program_kind") == "candidate_stage_aware_schedule")
         family = classify_program_family(target).to_dict()
         self.assertTrue(family["is_family_outside"])
+
+    def test_rac_vpp_crc_weights_only_exposed_critical_conflict(self) -> None:
+        windows = [
+            {"duration_ms": 10.0, "criticality": 0.0, "pcie_h2d": 3.0, "nic": 3.0},
+            {"duration_ms": 10.0, "criticality": 0.5, "pcie_h2d": 1.6, "nic": 0.8},
+            {"duration_ms": 5.0, "criticality": 1.0, "pcie_h2d": 1.1, "nic": 1.4},
+        ]
+
+        crc = critical_path_resource_conflict(windows, {"pcie_h2d": 1.0, "nic": 1.0})
+
+        self.assertAlmostEqual(crc, 5.5, places=3)
+
+    def test_rac_vpp_observation_lowest_bubble_is_not_fastest(self) -> None:
+        records = generate_vpp_config_comparison()
+
+        lowest_bubble = min(records, key=lambda item: item.bubble_ratio)
+        fastest = max(records, key=lambda item: item.tokens_per_s)
+
+        self.assertEqual(lowest_bubble.config_name, "bubble_minimized_vpp")
+        self.assertEqual(fastest.config_name, "rac_vpp_cmnc")
+        self.assertGreater(lowest_bubble.crc_score, fastest.crc_score)
+        self.assertGreater(lowest_bubble.reload_stall_ms, fastest.reload_stall_ms)
+
+    def test_rac_vpp_observation_lifetime_is_not_sufficient_for_offload(self) -> None:
+        records = {item.policy_name: item for item in generate_offload_policy_comparison()}
+
+        lifetime = records["lifetime_only_offload"]
+        rac = records["rac_vpp_conflict_aware_offload"]
+
+        self.assertIn("boundary_long_lived", lifetime.selected_chunks)
+        self.assertNotIn("boundary_long_lived", rac.selected_chunks)
+        self.assertLess(lifetime.peak_memory_gib, rac.peak_memory_gib)
+        self.assertGreater(lifetime.reload_stall_ms, rac.reload_stall_ms)
+        self.assertGreater(rac.tokens_per_s, lifetime.tokens_per_s)
+
+    def test_rac_vpp_validation_suite_writes_tables_and_figures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = run_validation_suite(tmp)
+
+            self.assertTrue(manifest["observations"]["lowest_bubble_not_fastest"])
+            self.assertTrue(manifest["observations"]["lifetime_only_not_best_offload"])
+            for path in manifest["tables"].values():
+                table_path = Path(path)
+                self.assertTrue(table_path.exists(), path)
+                self.assertGreater(table_path.stat().st_size, 40)
+            for path in manifest["figures"].values():
+                figure_path = Path(path)
+                self.assertTrue(figure_path.exists(), path)
+                self.assertGreater(figure_path.stat().st_size, 0)
 
     def test_sequence_parallel_toggle_requires_backend_caps_support(self) -> None:
         baseline = default_dense_program("single_g5")
