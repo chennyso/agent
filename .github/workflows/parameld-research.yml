@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install numerical optimization and test dependencies
-        run: python -m pip install numpy scipy networkx pytest
+        run: python -m pip install numpy scipy networkx ortools pytest
       - name: Validate optimizers
         env:
           PYTHONPATH: research/parameld
