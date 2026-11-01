@@ -1,37 +1,42 @@
-# ParaMeld：执行证据驱动的数值搜索研究模块
+# ParaMeld：执行条件邻域与混合并行搜索研究
 
-本目录为独立研究实现，暂时不修改当前 AutoFSDP-Agent 的真实训练执行路径。
+该目录提供真实数值求解与数学测试，位于独立研究分支，不改变现有 AutoFSDP-Agent 的训练主线。
 
-## 实现状态
+详细算法、文献对照、正确性范围与完整 GPU 验证条件见 [DESIGN.md](DESIGN.md)。
 
-- fixed_order_path.py：对于固定 DAG、已确认的资源先后关系及模块成本，使用混合整数主问题与最长路径分离求解模块边界。提供模块冻结、非空连续区间约束、路径约束增量添加。
-- exclusive_schedule.py：对任务依赖、排他资源和已核实的跨 Rank 通信顺序进行混合整数调度优化。
-- tests/test_optimizers.py：使用穷举分区和 Google OR-Tools 官方作业调度实例检查最优性；测试非法输入与资源互斥约束。
+## 已实现的六个模块
 
-## 现有工程接口
+| 文件 | 功能 |
+| --- | --- |
+| fixed_order_path.py | 固定执行依赖与模块费用下，用 SciPy MILP 与 DAG 最长路径实现增量路径约束分区 |
+| execution_neighborhood.py | 根据事件时间余量、资源影响及配置变量依赖生成有证据的联合搜索邻域 |
+| exclusive_schedule.py | 在已验证跨 Rank 通信次序时，以排他资源模型求解局部事件安排 |
+| capacity_schedule.py | OR-Tools CP-SAT 的累计资源、每 Rank 动态参数缓冲与计算通信调度 |
+| decision_aware_measurement.py | 利用共享成本系数的候选时间差区间，选择有机会改变排序的补测对象 |
+| budgeted_portfolio.py | 上下文搜索行动选择；使用已观察的改善率和墙钟/GPU 小时预算 |
 
-src/fsdp_agent/config.py 已支持 Fsdp2Strategy、GroupingConfig、ParallelSpec、LayerOverride、策略序列化和验证。
-src/fsdp_agent/train.py 与 trial_runner.py 包含 FSDP2 真实训练、Profiler、CUDA 计时及运行指标。
-src/fsdp_agent/agent_loop.py 负责模型调用和 Trial 结果记录。
+## 测试
 
-当前仓库尚未确认具有 ParaMeld 论文完整的微批 DAG 路径恢复器和任意模块边界求解器，因此本目录尚未与主线训练流程集成。
+安装 Python 3.11、numpy、scipy、networkx、ortools、pytest，在仓库根目录执行：
 
-## 测试命令
+    PYTHONPATH=research/parameld python -m pytest -q research/parameld/tests
 
-安装 numpy、scipy、networkx、pytest 后，在仓库根目录执行：
+GitHub Actions 工作流为 .github/workflows/parameld-research.yml。
 
-    PYTHONPATH=research/parameld pytest -q research/parameld/tests
+测试使用真实数学求解器、精确小规模分区与公开作业调度示例，验证最优性、资源约束、显存存活和测量选择。没有使用 mock。测试结果只证明相应数学模型，在 GPU 上的运行行为需要单独实测。
 
-## 必须完成的 GPU 集成
+## 与已有仓库的关系
 
-1. 从真实执行事件获得 F、B、P2P、TP/CP/EP Collective、FSDP AllGather/ReduceScatter、参数释放以及设备资源顺序。
-2. 校验跨 Rank 通信一致性、P2P 匹配、梯度与参数版本，以及后端支持的 FSDP 单元和流水线布局。
-3. 将合法候选转成 Fsdp2Strategy 后运行实际 GPU 测量，验证预测时间、动态显存和训练正确性。
-4. 在模块分区或调度引发资源执行顺序变化时，重新构造 DAG；旧路径约束仅在其有效条件成立时可用。
-5. 再连接预算感知的 Agent 搜索，并根据真实费用和收益选择模型调用、数值求解或 GPU 测量。
+src/fsdp_agent/config.py 支持 Fsdp2Strategy、GroupingConfig、ParallelSpec 和 LayerOverride；train.py 和 trial_runner.py 提供真实 FSDP2 训练、性能计时与 profiler；agent_loop.py 提供模型调用与试验记录。
 
-## 数学证明范围
+目前尚未确认该仓库具有 ParaMeld 论文描述的完整微批 DAG 回放器及对应任意模块边界的 CP-SAT 代码，因此这些研究模块仍是独立可运行的求解器。不能把示例时间解释成真实训练加速。
 
-固定执行图下，路径约束增量生成可求解对应的路径代理目标。资源顺序、执行成本或者通信竞争发生改变时，该性质不能直接推广到完整训练搜索。
+## 真实集成的必要条件
 
-调度模型目前将指定资源视为排他资源，未表达真实 GPU 通信和计算同时执行时的减速关系。优化结果需要完整执行模型和 GPU 训练验证。求解器不能证明最优时会明确报错。
+1. 从训练后端获得受验证的任务依赖、通信组、参数/激活存活及资源先后关系。
+2. 对任何 PP/VPP、FSDP、通信和微批配置变更重新检查任务图与成本适用范围。
+3. 由后端核验跨 Rank Collective、P2P、参数版本和梯度更新顺序。
+4. 用 profiler 校准并行通信干扰与动态显存，再将候选提交真实训练与正确性验证。
+5. 在同预算实验中比较原确定性搜索、原 Agent、BALANS、OptiCo、Primus、ATTUNE 和新增算法。
+
+只有固定结构路径子问题及输入资源模型上的最优性可以依据当前实现声明；完整混合并行训练的收益仍须验证。
