@@ -61,12 +61,12 @@ class ExecutionNeighborhoodBuilder:
                 raise ValueError("任务资源标识不能重复")
             if len(event.influenced_by) != len(set(event.influenced_by)):
                 raise ValueError("任务影响变量不能重复")
-            if any(var not in self.rules for var in event.influenced_by):
+            if any(variable not in self.rules for variable in event.influenced_by):
                 raise ValueError("执行事件引用了未登记的配置变量")
-            for parent in event.predecessors:
-                if parent not in self.events:
+            for predecessor in event.predecessors:
+                if predecessor not in self.events:
                     raise ValueError("执行任务引用了未知前置事件")
-                self.graph.add_edge(parent, event.name)
+                self.graph.add_edge(predecessor, event.name)
         if not nx.is_directed_acyclic_graph(self.graph):
             raise ValueError("执行依赖存在循环，无法计算最长路径")
         for rule in variable_rules:
@@ -134,18 +134,24 @@ class ExecutionNeighborhoodBuilder:
         return frozenset(closure)
 
     def _related_events(
-        self, seed: str, resource_slack_limit: int
+        self,
+        seed: str,
+        neighbor_slack_limit: int,
     ) -> tuple[str, ...]:
+        # 只将时间敏感的邻接事件加入本轮子问题，避免无关分支扩大搜索变量。
         related = {seed}
-        related.update(self.events[seed].predecessors)
-        related.update(self.graph.successors(seed))
+        immediate = set(self.events[seed].predecessors)
+        immediate.update(self.graph.successors(seed))
+        for name in immediate:
+            if self._criticalities[name].slack_us <= neighbor_slack_limit:
+                related.add(name)
         resource_set = set(self.events[seed].resources)
         for event in self.events.values():
             if event.name == seed:
                 continue
             if (
                 resource_set.intersection(event.resources)
-                and self._criticalities[event.name].slack_us <= resource_slack_limit
+                and self._criticalities[event.name].slack_us <= neighbor_slack_limit
             ):
                 related.add(event.name)
         return tuple(sorted(related))
@@ -170,15 +176,14 @@ class ExecutionNeighborhoodBuilder:
             if critical.slack_us > critical_slack_us:
                 continue
             related = self._related_events(
-                critical.name, resource_slack_us
+                critical.name,
+                resource_slack_us,
             )
             score: dict[str, float] = {}
             for name in related:
                 event = self.events[name]
                 info = self._criticalities[name]
-                contribution = (
-                    (event.duration_us + 1.0) / (info.slack_us + 1.0)
-                )
+                contribution = (event.duration_us + 1.0) / (info.slack_us + 1.0)
                 if name != critical.name:
                     contribution *= 0.5
                 for variable in event.influenced_by:
@@ -218,7 +223,7 @@ class ExecutionNeighborhoodBuilder:
                     recompute_fields=recompute,
                     affected_events=related,
                     event_slack_us=critical.slack_us,
-                    evidence_weight=sum(score.get(var, 0.0) for var in signature),
+                    evidence_weight=sum(score.get(variable, 0.0) for variable in signature),
                 )
             )
             if len(output) >= max_neighborhoods:
