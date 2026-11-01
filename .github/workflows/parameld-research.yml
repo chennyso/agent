@@ -1,0 +1,32 @@
+name: ParaMeld Research Validation
+
+on:
+  pull_request:
+    paths:
+      - 'research/parameld/**'
+      - '.github/workflows/parameld-research.yml'
+  push:
+    branches:
+      - 'research/parameld-evidence-guided-milp'
+    paths:
+      - 'research/parameld/**'
+      - '.github/workflows/parameld-research.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  research-solvers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install numerical optimization and test dependencies
+        run: python -m pip install numpy scipy networkx ortools pytest
+      - name: Validate optimizers
+        env:
+          PYTHONPATH: research/parameld
+        run: python -m pytest -q research/parameld/tests
