@@ -17,6 +17,7 @@ class ScheduledTask:
 @dataclass(frozen=True)
 class BufferLifetime:
     name: str
+    rank: str
     bytes: int
     acquire_at_start: str
     release_after_end: str
@@ -38,8 +39,8 @@ class CapacityAwareSchedule:
         resource_capacities: dict[str, int],
         buffers: tuple[BufferLifetime, ...],
         *,
-        memory_capacity_bytes: int,
-        persistent_memory_bytes: int,
+        memory_capacities_bytes: dict[str, int],
+        persistent_memory_bytes: dict[str, int],
         collective_order_validated: bool,
     ):
         if not collective_order_validated:
@@ -49,17 +50,22 @@ class CapacityAwareSchedule:
             raise ValueError("任务列表必须存在且名称唯一")
         if any(task.duration_us <= 0 for task in tasks):
             raise ValueError("所有任务必须具有正整数微秒成本")
-        if (
-            memory_capacity_bytes < 0
-            or persistent_memory_bytes < 0
-            or persistent_memory_bytes > memory_capacity_bytes
+        if not memory_capacities_bytes or set(memory_capacities_bytes) != set(persistent_memory_bytes):
+            raise ValueError("每个 Rank 都必须具有独立的显存容量与持久状态记录")
+        if any(
+            capacity <= 0 or not 0 <= persistent <= capacity
+            for rank, capacity in memory_capacities_bytes.items()
+            for persistent in (persistent_memory_bytes[rank],)
         ):
-            raise ValueError("显存容量与持久存储无效")
+            raise ValueError("各 Rank 的显存容量与持久存储无效")
         if any(cap <= 0 for cap in resource_capacities.values()):
             raise ValueError("共享资源容量必须为正整数")
         self.resources = dict(resource_capacities)
         self.buffers = buffers
-        self.available_memory = memory_capacity_bytes - persistent_memory_bytes
+        self.available_memory = {
+            rank: capacity - persistent_memory_bytes[rank]
+            for rank, capacity in memory_capacities_bytes.items()
+        }
         self.graph = nx.DiGraph()
         self.graph.add_nodes_from(self.tasks)
         for task in tasks:
@@ -77,8 +83,10 @@ class CapacityAwareSchedule:
         if len(buffers) != len({buffer.name for buffer in buffers}):
             raise ValueError("参数存活对象名称不能重复")
         for buffer in buffers:
-            if buffer.bytes <= 0 or buffer.bytes > self.available_memory:
-                raise ValueError("单个存活对象超过可用动态显存")
+            if buffer.rank not in self.available_memory:
+                raise ValueError("显存对象关联了未知 Rank")
+            if buffer.bytes <= 0 or buffer.bytes > self.available_memory[buffer.rank]:
+                raise ValueError("单个存活对象超过其 Rank 的动态显存")
             if (
                 buffer.acquire_at_start not in self.tasks
                 or buffer.release_after_end not in self.tasks
@@ -133,14 +141,10 @@ class CapacityAwareSchedule:
                         resource_intervals.append(intervals[task.name])
                         demands.append(units)
             if resource_intervals:
-                model.add_cumulative(
-                    resource_intervals,
-                    demands,
-                    capacity,
-                )
+                model.add_cumulative(resource_intervals, demands, capacity)
 
-        memory_intervals = []
-        memory_demands = []
+        rank_intervals = {rank: [] for rank in self.available_memory}
+        rank_demands = {rank: [] for rank in self.available_memory}
         for buffer in self.buffers:
             size = model.new_int_var(
                 0, self.horizon, f"live_duration_{buffer.name}"
@@ -150,7 +154,7 @@ class CapacityAwareSchedule:
                 == ends[buffer.release_after_end]
                 - starts[buffer.acquire_at_start]
             )
-            memory_intervals.append(
+            rank_intervals[buffer.rank].append(
                 model.new_interval_var(
                     starts[buffer.acquire_at_start],
                     size,
@@ -158,13 +162,14 @@ class CapacityAwareSchedule:
                     f"live_{buffer.name}",
                 )
             )
-            memory_demands.append(buffer.bytes)
-        if memory_intervals:
-            model.add_cumulative(
-                memory_intervals,
-                memory_demands,
-                self.available_memory,
-            )
+            rank_demands[buffer.rank].append(buffer.bytes)
+        for rank, intervals_on_rank in rank_intervals.items():
+            if intervals_on_rank:
+                model.add_cumulative(
+                    intervals_on_rank,
+                    rank_demands[rank],
+                    self.available_memory[rank],
+                )
 
         makespan = model.new_int_var(0, self.horizon, "makespan")
         model.add_max_equality(makespan, list(ends.values()))
@@ -176,10 +181,7 @@ class CapacityAwareSchedule:
         if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
             raise RuntimeError(f"求解器未找到满足依赖、资源及显存的合法调度：{status}")
 
-        placements = {
-            name: solver.value(start)
-            for name, start in starts.items()
-        }
+        placements = {name: solver.value(start) for name, start in starts.items()}
         buffer_spans = {
             buffer.name: (
                 placements[buffer.acquire_at_start],
